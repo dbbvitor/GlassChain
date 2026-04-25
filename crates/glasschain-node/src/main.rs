@@ -116,6 +116,9 @@ async fn main() {
                 NodeEvent::BlockMined { index, hash } => {
                     log::info!("[event] Block mined: index={index} hash={}", &hash[..8]);
                 }
+                NodeEvent::BlockReceived { index, hash } => {
+                    log::info!("[event] Block received from peer: index={index} hash={}", &hash[..8]);
+                }
                 NodeEvent::PeerConnected(addr) => {
                     log::info!("[event] Peer connected: {addr}");
                 }

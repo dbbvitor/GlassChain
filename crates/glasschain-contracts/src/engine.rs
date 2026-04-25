@@ -4,7 +4,6 @@ use glasschain_core::{
     ContractExecution, PurchaseOrder, SmartContractDef, SupplyOffer, Transaction, TransactionKind,
 };
 use std::collections::HashMap;
-
 /// The smart-contract execution engine.
 ///
 /// Stores all registered contracts in memory and evaluates them whenever a new
@@ -173,28 +172,41 @@ impl ContractEngine {
                 .min(conditions.max_quantity);
 
             let total_price = order_qty as f64 * offer.price_per_unit;
-            let po_tx_id = uuid::Uuid::new_v4().to_string();
 
-            let po_tx = Transaction::new(TransactionKind::PurchaseOrder(PurchaseOrder {
-                product_id: offer.product_id.clone(),
-                buyer_id: contract.buyer_id().to_owned(),
-                seller_id: offer.seller_id.clone(),
-                quantity: order_qty,
-                agreed_price_per_unit: offer.price_per_unit,
-                currency: offer.currency.clone(),
-                contract_id: Some(contract.id().to_owned()),
-            }));
+            // Use deterministic IDs derived from the contract and offer so that
+            // all nodes evaluating the same offer generate identical transaction
+            // IDs.  The idempotency check in `Ledger::add_transaction` then
+            // suppresses the duplicates that would otherwise arise from multiple
+            // nodes auto-executing the same contract+offer pair.
+            let po_id = format!("po:{}-{}", contract.id(), offer_tx_id);
+            let exec_id = format!("exec:{}-{}", contract.id(), offer_tx_id);
 
-            let exec_tx = Transaction::new(TransactionKind::ContractExecution(ContractExecution {
-                contract_id: contract.id().to_owned(),
-                purchase_order_tx_id: po_tx_id,
-                buyer_id: contract.buyer_id().to_owned(),
-                seller_id: offer.seller_id.clone(),
-                product_id: offer.product_id.clone(),
-                quantity: order_qty,
-                total_price,
-                currency: offer.currency.clone(),
-            }));
+            let po_tx = Transaction::with_id(
+                po_id,
+                TransactionKind::PurchaseOrder(PurchaseOrder {
+                    product_id: offer.product_id.clone(),
+                    buyer_id: contract.buyer_id().to_owned(),
+                    seller_id: offer.seller_id.clone(),
+                    quantity: order_qty,
+                    agreed_price_per_unit: offer.price_per_unit,
+                    currency: offer.currency.clone(),
+                    contract_id: Some(contract.id().to_owned()),
+                }),
+            );
+
+            let exec_tx = Transaction::with_id(
+                exec_id,
+                TransactionKind::ContractExecution(ContractExecution {
+                    contract_id: contract.id().to_owned(),
+                    purchase_order_tx_id: po_tx.id.clone(),
+                    buyer_id: contract.buyer_id().to_owned(),
+                    seller_id: offer.seller_id.clone(),
+                    product_id: offer.product_id.clone(),
+                    quantity: order_qty,
+                    total_price,
+                    currency: offer.currency.clone(),
+                }),
+            );
 
             log::info!(
                 "Contract {} auto-executed: {} × {} @ {:.2} {} from {} (total {:.2})",

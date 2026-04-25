@@ -213,7 +213,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
- "uuid",
 ]
 
 [[package]]
@@ -242,7 +241,6 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
- "uuid",
 ]
 
 [[package]]
@@ -253,8 +251,6 @@ dependencies = [
  "glasschain-core",
  "glasschain-network",
  "log",
- "serde",
- "serde_json",
  "tokio",
 ]
 

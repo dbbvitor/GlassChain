@@ -47,7 +47,9 @@ pub struct PurchaseConditions {
     pub max_price_per_unit: f64,
     /// Minimum quantity the buyer wants to order.
     pub min_quantity: u64,
-    /// Maximum quantity the buyer is willing to order in one execution.
+    /// Total maximum quantity across the entire lifetime of the contract.
+    /// The engine accumulates `quantity_purchased` and marks the contract
+    /// [`Fulfilled`][crate::ContractStatus] once this cap is reached.
     pub max_quantity: u64,
     /// Maximum acceptable lead time in calendar days.
     pub max_lead_time_days: u32,
@@ -137,6 +139,21 @@ impl Transaction {
             .as_secs();
         Self {
             id: Uuid::new_v4().to_string(),
+            timestamp,
+            kind,
+        }
+    }
+
+    /// Create a transaction with an explicit `id` (e.g. a deterministic ID) and
+    /// the current wall-clock time.  Useful when the caller needs the transaction
+    /// ID to be reproducible across multiple nodes.
+    pub fn with_id(id: impl Into<String>, kind: TransactionKind) -> Self {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is before UNIX epoch")
+            .as_secs();
+        Self {
+            id: id.into(),
             timestamp,
             kind,
         }

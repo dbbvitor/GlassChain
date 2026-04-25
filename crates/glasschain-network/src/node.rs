@@ -2,7 +2,7 @@ use crate::error::NetworkError;
 use crate::peer::PeerConnection;
 use crate::protocol::{Message, PROTOCOL_VERSION};
 use glasschain_contracts::ContractEngine;
-use glasschain_core::{Ledger, SmartContractDef, Transaction, TransactionKind};
+use glasschain_core::{Block, Ledger, SmartContractDef, Transaction, TransactionKind};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -13,8 +13,10 @@ use tokio::sync::{broadcast, Mutex};
 pub enum NodeEvent {
     /// A new transaction was accepted into the pending pool.
     TransactionAccepted(Transaction),
-    /// A new block was mined and appended to the chain.
+    /// A block was successfully mined **by this node** and appended to the chain.
     BlockMined { index: u64, hash: String },
+    /// A block received from a remote peer was validated and appended to the chain.
+    BlockReceived { index: u64, hash: String },
     /// A peer connected.
     PeerConnected(String),
     /// A peer disconnected.
@@ -77,6 +79,7 @@ impl Node {
 
         let state = Arc::clone(&self.state);
         let node_id = self.node_id.clone();
+        let listen_addr = self.listen_addr.clone();
         let event_tx = self.event_tx.clone();
 
         tokio::spawn(async move {
@@ -87,9 +90,10 @@ impl Node {
                         log::info!("Inbound connection from {}", addr);
                         let state2 = Arc::clone(&state);
                         let nid = node_id.clone();
+                        let la = listen_addr.clone();
                         let etx = event_tx.clone();
                         tokio::spawn(async move {
-                            handle_peer(stream, addr, state2, nid, etx).await;
+                            handle_peer(stream, addr, la, state2, nid, etx).await;
                         });
                     }
                     Err(e) => {
@@ -103,9 +107,10 @@ impl Node {
         for peer_addr in seed_peers {
             let state = Arc::clone(&self.state);
             let node_id = self.node_id.clone();
+            let listen_addr = self.listen_addr.clone();
             let event_tx = self.event_tx.clone();
             tokio::spawn(async move {
-                connect_to_peer(peer_addr, state, node_id, event_tx).await;
+                connect_to_peer(peer_addr, listen_addr, state, node_id, event_tx).await;
             });
         }
 
@@ -159,17 +164,38 @@ impl Node {
     }
 
     /// Mine a new block containing all pending transactions and broadcast it.
+    ///
+    /// The CPU-heavy Proof-of-Work loop runs **outside** the state mutex so
+    /// that other node activity (transaction submission, message handling) is
+    /// not blocked during mining.
     pub async fn mine(&self) -> Result<(), NetworkError> {
-        let block = {
+        // Step 1 – snapshot what we need and drain the pending pool, then drop
+        // the lock before starting PoW.
+        let (index, prev_hash, transactions, difficulty) = {
             let mut state = self.state.lock().await;
-            state.ledger.mine_pending_transactions()?.clone()
+            state.ledger.prepare_mining()?
         };
-        log::info!("Mined block {} ({})", block.index, &block.hash[..8]);
-        let _ = self.event_tx.send(NodeEvent::BlockMined {
-            index: block.index,
-            hash: block.hash.clone(),
-        });
-        self.broadcast(Message::Block(block)).await;
+
+        // Step 2 – CPU-heavy PoW runs without holding the mutex.
+        let mut block = Block::new(index, transactions, prev_hash.clone());
+        block.mine(difficulty);
+
+        // Step 3 – re-acquire the lock and append the block only if the chain
+        // tip has not moved since we started mining.
+        let appended = {
+            let mut state = self.state.lock().await;
+            state.ledger.commit_mined_block(block.clone(), &prev_hash)?
+        };
+
+        if appended {
+            log::info!("Mined block {} ({})", block.index, &block.hash[..8]);
+            let _ = self.event_tx.send(NodeEvent::BlockMined {
+                index: block.index,
+                hash: block.hash.clone(),
+            });
+            self.broadcast(Message::Block(block)).await;
+        }
+
         Ok(())
     }
 
@@ -216,16 +242,22 @@ impl Node {
 }
 
 /// Handle a single peer connection (inbound or outbound).
+///
+/// Peer registration is deferred until the remote node's `Hello` message is
+/// received, so that the stable `listen_addr` advertised in the handshake
+/// (rather than the ephemeral TCP source port) is stored in `known_peers`.
 async fn handle_peer(
     stream: TcpStream,
     addr: String,
+    listen_addr: String,
     state: Arc<Mutex<NodeState>>,
     node_id: String,
     event_tx: broadcast::Sender<NodeEvent>,
 ) {
     let mut conn = PeerConnection::new(stream, addr.clone());
 
-    // Send hello.
+    // Send our Hello including our stable listening address so the remote peer
+    // can register us correctly.
     let chain_length = {
         let s = state.lock().await;
         s.ledger.chain.len() as u64
@@ -234,24 +266,32 @@ async fn handle_peer(
         node_id: node_id.clone(),
         chain_length,
         version: PROTOCOL_VERSION.to_owned(),
+        listen_addr: listen_addr.clone(),
     };
     if let Err(e) = conn.send(&hello).await {
         log::warn!("Failed to send Hello to {addr}: {e}");
         return;
     }
 
-    // Register peer.
-    {
-        let mut s = state.lock().await;
-        s.known_peers.insert(addr.clone());
-    }
-    let _ = event_tx.send(NodeEvent::PeerConnected(addr.clone()));
+    // `peer_stable_addr` is populated by the Hello handler and used on
+    // disconnect to remove the right entry from `known_peers`.
+    let peer_stable_addr: std::sync::Mutex<Option<String>> =
+        std::sync::Mutex::new(None);
 
     // Message loop.
     loop {
         match conn.receive().await {
             Ok(msg) => {
-                process_message(msg, &addr, &state, &node_id, &mut conn, &event_tx).await;
+                process_message(
+                    msg,
+                    &addr,
+                    &state,
+                    &node_id,
+                    &mut conn,
+                    &event_tx,
+                    &peer_stable_addr,
+                )
+                .await;
             }
             Err(crate::error::NetworkError::PeerDisconnected(_)) => {
                 log::info!("Peer {} disconnected", addr);
@@ -264,17 +304,21 @@ async fn handle_peer(
         }
     }
 
-    // Unregister peer.
-    {
+    // Unregister peer using the stable address if we managed to complete the
+    // handshake, otherwise fall back to the TCP source address.
+    let registered = peer_stable_addr.lock().unwrap().clone();
+    let display_addr = registered.clone().unwrap_or_else(|| addr.clone());
+    if let Some(ref stable) = registered {
         let mut s = state.lock().await;
-        s.known_peers.remove(&addr);
+        s.known_peers.remove(stable);
     }
-    let _ = event_tx.send(NodeEvent::PeerDisconnected(addr));
+    let _ = event_tx.send(NodeEvent::PeerDisconnected(display_addr));
 }
 
 /// Connect outbound to a peer and run its handle loop.
 async fn connect_to_peer(
     peer_addr: String,
+    listen_addr: String,
     state: Arc<Mutex<NodeState>>,
     node_id: String,
     event_tx: broadcast::Sender<NodeEvent>,
@@ -282,7 +326,7 @@ async fn connect_to_peer(
     match TcpStream::connect(&peer_addr).await {
         Ok(stream) => {
             log::info!("Connected to peer {}", peer_addr);
-            handle_peer(stream, peer_addr, state, node_id, event_tx).await;
+            handle_peer(stream, peer_addr, listen_addr, state, node_id, event_tx).await;
         }
         Err(e) => {
             log::warn!("Could not connect to {peer_addr}: {e}");
@@ -298,20 +342,33 @@ async fn process_message(
     _node_id: &str,
     conn: &mut PeerConnection,
     event_tx: &broadcast::Sender<NodeEvent>,
+    peer_stable_addr: &std::sync::Mutex<Option<String>>,
 ) {
     match msg {
         Message::Hello {
             node_id: peer_id,
             chain_length,
+            listen_addr: peer_listen_addr,
             ..
         } => {
             conn.peer_id = Some(peer_id.clone());
             log::info!(
-                "Hello from {} (id={}, chain_len={})",
+                "Hello from {} (id={}, chain_len={}, listen_addr={})",
                 addr,
                 peer_id,
-                chain_length
+                chain_length,
+                peer_listen_addr,
             );
+
+            // Register the peer using its stable listening address (not the
+            // ephemeral TCP source port).
+            {
+                let mut s = state.lock().await;
+                s.known_peers.insert(peer_listen_addr.clone());
+            }
+            *peer_stable_addr.lock().unwrap() = Some(peer_listen_addr.clone());
+            let _ = event_tx.send(NodeEvent::PeerConnected(peer_listen_addr.clone()));
+
             // If the peer has a longer chain, request it.
             let local_len = state.lock().await.ledger.chain.len() as u64;
             if chain_length > local_len {
@@ -351,11 +408,24 @@ async fn process_message(
             let expected_index = s.ledger.chain.len() as u64;
             if block.index == expected_index {
                 if let Some(prev) = s.ledger.chain.last() {
-                    if block.chains_to(prev).is_ok() {
+                    let difficulty = s.ledger.difficulty;
+                    if block.chains_to(prev).is_ok() && block.has_valid_pow(difficulty) {
                         let idx = block.index;
                         let hash = block.hash.clone();
+
+                        // Remove any pending transactions that are already
+                        // included in this block to avoid re-committing them.
+                        let committed_ids: HashSet<&str> =
+                            block.transactions.iter().map(|t| t.id.as_str()).collect();
+                        s.ledger
+                            .pending_transactions
+                            .retain(|t| !committed_ids.contains(t.id.as_str()));
+
                         s.ledger.chain.push(block);
-                        let _ = event_tx.send(NodeEvent::BlockMined { index: idx, hash });
+                        // Use BlockReceived (not BlockMined) to distinguish
+                        // remotely sourced blocks from locally mined ones.
+                        let _ = event_tx
+                            .send(NodeEvent::BlockReceived { index: idx, hash });
                     } else {
                         log::warn!("Received invalid block from {addr}");
                     }
@@ -382,12 +452,14 @@ async fn process_message(
         }
 
         Message::RequestPeers => {
+            let stable = peer_stable_addr.lock().unwrap().clone();
+            let exclude = stable.as_deref().unwrap_or(addr);
             let peers: Vec<String> = state
                 .lock()
                 .await
                 .known_peers
                 .iter()
-                .filter(|p| p.as_str() != addr)
+                .filter(|p| p.as_str() != exclude)
                 .cloned()
                 .collect();
             if let Err(e) = conn.send(&Message::Peers(peers)).await {

@@ -65,6 +65,10 @@ impl Ledger {
     ///
     /// Returns the newly mined block (already appended to the chain).
     /// Returns `Err(CoreError::EmptyLedger)` if the chain is somehow empty.
+    ///
+    /// **Note:** this method holds no external lock – callers that need to avoid
+    /// blocking an async task's mutex should use [`prepare_mining`] /
+    /// [`commit_mined_block`] instead.
     pub fn mine_pending_transactions(&mut self) -> Result<&Block, CoreError> {
         let previous = self
             .chain
@@ -79,6 +83,49 @@ impl Ledger {
         Ok(self.chain.last().expect("just pushed"))
     }
 
+    /// Snapshot the chain tip and drain the pending pool for **out-of-lock** mining.
+    ///
+    /// Returns `(index, previous_hash, pending_transactions, difficulty)`.
+    /// After calling this the pending pool is empty; the caller must either
+    /// commit the mined block via [`commit_mined_block`] (which also handles
+    /// restoring transactions on a stale tip) or push the transactions back
+    /// manually.
+    pub fn prepare_mining(
+        &mut self,
+    ) -> Result<(u64, String, Vec<Transaction>, usize), CoreError> {
+        let prev = self.chain.last().ok_or(CoreError::EmptyLedger)?.clone();
+        let txns = std::mem::take(&mut self.pending_transactions);
+        Ok((prev.index + 1, prev.hash.clone(), txns, self.difficulty))
+    }
+
+    /// Append a pre-mined block if `expected_prev_hash` still matches the chain tip.
+    ///
+    /// Returns `true` when the block was appended.  If the chain tip advanced
+    /// while mining (a race), the block's transactions are restored to the
+    /// pending pool and `false` is returned so the caller can retry.
+    pub fn commit_mined_block(
+        &mut self,
+        block: Block,
+        expected_prev_hash: &str,
+    ) -> Result<bool, CoreError> {
+        let tip_hash = self
+            .chain
+            .last()
+            .ok_or(CoreError::EmptyLedger)?
+            .hash
+            .clone();
+        if tip_hash != expected_prev_hash {
+            // Chain advanced while we were mining; restore transactions to pool.
+            for tx in block.transactions {
+                let _ = self.add_transaction(tx);
+            }
+            log::warn!("Mined block is stale (chain tip moved); transactions restored to pool");
+            return Ok(false);
+        }
+        self.chain.push(block);
+        Ok(true)
+    }
+
     /// Return a reference to the most recently committed block.
     pub fn latest_block(&self) -> Option<&Block> {
         self.chain.last()
@@ -86,19 +133,30 @@ impl Ledger {
 
     /// Validate the entire chain from genesis to tip.
     ///
-    /// Returns `Ok(())` if every block is internally valid and correctly
-    /// chains to its predecessor.
+    /// Returns `Ok(())` if every block is internally valid, correctly
+    /// chains to its predecessor, and satisfies the configured PoW target.
     pub fn validate_chain(&self) -> Result<(), CoreError> {
         for i in 1..self.chain.len() {
             let current = &self.chain[i];
             let previous = &self.chain[i - 1];
             current.chains_to(previous)?;
+            if !current.has_valid_pow(self.difficulty) {
+                return Err(CoreError::InvalidBlock(format!(
+                    "block {} does not satisfy PoW difficulty {}",
+                    current.index, self.difficulty
+                )));
+            }
         }
         // Also validate the genesis block itself.
         if let Some(genesis) = self.chain.first() {
             if !genesis.is_valid() {
                 return Err(CoreError::InvalidBlock(
                     "genesis block hash is invalid".into(),
+                ));
+            }
+            if !genesis.has_valid_pow(self.difficulty) {
+                return Err(CoreError::InvalidBlock(
+                    "genesis block does not satisfy PoW difficulty".into(),
                 ));
             }
         }
@@ -111,14 +169,20 @@ impl Ledger {
         if candidate.len() <= self.chain.len() {
             return false;
         }
-        // Validate candidate from scratch.
+        // Validate candidate from scratch (hash integrity + PoW).
         for i in 1..candidate.len() {
             if candidate[i].chains_to(&candidate[i - 1]).is_err() {
+                return false;
+            }
+            if !candidate[i].has_valid_pow(self.difficulty) {
                 return false;
             }
         }
         if let Some(genesis) = candidate.first() {
             if !genesis.is_valid() {
+                return false;
+            }
+            if !genesis.has_valid_pow(self.difficulty) {
                 return false;
             }
         }

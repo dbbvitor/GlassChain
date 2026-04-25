@@ -20,6 +20,12 @@ pub enum Message {
         chain_length: u64,
         /// Protocol version string (e.g. `"glasschain/1"`).
         version: String,
+        /// The sender's stable TCP listening address (e.g. `"192.168.1.5:8000"`).
+        ///
+        /// Peers must use this address (rather than the TCP source address, which
+        /// is ephemeral for inbound connections) when adding the sender to their
+        /// known-peers set and when reconnecting.
+        listen_addr: String,
     },
 
     /// Broadcast a new transaction to all connected peers.

@@ -30,14 +30,26 @@ impl Block {
     /// The hash covers: `index`, `timestamp`, serialised `transactions`,
     /// `previous_hash`, and `nonce`.  Any change to these fields invalidates
     /// the stored hash.
+    ///
+    /// Fields are encoded as a JSON tuple to ensure an unambiguous canonical
+    /// representation (avoids hash collisions from raw string concatenation).
     pub fn calculate_hash(&self) -> String {
-        let tx_json =
-            serde_json::to_string(&self.transactions).expect("transactions must be serializable");
-        let content = format!(
-            "{}{}{}{}{}",
-            self.index, self.timestamp, tx_json, self.previous_hash, self.nonce
-        );
+        let content = serde_json::to_string(&(
+            self.index,
+            self.timestamp,
+            &self.transactions,
+            &self.previous_hash,
+            self.nonce,
+        ))
+        .expect("block header must be serializable");
         sha256(content.as_bytes())
+    }
+
+    /// Return `true` if the block's hash satisfies the Proof-of-Work target
+    /// (i.e., it starts with `difficulty` leading zero characters).
+    pub fn has_valid_pow(&self, difficulty: usize) -> bool {
+        let target = "0".repeat(difficulty);
+        self.hash.starts_with(&target)
     }
 
     /// Create a new, **unmined** block.
