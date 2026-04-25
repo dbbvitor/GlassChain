@@ -275,6 +275,9 @@ async fn handle_peer(
 
     // `peer_stable_addr` is populated by the Hello handler and used on
     // disconnect to remove the right entry from `known_peers`.
+    // `std::sync::Mutex` (not `tokio::sync::Mutex`) is intentional: the lock
+    // is only ever acquired in non-async, non-blocking code so it will never
+    // be held across an `.await` point and therefore cannot stall the runtime.
     let peer_stable_addr: std::sync::Mutex<Option<String>> =
         std::sync::Mutex::new(None);
 
@@ -416,7 +419,7 @@ async fn process_message(
                         // Remove any pending transactions that are already
                         // included in this block to avoid re-committing them.
                         let committed_ids: HashSet<&str> =
-                            block.transactions.iter().map(|t| t.id.as_str()).collect();
+                            HashSet::from_iter(block.transactions.iter().map(|t| t.id.as_str()));
                         s.ledger
                             .pending_transactions
                             .retain(|t| !committed_ids.contains(t.id.as_str()));
