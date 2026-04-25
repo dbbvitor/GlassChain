@@ -1,0 +1,277 @@
+use crate::block::Block;
+use crate::error::CoreError;
+use crate::transaction::Transaction;
+use serde::{Deserialize, Serialize};
+
+/// Default Proof-of-Work difficulty (number of leading zero characters required).
+pub const DEFAULT_DIFFICULTY: usize = 2;
+
+/// The GlassChain distributed ledger.
+///
+/// Maintains a validated chain of [`Block`]s and a pool of pending
+/// [`Transaction`]s waiting to be committed in the next block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ledger {
+    /// The ordered, validated chain of blocks.
+    pub chain: Vec<Block>,
+    /// Transactions received but not yet committed to a block.
+    pub pending_transactions: Vec<Transaction>,
+    /// PoW difficulty used when mining new blocks.
+    pub difficulty: usize,
+}
+
+impl Default for Ledger {
+    fn default() -> Self {
+        Self::new(DEFAULT_DIFFICULTY)
+    }
+}
+
+impl Ledger {
+    /// Create a new ledger, automatically mining the genesis block.
+    pub fn new(difficulty: usize) -> Self {
+        let mut genesis = Block::new(0, vec![], "0".to_owned());
+        genesis.mine(difficulty);
+        Self {
+            chain: vec![genesis],
+            pending_transactions: Vec::new(),
+            difficulty,
+        }
+    }
+
+    /// Add a transaction to the pending pool.
+    ///
+    /// Transactions must have a non-empty `id`; duplicate IDs are silently
+    /// ignored to provide idempotency across federated nodes.
+    pub fn add_transaction(&mut self, tx: Transaction) -> Result<(), CoreError> {
+        if tx.id.is_empty() {
+            return Err(CoreError::InvalidTransaction(
+                "transaction id must not be empty".into(),
+            ));
+        }
+        // Idempotency check: reject if already committed or pending.
+        let already_committed = self
+            .chain
+            .iter()
+            .flat_map(|b| b.transactions.iter())
+            .any(|t| t.id == tx.id);
+        let already_pending = self.pending_transactions.iter().any(|t| t.id == tx.id);
+        if !already_committed && !already_pending {
+            self.pending_transactions.push(tx);
+        }
+        Ok(())
+    }
+
+    /// Mine a new block containing all pending transactions.
+    ///
+    /// Returns the newly mined block (already appended to the chain).
+    /// Returns `Err(CoreError::EmptyLedger)` if the chain is somehow empty.
+    pub fn mine_pending_transactions(&mut self) -> Result<&Block, CoreError> {
+        let previous = self
+            .chain
+            .last()
+            .ok_or(CoreError::EmptyLedger)?
+            .clone();
+        let index = previous.index + 1;
+        let transactions = std::mem::take(&mut self.pending_transactions);
+        let mut block = Block::new(index, transactions, previous.hash.clone());
+        block.mine(self.difficulty);
+        self.chain.push(block);
+        Ok(self.chain.last().expect("just pushed"))
+    }
+
+    /// Return a reference to the most recently committed block.
+    pub fn latest_block(&self) -> Option<&Block> {
+        self.chain.last()
+    }
+
+    /// Validate the entire chain from genesis to tip.
+    ///
+    /// Returns `Ok(())` if every block is internally valid and correctly
+    /// chains to its predecessor.
+    pub fn validate_chain(&self) -> Result<(), CoreError> {
+        for i in 1..self.chain.len() {
+            let current = &self.chain[i];
+            let previous = &self.chain[i - 1];
+            current.chains_to(previous)?;
+        }
+        // Also validate the genesis block itself.
+        if let Some(genesis) = self.chain.first() {
+            if !genesis.is_valid() {
+                return Err(CoreError::InvalidBlock(
+                    "genesis block hash is invalid".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Return `true` when the supplied chain is longer **and** valid,
+    /// and replace the local chain if so (longest-chain consensus rule).
+    pub fn try_replace_chain(&mut self, candidate: Vec<Block>) -> bool {
+        if candidate.len() <= self.chain.len() {
+            return false;
+        }
+        // Validate candidate from scratch.
+        for i in 1..candidate.len() {
+            if candidate[i].chains_to(&candidate[i - 1]).is_err() {
+                return false;
+            }
+        }
+        if let Some(genesis) = candidate.first() {
+            if !genesis.is_valid() {
+                return false;
+            }
+        }
+        log::info!(
+            "Replacing local chain (length {}) with longer candidate (length {})",
+            self.chain.len(),
+            candidate.len()
+        );
+        self.chain = candidate;
+        true
+    }
+
+    /// Return all supply-offer transactions committed on the ledger,
+    /// useful for transparency queries (lead times, bottleneck analysis).
+    pub fn committed_supply_offers(
+        &self,
+    ) -> impl Iterator<Item = &crate::transaction::SupplyOffer> {
+        use crate::transaction::TransactionKind;
+        self.chain
+            .iter()
+            .flat_map(|b| b.transactions.iter())
+            .filter_map(|tx| {
+                if let TransactionKind::SupplyOffer(ref offer) = tx.kind {
+                    Some(offer)
+                } else {
+                    None
+                }
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transaction::{
+        InventoryUpdate, PurchaseOrder, SupplyOffer, Transaction, TransactionKind,
+    };
+
+    fn supply_offer_tx(seller: &str, product: &str, qty: u64, price: f64, lead: u32) -> Transaction {
+        Transaction::new(TransactionKind::SupplyOffer(SupplyOffer {
+            product_id: product.into(),
+            product_name: "Widget".into(),
+            seller_id: seller.into(),
+            quantity_available: qty,
+            price_per_unit: price,
+            lead_time_days: lead,
+            currency: "USD".into(),
+        }))
+    }
+
+    fn inventory_tx(owner: &str) -> Transaction {
+        Transaction::new(TransactionKind::InventoryUpdate(InventoryUpdate {
+            product_id: "SKU-001".into(),
+            owner_id: owner.into(),
+            quantity_delta: 50,
+            reason: "test".into(),
+        }))
+    }
+
+    #[test]
+    fn test_new_ledger_has_genesis() {
+        let ledger = Ledger::new(1);
+        assert_eq!(ledger.chain.len(), 1);
+        assert_eq!(ledger.chain[0].index, 0);
+        assert_eq!(ledger.chain[0].previous_hash, "0");
+    }
+
+    #[test]
+    fn test_add_and_mine_transactions() {
+        let mut ledger = Ledger::new(1);
+        ledger.add_transaction(inventory_tx("node-1")).unwrap();
+        ledger.add_transaction(inventory_tx("node-2")).unwrap();
+        assert_eq!(ledger.pending_transactions.len(), 2);
+
+        ledger.mine_pending_transactions().unwrap();
+        assert_eq!(ledger.chain.len(), 2);
+        assert!(ledger.pending_transactions.is_empty());
+        assert!(ledger.validate_chain().is_ok());
+    }
+
+    #[test]
+    fn test_idempotent_transaction_addition() {
+        let mut ledger = Ledger::new(1);
+        let tx = inventory_tx("node-1");
+        ledger.add_transaction(tx.clone()).unwrap();
+        ledger.add_transaction(tx).unwrap(); // same tx again
+        assert_eq!(ledger.pending_transactions.len(), 1);
+    }
+
+    #[test]
+    fn test_validate_chain_detects_tamper() {
+        let mut ledger = Ledger::new(1);
+        ledger.add_transaction(inventory_tx("node-1")).unwrap();
+        ledger.mine_pending_transactions().unwrap();
+
+        // Tamper: corrupt the hash of block 1
+        ledger.chain[1].hash = "tampered".into();
+        assert!(ledger.validate_chain().is_err());
+    }
+
+    #[test]
+    fn test_try_replace_chain_longer_wins() {
+        let mut ledger_a = Ledger::new(1);
+        let mut ledger_b = Ledger::new(1);
+
+        ledger_b.add_transaction(inventory_tx("node-x")).unwrap();
+        ledger_b.mine_pending_transactions().unwrap();
+        ledger_b.add_transaction(inventory_tx("node-y")).unwrap();
+        ledger_b.mine_pending_transactions().unwrap();
+
+        assert!(ledger_a.try_replace_chain(ledger_b.chain.clone()));
+        assert_eq!(ledger_a.chain.len(), 3);
+    }
+
+    #[test]
+    fn test_try_replace_chain_shorter_ignored() {
+        let mut ledger_a = Ledger::new(1);
+        ledger_a.add_transaction(inventory_tx("node-1")).unwrap();
+        ledger_a.mine_pending_transactions().unwrap();
+
+        let ledger_b = Ledger::new(1); // only genesis
+        assert!(!ledger_a.try_replace_chain(ledger_b.chain));
+    }
+
+    #[test]
+    fn test_committed_supply_offers() {
+        let mut ledger = Ledger::new(1);
+        ledger
+            .add_transaction(supply_offer_tx("s1", "SKU-001", 100, 10.0, 5))
+            .unwrap();
+        ledger
+            .add_transaction(supply_offer_tx("s2", "SKU-002", 200, 5.0, 3))
+            .unwrap();
+        ledger.mine_pending_transactions().unwrap();
+
+        let offers: Vec<_> = ledger.committed_supply_offers().collect();
+        assert_eq!(offers.len(), 2);
+    }
+
+    #[test]
+    fn test_purchase_order_transaction() {
+        let mut ledger = Ledger::new(1);
+        let po_tx = Transaction::new(TransactionKind::PurchaseOrder(PurchaseOrder {
+            product_id: "SKU-001".into(),
+            buyer_id: "buyer-1".into(),
+            seller_id: "seller-1".into(),
+            quantity: 50,
+            agreed_price_per_unit: 10.0,
+            currency: "USD".into(),
+            contract_id: None,
+        }));
+        ledger.add_transaction(po_tx).unwrap();
+        ledger.mine_pending_transactions().unwrap();
+        assert!(ledger.validate_chain().is_ok());
+    }
+}
