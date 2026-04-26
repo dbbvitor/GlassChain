@@ -13,4 +13,10 @@ pub enum CoreError {
 
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    #[error("gas exhausted after {used} units (limit: {limit})")]
+    GasExhausted { used: u64, limit: u64 },
+
+    #[error("storage error: {0}")]
+    Storage(String),
 }

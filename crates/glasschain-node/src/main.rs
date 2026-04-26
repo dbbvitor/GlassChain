@@ -1,6 +1,6 @@
 use glasschain_core::{
     InventoryUpdate, PurchaseConditions, PurchaseOrder, SmartContractDef, SupplyOffer, Transaction,
-    TransactionKind,
+    TraceableAsset, TraceableAssetRegistration, TransactionKind,
 };
 use glasschain_network::{Node, NodeEvent};
 use std::env;
@@ -33,6 +33,10 @@ INTERACTIVE COMMANDS (after startup):
 
     inventory <owner> <product> <delta> <reason>
         Post an inventory update.
+
+    asset <originator> <product_name> <gtin> <batch> <expiry> <serial> <qty> <event_type>
+        Register a traceable asset (Phase 3). Displays the Metadata Trust Score.
+        Use "-" for any optional field to leave it empty.
 
     mine
         Mine a block with all pending transactions.
@@ -295,6 +299,51 @@ async fn main() {
                 }
             }
 
+            "asset" => {
+                if parts.len() < 9 {
+                    eprintln!(
+                        "Usage: asset <originator> <product_name> <gtin> <batch> <expiry> <serial> <qty> <event_type>"
+                    );
+                    continue;
+                }
+                let qty: u64 = match parts[7].parse() {
+                    Ok(v) => v,
+                    Err(_) => { eprintln!("Invalid qty"); continue; }
+                };
+                let opt = |s: &str| if s == "-" { None } else { Some(s.to_owned()) };
+                let asset = TraceableAsset {
+                    gtin: opt(parts[3]),
+                    batch_number: opt(parts[4]),
+                    expiry_date: opt(parts[5]),
+                    serial_number: opt(parts[6]),
+                    anvisa_registration: None,
+                    manufacturer_id: None,
+                    product_name: parts[2].to_owned(),
+                    custodian_id: parts[1].to_owned(),
+                    country_of_origin: None,
+                    storage_temp_celsius: None,
+                    quantity: qty,
+                };
+                let score = glasschain_core::MetadataTrustScore::compute(&asset);
+                println!(
+                    "Metadata Trust Score: {} (fee multiplier: {:.0}%)",
+                    score,
+                    score.fee_multiplier() * 100.0
+                );
+                let tx = Transaction::new(TransactionKind::AssetRegistration(
+                    TraceableAssetRegistration {
+                        asset,
+                        event_type: parts[8].to_owned(),
+                        originator_id: parts[1].to_owned(),
+                        purchase_order_ref: None,
+                    },
+                ));
+                match node.submit_transaction(tx).await {
+                    Ok(_) => println!("Asset registration submitted."),
+                    Err(e) => eprintln!("Error: {e}"),
+                }
+            }
+
             "mine" => {
                 match node.mine().await {
                     Ok(_) => println!("Block mined."),
@@ -326,6 +375,7 @@ async fn main() {
                         TransactionKind::ContractCreation(_) => "ContractCreation",
                         TransactionKind::ContractExecution(_) => "ContractExecution",
                         TransactionKind::InventoryUpdate(_) => "InventoryUpdate",
+                        TransactionKind::AssetRegistration(_) => "AssetRegistration",
                     };
                     println!("  {} [{}]", tx.id, kind);
                 }

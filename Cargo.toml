@@ -4,5 +4,6 @@ members = [
     "crates/glasschain-contracts",
     "crates/glasschain-network",
     "crates/glasschain-node",
+    "crates/glasschain-storage",
 ]
 resolver = "2"

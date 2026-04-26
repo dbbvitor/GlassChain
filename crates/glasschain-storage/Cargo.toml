@@ -1,0 +1,15 @@
+[package]
+name = "glasschain-storage"
+version = "0.1.0"
+edition = "2021"
+description = "Pluggable storage backends for GlassChain (Sled, in-memory)"
+
+[dependencies]
+glasschain-core = { path = "../glasschain-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sled = "0.34"
+log = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
