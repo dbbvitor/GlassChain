@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "crates/glasschain-core",
+    "crates/glasschain-contracts",
+    "crates/glasschain-network",
+    "crates/glasschain-node",
+]
+resolver = "2"

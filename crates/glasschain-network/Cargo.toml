@@ -1,0 +1,17 @@
+[package]
+name = "glasschain-network"
+version = "0.1.0"
+edition = "2021"
+description = "P2P network protocol for federated GlassChain transactions"
+
+[dependencies]
+glasschain-core = { path = "../glasschain-core" }
+glasschain-contracts = { path = "../glasschain-contracts" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.44", features = ["full"] }
+thiserror = "2.0"
+log = "0.4"
+
+[dev-dependencies]
+env_logger = "0.11"

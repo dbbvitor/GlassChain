@@ -1,0 +1,16 @@
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum CoreError {
+    #[error("invalid block: {0}")]
+    InvalidBlock(String),
+
+    #[error("invalid transaction: {0}")]
+    InvalidTransaction(String),
+
+    #[error("ledger is empty")]
+    EmptyLedger,
+
+    #[error("serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+}
