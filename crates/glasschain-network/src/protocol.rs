@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 /// Maximum wire-frame size accepted (16 MiB).
 pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
-/// Every message exchanged between GlassChain peers is one of these variants.
+/// Every message exchanged between `GlassChain` peers is one of these variants.
 ///
 /// Messages are serialised as JSON and framed with a 4-byte big-endian length
 /// prefix, so each variant must be small enough to fit within

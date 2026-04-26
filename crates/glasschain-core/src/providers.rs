@@ -1,4 +1,4 @@
-//! Pluggable provider traits for GlassChain's core protocol layers.
+//! Pluggable provider traits for `GlassChain`'s core protocol layers.
 //!
 //! These traits define the abstract interfaces for the three pillars of the
 //! distributed ledger: **Consensus**, **Storage**, and **Execution**.  Any
@@ -35,7 +35,11 @@ pub trait ConsensusProvider: Send + Sync {
     ///
     /// Returns the finished block (with a valid `hash`) on success.
     /// The provider is responsible for any work required by the chosen
-    /// consensus algorithm (e.g., mining a PoW nonce or gathering signatures).
+    /// consensus algorithm (e.g., mining a `PoW` nonce or gathering signatures).
+    ///
+    /// # Errors
+    /// Returns `Err` if the consensus algorithm fails to produce a valid block
+    /// (e.g., mining failure or quorum not reached).
     fn propose_block(
         &self,
         index: u64,
@@ -46,7 +50,11 @@ pub trait ConsensusProvider: Send + Sync {
     /// Validate a block proposed by a remote peer.
     ///
     /// Returns `Ok(())` when the block is structurally valid and satisfies the
-    /// consensus rules (e.g., PoW target, quorum signatures).
+    /// consensus rules (e.g., `PoW` target, quorum signatures).
+    ///
+    /// # Errors
+    /// Returns `Err(CoreError::InvalidBlock)` if the block violates any
+    /// consensus rule (wrong `previous_hash`, insufficient `PoW`, etc.).
     fn validate_block(&self, block: &Block, previous: &Block) -> Result<(), CoreError>;
 
     /// Human-readable identifier for this consensus implementation.
@@ -57,28 +65,46 @@ pub trait ConsensusProvider: Send + Sync {
 ///
 /// The World State is a key-value snapshot of the latest committed state
 /// derived from all committed transactions (analogous to Ethereum's state
-/// trie or Hyperledger Fabric's CouchDB state database).
+/// trie or Hyperledger Fabric's `CouchDB` state database).
 ///
-/// Implementors may back this with in-memory structures, `sled`, RocksDB, or
+/// Implementors may back this with in-memory structures, `sled`, `RocksDB`, or
 /// any other store.
 pub trait StorageProvider: Send + Sync {
     /// Persist a committed block.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying storage backend fails to persist the block.
     fn put_block(&self, block: &Block) -> Result<(), CoreError>;
 
     /// Retrieve a block by its sequential index.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying storage backend returns an error.
     fn get_block(&self, index: u64) -> Result<Option<Block>, CoreError>;
 
     /// Return the index of the highest committed block, or `None` if the store
     /// is empty.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying storage backend returns an error.
     fn latest_block_index(&self) -> Result<Option<u64>, CoreError>;
 
     /// Write a World State key-value pair.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying storage backend fails to write the value.
     fn put_state(&self, key: &str, value: &[u8]) -> Result<(), CoreError>;
 
     /// Read a World State value by key.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying storage backend returns an error.
     fn get_state(&self, key: &str) -> Result<Option<Vec<u8>>, CoreError>;
 
     /// Delete a World State key.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying storage backend fails to delete the key.
     fn delete_state(&self, key: &str) -> Result<(), CoreError>;
 
     /// Human-readable identifier for this storage implementation.
@@ -99,12 +125,39 @@ pub trait ExecutionProvider: Send + Sync {
     /// specific (e.g., a WASM module, a Lua script, or JSON instructions).
     /// `gas_limit` caps the computational budget; the provider should return
     /// [`CoreError::GasExhausted`] if the contract exceeds it.
+    ///
+    /// # Errors
+    /// Returns `Err(CoreError::GasExhausted)` if the contract exceeds
+    /// `gas_limit`, or `Err` for any other execution failure.
     fn execute(
         &self,
         contract_id: &str,
         payload: &[u8],
         gas_limit: u64,
     ) -> Result<Vec<(String, Vec<u8>)>, CoreError>;
+
+    /// Execute a contract with a pre-populated world-state snapshot.
+    ///
+    /// The `initial_state` entries are visible to the contract via the
+    /// `get_state` / `get_state_len` host functions.  Mutations returned by
+    /// the contract are applied on top of this snapshot.
+    ///
+    /// The default implementation ignores `initial_state` (backward-compat).
+    /// Override in concrete providers to expose the snapshot to contracts.
+    ///
+    /// # Errors
+    /// Returns `Err(CoreError::GasExhausted)` if the contract exceeds
+    /// `gas_limit`, or `Err` for any other execution failure.
+    fn execute_with_state(
+        &self,
+        contract_id: &str,
+        payload: &[u8],
+        initial_state: std::collections::HashMap<String, Vec<u8>>,
+        gas_limit: u64,
+    ) -> Result<Vec<(String, Vec<u8>)>, CoreError> {
+        let _ = initial_state;
+        self.execute(contract_id, payload, gas_limit)
+    }
 
     /// Human-readable identifier for this execution implementation.
     fn name(&self) -> &str;
@@ -142,7 +195,7 @@ pub trait NetworkProvider: Send + Sync {
 
 /// Proof-of-Work consensus provider.
 ///
-/// This is the default `ConsensusProvider` for GlassChain.  It mines new
+/// This is the default `ConsensusProvider` for `GlassChain`.  It mines new
 /// blocks by incrementing a nonce until the SHA-256 hash of the block header
 /// starts with `difficulty` leading zero hex characters.
 ///
@@ -156,8 +209,9 @@ pub struct PowConsensusProvider {
 }
 
 impl PowConsensusProvider {
-    /// Create a new PoW provider with the given mining difficulty.
-    pub fn new(difficulty: usize) -> Self {
+    /// Create a new `PoW` provider with the given mining difficulty.
+    #[must_use]
+    pub const fn new(difficulty: usize) -> Self {
         Self { difficulty }
     }
 }
@@ -185,7 +239,7 @@ impl ConsensusProvider for PowConsensusProvider {
         Ok(())
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "proof-of-work"
     }
 }
@@ -195,7 +249,7 @@ impl ConsensusProvider for PowConsensusProvider {
 ///
 /// **Not** suitable for production (data is lost on process restart).
 pub mod in_memory {
-    use super::*;
+    use super::{Block, CoreError, StorageProvider};
     use std::collections::HashMap;
     use std::sync::RwLock;
 
@@ -208,6 +262,7 @@ pub mod in_memory {
 
     impl InMemoryStorageProvider {
         /// Create a new empty in-memory store.
+        #[must_use]
         pub fn new() -> Self {
             Self::default()
         }
@@ -250,23 +305,15 @@ pub mod in_memory {
         }
 
         fn get_state(&self, key: &str) -> Result<Option<Vec<u8>>, CoreError> {
-            Ok(self
-                .state
-                .read()
-                .expect("lock poisoned")
-                .get(key)
-                .cloned())
+            Ok(self.state.read().expect("lock poisoned").get(key).cloned())
         }
 
         fn delete_state(&self, key: &str) -> Result<(), CoreError> {
-            self.state
-                .write()
-                .expect("lock poisoned")
-                .remove(key);
+            self.state.write().expect("lock poisoned").remove(key);
             Ok(())
         }
 
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             "in-memory"
         }
     }
@@ -328,7 +375,6 @@ mod consensus_tests {
     use crate::transaction::{InventoryUpdate, Transaction, TransactionKind};
 
     fn genesis() -> Block {
-        let provider = PowConsensusProvider::new(1);
         let empty = Block::new(0, vec![], "0".into());
         // genesis is special – mine manually
         let mut g = empty;
@@ -355,9 +401,7 @@ mod consensus_tests {
     fn test_pow_propose_block() {
         let provider = PowConsensusProvider::new(1);
         let g = genesis();
-        let block = provider
-            .propose_block(1, vec![sample_tx()], &g)
-            .unwrap();
+        let block = provider.propose_block(1, vec![sample_tx()], &g).unwrap();
         assert_eq!(block.index, 1);
         assert!(block.has_valid_pow(1));
         assert!(block.is_valid());
@@ -378,7 +422,7 @@ mod consensus_tests {
         let mut block = provider.propose_block(1, vec![], &g).unwrap();
         block.previous_hash = "bad".into();
         block.hash = block.calculate_hash(); // re-hash so it's internally valid
-        // Chains_to should fail even with correct hash if pow is recalculated
+                                             // Chains_to should fail even with correct hash if pow is recalculated
         assert!(provider.validate_block(&block, &g).is_err());
     }
 }

@@ -17,6 +17,9 @@ pub enum CoreError {
     #[error("gas exhausted after {used} units (limit: {limit})")]
     GasExhausted { used: u64, limit: u64 },
 
+    #[error("execution error: {0}")]
+    Execution(String),
+
     #[error("storage error: {0}")]
     Storage(String),
 }

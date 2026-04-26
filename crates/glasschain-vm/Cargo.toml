@@ -13,4 +13,7 @@ thiserror = "2.0"
 log = "0.4"
 
 [dev-dependencies]
-wat = "1.0"
+wat = "1.247"
+
+[lints]
+workspace = true

@@ -16,9 +16,7 @@
 //! Triggers are registered via [`WatcherService::add_trigger`] and evaluated
 //! on every call to [`WatcherService::on_inventory_update`].
 
-use glasschain_core::{
-    InventoryUpdate, PurchaseOrder, Transaction, TransactionKind,
-};
+use glasschain_core::{InventoryUpdate, PurchaseOrder, Transaction, TransactionKind};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -37,8 +35,8 @@ pub struct InventoryTrigger {
     pub reorder_quantity: u64,
     /// Preferred seller for the auto-generated purchase order.
     pub seller_id: String,
-    /// Agreed unit price for the auto-generated purchase order.
-    pub price_per_unit: f64,
+    /// Agreed unit price in minor currency units (e.g. cents for USD).
+    pub price_per_unit: u64,
     /// ISO-4217 currency code.
     pub currency: String,
     /// Whether this trigger is currently active.
@@ -55,12 +53,20 @@ pub struct WatcherService {
     triggers: HashMap<String, InventoryTrigger>,
     /// Running inventory totals: `inventory[product_id][owner_id] = level`.
     inventory: HashMap<String, HashMap<String, i64>>,
+    /// Per-trigger fire counter to guarantee unique transaction IDs across
+    /// repeated firings of the same trigger.
+    trigger_fire_counts: HashMap<String, u64>,
 }
 
 impl WatcherService {
     /// Create a new empty watcher service.
+    #[must_use] 
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            triggers: HashMap::new(),
+            inventory: HashMap::new(),
+            trigger_fire_counts: HashMap::new(),
+        }
     }
 
     /// Register an inventory-level trigger.
@@ -83,6 +89,7 @@ impl WatcherService {
     }
 
     /// Return the current inventory level for `(product_id, owner_id)`.
+    #[must_use] 
     pub fn inventory_level(&self, product_id: &str, owner_id: &str) -> i64 {
         self.inventory
             .get(product_id)
@@ -98,10 +105,10 @@ impl WatcherService {
     /// 1. **Event** — an `InventoryUpdate` arrives.
     /// 2. **Condition** — is the new level at or below any trigger threshold?
     /// 3. **Action** — generate a `PurchaseOrder` and return it for submission.
-    pub fn on_inventory_update(
-        &mut self,
-        update: &InventoryUpdate,
-    ) -> Vec<Transaction> {
+    ///
+    /// Each firing of a trigger increments an internal counter that is embedded
+    /// in the transaction ID, guaranteeing unique IDs across repeated firings.
+    pub fn on_inventory_update(&mut self, update: &InventoryUpdate) -> Vec<Transaction> {
         // Apply the inventory delta.
         let level = self
             .inventory
@@ -119,40 +126,57 @@ impl WatcherService {
             new_level
         );
 
-        // Evaluate all active triggers.
+        // Collect triggers that should fire into a local Vec so that we can
+        // subsequently mutate `trigger_fire_counts` without conflicting with
+        // the shared borrow on `self.triggers`.
+        let firing_triggers: Vec<InventoryTrigger> = self
+            .triggers
+            .values()
+            .filter(|t| {
+                t.active
+                    && t.product_id == update.product_id
+                    && t.owner_id == update.owner_id
+                    && new_level <= t.reorder_threshold
+            })
+            .cloned()
+            .collect();
+
         let mut orders = Vec::new();
-        for trigger in self.triggers.values() {
-            if !trigger.active {
-                continue;
-            }
-            if trigger.product_id != update.product_id {
-                continue;
-            }
-            if trigger.owner_id != update.owner_id {
-                continue;
-            }
-            if new_level <= trigger.reorder_threshold {
-                log::info!(
-                    "WatcherService: trigger '{}' fired — level {} ≤ threshold {}; ordering {}",
-                    trigger.trigger_id,
-                    new_level,
-                    trigger.reorder_threshold,
-                    trigger.reorder_quantity
-                );
-                let tx = Transaction::with_id(
-                    format!("watcher:{}:{}:{}", trigger.trigger_id, update.product_id, update.owner_id),
-                    TransactionKind::PurchaseOrder(PurchaseOrder {
-                        product_id: trigger.product_id.clone(),
-                        buyer_id: trigger.owner_id.clone(),
-                        seller_id: trigger.seller_id.clone(),
-                        quantity: trigger.reorder_quantity,
-                        agreed_price_per_unit: trigger.price_per_unit,
-                        currency: trigger.currency.clone(),
-                        contract_id: Some(trigger.trigger_id.clone()),
-                    }),
-                );
-                orders.push(tx);
-            }
+        for trigger in firing_triggers {
+            // Increment the per-trigger fire counter and capture it so the
+            // transaction ID is unique across multiple firings.
+            let fire_count = self
+                .trigger_fire_counts
+                .entry(trigger.trigger_id.clone())
+                .or_insert(0);
+            *fire_count += 1;
+            let count = *fire_count;
+
+            log::info!(
+                "WatcherService: trigger '{}' fired (#{}) — level {} ≤ threshold {}; ordering {}",
+                trigger.trigger_id,
+                count,
+                new_level,
+                trigger.reorder_threshold,
+                trigger.reorder_quantity,
+            );
+
+            let tx = Transaction::with_id(
+                format!(
+                    "watcher:{}:{}:{}:{}",
+                    trigger.trigger_id, update.product_id, update.owner_id, count,
+                ),
+                TransactionKind::PurchaseOrder(PurchaseOrder {
+                    product_id: trigger.product_id.clone(),
+                    buyer_id: trigger.owner_id.clone(),
+                    seller_id: trigger.seller_id.clone(),
+                    quantity: trigger.reorder_quantity,
+                    agreed_price_per_unit: trigger.price_per_unit,
+                    currency: trigger.currency.clone(),
+                    contract_id: Some(trigger.trigger_id.clone()),
+                }),
+            );
+            orders.push(tx);
         }
         orders
     }
@@ -162,6 +186,8 @@ impl WatcherService {
 mod tests {
     use super::*;
 
+    /// Build a minimal trigger with `price_per_unit` expressed in minor
+    /// currency units (e.g. cents: 1000 = $10.00).
     fn make_trigger(
         id: &str,
         product: &str,
@@ -176,7 +202,7 @@ mod tests {
             reorder_threshold: threshold,
             reorder_quantity: reorder_qty,
             seller_id: "supplier-1".into(),
-            price_per_unit: 10.0,
+            price_per_unit: 1000,
             currency: "USD".into(),
             active: true,
         }
@@ -191,6 +217,10 @@ mod tests {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Inventory accumulation
+    // -------------------------------------------------------------------------
+
     #[test]
     fn test_inventory_accumulates() {
         let mut svc = WatcherService::new();
@@ -199,16 +229,20 @@ mod tests {
         assert_eq!(svc.inventory_level("SKU-001", "pharmacy-1"), 150);
     }
 
+    // -------------------------------------------------------------------------
+    // Trigger firing
+    // -------------------------------------------------------------------------
+
     #[test]
     fn test_trigger_fires_below_threshold() {
         let mut svc = WatcherService::new();
         svc.add_trigger(make_trigger("t1", "SKU-001", "pharmacy-1", 100, 500));
 
-        // Stock above threshold – should NOT fire.
+        // Stock above threshold — should NOT fire.
         let orders = svc.on_inventory_update(&inv_update("SKU-001", "pharmacy-1", 200));
         assert!(orders.is_empty());
 
-        // Drain below threshold – should fire.
+        // Drain below threshold — should fire.
         let orders = svc.on_inventory_update(&inv_update("SKU-001", "pharmacy-1", -150));
         assert_eq!(orders.len(), 1);
         if let TransactionKind::PurchaseOrder(ref po) = orders[0].kind {
@@ -224,7 +258,7 @@ mod tests {
     fn test_trigger_fires_at_exact_threshold() {
         let mut svc = WatcherService::new();
         svc.add_trigger(make_trigger("t1", "SKU-001", "pharmacy-1", 100, 300));
-        // Set inventory exactly at threshold.
+        // Set inventory exactly at threshold — trigger must fire (≤).
         let orders = svc.on_inventory_update(&inv_update("SKU-001", "pharmacy-1", 100));
         assert_eq!(orders.len(), 1);
     }
@@ -252,7 +286,7 @@ mod tests {
     fn test_trigger_only_fires_for_matching_product() {
         let mut svc = WatcherService::new();
         svc.add_trigger(make_trigger("t1", "SKU-001", "pharmacy-1", 100, 300));
-        // Update for a different product – should NOT fire.
+        // Update for a different product — should NOT fire.
         let orders = svc.on_inventory_update(&inv_update("SKU-999", "pharmacy-1", 50));
         assert!(orders.is_empty());
     }
@@ -270,5 +304,31 @@ mod tests {
         // Inventory drops to 30 — t2 fires too.
         let orders2 = svc.on_inventory_update(&inv_update("SKU-001", "pharmacy-1", -50));
         assert_eq!(orders2.len(), 2);
+    }
+
+    // -------------------------------------------------------------------------
+    // Transaction ID uniqueness across repeated firings
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_repeated_trigger_generates_unique_tx_ids() {
+        let mut svc = WatcherService::new();
+        svc.add_trigger(make_trigger("t1", "SKU-001", "pharmacy-1", 100, 300));
+
+        // First firing — inventory starts at 0 and is set to 50, which is ≤ 100.
+        let orders1 = svc.on_inventory_update(&inv_update("SKU-001", "pharmacy-1", 50));
+        assert_eq!(orders1.len(), 1);
+
+        // Restock above threshold so the trigger is no longer active at this level.
+        svc.on_inventory_update(&inv_update("SKU-001", "pharmacy-1", 200));
+
+        // Second firing — drain back below the threshold.
+        let orders2 = svc.on_inventory_update(&inv_update("SKU-001", "pharmacy-1", -200));
+        assert_eq!(orders2.len(), 1);
+
+        assert_ne!(
+            orders1[0].id, orders2[0].id,
+            "repeated trigger firings must produce unique transaction IDs"
+        );
     }
 }

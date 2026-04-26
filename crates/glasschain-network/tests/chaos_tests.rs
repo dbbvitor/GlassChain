@@ -1,6 +1,6 @@
 //! Network Chaos Testing Suite (Phase 6).
 //!
-//! These tests simulate adverse network conditions to verify that GlassChain
+//! These tests simulate adverse network conditions to verify that `GlassChain`
 //! nodes handle failures gracefully:
 //!
 //! - **30% node failure**: spin up 10 nodes, kill 3, verify the remainder
@@ -37,9 +37,9 @@ fn free_addr() -> String {
 
 /// Scenario: 30% node failure.
 ///
-/// Start node_0 and mine 2 blocks.  Then start node_1 and node_2 which both
-/// sync via the RequestChain handshake.  Drop node_2 (~33% failure), mine
-/// another block on node_0.  A new node_3 that connects should see all 4
+/// Start `node_0` and mine 2 blocks.  Then start `node_1` and `node_2` which both
+/// sync via the `RequestChain` handshake.  Drop `node_2` (~33% failure), mine
+/// another block on `node_0`.  A new `node_3` that connects should see all 4
 /// blocks and the chain must be valid.
 #[tokio::test]
 async fn test_partial_node_failure_chain_remains_operational() {

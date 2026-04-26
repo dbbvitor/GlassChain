@@ -1,4 +1,4 @@
-//! Block indexer, Provenance API, and Event Bus for GlassChain (Phase 5).
+//! Block indexer, Provenance API, and Event Bus for `GlassChain` (Phase 5).
 //!
 //! ## Components
 //!
@@ -8,10 +8,10 @@
 //! | [`provenance`] | Chain-of-custody Provenance API |
 //! | [`event_bus`] | [`EventBusProvider`] trait + [`InMemoryEventBus`] |
 //!
-//! ## SQLx / ClickHouse integration
+//! ## `SQLx` / `ClickHouse` integration
 //!
 //! The [`InMemoryIndexer`] is the default (zero-dependency) implementation.
-//! A PostgreSQL adapter powered by **SQLx** can be enabled by implementing the
+//! A `PostgreSQL` adapter powered by **`SQLx`** can be enabled by implementing the
 //! [`IndexerProvider`] trait on a struct that wraps a `sqlx::PgPool`.  The
 //! trait methods map directly to SQL `INSERT` / `SELECT` statements.
 //!

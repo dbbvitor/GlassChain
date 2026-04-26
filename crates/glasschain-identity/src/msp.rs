@@ -6,11 +6,11 @@
 
 use crate::error::IdentityError;
 use crate::identity::Identity;
-use rcgen::{Certificate, CertificateParams, DistinguishedName, DnType, KeyPair};
+use rcgen::{CertificateParams, DistinguishedName, DnType, Issuer, KeyPair};
 use std::collections::HashMap;
 
 /// An organization that manages member identities and acts as the Root CA for
-/// the GlassChain MSP.
+/// the `GlassChain` MSP.
 ///
 /// Every transaction submitted to the ledger can be cryptographically tied
 /// back to an organization, providing permissioned governance on top of the
@@ -20,39 +20,47 @@ pub struct Organization {
     pub name: String,
     /// PEM-encoded Root CA certificate (shared with peers for verification).
     pub root_ca_cert_pem: String,
-    /// Root CA Certificate object (kept to sign member certs).
-    ca_cert: Certificate,
-    /// Root CA key pair (kept to sign member certs; never serialized).
-    ca_key: KeyPair,
+    /// Root CA issuer — bundles the CA params and key pair so member certificates
+    /// can be signed without needing the original `Certificate` object.
+    ca_issuer: Issuer<'static, KeyPair>,
     /// Registered member identities, keyed by `node_id`.
     members: HashMap<String, Identity>,
 }
 
 impl Organization {
     /// Create a new organization, generating a self-signed Root CA certificate.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(IdentityError::CertGen)` if the root CA key pair or
+    /// self-signed certificate cannot be generated.
     pub fn new(name: impl Into<String>) -> Result<Self, IdentityError> {
         let org_name = name.into();
 
         let mut params = CertificateParams::default();
         let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, format!("{} Root CA", org_name));
+        dn.push(DnType::CommonName, format!("{org_name} Root CA"));
         dn.push(DnType::OrganizationName, org_name.clone());
         params.distinguished_name = dn;
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
 
-        let key_pair =
-            KeyPair::generate().map_err(|e| IdentityError::CertGen(e.to_string()))?;
+        let key_pair = KeyPair::generate().map_err(|e| IdentityError::CertGen(e.to_string()))?;
+
+        // self_signed borrows params, so cert and root_ca_cert_pem can be obtained
+        // before params and key_pair are consumed by Issuer::new below.
         let cert = params
             .self_signed(&key_pair)
             .map_err(|e| IdentityError::CertGen(e.to_string()))?;
-
         let root_ca_cert_pem = cert.pem();
+
+        // Issuer::new consumes params and key_pair; all Cow values are Owned
+        // so the issuer carries 'static lifetime and can be stored in the struct.
+        let ca_issuer = Issuer::new(params, key_pair);
 
         Ok(Self {
             name: org_name,
             root_ca_cert_pem,
-            ca_cert: cert,
-            ca_key: key_pair,
+            ca_issuer,
             members: HashMap::new(),
         })
     }
@@ -62,6 +70,15 @@ impl Organization {
     /// Generates an ed25519 key pair and signs the member certificate with the
     /// organization's Root CA.  The resulting [`Identity`] is stored in the
     /// member registry and returned to the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(IdentityError::CertGen)` if the member key pair or certificate
+    /// cannot be generated.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal member registry is inconsistent (should never occur in practice).
     pub fn issue_identity(
         &mut self,
         node_id: impl Into<String>,
@@ -77,13 +94,18 @@ impl Organization {
         params.distinguished_name = dn;
         params.is_ca = rcgen::IsCa::NoCa;
 
-        // Use a fresh key pair for the member certificate.
-        let member_key: KeyPair =
-            KeyPair::generate().map_err(|e| IdentityError::CertGen(e.to_string()))?;
+        // Derive the member certificate key pair from the identity's own ed25519
+        // signing key so that certificate and transaction signatures share the same
+        // public key.
+        let member_key = identity
+            .rcgen_key_pair()
+            .map_err(|e| IdentityError::CertGen(e.to_string()))?;
 
-        // Sign the member certificate with the Root CA.
+        // Sign the member certificate with the Root CA issuer.
+        // rcgen 0.14: signed_by takes (&public_key, &Issuer) instead of
+        // (&key_pair, &cert, &ca_key).
         let member_cert = params
-            .signed_by(&member_key, &self.ca_cert, &self.ca_key)
+            .signed_by(&member_key, &self.ca_issuer)
             .map_err(|e| IdentityError::CertGen(e.to_string()))?;
 
         identity.certificate_pem = Some(member_cert.pem());
@@ -93,16 +115,22 @@ impl Organization {
     }
 
     /// Look up a member identity by node ID.
+    #[must_use]
     pub fn get_member(&self, node_id: &str) -> Option<&Identity> {
         self.members.get(node_id)
     }
 
     /// Return all member node IDs.
+    #[must_use]
     pub fn member_ids(&self) -> Vec<&str> {
-        self.members.keys().map(|s| s.as_str()).collect()
+        self.members
+            .keys()
+            .map(std::string::String::as_str)
+            .collect()
     }
 
     /// Verify that a node ID is a registered member.
+    #[must_use]
     pub fn is_member(&self, node_id: &str) -> bool {
         self.members.contains_key(node_id)
     }

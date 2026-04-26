@@ -32,10 +32,10 @@ use serde::{Deserialize, Serialize};
 
 /// A fully traceable pharmaceutical or serialised product asset.
 ///
-/// This struct is the central data model for GlassChain's regulatory
+/// This struct is the central data model for `GlassChain`'s regulatory
 /// compliance layer.  Participants SHOULD populate all fields;
 /// [`MetadataTrustScore::compute`] will flag missing core fields.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TraceableAsset {
     // ── Core identity (GS1 / Anvisa mandatory) ──────────────────────────────
 
@@ -92,7 +92,7 @@ pub struct TraceableAsset {
 /// Scores range from **0** (no regulatory metadata) to **100** (all core
 /// fields present).  The breakdown shows which specific fields contributed
 /// to or reduced the score.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MetadataTrustScore {
     /// Overall score in the range \[0, 100\].
     pub score: u8,
@@ -134,7 +134,7 @@ fn is_valid_iso8601_date(s: &str) -> bool {
         Ok(v) => v,
         Err(_) => return false,
     };
-    year >= 1900 && month >= 1 && month <= 12 && day >= 1 && day <= 31
+    year >= 1900 && (1..=12).contains(&month) && (1..=31).contains(&day)
 }
 
 impl MetadataTrustScore {
@@ -152,7 +152,7 @@ impl MetadataTrustScore {
         let mut bonus = Vec::new();
 
         // Core fields — 20 pts each.
-        if asset.gtin.as_deref().map(|s| !s.is_empty()).unwrap_or(false) {
+        if asset.gtin.as_deref().is_some_and(|s| !s.is_empty()) {
             score += 20;
         } else {
             missing.push("gtin".to_owned());
@@ -160,8 +160,7 @@ impl MetadataTrustScore {
         if asset
             .batch_number
             .as_deref()
-            .map(|s| !s.is_empty())
-            .unwrap_or(false)
+            .is_some_and(|s| !s.is_empty())
         {
             score += 20;
         } else {
@@ -172,8 +171,7 @@ impl MetadataTrustScore {
         if asset
             .expiry_date
             .as_deref()
-            .map(is_valid_iso8601_date)
-            .unwrap_or(false)
+            .is_some_and(is_valid_iso8601_date)
         {
             score += 20;
         } else {
@@ -182,8 +180,7 @@ impl MetadataTrustScore {
         if asset
             .serial_number
             .as_deref()
-            .map(|s| !s.is_empty())
-            .unwrap_or(false)
+            .is_some_and(|s| !s.is_empty())
         {
             score += 20;
         } else {
@@ -194,8 +191,7 @@ impl MetadataTrustScore {
         if asset
             .anvisa_registration
             .as_deref()
-            .map(|s| !s.is_empty())
-            .unwrap_or(false)
+            .is_some_and(|s| !s.is_empty())
         {
             score += 10;
             bonus.push("anvisa_registration".to_owned());
@@ -203,8 +199,7 @@ impl MetadataTrustScore {
         if asset
             .manufacturer_id
             .as_deref()
-            .map(|s| !s.is_empty())
-            .unwrap_or(false)
+            .is_some_and(|s| !s.is_empty())
         {
             score += 10;
             bonus.push("manufacturer_id".to_owned());
@@ -212,7 +207,7 @@ impl MetadataTrustScore {
 
         let is_standard = score >= TRUST_SCORE_STANDARD_THRESHOLD;
 
-        MetadataTrustScore {
+        Self {
             score,
             is_standard,
             missing_core_fields: missing,
@@ -224,7 +219,8 @@ impl MetadataTrustScore {
     ///
     /// Standard-compliant assets (`is_standard == true`) pay 50 % less gas,
     /// incentivising participants to supply complete regulatory data.
-    pub fn fee_multiplier(&self) -> f64 {
+    #[must_use] 
+    pub const fn fee_multiplier(&self) -> f64 {
         if self.is_standard {
             0.5
         } else {

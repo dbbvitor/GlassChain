@@ -1,6 +1,6 @@
 //! Deterministic gas metering.
 //!
-//! GlassChain uses Wasmtime's **fuel** feature for gas metering.  Each WASM
+//! `GlassChain` uses Wasmtime's **fuel** feature for gas metering.  Each WASM
 //! instruction consumes one unit of fuel.  This module provides helper types
 //! for reporting and tracking gas usage.
 
@@ -20,7 +20,8 @@ pub struct GasReport {
 
 impl GasReport {
     /// Create a new gas report.
-    pub fn new(gas_used: u64, gas_limit: u64, completed_normally: bool) -> Self {
+    #[must_use]
+    pub const fn new(gas_used: u64, gas_limit: u64, completed_normally: bool) -> Self {
         Self {
             gas_used,
             gas_limit,
@@ -29,6 +30,8 @@ impl GasReport {
     }
 
     /// Return the fraction of gas consumed, in the range `[0.0, 1.0]`.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn utilisation(&self) -> f64 {
         if self.gas_limit == 0 {
             return 0.0;

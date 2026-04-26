@@ -31,9 +31,9 @@
 //! ```
 
 use crate::error::IdentityError;
+use glasschain_core::crypto::sha256;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use glasschain_core::crypto::sha256;
 
 /// Configuration for creating a new [`Channel`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +78,7 @@ pub struct PrivateDataEntry {
 
 impl Channel {
     /// Create a new channel from the given configuration.
+    #[must_use]
     pub fn new(config: ChannelConfig) -> Self {
         let member_set = config.member_ids.iter().cloned().collect();
         Self {
@@ -89,15 +90,19 @@ impl Channel {
     }
 
     /// Return `true` if `node_id` is a member of this channel.
+    #[must_use]
     pub fn is_member(&self, node_id: &str) -> bool {
         self.member_set.contains(node_id)
     }
 
     /// Submit private data to the channel.
     ///
-    /// Returns `Err(IdentityError::Channel)` if the submitter is not a member.
     /// On success, returns the SHA-256 hash of the payload (to be included in
     /// the main-chain transaction as a "hash commitment").
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(IdentityError::Channel)` if the submitter is not a channel member.
     pub fn submit_private_data(
         &mut self,
         submitter_id: &str,
@@ -123,20 +128,16 @@ impl Channel {
     /// Retrieve private data by its payload hash.
     ///
     /// Only accessible to channel members; non-members receive `None`.
-    pub fn get_private_data(
-        &self,
-        hash: &str,
-        requestor_id: &str,
-    ) -> Option<&PrivateDataEntry> {
+    #[must_use]
+    pub fn get_private_data(&self, hash: &str, requestor_id: &str) -> Option<&PrivateDataEntry> {
         if !self.is_member(requestor_id) {
             return None;
         }
-        self.private_data
-            .iter()
-            .find(|e| e.payload_hash == hash)
+        self.private_data.iter().find(|e| e.payload_hash == hash)
     }
 
     /// Return all on-chain hash commitments for this channel.
+    #[must_use]
     pub fn committed_hashes(&self) -> &[String] {
         &self.committed_hashes
     }

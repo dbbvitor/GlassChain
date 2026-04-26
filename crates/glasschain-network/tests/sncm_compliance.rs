@@ -1,7 +1,7 @@
 //! Anvisa SNCM Compliance Validation Suite
 //!
 //! This test suite simulates a complete pharmaceutical supply-chain shipment
-//! from **Manufacturer → Distributor → Pharmacy**, verifying that GlassChain
+//! from **Manufacturer → Distributor → Pharmacy**, verifying that `GlassChain`
 //! correctly records every custody transfer and computes Metadata Trust Scores
 //! in accordance with Brazilian traceability law **RDC 157/2017**.
 //!
@@ -293,7 +293,7 @@ async fn sncm_non_compliant_asset_accepted_but_low_trust() {
     }
 }
 
-/// Verify the TransactionAccepted event fires for an SNCM asset registration.
+/// Verify the `TransactionAccepted` event fires for an SNCM asset registration.
 #[tokio::test]
 async fn sncm_asset_registration_emits_transaction_accepted_event() {
     let addr = free_addr();

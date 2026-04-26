@@ -1,4 +1,4 @@
-/// Integration tests for the GlassChain network node.
+/// Integration tests for the `GlassChain` network node.
 ///
 /// These tests spin up real Tokio tasks and real TCP connections on localhost.
 use glasschain_core::{InventoryUpdate, SupplyOffer, Transaction, TransactionKind};
@@ -15,7 +15,7 @@ fn inventory_tx(owner: &str) -> Transaction {
     }))
 }
 
-fn supply_offer_tx(seller: &str, product: &str, price: f64, lead: u32) -> Transaction {
+fn supply_offer_tx(seller: &str, product: &str, price: u64, lead: u32) -> Transaction {
     Transaction::new(TransactionKind::SupplyOffer(SupplyOffer {
         product_id: product.into(),
         product_name: "Widget".into(),
@@ -42,7 +42,9 @@ async fn test_node_starts_and_mines_block() {
     let node = Node::new("test-node", &addr, 1);
     node.start(vec![]).await.unwrap();
 
-    node.submit_transaction(inventory_tx("owner-1")).await.unwrap();
+    node.submit_transaction(inventory_tx("owner-1"))
+        .await
+        .unwrap();
     node.mine().await.unwrap();
 
     let ledger = node.ledger_snapshot().await;
@@ -58,7 +60,9 @@ async fn test_transaction_accepted_event_fires() {
     let mut events = node.subscribe();
     node.start(vec![]).await.unwrap();
 
-    node.submit_transaction(inventory_tx("owner-1")).await.unwrap();
+    node.submit_transaction(inventory_tx("owner-1"))
+        .await
+        .unwrap();
 
     let evt = timeout(Duration::from_secs(2), events.recv())
         .await
@@ -75,7 +79,9 @@ async fn test_block_mined_event_fires() {
     let mut events = node.subscribe();
     node.start(vec![]).await.unwrap();
 
-    node.submit_transaction(inventory_tx("owner-1")).await.unwrap();
+    node.submit_transaction(inventory_tx("owner-1"))
+        .await
+        .unwrap();
     // Consume TransactionAccepted event first.
     let _ = timeout(Duration::from_secs(1), events.recv()).await;
 
@@ -104,7 +110,7 @@ async fn test_smart_contract_auto_execution_on_supply_offer() {
         buyer_id: "buyer-acme".into(),
         product_id: "SKU-AUTO".into(),
         conditions: PurchaseConditions {
-            max_price_per_unit: 20.0,
+            max_price_per_unit: 2000,
             min_quantity: 1,
             max_quantity: 50,
             max_lead_time_days: 14,
@@ -112,6 +118,7 @@ async fn test_smart_contract_auto_execution_on_supply_offer() {
             currency: "USD".into(),
             auto_execute: true,
         },
+        wasm_code_b64: None,
     }));
     node.submit_transaction(contract_tx).await.unwrap();
 
@@ -119,7 +126,7 @@ async fn test_smart_contract_auto_execution_on_supply_offer() {
     let _ = timeout(Duration::from_millis(200), events.recv()).await;
 
     // Post a matching supply offer.
-    let offer_tx = supply_offer_tx("seller-z", "SKU-AUTO", 15.0, 7);
+    let offer_tx = supply_offer_tx("seller-z", "SKU-AUTO", 1500, 7);
     node.submit_transaction(offer_tx).await.unwrap();
 
     // Collect events with a 3-second window, looking for ContractExecuted.
@@ -146,7 +153,10 @@ async fn test_two_nodes_sync_chain() {
     let addr_a = free_addr();
     let node_a = Node::new("node-a", &addr_a, 1);
     node_a.start(vec![]).await.unwrap();
-    node_a.submit_transaction(inventory_tx("owner-a")).await.unwrap();
+    node_a
+        .submit_transaction(inventory_tx("owner-a"))
+        .await
+        .unwrap();
     node_a.mine().await.unwrap();
 
     // Give node A a moment to finish mining.

@@ -55,6 +55,7 @@ pub struct ProvenanceIndex {
 
 impl ProvenanceIndex {
     /// Create an empty provenance index.
+    #[must_use] 
     pub fn new() -> Self {
         Self::default()
     }
@@ -91,16 +92,18 @@ impl ProvenanceIndex {
     /// Return the full ordered custody chain for an asset.
     ///
     /// Returns an empty slice if no events have been recorded for the asset.
+    #[must_use] 
     pub fn get_custody_chain(&self, asset_id: &str) -> &[CustodyEvent] {
         self.custody_chains
             .get(asset_id)
-            .map(|v| v.as_slice())
+            .map(std::vec::Vec::as_slice)
             .unwrap_or_default()
     }
 
     /// Return all asset IDs currently tracked by the provenance index.
+    #[must_use] 
     pub fn tracked_assets(&self) -> Vec<&str> {
-        self.custody_chains.keys().map(|s| s.as_str()).collect()
+        self.custody_chains.keys().map(std::string::String::as_str).collect()
     }
 
     /// Verify that an asset's custody chain is complete: every mandatory
@@ -110,6 +113,7 @@ impl ProvenanceIndex {
     /// `["manufacture", "dispatch", "receive"]`).
     ///
     /// Returns `true` when all expected events appear in order in the chain.
+    #[must_use] 
     pub fn verify_lineage(&self, asset_id: &str, expected_events: &[&str]) -> bool {
         let chain = self.get_custody_chain(asset_id);
         if chain.len() < expected_events.len() {
@@ -133,9 +137,9 @@ impl ProvenanceIndex {
 /// Otherwise, the batch-level ID `"GTIN:<gtin>:BATCH:<batch>"` is used.
 fn asset_id_for(asset: &glasschain_core::TraceableAsset) -> String {
     match (&asset.gtin, &asset.serial_number, &asset.batch_number) {
-        (Some(gtin), Some(sn), _) => format!("GTIN:{}:SN:{}", gtin, sn),
-        (Some(gtin), _, Some(batch)) => format!("GTIN:{}:BATCH:{}", gtin, batch),
-        (Some(gtin), _, _) => format!("GTIN:{}", gtin),
+        (Some(gtin), Some(sn), _) => format!("GTIN:{gtin}:SN:{sn}"),
+        (Some(gtin), _, Some(batch)) => format!("GTIN:{gtin}:BATCH:{batch}"),
+        (Some(gtin), _, _) => format!("GTIN:{gtin}"),
         _ => format!("PRODUCT:{}", asset.product_name),
     }
 }

@@ -8,7 +8,7 @@ pub enum ContractStatus {
     Active,
     /// Contract has been paused by the buyer; no automatic execution occurs.
     Paused,
-    /// Contract was fully executed (max_quantity purchased) and is closed.
+    /// Contract was fully executed (`max_quantity` purchased) and is closed.
     Fulfilled,
     /// Contract was explicitly cancelled by the buyer.
     Cancelled,
@@ -17,10 +17,10 @@ pub enum ContractStatus {
 impl std::fmt::Display for ContractStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ContractStatus::Active => write!(f, "Active"),
-            ContractStatus::Paused => write!(f, "Paused"),
-            ContractStatus::Fulfilled => write!(f, "Fulfilled"),
-            ContractStatus::Cancelled => write!(f, "Cancelled"),
+            Self::Active => write!(f, "Active"),
+            Self::Paused => write!(f, "Paused"),
+            Self::Fulfilled => write!(f, "Fulfilled"),
+            Self::Cancelled => write!(f, "Cancelled"),
         }
     }
 }
@@ -43,7 +43,8 @@ pub struct Contract {
 
 impl Contract {
     /// Create a new active contract from a ledger-committed definition.
-    pub fn new(definition: SmartContractDef) -> Self {
+    #[must_use] 
+    pub const fn new(definition: SmartContractDef) -> Self {
         Self {
             definition,
             status: ContractStatus::Active,
@@ -53,26 +54,31 @@ impl Contract {
     }
 
     /// Return `true` when the contract is accepting automatic executions.
+    #[must_use] 
     pub fn is_active(&self) -> bool {
         self.status == ContractStatus::Active
     }
 
     /// Return a reference to the contract's purchase conditions.
-    pub fn conditions(&self) -> &PurchaseConditions {
+    #[must_use] 
+    pub const fn conditions(&self) -> &PurchaseConditions {
         &self.definition.conditions
     }
 
     /// Return the contract's unique identifier.
+    #[must_use] 
     pub fn id(&self) -> &str {
         &self.definition.contract_id
     }
 
     /// Return the buyer's identifier.
+    #[must_use] 
     pub fn buyer_id(&self) -> &str {
         &self.definition.buyer_id
     }
 
     /// Return the targeted product identifier.
+    #[must_use] 
     pub fn product_id(&self) -> &str {
         &self.definition.product_id
     }

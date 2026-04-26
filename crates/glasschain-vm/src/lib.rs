@@ -1,4 +1,4 @@
-//! WebAssembly contract runtime for GlassChain (Phase 4).
+//! WebAssembly contract runtime for `GlassChain` (Phase 4).
 //!
 //! This crate implements the [`ExecutionProvider`] trait using **Wasmtime**,
 //! a fast, safe, standards-compliant WebAssembly runtime from the Bytecode

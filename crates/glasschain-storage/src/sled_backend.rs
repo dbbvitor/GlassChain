@@ -34,6 +34,11 @@ pub struct SledStorageProvider {
 
 impl SledStorageProvider {
     /// Open (or create) a sled database at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Storage`] if the database cannot be opened or the
+    /// internal trees cannot be created.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, CoreError> {
         let db = sled::open(path).map_err(|e| CoreError::Storage(e.to_string()))?;
         let blocks = db
@@ -50,6 +55,10 @@ impl SledStorageProvider {
     }
 
     /// Flush all pending writes to disk synchronously.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Storage`] if the underlying sled flush fails.
     pub fn flush(&self) -> Result<(), CoreError> {
         self.blocks
             .flush()
@@ -112,14 +121,11 @@ impl StorageProvider for SledStorageProvider {
     }
 
     fn get_state(&self, key: &str) -> Result<Option<Vec<u8>>, CoreError> {
-        match self
+        Ok(self
             .state
             .get(key.as_bytes())
             .map_err(|e| CoreError::Storage(e.to_string()))?
-        {
-            Some(bytes) => Ok(Some(bytes.to_vec())),
-            None => Ok(None),
-        }
+            .map(|bytes| bytes.to_vec()))
     }
 
     fn delete_state(&self, key: &str) -> Result<(), CoreError> {
@@ -129,7 +135,7 @@ impl StorageProvider for SledStorageProvider {
         Ok(())
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "sled"
     }
 }

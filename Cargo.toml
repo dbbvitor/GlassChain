@@ -11,3 +11,32 @@ members = [
     "crates/glasschain-rpc",
 ]
 resolver = "2"
+
+# ── Workspace-wide lint configuration ────────────────────────────────────────
+#
+# Every crate that adds `[lints] workspace = true` to its Cargo.toml
+# inherits these settings automatically.
+#
+# Lint groups are set at priority = -1 so that item-level
+# `#[allow(clippy::...)]` attributes (priority 0) always take precedence,
+# allowing targeted suppressions for legitimately complex code paths.
+#
+# To enforce these as hard errors in CI, run:
+#   cargo clippy --all-targets -- -D warnings
+
+[workspace.lints.rust]
+# No unsafe code anywhere in the workspace; every unsafe block must carry an
+# explicit `#[allow(unsafe_code)]` with a safety comment explaining why it is
+# sound.
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+# ── Core lint groups ──────────────────────────────────────────────────────────
+# `all`      — the default set Clippy ships with.
+# `pedantic` — stricter style and correctness lints.
+# `nursery`  — lints that are still being refined but already valuable.
+# `cargo`    — checks the Cargo.toml manifests (metadata, dependency hygiene).
+all      = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery  = { level = "warn", priority = -1 }
+cargo    = { level = "warn", priority = -1 }
