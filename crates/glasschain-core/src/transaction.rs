@@ -1,3 +1,4 @@
+use crate::asset::TraceableAsset;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -74,6 +75,23 @@ pub struct SmartContractDef {
     pub conditions: PurchaseConditions,
 }
 
+/// Registration of a traceable asset on-chain (Phase 3 traceability model).
+///
+/// Wraps a [`TraceableAsset`] and records the custody-transfer event type,
+/// making every step of the supply chain (manufacture → distribution →
+/// pharmacy) immutably visible on the ledger.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TraceableAssetRegistration {
+    /// The asset being registered.
+    pub asset: TraceableAsset,
+    /// Type of supply-chain event (e.g. "manufacture", "dispatch", "receive").
+    pub event_type: String,
+    /// Node/participant originating this event.
+    pub originator_id: String,
+    /// Optional reference to a linked purchase order transaction.
+    pub purchase_order_ref: Option<String>,
+}
+
 /// Recorded when a smart contract successfully executes a purchase.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ContractExecution {
@@ -117,6 +135,8 @@ pub enum TransactionKind {
     ContractCreation(SmartContractDef),
     ContractExecution(ContractExecution),
     InventoryUpdate(InventoryUpdate),
+    /// Phase 3: on-chain registration of a traceable asset with trust scoring.
+    AssetRegistration(TraceableAssetRegistration),
 }
 
 /// A single ledger entry.
