@@ -108,6 +108,35 @@ pub struct MetadataTrustScore {
 /// 50 % fee discount and are placed in the "High Trust" indexer bucket.
 pub const TRUST_SCORE_STANDARD_THRESHOLD: u8 = 80;
 
+/// Return `true` if `s` is a well-formed ISO-8601 date (`YYYY-MM-DD`).
+///
+/// This is a lightweight structural check: it verifies the length, separators,
+/// and that the numeric fields are in plausible ranges.  It does not perform a
+/// full calendar validation (e.g., it accepts February 30).
+fn is_valid_iso8601_date(s: &str) -> bool {
+    // Expected format: "YYYY-MM-DD"
+    if s.len() != 10 {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    let year: u16 = match s[0..4].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let month: u8 = match s[5..7].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let day: u8 = match s[8..10].parse() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    year >= 1900 && month >= 1 && month <= 12 && day >= 1 && day <= 31
+}
+
 impl MetadataTrustScore {
     /// Compute the trust score for a [`TraceableAsset`].
     ///
@@ -138,10 +167,12 @@ impl MetadataTrustScore {
         } else {
             missing.push("batch_number".to_owned());
         }
+        // expiry_date must be non-empty AND conform to YYYY-MM-DD (ISO-8601)
+        // to earn points.  A malformed date does not score.
         if asset
             .expiry_date
             .as_deref()
-            .map(|s| !s.is_empty())
+            .map(is_valid_iso8601_date)
             .unwrap_or(false)
         {
             score += 20;
@@ -315,5 +346,35 @@ mod tests {
         let s = score.to_string();
         assert!(s.contains("100/100"));
         assert!(s.contains("standard=true"));
+    }
+
+    #[test]
+    fn test_malformed_expiry_date_does_not_score() {
+        let mut asset = full_asset();
+        asset.expiry_date = Some("31-12-2027".into()); // DD-MM-YYYY is not ISO-8601
+        let score = MetadataTrustScore::compute(&asset);
+        assert!(score.missing_core_fields.iter().any(|f| f == "expiry_date"));
+        // gtin(20) + batch(20) + serial(20) + anvisa(10) + manufacturer(10) = 80
+        assert_eq!(score.score, 80);
+    }
+
+    #[test]
+    fn test_valid_iso8601_date_scores() {
+        let mut asset = full_asset();
+        asset.expiry_date = Some("2027-12-31".into()); // correct ISO-8601
+        let score = MetadataTrustScore::compute(&asset);
+        assert!(!score.missing_core_fields.iter().any(|f| f == "expiry_date"));
+    }
+
+    #[test]
+    fn test_is_valid_iso8601_date_helper() {
+        assert!(super::is_valid_iso8601_date("2027-06-30"));
+        assert!(super::is_valid_iso8601_date("1900-01-01"));
+        assert!(!super::is_valid_iso8601_date("30-06-2027")); // wrong order
+        assert!(!super::is_valid_iso8601_date("2027/06/30")); // wrong separator
+        assert!(!super::is_valid_iso8601_date("2027-13-01")); // month > 12
+        assert!(!super::is_valid_iso8601_date("2027-06-32")); // day > 31
+        assert!(!super::is_valid_iso8601_date(""));
+        assert!(!super::is_valid_iso8601_date("not-a-date"));
     }
 }
