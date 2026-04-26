@@ -1,0 +1,16 @@
+[package]
+name = "glasschain-indexer"
+version = "0.1.0"
+edition = "2021"
+description = "Block indexer, Provenance API, and Event Bus for GlassChain (Phase 5)"
+
+[dependencies]
+glasschain-core = { path = "../glasschain-core" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+log = "0.4"
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

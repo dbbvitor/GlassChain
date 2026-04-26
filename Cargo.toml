@@ -5,5 +5,9 @@ members = [
     "crates/glasschain-network",
     "crates/glasschain-node",
     "crates/glasschain-storage",
+    "crates/glasschain-identity",
+    "crates/glasschain-vm",
+    "crates/glasschain-indexer",
+    "crates/glasschain-rpc",
 ]
 resolver = "2"

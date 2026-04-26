@@ -110,6 +110,86 @@ pub trait ExecutionProvider: Send + Sync {
     fn name(&self) -> &str;
 }
 
+/// Abstraction over the peer-to-peer network transport layer.
+///
+/// This trait decouples the node logic from the underlying transport, making it
+/// straightforward to replace the built-in TCP implementation with a `libp2p`-
+/// based transport (Kademlia discovery, Noise encryption, Yamux multiplexing).
+///
+/// ## Plugging in `libp2p`
+/// 1. Add `libp2p` as a dependency (feature-gated via `features = ["libp2p"]`).
+/// 2. Implement `NetworkProvider` on a struct that wraps a `libp2p::Swarm`.
+/// 3. Pass the implementation to `Node::with_network_provider`.
+///
+/// The current TCP implementation in `glasschain-network` satisfies this
+/// contract and can be treated as the "default" adapter.
+pub trait NetworkProvider: Send + Sync {
+    /// Broadcast a serialised message to all known peers.
+    ///
+    /// The message is an opaque byte slice (typically JSON-serialised
+    /// [`protocol::Message`][crate::protocol::Message]).
+    /// Failures are logged but do not propagate — the network layer is
+    /// best-effort.
+    fn broadcast(&self, message: &[u8]);
+
+    /// Return the list of currently connected peer addresses.
+    fn connected_peers(&self) -> Vec<String>;
+
+    /// Human-readable name for this transport implementation (e.g. `"tcp"`,
+    /// `"libp2p-kademlia"`).
+    fn name(&self) -> &str;
+}
+
+/// Proof-of-Work consensus provider.
+///
+/// This is the default `ConsensusProvider` for GlassChain.  It mines new
+/// blocks by incrementing a nonce until the SHA-256 hash of the block header
+/// starts with `difficulty` leading zero hex characters.
+///
+/// ## Plugging in a different algorithm
+/// Replace `PowConsensusProvider` with an implementation of [`ConsensusProvider`]
+/// that uses Raft, PBFT, or any other algorithm.  The `glasschain-node` binary
+/// accepts any `Box<dyn ConsensusProvider>`.
+pub struct PowConsensusProvider {
+    /// Number of leading zero characters required in the block hash.
+    pub difficulty: usize,
+}
+
+impl PowConsensusProvider {
+    /// Create a new PoW provider with the given mining difficulty.
+    pub fn new(difficulty: usize) -> Self {
+        Self { difficulty }
+    }
+}
+
+impl ConsensusProvider for PowConsensusProvider {
+    fn propose_block(
+        &self,
+        index: u64,
+        transactions: Vec<Transaction>,
+        previous: &Block,
+    ) -> Result<Block, CoreError> {
+        let mut block = Block::new(index, transactions, previous.hash.clone());
+        block.mine(self.difficulty);
+        Ok(block)
+    }
+
+    fn validate_block(&self, block: &Block, previous: &Block) -> Result<(), CoreError> {
+        block.chains_to(previous)?;
+        if !block.has_valid_pow(self.difficulty) {
+            return Err(CoreError::InvalidBlock(format!(
+                "block {} does not satisfy PoW difficulty {}",
+                block.index, self.difficulty
+            )));
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "proof-of-work"
+    }
+}
+
 /// A minimal in-memory [`StorageProvider`] used for testing and the default
 /// single-node configuration.
 ///
@@ -239,5 +319,66 @@ pub mod in_memory {
             store.delete_state("k").unwrap();
             assert!(store.get_state("k").unwrap().is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod consensus_tests {
+    use super::*;
+    use crate::transaction::{InventoryUpdate, Transaction, TransactionKind};
+
+    fn genesis() -> Block {
+        let provider = PowConsensusProvider::new(1);
+        let empty = Block::new(0, vec![], "0".into());
+        // genesis is special – mine manually
+        let mut g = empty;
+        g.mine(1);
+        g
+    }
+
+    fn sample_tx() -> Transaction {
+        Transaction::new(TransactionKind::InventoryUpdate(InventoryUpdate {
+            product_id: "SKU-001".into(),
+            owner_id: "node-1".into(),
+            quantity_delta: 10,
+            reason: "test".into(),
+        }))
+    }
+
+    #[test]
+    fn test_pow_provider_name() {
+        let p = PowConsensusProvider::new(2);
+        assert_eq!(p.name(), "proof-of-work");
+    }
+
+    #[test]
+    fn test_pow_propose_block() {
+        let provider = PowConsensusProvider::new(1);
+        let g = genesis();
+        let block = provider
+            .propose_block(1, vec![sample_tx()], &g)
+            .unwrap();
+        assert_eq!(block.index, 1);
+        assert!(block.has_valid_pow(1));
+        assert!(block.is_valid());
+    }
+
+    #[test]
+    fn test_pow_validate_block_valid() {
+        let provider = PowConsensusProvider::new(1);
+        let g = genesis();
+        let block = provider.propose_block(1, vec![], &g).unwrap();
+        assert!(provider.validate_block(&block, &g).is_ok());
+    }
+
+    #[test]
+    fn test_pow_validate_block_wrong_prev_hash() {
+        let provider = PowConsensusProvider::new(1);
+        let g = genesis();
+        let mut block = provider.propose_block(1, vec![], &g).unwrap();
+        block.previous_hash = "bad".into();
+        block.hash = block.calculate_hash(); // re-hash so it's internally valid
+        // Chains_to should fail even with correct hash if pow is recalculated
+        assert!(provider.validate_block(&block, &g).is_err());
     }
 }

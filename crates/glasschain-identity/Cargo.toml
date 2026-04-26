@@ -1,0 +1,18 @@
+[package]
+name = "glasschain-identity"
+version = "0.1.0"
+edition = "2021"
+description = "Decentralized identity and X.509 MSP for GlassChain (Phase 2)"
+
+[dependencies]
+glasschain-core = { path = "../glasschain-core" }
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+rcgen = { version = "0.13", features = ["pem"] }
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+hex = "0.4"
+sha2 = "0.10"
+
+[dev-dependencies]
