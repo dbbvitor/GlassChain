@@ -22,6 +22,16 @@ pub struct Identity {
     pub certificate_pem: Option<String>,
 }
 
+impl Clone for Identity {
+    fn clone(&self) -> Self {
+        Self {
+            node_id: self.node_id.clone(),
+            signing_key: self.signing_key.clone(),
+            certificate_pem: self.certificate_pem.clone(),
+        }
+    }
+}
+
 impl Identity {
     /// Generate a fresh identity with a randomly-generated ed25519 key pair.
     pub fn generate(node_id: impl Into<String>) -> Self {
@@ -55,15 +65,15 @@ impl Identity {
     /// Produce an `rcgen::KeyPair` that wraps the **same** ed25519 private key
     /// used for transaction signing.
     ///
-    /// This allows the MSP to issue X.509 certificates whose public key is
-    /// identical to the key that signs on-ledger transactions, unifying the
-    /// two key systems.
+    /// This allows the MSP and network layer to issue X.509 certificates whose
+    /// public key is identical to the key that signs on-ledger transactions,
+    /// unifying the two key systems.
     ///
     /// # Errors
     ///
     /// Returns `Err(IdentityError::CertGen)` if the ed25519 private key cannot be
     /// encoded to PKCS#8 DER format or if `rcgen` rejects the key material.
-    pub(crate) fn rcgen_key_pair(&self) -> Result<rcgen::KeyPair, crate::error::IdentityError> {
+    pub fn rcgen_key_pair(&self) -> Result<rcgen::KeyPair, crate::error::IdentityError> {
         use ed25519_dalek::pkcs8::EncodePrivateKey;
         let pkcs8_doc = self
             .signing_key

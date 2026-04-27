@@ -15,7 +15,7 @@ GlassChain connects buyers and sellers across a peer-to-peer network, giving par
 | **Contract Automation** | `ContractCreation` rules auto-execute purchase flows on matching offers |
 | **Watcher Automation** | Commit-phase inventory hooks can enqueue autonomous reorder purchase orders |
 | **Regulatory Traceability** | Anvisa/SNCM-aligned metadata model with `MetadataTrustScore` scoring |
-| **Federated Network** | TCP-based P2P protocol with handshake, transaction/block broadcast, and sync |
+| **Federated Network** | TCP-based P2P protocol with mutual certificate exchange, TLS-encrypted transport, transaction/block broadcast, and sync |
 | **gRPC API** | Tonic/Prost server for ledger queries, tx submission, asset history, and event streams |
 | **Indexer + Provenance** | In-memory indexing and custody-chain primitives for analytics/audit workflows |
 
@@ -60,6 +60,16 @@ Run a node:
 cargo run --release -p glasschain-node -- --id node-1 --listen 0.0.0.0:8000
 ```
 
+Run a node with an identity-backed TLS certificate:
+
+```bash
+cargo run --release -p glasschain-node -- \
+  --id node-1 \
+  --listen 0.0.0.0:8000 \
+  --org PharmaCorp \
+  --identity-node-id node-1
+```
+
 Run two local peers:
 
 ```bash
@@ -69,6 +79,8 @@ cargo run --release -p glasschain-node -- --id node-1 --listen 0.0.0.0:8000
 # Terminal 2
 cargo run --release -p glasschain-node -- --id node-2 --listen 0.0.0.0:8001 --peer 127.0.0.1:8000
 ```
+
+Peer transport is **TLS-encrypted by default in release builds**. By default, nodes exchange certificates during connection setup and pin the presented peer certificate for that session. For stronger identity binding, the node binary also supports **identity-backed TLS certificates** issued from the `glasschain-identity` crate. The optional `GLASSCHAIN_INSECURE_TLS=1` escape hatch is intended only for local debugging.
 
 ---
 
@@ -81,6 +93,7 @@ contract <contract_id> <buyer> <product> <max_price> <min_qty> <max_qty> <max_le
 inventory <owner> <product> <delta> <reason>
 asset <originator> <product_name> <gtin> <batch> <expiry> <serial> <qty> <event_type>
 mine
+mine-async
 chain
 pending
 peers
@@ -89,12 +102,16 @@ quit | exit
 
 `asset` prints Metadata Trust Score at submission time. Use `-` for optional metadata fields.
 
+`mine` waits for block production to finish before returning. `mine-async` starts mining in the background and returns immediately.
+
 ---
 
 ## gRPC API (Current)
 
 Proto path: `crates/glasschain-rpc/proto/glasschain/v1/glasschain.proto`  
 Package: `glasschain.v1`
+
+The `glasschain-rpc` crate exposes the current gRPC server implementation, but the `glasschain-node` CLI binary does **not** start that server automatically yet. Today, the node binary provides the interactive REPL and P2P networking layer; gRPC serving must be wired in by an embedding binary or integration.
 
 - `LedgerService`
   - `GetBlock`
@@ -117,6 +134,15 @@ All peer messages are framed as:
 - 4-byte big-endian length prefix (`u32`)
 - UTF-8 JSON payload
 
+Before the framed protocol begins, peers exchange certificates and then upgrade the connection to TLS. The presented peer certificate fingerprint is verified against the `Hello` message and recorded in a TOFU (Trust On First Use) registry. On subsequent connections the registry rejects any peer whose node ID or certificate fingerprint has changed for the same listen address. When started with `--org <NAME>`, the node issues a TLS certificate derived from its identity key material, so the same key backs both transaction signing and transport encryption.
+
+Current trust model:
+- **Default mode:** encrypted transport, per-session certificate pinning, and TOFU identity persistence across reconnects.
+- **Identity-backed mode:** same as default, plus the TLS certificate is derived from the node's identity key so that transport and transaction identity share one key pair.
+- **Insecure mode:** only when explicitly enabled with `GLASSCHAIN_INSECURE_TLS=1` or the matching build feature.
+
+> **Note:** TOFU trust is address-bound and in-memory. There is no shared CA, no certificate-chain validation, and no trust persistence across process restarts. A peer that changes its listen address is treated as a new peer. These are known limitations, not bugs.
+
 Message types:
 
 - `Hello`
@@ -134,6 +160,8 @@ Message types:
 
 - **Contract Engine path:** `SupplyOffer` can trigger contract auto-execution and purchase transactions.
 - **Watcher path:** committed `InventoryUpdate` events are processed in post-commit hooks and may generate autonomous reorder `PurchaseOrder` transactions.
+- **Restart / sync behavior:** contract runtime state is rebuilt from the committed chain, and watcher inventory state is replayed from committed `InventoryUpdate` transactions after restore or chain replacement.
+- **Identity-backed transport option:** starting the node with `--org <NAME>` and optional `--identity-node-id <ID>` derives the TLS certificate from the node's identity key. This binds the certificate fingerprint to the advertised node identity via the TOFU peer registry, but does not establish shared-CA trust between organizations.
 
 Example contract condition payload:
 

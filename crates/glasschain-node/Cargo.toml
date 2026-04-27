@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 glasschain-core = { path = "../glasschain-core" }
 glasschain-network = { path = "../glasschain-network" }
+glasschain-identity = { path = "../glasschain-identity" }
 glasschain-storage = { path = "../glasschain-storage" }
 glasschain-vm = { path = "../glasschain-vm" }
 tokio = { version = "1.52", features = ["full"] }

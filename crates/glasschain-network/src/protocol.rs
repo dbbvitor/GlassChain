@@ -16,6 +16,12 @@ pub enum Message {
     Hello {
         /// The sender's node identifier.
         node_id: String,
+        /// Hex-encoded fingerprint of the sender's TLS certificate.
+        ///
+        /// Peers should verify that this matches the certificate fingerprint
+        /// observed during the TLS session before trusting the advertised
+        /// identity and listen address.
+        tls_cert_fingerprint: String,
         /// The sender's chain length (used for chain-sync decisions).
         chain_length: u64,
         /// Protocol version string (e.g. `"glasschain/1"`).

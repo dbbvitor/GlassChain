@@ -2,6 +2,7 @@ use glasschain_core::{
     InventoryUpdate, PurchaseConditions, PurchaseOrder, SmartContractDef, SupplyOffer,
     TraceableAsset, TraceableAssetRegistration, Transaction, TransactionKind,
 };
+use glasschain_identity::Organization;
 use glasschain_network::{Node, NodeEvent};
 use glasschain_storage::SledStorageProvider;
 use glasschain_vm::WasmExecutionProvider;
@@ -50,6 +51,9 @@ OPTIONS:
     --difficulty <N>        PoW difficulty – number of leading zeros (default: 2)
     --storage-path <PATH>   Directory for persistent Sled block storage (optional).
                             When provided, the chain is reloaded from disk on restart.
+    --org <NAME>            Organization name for issuing an identity-backed TLS certificate.
+    --identity-node-id <ID> Node ID to embed in the issued TLS identity certificate.
+                            Defaults to the value passed to --id.
     --help                  Show this help message
 
 INTERACTIVE COMMANDS (after startup):
@@ -70,7 +74,10 @@ INTERACTIVE COMMANDS (after startup):
         Use "-" for any optional field to leave it empty.
 
     mine
-        Mine a block with all pending transactions.
+        Mine a block with all pending transactions and wait for completion.
+
+    mine-async
+        Start mining in the background and return immediately.
 
     chain
         Print the current chain summary.
@@ -106,6 +113,8 @@ async fn main() {
     let mut seed_peers: Vec<String> = Vec::new();
     let mut difficulty = 2usize;
     let mut storage_path: Option<String> = None;
+    let mut org_name: Option<String> = None;
+    let mut identity_node_id: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -140,6 +149,18 @@ async fn main() {
                     storage_path = Some(v.clone());
                 }
             }
+            "--org" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    org_name = Some(v.clone());
+                }
+            }
+            "--identity-node-id" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    identity_node_id = Some(v.clone());
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -149,21 +170,68 @@ async fn main() {
         "Starting GlassChain node id={node_id}  listen={listen_addr}  difficulty={difficulty}"
     );
 
+    let identity = if let Some(ref org) = org_name {
+        let identity_name = identity_node_id.clone().unwrap_or_else(|| node_id.clone());
+        let mut organization = match Organization::new(org.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("Failed to create organization `{org}`: {e}");
+                std::process::exit(1);
+            }
+        };
+        let issued_identity = match organization.issue_identity(identity_name.clone()) {
+            Ok(v) => v.clone(),
+            Err(e) => {
+                log::error!(
+                    "Failed to issue identity `{identity_name}` from organization `{org}`: {e}"
+                );
+                std::process::exit(1);
+            }
+        };
+        log::info!(
+            "Using identity-backed TLS certificate for node `{}` issued by organization `{}`",
+            identity_name,
+            org
+        );
+        Some(Arc::new(issued_identity))
+    } else {
+        None
+    };
+
     // Build the node — optionally backed by persistent Sled storage.
     let node = if let Some(ref path) = storage_path {
         log::info!("Using persistent storage at {path}");
         match SledStorageProvider::open(path) {
-            Ok(storage) => Arc::new(Node::new_with_storage(
-                node_id.clone(),
-                listen_addr.clone(),
-                difficulty,
-                Arc::new(storage),
-            )),
+            Ok(storage) => {
+                if let Some(identity) = identity.clone() {
+                    Arc::new(Node::new_with_storage_and_identity(
+                        node_id.clone(),
+                        listen_addr.clone(),
+                        difficulty,
+                        Arc::new(storage),
+                        identity,
+                    ))
+                } else {
+                    Arc::new(Node::new_with_storage(
+                        node_id.clone(),
+                        listen_addr.clone(),
+                        difficulty,
+                        Arc::new(storage),
+                    ))
+                }
+            }
             Err(e) => {
                 log::error!("Failed to open storage at {path}: {e}");
                 std::process::exit(1);
             }
         }
+    } else if let Some(identity) = identity {
+        Arc::new(Node::new_with_identity(
+            node_id.clone(),
+            listen_addr.clone(),
+            difficulty,
+            identity,
+        ))
     } else {
         Arc::new(Node::new(node_id.clone(), listen_addr.clone(), difficulty))
     };
@@ -259,15 +327,21 @@ async fn main() {
                     eprintln!("Usage: supply <seller> <product_id> <product_name> <qty> <price> <lead_days> <currency>");
                     continue;
                 }
-                let qty: u64 = if let Ok(v) = parts[4].parse() { v } else {
+                let qty: u64 = if let Ok(v) = parts[4].parse() {
+                    v
+                } else {
                     eprintln!("Invalid quantity");
                     continue;
                 };
-                let price: u64 = if let Some(v) = parse_price(parts[5]) { v } else {
+                let price: u64 = if let Some(v) = parse_price(parts[5]) {
+                    v
+                } else {
                     eprintln!("Invalid price (use decimal like 12.50)");
                     continue;
                 };
-                let lead: u32 = if let Ok(v) = parts[6].parse() { v } else {
+                let lead: u32 = if let Ok(v) = parts[6].parse() {
+                    v
+                } else {
                     eprintln!("Invalid lead_days");
                     continue;
                 };
@@ -291,11 +365,15 @@ async fn main() {
                     eprintln!("Usage: order <buyer> <seller> <product> <qty> <price> <currency>");
                     continue;
                 }
-                let qty: u64 = if let Ok(v) = parts[4].parse() { v } else {
+                let qty: u64 = if let Ok(v) = parts[4].parse() {
+                    v
+                } else {
                     eprintln!("Invalid quantity");
                     continue;
                 };
-                let price: u64 = if let Some(v) = parse_price(parts[5]) { v } else {
+                let price: u64 = if let Some(v) = parse_price(parts[5]) {
+                    v
+                } else {
                     eprintln!("Invalid price");
                     continue;
                 };
@@ -321,19 +399,27 @@ async fn main() {
                     );
                     continue;
                 }
-                let max_price: u64 = if let Some(v) = parse_price(parts[4]) { v } else {
+                let max_price: u64 = if let Some(v) = parse_price(parts[4]) {
+                    v
+                } else {
                     eprintln!("Invalid max_price");
                     continue;
                 };
-                let min_qty: u64 = if let Ok(v) = parts[5].parse() { v } else {
+                let min_qty: u64 = if let Ok(v) = parts[5].parse() {
+                    v
+                } else {
                     eprintln!("Invalid min_qty");
                     continue;
                 };
-                let max_qty: u64 = if let Ok(v) = parts[6].parse() { v } else {
+                let max_qty: u64 = if let Ok(v) = parts[6].parse() {
+                    v
+                } else {
                     eprintln!("Invalid max_qty");
                     continue;
                 };
-                let max_lead: u32 = if let Ok(v) = parts[7].parse() { v } else {
+                let max_lead: u32 = if let Ok(v) = parts[7].parse() {
+                    v
+                } else {
                     eprintln!("Invalid max_lead");
                     continue;
                 };
@@ -363,7 +449,9 @@ async fn main() {
                     eprintln!("Usage: inventory <owner> <product> <delta> <reason>");
                     continue;
                 }
-                let delta: i64 = if let Ok(v) = parts[3].parse() { v } else {
+                let delta: i64 = if let Ok(v) = parts[3].parse() {
+                    v
+                } else {
                     eprintln!("Invalid delta");
                     continue;
                 };
@@ -387,7 +475,9 @@ async fn main() {
                     );
                     continue;
                 }
-                let qty: u64 = if let Ok(v) = parts[7].parse() { v } else {
+                let qty: u64 = if let Ok(v) = parts[7].parse() {
+                    v
+                } else {
                     eprintln!("Invalid qty");
                     continue;
                 };
@@ -425,10 +515,15 @@ async fn main() {
                 }
             }
 
-            "mine" => {
+            "mine" => match node.mine().await {
+                Ok(()) => println!("Block mined."),
+                Err(e) => eprintln!("Error mining: {e}"),
+            },
+
+            "mine-async" => {
                 let node_ref = Arc::clone(&node);
                 tokio::spawn(async move {
-                    match node_ref.mine().await {
+                    match node_ref.mine_async().await {
                         Ok(()) => println!("Block mined."),
                         Err(e) => eprintln!("Error mining: {e}"),
                     }

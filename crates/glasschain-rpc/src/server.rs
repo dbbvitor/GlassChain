@@ -132,8 +132,10 @@ impl LedgerService for ServerState {
             // Then stream new blocks as they are mined or received.
             loop {
                 match event_rx.recv().await {
-                    Ok(NodeEvent::BlockMined { index, .. } | NodeEvent::BlockReceived { index, ..
-}) => {
+                    Ok(
+                        NodeEvent::BlockMined { index, .. }
+                        | NodeEvent::BlockReceived { index, .. },
+                    ) => {
                         if (index as usize) >= start {
                             let block_proto = {
                                 let ledger = shared_ledger.lock().await;
@@ -194,13 +196,11 @@ impl LedgerService for ServerState {
             }
             let tx_id = signed.transaction.id.clone();
             return match self.node.submit_transaction(signed.transaction).await {
-                Ok(()) => {
-                    Ok(Response::new(SubmitTransactionResponse {
-                        accepted: true,
-                        transaction_id: tx_id,
-                        error: String::new(),
-                    }))
-                }
+                Ok(()) => Ok(Response::new(SubmitTransactionResponse {
+                    accepted: true,
+                    transaction_id: tx_id,
+                    error: String::new(),
+                })),
                 Err(e) => Ok(Response::new(SubmitTransactionResponse {
                     accepted: false,
                     transaction_id: tx_id,
@@ -222,13 +222,11 @@ impl LedgerService for ServerState {
         };
         let tx_id = tx.id.clone();
         match self.node.submit_transaction(tx).await {
-            Ok(()) => {
-                Ok(Response::new(SubmitTransactionResponse {
-                    accepted: true,
-                    transaction_id: tx_id,
-                    error: String::new(),
-                }))
-            }
+            Ok(()) => Ok(Response::new(SubmitTransactionResponse {
+                accepted: true,
+                transaction_id: tx_id,
+                error: String::new(),
+            })),
             Err(e) => Ok(Response::new(SubmitTransactionResponse {
                 accepted: false,
                 transaction_id: tx_id,
@@ -405,9 +403,8 @@ impl NodeService for ServerState {
 
     /// Mine a block via the node's `PoW` implementation.
     ///
-    /// The CPU-heavy `PoW` loop runs outside any mutex (the node's `mine()`
-    /// method already uses the `prepare_mining` / `commit_mined_block` split),
-    /// so this RPC call does not block other requests.
+    /// This RPC uses the node's synchronous mining API, which waits for block
+    /// production to complete before returning the result to the caller.
     async fn mine_block(
         &self,
         _request: Request<MineBlockRequest>,
@@ -454,7 +451,7 @@ pub struct GlasschainServer {
 
 impl GlasschainServer {
     /// Create a new server backed by the given node.
-    #[must_use] 
+    #[must_use]
     pub const fn new(node: Arc<Node>) -> Self {
         Self { node }
     }

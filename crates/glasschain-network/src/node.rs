@@ -2,20 +2,24 @@ use crate::error::NetworkError;
 use crate::peer::{PeerReader, PeerWriter};
 use crate::protocol::{Message, PROTOCOL_VERSION};
 use glasschain_contracts::{ContractEngine, InventoryTrigger, WatcherService};
+use glasschain_core::crypto::sha256;
 use glasschain_core::providers::in_memory::InMemoryStorageProvider;
 use glasschain_core::{
     Block, ExecutionProvider, Ledger, StorageProvider, Transaction, TransactionKind,
 };
+use glasschain_identity::Identity;
 use glasschain_indexer::{EventBusProvider, InMemoryEventBus, InMemoryIndexer, IndexerProvider};
 use rcgen;
 use rustls;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, SignatureScheme};
+use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc::{error::TrySendError, Receiver, Sender, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{
+    error::TrySendError, Receiver, Sender, UnboundedReceiver, UnboundedSender,
+};
 use tokio::sync::{broadcast, Mutex};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -64,6 +68,10 @@ struct NodeTls {
     acceptor: Arc<TlsAcceptor>,
     /// Initiates outbound TLS connections.
     connector: Arc<TlsConnector>,
+    /// DER-encoded certificate presented by this node.
+    cert_der: CertificateDer<'static>,
+    /// Fingerprint of `cert_der`, used to bind the TLS session to the peer handshake.
+    cert_fingerprint: String,
 }
 
 /// A TLS [`ServerCertVerifier`] that accepts any certificate.
@@ -132,6 +140,74 @@ struct NodeState {
     known_peers: HashSet<String>,
     /// Per-peer write channels; keyed by the peer's stable listen address.
     peer_senders: HashMap<String, Sender<Message>>,
+    /// TOFU peer registry: verified peer identities keyed by stable listen address.
+    peer_registry: PeerRegistry,
+}
+
+// ── TOFU Peer Registry ───────────────────────────────────────────────────────
+
+/// A verified peer identity recorded on first contact (Trust On First Use).
+#[derive(Debug, Clone)]
+struct VerifiedPeer {
+    node_id: String,
+    cert_fingerprint: String,
+}
+
+/// Stable peer identity store using a TOFU (Trust On First Use) model.
+///
+/// The first time a peer connects from a given listen address, its identity
+/// (node ID + TLS certificate fingerprint) is recorded.  On subsequent
+/// connections the identity is verified against the stored record — any change
+/// is treated as a potential impersonation and rejected.
+///
+/// Records are **not** removed on disconnect so that reconnecting peers are
+/// still verified against their original identity.
+struct PeerRegistry {
+    peers: HashMap<String, VerifiedPeer>,
+}
+
+impl PeerRegistry {
+    fn new() -> Self {
+        Self {
+            peers: HashMap::new(),
+        }
+    }
+
+    /// Verify and optionally register a peer.
+    ///
+    /// * First contact → identity is recorded, returns `Ok(true)`.
+    /// * Known peer, identity matches → returns `Ok(false)`.
+    /// * Known peer, identity **changed** → returns `Err(reason)`.
+    fn verify_or_register(
+        &mut self,
+        listen_addr: &str,
+        node_id: &str,
+        cert_fingerprint: &str,
+    ) -> Result<bool, String> {
+        if let Some(existing) = self.peers.get(listen_addr) {
+            if existing.node_id != node_id {
+                return Err(format!(
+                    "node_id changed: expected '{}', got '{node_id}'",
+                    existing.node_id,
+                ));
+            }
+            if existing.cert_fingerprint != cert_fingerprint {
+                return Err(format!(
+                    "TLS certificate fingerprint changed for node '{node_id}'"
+                ));
+            }
+            Ok(false)
+        } else {
+            self.peers.insert(
+                listen_addr.to_owned(),
+                VerifiedPeer {
+                    node_id: node_id.to_owned(),
+                    cert_fingerprint: cert_fingerprint.to_owned(),
+                },
+            );
+            Ok(true)
+        }
+    }
 }
 
 // ── Node ──────────────────────────────────────────────────────────────────────
@@ -172,7 +248,7 @@ impl Node {
         difficulty: usize,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(256);
-        Self {
+        let node = Self {
             node_id: node_id.into(),
             listen_addr: listen_addr.into(),
             ledger: Arc::new(Mutex::new(Ledger::new(difficulty))),
@@ -181,13 +257,16 @@ impl Node {
                 watcher: WatcherService::new(),
                 known_peers: HashSet::new(),
                 peer_senders: HashMap::new(),
+                peer_registry: PeerRegistry::new(),
             })),
             event_tx,
             indexer: Arc::new(InMemoryIndexer::new()),
             event_bus: Arc::new(InMemoryEventBus::new(4096)),
             storage: Arc::new(InMemoryStorageProvider::new()),
-            tls: Arc::new(Self::build_tls()),
-        }
+            tls: Arc::new(Self::build_tls(None)),
+        };
+
+        node
     }
 
     /// Create a node backed by a persistent [`StorageProvider`].
@@ -207,7 +286,9 @@ impl Node {
                 let mut chain = Vec::with_capacity((latest_idx + 1) as usize);
                 let mut valid = true;
                 for i in 0..=latest_idx {
-                    if let Ok(Some(block)) = storage.get_block(i) { chain.push(block) } else {
+                    if let Ok(Some(block)) = storage.get_block(i) {
+                        chain.push(block)
+                    } else {
                         valid = false;
                         break;
                     }
@@ -217,9 +298,103 @@ impl Node {
                         && chain[0].has_valid_pow(difficulty)
                         && chain[0].previous_hash == "0";
                     let chain_ok = genesis_ok
-                        && chain
-                        .windows(2)
-                        .all(|w| w[1].chains_to(&w[0]).is_ok() && w[1].has_valid_pow(difficulty));
+                        && chain.windows(2).all(|w| {
+                            w[1].chains_to(&w[0]).is_ok() && w[1].has_valid_pow(difficulty)
+                        });
+                    if chain_ok {
+                        l.chain = chain;
+                        log::info!("Restored {} blocks from storage", l.chain.len());
+                    } else {
+                        log::warn!("Stored chain failed validation; starting fresh");
+                    }
+                }
+            }
+            Arc::new(Mutex::new(l))
+        };
+
+        let (event_tx, _) = broadcast::channel(256);
+        let node = Self {
+            node_id: node_id.into(),
+            listen_addr: listen_addr.into(),
+            ledger,
+            state: Arc::new(Mutex::new(NodeState {
+                engine: ContractEngine::new(),
+                watcher: WatcherService::new(),
+                known_peers: HashSet::new(),
+                peer_senders: HashMap::new(),
+                peer_registry: PeerRegistry::new(),
+            })),
+            event_tx,
+            indexer: Arc::new(InMemoryIndexer::new()),
+            event_bus: Arc::new(InMemoryEventBus::new(4096)),
+            storage,
+            tls: Arc::new(Self::build_tls(None)),
+        };
+
+        node
+    }
+
+    /// Create a new node with an identity-backed TLS certificate.
+    pub fn new_with_identity(
+        node_id: impl Into<String>,
+        listen_addr: impl Into<String>,
+        difficulty: usize,
+        identity: Arc<Identity>,
+    ) -> Self {
+        let node_id = node_id.into();
+        let listen_addr = listen_addr.into();
+        let (event_tx, _) = broadcast::channel(256);
+        Self {
+            node_id,
+            listen_addr,
+            ledger: Arc::new(Mutex::new(Ledger::new(difficulty))),
+            state: Arc::new(Mutex::new(NodeState {
+                engine: ContractEngine::new(),
+                watcher: WatcherService::new(),
+                known_peers: HashSet::new(),
+                peer_senders: HashMap::new(),
+                peer_registry: PeerRegistry::new(),
+            })),
+            event_tx,
+            indexer: Arc::new(InMemoryIndexer::new()),
+            event_bus: Arc::new(InMemoryEventBus::new(4096)),
+            storage: Arc::new(InMemoryStorageProvider::new()),
+            tls: Arc::new(Self::build_tls(Some(Arc::clone(&identity)))),
+        }
+    }
+
+    /// Create a persistent node with an identity-backed TLS certificate.
+    pub fn new_with_storage_and_identity(
+        node_id: impl Into<String>,
+        listen_addr: impl Into<String>,
+        difficulty: usize,
+        storage: Arc<dyn StorageProvider>,
+        identity: Arc<Identity>,
+    ) -> Self {
+        let node_id = node_id.into();
+        let listen_addr = listen_addr.into();
+
+        let ledger = {
+            let mut l = Ledger::new(difficulty);
+            if let Ok(Some(latest_idx)) = storage.latest_block_index() {
+                let mut chain = Vec::with_capacity((latest_idx + 1) as usize);
+                let mut valid = true;
+                for i in 0..=latest_idx {
+                    if let Ok(Some(block)) = storage.get_block(i) {
+                        chain.push(block)
+                    } else {
+                        valid = false;
+                        break;
+                    }
+                }
+                if valid && !chain.is_empty() {
+                    let genesis_ok = chain[0].is_valid()
+                        && chain[0].has_valid_pow(difficulty)
+                        && chain[0].previous_hash == "0";
+                    let chain_ok = genesis_ok
+                        && chain.windows(2).all(|w| {
+                            w[1].chains_to(&w[0]).is_ok() && w[1].has_valid_pow(difficulty)
+                        });
                     if chain_ok {
                         l.chain = chain;
                         log::info!("Restored {} blocks from storage", l.chain.len());
@@ -233,37 +408,38 @@ impl Node {
 
         let (event_tx, _) = broadcast::channel(256);
         Self {
-            node_id: node_id.into(),
-            listen_addr: listen_addr.into(),
+            node_id,
+            listen_addr,
             ledger,
             state: Arc::new(Mutex::new(NodeState {
                 engine: ContractEngine::new(),
                 watcher: WatcherService::new(),
                 known_peers: HashSet::new(),
                 peer_senders: HashMap::new(),
+                peer_registry: PeerRegistry::new(),
             })),
             event_tx,
             indexer: Arc::new(InMemoryIndexer::new()),
             event_bus: Arc::new(InMemoryEventBus::new(4096)),
             storage,
-            tls: Arc::new(Self::build_tls()),
+            tls: Arc::new(Self::build_tls(Some(Arc::clone(&identity)))),
         }
     }
 
     /// Subscribe to node events (transactions, blocks, peers, contracts).
-    #[must_use] 
+    #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<NodeEvent> {
         self.event_tx.subscribe()
     }
 
     /// Return a clone of the shared ledger handle.
-    #[must_use] 
+    #[must_use]
     pub fn shared_ledger(&self) -> Arc<Mutex<Ledger>> {
         Arc::clone(&self.ledger)
     }
 
     /// Return the TCP address this node listens on.
-    #[must_use] 
+    #[must_use]
     pub fn listen_addr(&self) -> &str {
         &self.listen_addr
     }
@@ -291,23 +467,49 @@ impl Node {
             .collect()
     }
 
-    /// Generate a self-signed TLS certificate and build the node's TLS context.
-    fn build_tls() -> NodeTls {
+    /// Generate a TLS certificate and build the node's TLS context.
+    fn build_tls(identity: Option<Arc<Identity>>) -> NodeTls {
         // Ensure the ring crypto provider is installed (required by rustls 0.23).
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let key_pair = rcgen::KeyPair::generate().expect("TLS key generation");
-        let params = rcgen::CertificateParams::new(vec!["glasschain-node".to_string()])
-            .expect("TLS cert params");
-        let cert = params.self_signed(&key_pair).expect("TLS self-signed cert");
+        let (cert_der, key_der) = if let Some(identity) = identity {
+            let key_pair = identity
+                .rcgen_key_pair()
+                .expect("TLS key generation from identity");
+            let mut params = rcgen::CertificateParams::new(vec!["glasschain-node".to_string()])
+                .expect("TLS cert params");
+            let mut dn = rcgen::DistinguishedName::new();
+            dn.push(rcgen::DnType::CommonName, identity.node_id.clone());
+            params.distinguished_name = dn;
+            let cert = params
+                .self_signed(&key_pair)
+                .expect("TLS self-signed cert from identity");
+            (
+                cert.der().clone(),
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der())),
+            )
+        } else {
+            let key_pair = rcgen::KeyPair::generate().expect("TLS key generation");
+            let params = rcgen::CertificateParams::new(vec!["glasschain-node".to_string()])
+                .expect("TLS cert params");
+            let cert = params.self_signed(&key_pair).expect("TLS self-signed cert");
+            (
+                cert.der().clone(),
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der())),
+            )
+        };
 
-        let cert_der: CertificateDer<'static> = cert.der().clone();
-        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der()));
+        let cert_fingerprint = sha256(cert_der.as_ref());
 
         let server_cfg = rustls::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key_der)
+            .with_single_cert(vec![cert_der.clone()], key_der)
             .expect("server TLS config");
+
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(cert_der.clone())
+            .expect("add node certificate to root store");
 
         let client_cfg = if Self::insecure_tls_allowed() {
             log::warn!(
@@ -320,22 +522,51 @@ impl Node {
                 .with_no_client_auth()
         } else {
             rustls::ClientConfig::builder()
-                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_root_certificates(roots)
                 .with_no_client_auth()
         };
 
         NodeTls {
             acceptor: Arc::new(TlsAcceptor::from(Arc::new(server_cfg))),
             connector: Arc::new(TlsConnector::from(Arc::new(client_cfg))),
+            cert_der,
+            cert_fingerprint,
         }
     }
 
-    /// Insecure verifier is allowed only in debug builds, via feature flag,
-    /// or explicitly via `GLASSCHAIN_INSECURE_TLS=1`.
+    /// Insecure verifier is allowed only when explicitly requested.
     fn insecure_tls_allowed() -> bool {
-        cfg!(debug_assertions)
-            || cfg!(feature = "insecure-tls")
+        cfg!(feature = "insecure-tls")
             || std::env::var("GLASSCHAIN_INSECURE_TLS").is_ok_and(|v| v == "1")
+    }
+
+    /// Build a client TLS connector that trusts the supplied peer certificate.
+    fn connector_for_peer_cert(peer_cert: CertificateDer<'static>) -> Arc<TlsConnector> {
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(peer_cert)
+            .expect("add peer certificate to root store");
+        let client_cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Arc::new(TlsConnector::from(Arc::new(client_cfg)))
+    }
+
+    /// Rebuild watcher runtime state by replaying committed inventory updates.
+    async fn rebuild_runtime_state_from_chain(
+        ledger: &Arc<Mutex<Ledger>>,
+        state: &Arc<Mutex<NodeState>>,
+    ) {
+        let chain = { ledger.lock().await.chain.clone() };
+        let mut s = state.lock().await;
+        let mut watcher = WatcherService::new();
+        for tx in chain.iter().flat_map(|block| block.transactions.iter()) {
+            if let TransactionKind::InventoryUpdate(ref update) = tx.kind {
+                let _ = watcher.on_inventory_update(update);
+            }
+        }
+        s.engine = ContractEngine::rebuild_from_chain(&chain);
+        s.watcher = watcher;
     }
 
     /// Attach a WASM execution provider to the contract engine.
@@ -346,10 +577,12 @@ impl Node {
         self.state.lock().await.engine.set_executor(executor);
     }
 
-    /// Start the node: spawn a TCP listener task and connect to seed peers.
+    /// Start the node: rebuild runtime state, spawn a TCP listener task, and connect to seed peers.
     ///
     /// Returns immediately; all network activity runs in background tasks.
     pub async fn start(&self, seed_peers: Vec<String>) -> Result<(), NetworkError> {
+        Self::rebuild_runtime_state_from_chain(&self.ledger, &self.state).await;
+
         let listener = TcpListener::bind(&self.listen_addr).await?;
         log::info!("Node {} listening on {}", self.node_id, self.listen_addr);
 
@@ -396,19 +629,89 @@ impl Node {
                         let dx = dtx.clone();
                         let tls2 = Arc::clone(&tls_l);
                         let st2 = Arc::clone(&storage_l);
+                        let local_tls_cert_fingerprint = tls2.cert_fingerprint.clone();
                         tokio::spawn(async move {
-                            let tls_stream = match tls2.acceptor.accept(stream).await {
+                            let mut stream = stream;
+
+                            let mut peer_len_buf = [0u8; 4];
+                            if let Err(e) =
+                                tokio::io::AsyncReadExt::read_exact(&mut stream, &mut peer_len_buf)
+                                    .await
+                            {
+                                log::warn!(
+                                    "Failed to read peer TLS certificate length from {addr}: {e}"
+                                );
+                                return;
+                            }
+                            let peer_len = u32::from_be_bytes(peer_len_buf) as usize;
+                            if peer_len == 0 || peer_len > 64 * 1024 {
+                                log::warn!("Peer {addr} advertised invalid TLS certificate length {peer_len}");
+                                return;
+                            }
+                            let mut peer_cert_buf = vec![0u8; peer_len];
+                            if let Err(e) =
+                                tokio::io::AsyncReadExt::read_exact(&mut stream, &mut peer_cert_buf)
+                                    .await
+                            {
+                                log::warn!("Failed to read peer TLS certificate from {addr}: {e}");
+                                return;
+                            }
+                            let local_cert = tls2.cert_der.as_ref();
+                            let cert_len = match u32::try_from(local_cert.len()) {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    log::warn!(
+                                        "Local TLS certificate too large to advertise to {addr}"
+                                    );
+                                    return;
+                                }
+                            };
+                            if let Err(e) = tokio::io::AsyncWriteExt::write_all(
+                                &mut stream,
+                                &cert_len.to_be_bytes(),
+                            )
+                            .await
+                            {
+                                log::warn!("Failed to send TLS certificate length to {addr}: {e}");
+                                return;
+                            }
+                            if let Err(e) =
+                                tokio::io::AsyncWriteExt::write_all(&mut stream, local_cert).await
+                            {
+                                log::warn!("Failed to send TLS certificate to {addr}: {e}");
+                                return;
+                            }
+
+                            let acceptor = Arc::clone(&tls2.acceptor);
+
+                            let tls_stream = match acceptor.accept(stream).await {
                                 Ok(s) => s,
                                 Err(e) => {
                                     log::warn!("TLS accept error from {addr}: {e}");
                                     return;
                                 }
                             };
+                            let observed_cert_fingerprint = sha256(&peer_cert_buf);
                             let (r, w) = tokio::io::split(tls_stream);
                             let reader = PeerReader::new(r, addr.clone());
                             let writer = PeerWriter::new(w, addr.clone());
-                            handle_peer(reader, writer, addr, la, l2, s2, ni, et, ix, eb, dx, st2)
-                                .await;
+                            handle_peer(
+                                reader,
+                                writer,
+                                addr,
+                                la,
+                                l2,
+                                s2,
+                                ni,
+                                et,
+                                ix,
+                                eb,
+                                dx,
+                                st2,
+                                local_tls_cert_fingerprint,
+                                observed_cert_fingerprint,
+                            )
+                            .await;
                         });
                     }
                     Err(e) => log::error!("Accept error: {e}"),
@@ -503,7 +806,7 @@ impl Node {
     }
 
     /// Mine a new block containing all pending transactions and broadcast it.
-    pub async fn mine(&self) -> Result<(), NetworkError> {
+    pub async fn mine_async(&self) -> Result<(), NetworkError> {
         let (index, prev_hash, transactions, difficulty) = {
             let mut ledger = self.ledger.lock().await;
             ledger.prepare_mining()?
@@ -541,6 +844,14 @@ impl Node {
         }
 
         Ok(())
+    }
+
+    /// Mine a new block and wait for completion.
+    ///
+    /// This is the synchronous convenience wrapper for callers that want the
+    /// original blocking semantics while still reusing the async mining path.
+    pub async fn mine(&self) -> Result<(), NetworkError> {
+        self.mine_async().await
     }
 
     /// Return a snapshot of the current ledger state.
@@ -660,8 +971,11 @@ async fn handle_peer(
     event_bus: Arc<InMemoryEventBus>,
     dial_tx: UnboundedSender<String>,
     storage: Arc<dyn StorageProvider>,
+    local_tls_cert_fingerprint: String,
+    observed_peer_cert_fingerprint: String,
 ) {
-    let (write_tx, mut write_rx): (Sender<Message>, Receiver<Message>) = tokio::sync::mpsc::channel(256);
+    let (write_tx, mut write_rx): (Sender<Message>, Receiver<Message>) =
+        tokio::sync::mpsc::channel(256);
 
     {
         let waddr = addr.clone();
@@ -676,9 +990,13 @@ async fn handle_peer(
         });
     }
 
+    // Connection-scoped: the observed cert fingerprint is passed directly
+    // through the call chain — no shared mutable state needed.
+
     let chain_length = ledger.lock().await.chain.len() as u64;
     let hello = Message::Hello {
         node_id: node_id.clone(),
+        tls_cert_fingerprint: local_tls_cert_fingerprint,
         chain_length,
         version: PROTOCOL_VERSION.to_owned(),
         listen_addr: listen_addr.clone(),
@@ -707,6 +1025,7 @@ async fn handle_peer(
                     &event_bus,
                     &dial_tx,
                     &storage,
+                    &observed_peer_cert_fingerprint,
                 )
                 .await;
 
@@ -731,6 +1050,9 @@ async fn handle_peer(
         let mut s = state.lock().await;
         s.known_peers.remove(stable);
         s.peer_senders.remove(stable);
+        // NOTE: we deliberately do NOT remove the peer from peer_registry
+        // here.  TOFU records persist across reconnects so that a returning
+        // peer is still verified against its original identity.
     }
     let _ = event_tx.send(NodeEvent::PeerDisconnected(display_addr));
 
@@ -759,12 +1081,59 @@ async fn connect_to_peer(
     tls: Arc<NodeTls>,
 ) {
     match TcpStream::connect(&peer_addr).await {
-        Ok(stream) => {
+        Ok(mut stream) => {
             log::info!("Connected to peer {peer_addr}");
+
+            let local_cert = tls.cert_der.as_ref();
+            let cert_len = match u32::try_from(local_cert.len()) {
+                Ok(v) => v,
+                Err(_) => {
+                    log::warn!("Local TLS certificate too large to advertise to {peer_addr}");
+                    return;
+                }
+            };
+            if let Err(e) =
+                tokio::io::AsyncWriteExt::write_all(&mut stream, &cert_len.to_be_bytes()).await
+            {
+                log::warn!("Failed to send TLS certificate length to {peer_addr}: {e}");
+                return;
+            }
+            if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut stream, local_cert).await {
+                log::warn!("Failed to send TLS certificate to {peer_addr}: {e}");
+                return;
+            }
+
+            let mut peer_len_buf = [0u8; 4];
+            if let Err(e) =
+                tokio::io::AsyncReadExt::read_exact(&mut stream, &mut peer_len_buf).await
+            {
+                log::warn!("Failed to read peer TLS certificate length from {peer_addr}: {e}");
+                return;
+            }
+            let peer_len = u32::from_be_bytes(peer_len_buf) as usize;
+            if peer_len == 0 || peer_len > 64 * 1024 {
+                log::warn!("Peer {peer_addr} advertised invalid TLS certificate length {peer_len}");
+                return;
+            }
+            let mut peer_cert_buf = vec![0u8; peer_len];
+            if let Err(e) =
+                tokio::io::AsyncReadExt::read_exact(&mut stream, &mut peer_cert_buf).await
+            {
+                log::warn!("Failed to read peer TLS certificate from {peer_addr}: {e}");
+                return;
+            }
+
+            let observed_cert_fingerprint = sha256(&peer_cert_buf);
+            let connector = if Node::insecure_tls_allowed() {
+                Arc::clone(&tls.connector)
+            } else {
+                Node::connector_for_peer_cert(CertificateDer::from(peer_cert_buf))
+            };
+
             let server_name = ServerName::try_from("glasschain-node")
                 .expect("valid server name")
                 .to_owned();
-            let tls_stream = match tls.connector.connect(server_name, stream).await {
+            let tls_stream = match connector.connect(server_name, stream).await {
                 Ok(s) => s,
                 Err(e) => {
                     log::warn!("TLS connect error to {peer_addr}: {e}");
@@ -787,6 +1156,8 @@ async fn connect_to_peer(
                 event_bus,
                 dial_tx,
                 storage,
+                tls.cert_fingerprint.clone(),
+                observed_cert_fingerprint,
             )
             .await;
         }
@@ -816,10 +1187,12 @@ async fn process_message(
     event_bus: &Arc<InMemoryEventBus>,
     dial_tx: &UnboundedSender<String>,
     storage: &Arc<dyn StorageProvider>,
+    observed_cert_fingerprint: &str,
 ) -> MessageEffect {
     match msg {
         Message::Hello {
             node_id: peer_id,
+            tls_cert_fingerprint,
             chain_length,
             listen_addr: peer_listen_addr,
             ..
@@ -830,14 +1203,57 @@ async fn process_message(
 
             // Don't register our own listen address as a peer.
             if peer_listen_addr == listen_addr {
-                log::debug!(
-                    "Ignoring Hello from own listen address {peer_listen_addr}"
+                log::debug!("Ignoring Hello from own listen address {peer_listen_addr}");
+                return MessageEffect::default();
+            }
+
+            // ── Step 1: session-level fingerprint verification ────────
+            // The Hello message carries the peer's self-reported TLS cert
+            // fingerprint.  Compare it against the fingerprint we observed
+            // during the TLS handshake (connection-scoped, passed as a
+            // parameter — never stored in shared mutable state).
+            if tls_cert_fingerprint != observed_cert_fingerprint {
+                log::warn!(
+                    "Rejecting peer {peer_id} at {addr}: advertised TLS fingerprint \
+                     does not match observed session certificate \
+                     (advertised={}, observed={})",
+                    &tls_cert_fingerprint[..16.min(tls_cert_fingerprint.len())],
+                    &observed_cert_fingerprint[..16.min(observed_cert_fingerprint.len())],
                 );
                 return MessageEffect::default();
             }
 
+            // ── Step 2: TOFU peer registry ────────────────────────────
+            // First contact  → record identity (node_id + cert fingerprint).
+            // Reconnection   → verify identity has not changed.
+            // Identity drift → reject the peer.
             {
                 let mut s = state.lock().await;
+                match s.peer_registry.verify_or_register(
+                    &peer_listen_addr,
+                    &peer_id,
+                    observed_cert_fingerprint,
+                ) {
+                    Ok(is_new) => {
+                        if is_new {
+                            log::info!(
+                                "TOFU: recorded new peer identity for {peer_listen_addr} \
+                                 (node_id={peer_id})"
+                            );
+                        } else {
+                            log::debug!(
+                                "TOFU: verified returning peer {peer_listen_addr} \
+                                 (node_id={peer_id})"
+                            );
+                        }
+                    }
+                    Err(reason) => {
+                        log::warn!("Rejecting peer {peer_id} at {peer_listen_addr}: {reason}");
+                        return MessageEffect::default();
+                    }
+                }
+
+                // ── Step 3: register live connection state ────────────
                 s.known_peers.insert(peer_listen_addr.clone());
                 s.peer_senders
                     .insert(peer_listen_addr.clone(), write_tx.clone());
@@ -980,7 +1396,6 @@ async fn process_message(
                 let mut l = ledger.lock().await;
                 l.try_replace_chain(candidate)
             };
-
             if replaced {
                 // Persist the new chain.
                 let new_chain = { ledger.lock().await.chain.clone() };
@@ -990,13 +1405,9 @@ async fn process_message(
                     }
                 }
 
-                // Rebuild the contract engine from the newly synced chain.
-                {
-                    let mut s = state.lock().await;
-                    s.engine = ContractEngine::rebuild_from_chain(&new_chain);
-                }
+                Node::rebuild_runtime_state_from_chain(ledger, state).await;
                 log::info!(
-                    "Contract engine rebuilt from synced chain ({} blocks)",
+                    "Contract engine and watcher state rebuilt from synced chain ({} blocks)",
                     new_chain.len()
                 );
             }
@@ -1035,5 +1446,78 @@ async fn process_message(
             log::info!("Peer {addr} says goodbye: {reason}");
             MessageEffect::default()
         }
+    }
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tofu_first_contact_records_identity() {
+        let mut reg = PeerRegistry::new();
+        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123");
+        assert_eq!(result, Ok(true), "first contact should return Ok(true)");
+        assert_eq!(reg.peers.len(), 1);
+        let peer = &reg.peers["127.0.0.1:8000"];
+        assert_eq!(peer.node_id, "node-a");
+        assert_eq!(peer.cert_fingerprint, "abc123");
+    }
+
+    #[test]
+    fn tofu_returning_peer_with_same_identity_passes() {
+        let mut reg = PeerRegistry::new();
+        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123")
+            .unwrap();
+        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123");
+        assert_eq!(
+            result,
+            Ok(false),
+            "returning peer with same identity should return Ok(false)"
+        );
+    }
+
+    #[test]
+    fn tofu_rejects_node_id_change() {
+        let mut reg = PeerRegistry::new();
+        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123")
+            .unwrap();
+        let result = reg.verify_or_register("127.0.0.1:8000", "node-IMPOSTER", "abc123");
+        assert!(result.is_err(), "changed node_id should be rejected");
+    }
+
+    #[test]
+    fn tofu_rejects_cert_fingerprint_change() {
+        let mut reg = PeerRegistry::new();
+        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123")
+            .unwrap();
+        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "TAMPERED");
+        assert!(
+            result.is_err(),
+            "changed cert fingerprint should be rejected"
+        );
+    }
+
+    #[test]
+    fn tofu_independent_addresses_are_independent() {
+        let mut reg = PeerRegistry::new();
+        reg.verify_or_register("127.0.0.1:8000", "node-a", "aaa")
+            .unwrap();
+        reg.verify_or_register("127.0.0.1:9000", "node-b", "bbb")
+            .unwrap();
+        assert_eq!(reg.peers.len(), 2);
+        // Each address keeps its own identity.
+        assert!(reg
+            .verify_or_register("127.0.0.1:8000", "node-a", "aaa")
+            .is_ok());
+        assert!(reg
+            .verify_or_register("127.0.0.1:9000", "node-b", "bbb")
+            .is_ok());
+        // Cross-contamination is rejected.
+        assert!(reg
+            .verify_or_register("127.0.0.1:8000", "node-b", "aaa")
+            .is_err());
     }
 }
