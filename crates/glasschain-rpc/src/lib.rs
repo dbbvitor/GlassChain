@@ -27,6 +27,7 @@
 //! }
 //! ```
 
+pub mod auth;
 pub mod server;
 
 /// Auto-generated protobuf/gRPC code for `package glasschain.v1`.
@@ -36,4 +37,5 @@ pub mod proto {
     }
 }
 
+pub use auth::{AuthTokenBuilder, MspAuthInterceptor, TrustedKeyRegistry};
 pub use server::GlasschainServer;

@@ -23,6 +23,9 @@ service LedgerService {
 
   // Subscribe to live node events (tx accepted, block mined, etc.).
   rpc SubscribeToEvents(SubscribeToEventsRequest) returns (stream SubscribeToEventsResponse);
+
+  // Return the full verifiable lineage for an asset.
+  rpc GetVerifiableLineage(GetVerifiableLineageRequest) returns (GetVerifiableLineageResponse);
 }
 
 // ─── Node Service ──────────────────────────────────────────────────────────
@@ -37,6 +40,19 @@ service NodeService {
 
   // Trigger manual block mining (dev / testing only).
   rpc MineBlock(MineBlockRequest) returns (MineBlockResponse);
+}
+
+// ─── Identity Service ──────────────────────────────────────────────────────
+// Certificate exchange and endorsement verification for multi-organisation
+// trust.  Nodes call ExchangeCertificate during the handshake phase and
+// VerifyEndorsement before committing any proposal that requires quorum.
+
+service IdentityService {
+  // Exchange an organization's Root CA certificate for peer verification.
+  rpc ExchangeCertificate(ExchangeCertificateRequest) returns (ExchangeCertificateResponse);
+
+  // Verify an endorsement proposal against the current policy.
+  rpc VerifyEndorsement(VerifyEndorsementRequest) returns (VerifyEndorsementResponse);
 }
 
 // ─── Shared data messages ──────────────────────────────────────────────────
@@ -142,4 +158,76 @@ message MineBlockResponse {
   uint64 block_index = 2;
   string block_hash = 3;
   string error = 4;
+}
+
+// ─── IdentityService messages ──────────────────────────────────────────────
+
+message ExchangeCertificateRequest {
+  // Human-readable organisation name (e.g. "fabricante-xyz").
+  string org_name = 1;
+  // PEM-encoded Root CA certificate for the organisation.
+  string root_ca_cert_pem = 2;
+  // Unique identifier of the node presenting the certificate.
+  string node_id = 3;
+}
+
+message ExchangeCertificateResponse {
+  // Whether the certificate was accepted by the receiving node.
+  bool accepted = 1;
+  // PEM-encoded node certificate issued in response (empty on rejection).
+  string node_cert_pem = 2;
+  // Human-readable error message when accepted = false.
+  string error = 3;
+}
+
+message VerifyEndorsementRequest {
+  // JSON-serialised endorsement proposal (type-erased for protobuf compatibility).
+  string proposal_json = 1;
+}
+
+message VerifyEndorsementResponse {
+  // Whether the proposal met the endorsement policy threshold.
+  bool approved = 1;
+  // Identifier of the proposal that was evaluated.
+  string proposal_id = 2;
+  // Number of distinct endorsers that signed the proposal.
+  uint32 endorser_count = 3;
+  // Human-readable rejection reason when approved = false.
+  string rejection_reason = 4;
+}
+
+// ─── Provenance messages ───────────────────────────────────────────────────
+
+message GetVerifiableLineageRequest {
+  // Composite asset identifier (e.g. "GTIN:07891234100016:SN:SN-001").
+  string asset_id = 1;
+}
+
+// Protobuf-compatible representation of a single custody transfer event.
+message CustodyEventProto {
+  // Composite asset identifier.
+  string asset_id = 1;
+  // Type of custody event (e.g. "manufacture", "dispatch", "receive").
+  string event_type = 2;
+  // Node/participant taking custody.
+  string custodian_id = 3;
+  // ID of the transaction that recorded this event.
+  string transaction_id = 4;
+  // Block index that committed this transaction.
+  uint64 block_index = 5;
+  // Unix timestamp of the transaction.
+  uint64 timestamp = 6;
+}
+
+message GetVerifiableLineageResponse {
+  // Composite asset identifier echoed from the request.
+  string asset_id = 1;
+  // Full ordered custody chain for the asset.
+  repeated CustodyEventProto custody_chain = 2;
+  // True if every custody event has a corresponding flat analytical record.
+  bool is_complete = 3;
+  // Average metadata trust score across all flat records (0.0 when none).
+  double trust_score_avg = 4;
+  // Total number of flat analytical records found for this asset.
+  uint32 total_records = 5;
 }

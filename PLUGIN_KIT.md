@@ -10,34 +10,61 @@ forks and no changes to the rest of the stack.
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        GlassChain Node                              │
-│                                                                     │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
-│  │  Consensus   │  │   Storage    │  │  Execution   │              │
-│  │  Provider    │  │   Provider   │  │  Provider    │              │
-│  │  (trait)     │  │   (trait)    │  │  (trait)     │              │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘              │
-│         │                 │                  │                      │
-│   PoW / Raft /      In-Memory /         Script /                    │
-│   PBFT / BFT          Sled / Rocks        WASM                      │
-│                                                                     │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
-│  │  Network     │  │   Indexer    │  │  Event Bus   │              │
-│  │  Provider    │  │   Provider   │  │  Provider    │              │
-│  │  (trait)     │  │   (trait)    │  │  (trait)     │              │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘              │
-│         │                 │                  │                      │
-│   TCP / libp2p      In-Memory /         In-Memory /                 │
-│                       PostgreSQL           Kafka                    │
-└─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          GlassChain Node                                │
+│                                                                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                  │
+│  │  Consensus   │  │   Storage    │  │  Execution   │                  │
+│  │  Provider    │  │   Provider   │  │  Provider    │                  │
+│  │  (trait)     │  │   (trait)    │  │  (trait)     │                  │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘                  │
+│         │                 │                  │                          │
+│   PoW / Raft /      In-Memory /         Script /                        │
+│   PBFT / BFT          Sled / Rocks        WASM                          │
+│                                                                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                  │
+│  │  Network     │  │   Indexer    │  │  Event Bus   │                  │
+│  │  Provider    │  │   Provider   │  │  Provider    │                  │
+│  │  (trait)     │  │   (trait)    │  │  (trait)     │                  │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘                  │
+│         │                 │                  │                          │
+│  TCP + libp2p       In-Memory /         In-Memory /                     │
+│  (Gossipsub/Kad)      PostgreSQL           Kafka                        │
+│                                                                         │
+│  ┌──────────────┐  ┌──────────────┐                                     │
+│  │  Identity /  │  │  Endorsement │                                     │
+│  │  MSP         │  │  Engine      │                                     │
+│  │  (Phase 2)   │  │  (Phase 2)   │                                     │
+│  └──────────────┘  └──────────────┘                                     │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## Plugin Summary Table
+
+| # | Plugin | Trait / Struct | Crate | Phase |
+|---|--------|---------------|-------|-------|
+| 1 | Consensus | `ConsensusProvider` | `glasschain-core` | Core |
+| 2 | Storage | `StorageProvider` | `glasschain-core` | Core |
+| 3 | Execution (WASM) | `ExecutionProvider` | `glasschain-core` | 4 |
+| 4 | Network (TCP) | `NetworkProvider` | `glasschain-core` | Core |
+| 4b | Network (libp2p) | `LibP2pNode` | `glasschain-network` | 1 |
+| 5 | Indexer | `IndexerProvider` | `glasschain-indexer` | 5 |
+| 6 | Event Bus | `EventBusProvider` | `glasschain-indexer` | 5 |
+| 7 | Identity / MSP | `Identity`, `Organization` | `glasschain-identity` | 2 |
+| 7b | Endorsement Engine | `EndorsementEngine` | `glasschain-identity` | 2 |
+| 8 | Watcher (ECA) | `WatcherService` | `glasschain-contracts` | 4 |
+| 9 | Schema Validation | `validate_asset` | `glasschain-core` | 3 |
+| 10 | Gas Metering | `GasCounter`, `GasCosts` | `glasschain-vm` | 4 |
+| 11 | Client SDK | `GlasschainClient` | `glasschain-sdk` | 6 |
+| 12 | CLI | `glasschain` binary | `glasschain-cli` | 6 |
 
 ---
 
 ## 1. Consensus Plugin (`ConsensusProvider`)
 
-**Crate:** `glasschain-core`  
+**Crate:** `glasschain-core`
 **Trait:** `glasschain_core::ConsensusProvider`
 
 ### Trait contract
@@ -96,7 +123,7 @@ impl ConsensusProvider for RaftConsensusProvider {
 
 ## 2. Storage Plugin (`StorageProvider`)
 
-**Crate:** `glasschain-core`  
+**Crate:** `glasschain-core`
 **Trait:** `glasschain_core::StorageProvider`
 
 ### Trait contract
@@ -119,7 +146,7 @@ pub trait StorageProvider: Send + Sync {
 
 | Name | Crate | Notes |
 |:-----|:------|:------|
-| `InMemoryStorageProvider` | `glasschain-core` | Testing/dev only |
+| `InMemoryStorageProvider` | `glasschain-core` | Testing / dev only |
 | `SledStorageProvider` | `glasschain-storage` | Pure Rust, single-node production |
 
 ### Implementing a RocksDB adapter
@@ -156,7 +183,7 @@ impl StorageProvider for RocksDbStorageProvider {
 
 ## 3. Execution Plugin (`ExecutionProvider`)
 
-**Crate:** `glasschain-core`  
+**Crate:** `glasschain-core`
 **Trait:** `glasschain_core::ExecutionProvider`
 
 ### Trait contract
@@ -180,12 +207,13 @@ pub trait ExecutionProvider: Send + Sync {
 
 ### Contract module interface
 
-WASM contracts must export:
+WASM contracts must export an `execute` function and a `memory` export:
 
 ```wat
 (module
-  (import "env" "set_state" (func $set_state (param i32 i32 i32 i32)))
+  (import "env" "set_state"     (func $set_state     (param i32 i32 i32 i32)))
   (import "env" "get_state_len" (func $get_state_len (param i32 i32) (result i32)))
+  (import "env" "get_state"     (func $get_state     (param i32 i32 i32 i32) (result i32)))
   (export "execute" (func $main))
   (export "memory" (memory 0))
   ...
@@ -204,8 +232,8 @@ extern "C" {
 
 #[no_mangle]
 pub extern "C" fn execute() {
-    let key = b"status";
-    let val = b"active";
+    let key = b"approve";
+    let val = b"1";
     unsafe {
         set_state(
             key.as_ptr() as i32, key.len() as i32,
@@ -215,26 +243,11 @@ pub extern "C" fn execute() {
 }
 ```
 
-### Gas metering
-
-Each WASM instruction consumes 1 unit of **fuel**.  Set `gas_limit` to the
-maximum number of instructions the contract is permitted to execute.
-Exceeding the limit returns `CoreError::GasExhausted { used, limit }`.
-
-Recommended limits by contract type:
-
-| Contract type | Recommended `gas_limit` |
-|:--------------|:------------------------|
-| Simple state write | 10,000 |
-| Inventory reorder logic | 50,000 |
-| Complex aggregation | 500,000 |
-| Maximum allowed | 10,000,000 |
-
 ---
 
-## 4. Network Plugin (`NetworkProvider`)
+## 4. Network Plugin — TCP (`NetworkProvider`)
 
-**Crate:** `glasschain-core`  
+**Crate:** `glasschain-core`
 **Trait:** `glasschain_core::NetworkProvider`
 
 ### Trait contract
@@ -249,42 +262,127 @@ pub trait NetworkProvider: Send + Sync {
 
 ### Built-in implementation
 
-The default TCP transport in `glasschain-network` implements this interface.
+The default TLS+TCP transport in `glasschain-network` (`Node`) implements this interface.
+All messages are length-prefixed JSON over TLS with TOFU certificate pinning.
 
-### Implementing a libp2p adapter
+---
+
+## 4b. Network Plugin — libp2p Swarm (`LibP2pNode`) ✨ Phase 1
+
+**Crate:** `glasschain-network`
+**Struct:** `glasschain_network::LibP2pNode`
+
+The `LibP2pNode` provides a production-grade P2P transport using:
+- **Kademlia DHT** for decentralized peer discovery (no bootstrap server required)
+- **Gossipsub** for efficient fan-out propagation of transactions and blocks
+- **Identify** for protocol negotiation and address advertisement
+- **mDNS** for automatic local-network peer discovery
+
+### Architecture
+
+```
+LibP2pNode
+    │
+    ├── GlasschainBehaviour (NetworkBehaviour derive)
+    │       ├── gossipsub::Behaviour  ──► topic: "glasschain/transactions"
+    │       │                         ──► topic: "glasschain/blocks"
+    │       ├── kad::Behaviour        ──► Kademlia DHT (Server mode)
+    │       ├── identify::Behaviour   ──► /glasschain/1.0.0
+    │       └── mdns::tokio::Behaviour──► local peer discovery
+    │
+    ├── command_tx  ──► tokio mpsc ──► background SwarmTask
+    └── event_rx    ◄── tokio mpsc ◄── background SwarmTask
+```
+
+### Quick Start
 
 ```rust
-use libp2p::{Swarm, gossipsub::Gossipsub};
-use glasschain_core::NetworkProvider;
+use glasschain_network::{LibP2pConfig, LibP2pNode};
+use libp2p::Multiaddr;
 
-pub struct LibP2pNetworkProvider {
-    // Wrap a running libp2p Swarm.
-    peers: std::sync::Arc<std::sync::RwLock<Vec<String>>>,
-    sender: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-}
+// Build configuration
+let config = LibP2pConfig {
+    listen_addr: "/ip4/0.0.0.0/tcp/9000".parse::<Multiaddr>().unwrap(),
+    bootstrap_peers: vec![],   // add (PeerId, Multiaddr) pairs for seed nodes
+};
 
-impl NetworkProvider for LibP2pNetworkProvider {
-    fn broadcast(&self, message: &[u8]) {
-        let _ = self.sender.send(message.to_vec());
+// Start the node (spawns the event loop in a background task)
+let node = LibP2pNode::new(config)?;
+println!("Local peer ID: {}", node.local_peer_id);
+
+// Publish a transaction to all peers
+node.publish_transaction(my_transaction).await;
+
+// Dial a specific peer
+node.dial("/ip4/192.168.1.100/tcp/9000".parse()?).await;
+
+// Receive events
+if let Some(event) = node.try_recv_event().await {
+    match event {
+        SwarmNodeEvent::TransactionReceived(tx) => { /* process tx */ }
+        SwarmNodeEvent::BlockReceived(block)    => { /* process block */ }
+        SwarmNodeEvent::PeerConnected(peer_id)  => { /* update peer list */ }
+        _ => {}
     }
-    fn connected_peers(&self) -> Vec<String> {
-        self.peers.read().unwrap().clone()
-    }
-    fn name(&self) -> &str { "libp2p-gossipsub" }
 }
 ```
 
-**Recommended libp2p configuration:**
-- Transport security: **Noise** protocol
-- Peer discovery: **Kademlia DHT**
-- Multiplexing: **Yamux**
-- Messaging: **GossipSub** for block/transaction broadcast
+### Gossipsub Topics
+
+| Constant | Value | Content |
+|:---------|:------|:--------|
+| `TOPIC_TRANSACTIONS` | `"glasschain/transactions"` | `Transaction` (JSON) |
+| `TOPIC_BLOCKS` | `"glasschain/blocks"` | `Block` (JSON) |
+
+### Kademlia Bootstrap
+
+For production multi-region deployments, seed the Kademlia routing table
+with well-known bootstrap peers:
+
+```rust
+use libp2p::{Multiaddr, PeerId};
+use std::str::FromStr;
+
+let bootstrap_peers = vec![
+    (
+        PeerId::from_str("12D3KooWBootstrap1...")?,
+        "/dns4/seed1.glasschain.io/tcp/9000".parse::<Multiaddr>()?,
+    ),
+    (
+        PeerId::from_str("12D3KooWBootstrap2...")?,
+        "/dns4/seed2.glasschain.io/tcp/9000".parse::<Multiaddr>()?,
+    ),
+];
+
+let config = LibP2pConfig { listen_addr, bootstrap_peers };
+```
+
+### `SwarmCommand` reference
+
+| Variant | Effect |
+|:--------|:-------|
+| `Dial(Multiaddr)` | Initiate outbound connection |
+| `PublishTransaction(Transaction)` | Gossipsub publish to transactions topic |
+| `PublishBlock(Block)` | Gossipsub publish to blocks topic |
+| `AddKnownPeer(PeerId, Multiaddr)` | Add address to Kademlia routing table |
+| `Shutdown` | Terminate the swarm event loop |
+
+### `SwarmNodeEvent` reference
+
+| Variant | Emitted when |
+|:--------|:-------------|
+| `PeerConnected(PeerId)` | TLS/Noise handshake completed |
+| `PeerDisconnected(PeerId)` | Connection closed |
+| `TransactionReceived(Transaction)` | Gossipsub message on transactions topic |
+| `BlockReceived(Block)` | Gossipsub message on blocks topic |
+| `RoutingTableUpdated` | Kademlia routing table changed |
+| `Error(String)` | Non-fatal error in the event loop |
 
 ---
 
 ## 5. Indexer Plugin (`IndexerProvider`)
 
-**Crate:** `glasschain-indexer`  
+**Crate:** `glasschain-indexer`
 **Trait:** `glasschain_indexer::IndexerProvider`
 
 ### Trait contract
@@ -304,6 +402,67 @@ pub trait IndexerProvider: Send + Sync {
 
 `InMemoryIndexer` — zero-dependency, for testing.
 
+### `AnalyticalFlattener` (Phase 5) ✨
+
+The `AnalyticalFlattener` transforms nested `TraceableAssetRegistration` transactions
+into flat `FlatAssetRecord` structs suitable for direct insertion into SQL or
+ClickHouse without further JSON parsing:
+
+```rust
+use glasschain_indexer::{AnalyticalFlattener, FlatAssetRecord};
+
+let mut flattener = AnalyticalFlattener::new();
+flattener.ingest_indexed_block(&indexed_block, &transactions);
+
+// Query by GTIN
+for record in flattener.records_by_gtin("07891234567890") {
+    println!("batch={:?} trust={}", record.batch_number, record.trust_score);
+}
+
+// Export to CSV for ClickHouse ingestion
+println!("{}", AnalyticalFlattener::to_csv_header());
+for record in flattener.records() {
+    println!("{}", AnalyticalFlattener::to_csv_row(record));
+}
+
+// Get verifiable lineage
+let lineage = VerifiableLineage::build("GTIN:07891234567890", &provenance_index, &flattener);
+println!("complete={} avg_trust={:.1}", lineage.is_complete, lineage.trust_score_avg);
+```
+
+### `FlatAssetRecord` SQL schema
+
+```sql
+CREATE TABLE asset_records (
+    block_index              BIGINT,
+    block_hash               TEXT,
+    block_timestamp          BIGINT,
+    transaction_id           TEXT PRIMARY KEY,
+    transaction_timestamp    BIGINT,
+    -- GS1 / SNCM identity fields
+    gtin                     TEXT,
+    batch_number             TEXT,
+    expiry_date              TEXT,
+    serial_number            TEXT,
+    anvisa_registration      TEXT,
+    manufacturer_id          TEXT,
+    -- Asset context
+    product_name             TEXT NOT NULL,
+    custodian_id             TEXT NOT NULL,
+    country_of_origin        TEXT,
+    storage_temp_celsius     TEXT,
+    quantity                 BIGINT,
+    -- Event context
+    event_type               TEXT NOT NULL,
+    originator_id            TEXT NOT NULL,
+    purchase_order_ref       TEXT,
+    -- Computed trust
+    trust_score              SMALLINT,
+    is_standard_compliant    BOOLEAN,
+    missing_core_fields      TEXT    -- comma-separated list
+);
+```
+
 ### Implementing a PostgreSQL adapter (SQLx)
 
 ```rust
@@ -315,42 +474,24 @@ pub struct PgIndexer { pool: PgPool }
 
 impl IndexerProvider for PgIndexer {
     fn index_block(&self, block: &Block) -> Result<(), IndexerError> {
-        // Use sqlx::query! macros for compile-time checked SQL.
         // sqlx::query!(
         //   "INSERT INTO blocks (index, hash, timestamp, tx_count)
         //    VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
-        //   block.index as i64, block.hash, block.timestamp as i64,
-        //   block.transactions.len() as i32
+        //   block.index as i64, &block.hash,
+        //   block.timestamp as i64, block.transactions.len() as i32
         // ).execute(&self.pool).await?;
         todo!()
     }
-    // ...
     fn name(&self) -> &str { "postgresql" }
+    // ... implement remaining methods
 }
-```
-
-**Schema:**
-```sql
-CREATE TABLE blocks (
-  index      BIGINT PRIMARY KEY,
-  hash       TEXT NOT NULL,
-  timestamp  BIGINT NOT NULL,
-  tx_count   INT NOT NULL
-);
-CREATE TABLE transactions (
-  id         TEXT PRIMARY KEY,
-  block_idx  BIGINT REFERENCES blocks(index),
-  kind       TEXT NOT NULL,
-  timestamp  BIGINT NOT NULL,
-  payload    JSONB NOT NULL
-);
 ```
 
 ---
 
 ## 6. Event Bus Plugin (`EventBusProvider`)
 
-**Crate:** `glasschain-indexer`  
+**Crate:** `glasschain-indexer`
 **Trait:** `glasschain_indexer::EventBusProvider`
 
 ### Trait contract
@@ -358,7 +499,7 @@ CREATE TABLE transactions (
 ```rust
 pub trait EventBusProvider: Send + Sync {
     fn publish(&self, event: IndexerEvent) -> Result<(), EventBusError>;
-    fn publish_block(&self, block: &Block) -> Result<(), EventBusError>;  // default impl
+    fn publish_block(&self, block: &Block) -> Result<(), EventBusError>; // default impl
     fn name(&self) -> &str;
 }
 ```
@@ -366,45 +507,29 @@ pub trait EventBusProvider: Send + Sync {
 ### Built-in implementation
 
 `InMemoryEventBus` — tokio broadcast channel, for testing.
+Supports `subscribe()` → `broadcast::Receiver<IndexerEvent>` for async consumers.
 
 ### Implementing a Kafka adapter (rdkafka)
 
-Add to `Cargo.toml`:
 ```toml
 [dependencies]
 rdkafka = { version = "0.39", features = ["cmake-build"] }
 ```
 
 ```rust
-use rdkafka::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use glasschain_indexer::event_bus::{EventBusError, EventBusProvider, IndexerEvent};
 
-pub struct KafkaEventBus {
-    producer: FutureProducer,
-    topic: String,
-}
-
-impl KafkaEventBus {
-    pub fn new(brokers: &str, topic: &str) -> Self {
-        let producer: FutureProducer = ClientConfig::new()
-            .set("bootstrap.servers", brokers)
-            .set("message.timeout.ms", "5000")
-            .create()
-            .expect("kafka producer");
-        Self { producer, topic: topic.into() }
-    }
-}
+pub struct KafkaEventBus { producer: FutureProducer, topic: String }
 
 impl EventBusProvider for KafkaEventBus {
     fn publish(&self, event: IndexerEvent) -> Result<(), EventBusError> {
         let payload = serde_json::to_string(&event)
             .map_err(EventBusError::Serialization)?;
-        // For a synchronous wrapper, use a blocking runtime:
         let record = FutureRecord::to(&self.topic)
             .payload(&payload)
             .key(&event.transaction_id);
-        // In an async context: self.producer.send(record, Duration::from_secs(5)).await
+        // In async context: self.producer.send(record, Duration::from_secs(5)).await
         Ok(())
     }
     fn name(&self) -> &str { "kafka" }
@@ -413,7 +538,7 @@ impl EventBusProvider for KafkaEventBus {
 
 ---
 
-## 7. Identity Plugin (`IdentityProvider` — Phase 2 MSP)
+## 7. Identity / MSP Plugin (Phase 2)
 
 **Crate:** `glasschain-identity`
 
@@ -427,22 +552,32 @@ GlassChain's identity system supports:
 
 ```rust
 use glasschain_identity::{Identity, Organization};
-use glasschain_core::{Transaction, TransactionKind, InventoryUpdate};
+use glasschain_core::{InventoryUpdate, Transaction, TransactionKind};
 
-let mut org = Organization::new("MyOrg").unwrap();
+let mut org = Organization::new("PharmaOrg").unwrap();
 let identity = org.issue_identity("node-1").unwrap();
 
 let tx = Transaction::new(TransactionKind::InventoryUpdate(InventoryUpdate {
     product_id: "SKU-001".into(),
-    owner_id: "node-1".into(),
+    owner_id:   "node-1".into(),
     quantity_delta: 100,
     reason: "initial stock".into(),
 }));
+
 let signed = identity.sign_transaction(tx).unwrap();
-signed.verify().unwrap();  // OK
+signed.verify().unwrap();  // cryptographic proof OK
 ```
 
-### Creating a private channel
+### MSP trust hierarchy
+
+```
+Organization Root CA (rcgen X.509)
+  └── issues certificate → Identity (ed25519 key pair + cert PEM)
+        └── signs          → SignedTransaction (tx + 64-byte ed25519 signature)
+              └── verified by any peer with → VerifyingKey (32 bytes)
+```
+
+### Creating a private data channel
 
 ```rust
 use glasschain_identity::{Channel, ChannelConfig};
@@ -453,37 +588,443 @@ let mut channel = Channel::new(ChannelConfig {
     description: "Anvisa-regulated product channel".into(),
 });
 
-// Submit private data (only visible to members).
-let hash = channel.submit_private_data("manufacturer", b"GTIN+serial+batch".to_vec()).unwrap();
-// `hash` is recorded on the main chain as proof.
+// Submit private data — only members can retrieve it.
+let hash = channel.submit_private_data(
+    "manufacturer",
+    b"GTIN:07891234567890:BATCH:LOT001:SN:SN-001".to_vec(),
+).unwrap();
+
+// `hash` is embedded in the main-chain transaction as a commitment proof.
+// Data stays off-chain on authorized nodes only.
 ```
 
 ---
 
-## 8. Watcher Service Plugin (Phase 4 — ECA Triggers)
+## 7b. Endorsement Engine (Phase 2) ✨
 
-**Crate:** `glasschain-contracts`  
-**Struct:** `glasschain_contracts::WatcherService`
+**Crate:** `glasschain-identity`
+**Types:** `EndorsementPolicy`, `EndorsementEngine`, `EndorsementProposal`
+
+The endorsement engine enforces **N-of-M multi-organization approval** before a
+transaction is considered valid for the ordering phase — mirroring Hyperledger
+Fabric's endorsement policy model.
+
+### Policy definition
 
 ```rust
-use glasschain_contracts::{WatcherService, InventoryTrigger};
+use glasschain_identity::{EndorsementEngine, EndorsementPolicy};
+
+// Require signatures from at least 2 of the 3 listed organizations.
+let policy = EndorsementPolicy::new(
+    "2-of-3 Pharma Orgs",
+    vec!["PharmaOrg".into(), "DistributorCo".into(), "PharmacyChain".into()],
+    2,
+);
+let engine = EndorsementEngine::new(policy);
+```
+
+### Building a proposal
+
+```rust
+use glasschain_identity::{
+    EndorsementProposal, EndorsementSignature, Identity, Organization,
+};
+use glasschain_core::{Transaction, TransactionKind, PurchaseOrder};
+
+// Each endorser organization signs the same transaction.
+let tx = Transaction::new(TransactionKind::PurchaseOrder(PurchaseOrder { /* ... */ }));
+let mut proposal = EndorsementProposal::new(tx.clone());
+
+for (org_name, identity) in &endorsers {
+    let signed = identity.sign_transaction(tx.clone()).unwrap();
+    proposal.add_signature(EndorsementSignature::new(signed, org_name.clone()));
+}
+```
+
+### Evaluating the proposal
+
+```rust
+use glasschain_identity::EndorsementResult;
+
+match engine.evaluate(&proposal) {
+    EndorsementResult::Approved { proposal_id, endorser_count } => {
+        println!("✅ Approved: {endorser_count} valid endorsements for {proposal_id}");
+        // Submit to ordering phase.
+    }
+    EndorsementResult::Rejected { reason, collected, required, .. } => {
+        println!("❌ Rejected: {reason} (got {collected}, need {required})");
+    }
+}
+```
+
+### Endorsement flow
+
+```
+Transaction proposed
+       │
+       ▼
+EndorsementProposal::new(tx)
+       │
+       ├── Org A: identity.sign_transaction(tx) → EndorsementSignature
+       ├── Org B: identity.sign_transaction(tx) → EndorsementSignature
+       └── Org C: identity.sign_transaction(tx) → EndorsementSignature (optional)
+       │
+       ▼
+EndorsementEngine::evaluate(&proposal)
+       │
+       ├── verify each signature (ed25519)
+       ├── check org_name ∈ policy.endorser_org_names
+       └── count valid endorsers ≥ required_count?
+              │
+     ┌────────┴────────┐
+     ▼                 ▼
+ Approved          Rejected
+```
+
+---
+
+## 8. Watcher Service Plugin — ECA Triggers (Phase 4)
+
+**Crate:** `glasschain-contracts`
+**Struct:** `glasschain_contracts::WatcherService`
+
+The `WatcherService` implements an **Event-Condition-Action** (ECA) model:
+inventory falls below a threshold → autonomously generate a `PurchaseOrder` transaction.
+
+```rust
+use glasschain_contracts::{InventoryTrigger, WatcherService};
 
 let mut watcher = WatcherService::new();
+
 watcher.add_trigger(InventoryTrigger {
-    trigger_id: "reorder-sku-001".into(),
-    product_id: "SKU-001".into(),
-    owner_id: "pharmacy-1".into(),
-    reorder_threshold: 100,      // fire when inventory ≤ 100
-    reorder_quantity: 500,       // order 500 units
-    seller_id: "supplier-x".into(),
-    price_per_unit: 9.99,
-    currency: "USD".into(),
-    active: true,
+    trigger_id:       "reorder-amoxicilina".into(),
+    product_id:       "07891234567890".into(),
+    owner_id:         "pharmacy-central".into(),
+    threshold:        50,    // fire when inventory ≤ 50 units
+    reorder_quantity: 500,   // order this many units
+    enabled:          true,
 });
 
-// Call on every InventoryUpdate transaction.
-let orders = watcher.on_inventory_update(&update);
-// Submit `orders` to the ledger.
+// Call this on every InventoryUpdate transaction after it is committed.
+let orders = watcher.on_inventory_update(
+    "07891234567890",   // product_id
+    "pharmacy-central", // owner_id
+    -30,               // quantity delta (deduction)
+);
+
+for po_tx in orders {
+    // Submit po_tx to the ledger — signed by the node's organizational key.
+    node.submit_transaction(po_tx).await?;
+}
+```
+
+**Trigger ID uniqueness:** each firing appends a monotonic counter (`trigger-id-fire-N`) so
+repeated firings produce unique transaction IDs, enabling idempotent replay.
+
+---
+
+## 9. Schema Validation — SNCM Nudge Engine (Phase 3) ✨
+
+**Crate:** `glasschain-core`
+**Function:** `glasschain_core::validate_asset`
+
+The SNCM schema validator enforces the Brazilian Anvisa RDC 157/2017 traceability
+requirements.  It uses a **nudge model**: non-compliant assets are accepted but
+flagged, while compliant assets earn a **30% gas fee discount**.
+
+### Schema fields
+
+| Field | Mandatory | Description |
+|:------|:----------|:------------|
+| `gtin` | ✅ | GTIN-14 or EAN-13 (13–14 numeric digits) |
+| `batch_number` | ✅ | Production lot number |
+| `expiry_date` | ✅ | ISO-8601 `YYYY-MM-DD` |
+| `serial_number` | ✅ | Unique serialization number per unit |
+| `anvisa_registration` | ⚠️ recommended | MS registration code |
+| `manufacturer_id` | ⚠️ recommended | CNPJ or legal entity ID |
+
+### Validation flow
+
+```rust
+use glasschain_core::{TraceableAsset, validate_asset, ViolationSeverity};
+
+let asset = TraceableAsset {
+    gtin:          Some("07891234567890".into()),
+    batch_number:  Some("LOTE-2025-001".into()),
+    expiry_date:   Some("2027-12-31".into()),
+    serial_number: Some("SN-00000001".into()),
+    ..
+};
+
+let report = validate_asset(&asset);
+
+if report.is_compliant {
+    println!("✅ SNCM compliant — gas multiplier: {:.0}%", report.gas_fee_multiplier * 100.0);
+    // 0.7 × = 30% discount
+} else {
+    for v in &report.violations {
+        match v.severity {
+            ViolationSeverity::Critical => eprintln!("❌ CRITICAL: {}", v.message),
+            ViolationSeverity::Warning  => eprintln!("⚠️  WARNING: {}", v.message),
+        }
+    }
+    // Asset is still accepted — nudge model, not rejection.
+}
+```
+
+### Combined with `MetadataTrustScore`
+
+The trust score (0–100) from `MetadataTrustScore` and the SNCM validation report
+complement each other:
+
+| Mechanism | Purpose | Gas effect |
+|:----------|:--------|:-----------|
+| `MetadataTrustScore` | Quality signal for indexers / AI models | `fee_multiplier()`: 0.5× or 1.0× |
+| `validate_asset` | SNCM regulatory compliance gate | `gas_fee_multiplier`: 0.7× or 1.0× |
+
+---
+
+## 10. Gas Metering (Phase 4) ✨
+
+**Crate:** `glasschain-vm`
+**Types:** `GasCosts`, `GasCounter`, `GasReport`
+
+### Per-operation cost table (`GasCosts`)
+
+```rust
+use glasschain_vm::gas::GasCosts;
+
+// Default cost table
+let costs = GasCosts::default_costs();
+// base_execution: 1_000
+// state_read:     50  + 1 per byte
+// state_write:    200 + 2 per byte
+// max_call_depth: 8   (anti-reentrancy guard)
+
+// Custom cost table for high-throughput nodes
+let custom = GasCosts {
+    base_execution: 500,
+    state_read: 25,
+    state_write: 100,
+    per_byte_read: 1,
+    per_byte_write: 1,
+    max_call_depth: 4,
+};
+```
+
+### Tracking gas during execution (`GasCounter`)
+
+```rust
+use glasschain_vm::gas::GasCounter;
+
+let mut counter = GasCounter::new(100_000);
+
+// Charge for execution start
+counter.charge(counter.costs().base_execution)?;
+
+// Charge for a state read (100 bytes)
+counter.charge_state_read(100)?;
+
+// Charge for a state write (50 bytes)
+counter.charge_state_write(50)?;
+
+// Anti-reentrancy: track call depth
+counter.push_call()?;   // depth 1
+counter.push_call()?;   // depth 2
+// ...
+counter.pop_call();
+
+// Get report
+let report = counter.to_report(true);
+println!("Gas used: {}/{} ({:.0}%)", report.gas_used, report.gas_limit,
+         report.utilisation() * 100.0);
+```
+
+### Anti-reentrancy depth guard
+
+```rust
+let mut counter = GasCounter::new(1_000_000);
+for _ in 0..8 {
+    counter.push_call().expect("within depth limit");
+}
+assert!(counter.push_call().is_err()); // depth 9 → rejected
+```
+
+### Recommended gas limits
+
+| Contract type | Recommended `gas_limit` |
+|:--------------|:------------------------|
+| Simple state write | 10,000 |
+| Inventory reorder logic | 50,000 |
+| Complex aggregation | 500,000 |
+| Autonomous PurchaseOrder generation | 100,000 |
+| Maximum allowed | 10,000,000 |
+
+---
+
+## 11. Client SDK (`GlasschainClient`) — Phase 6 ✨
+
+**Crate:** `glasschain-sdk`
+**Struct:** `glasschain_sdk::GlasschainClient`
+
+The SDK abstracts all gRPC/MSP complexity, allowing a supplier to register an
+asset in fewer than 10 lines of Rust:
+
+```rust
+use glasschain_sdk::GlasschainClient;
+use glasschain_core::TraceableAsset;
+
+// 1. Build the asset
+let asset = TraceableAsset {
+    gtin:          Some("07891234567890".into()),
+    batch_number:  Some("LOTE-2025-001".into()),
+    expiry_date:   Some("2027-06-30".into()),
+    serial_number: Some("SN-001".into()),
+    product_name:  "Dipirona 500mg".into(),
+    custodian_id:  "fab-xyz".into(),
+    quantity:      1000,
+    ..Default::default()
+};
+
+// 2. Build the transaction JSON (ready for gRPC SubmitTransaction)
+let tx_json = GlasschainClient::build_asset_registration_tx(
+    "fab-xyz",   // originator_id
+    asset,
+    "MANUFACTURE",
+)?;
+
+// 3. Submit via gRPC (the returned tx_json goes in SubmitTransactionRequest.transaction_json)
+println!("{tx_json}");
+```
+
+### Available builders
+
+| Method | Creates |
+|:-------|:--------|
+| `build_asset_registration_tx` | `AssetRegistration` transaction |
+| `build_supply_offer_tx` | `SupplyOffer` transaction |
+| `build_purchase_order_tx` | `PurchaseOrder` transaction |
+| `build_inventory_update_tx` | `InventoryUpdate` transaction |
+| `compute_trust_score` | Computes `MetadataTrustScore` without creating a transaction |
+
+### `GlasschainClientConfig`
+
+```rust
+use glasschain_sdk::GlasschainClientConfig;
+
+let config = GlasschainClientConfig::new("http://node.glasschain.io:50051")
+    .with_node_id("my-node-id");
+```
+
+---
+
+## 12. CLI Utility (`glasschain`) — Phase 6 ✨
+
+**Crate:** `glasschain-cli`
+**Binary:** `glasschain`
+
+```
+glasschain <COMMAND> [OPTIONS]
+
+Commands:
+  identity-gen     Generate a new node identity (with optional org Root CA)
+  contract-deploy  Deploy a smart contract to a GlassChain node
+  ledger-inspect   Inspect the ledger state (blocks, assets, chain status)
+  help             Print this message or the help of the given subcommand
+
+Options:
+  --log-level <LEVEL>  Log verbosity [default: info]
+  -h, --help           Print help
+  -V, --version        Print version
+```
+
+### `identity-gen`
+
+```bash
+# Generate a standalone node identity
+glasschain identity-gen --node-id node-pharma-sp
+
+# Generate an org-issued identity (creates Root CA + member cert)
+glasschain identity-gen \
+    --node-id    distributor-1 \
+    --org        "PharmaDistributors Brasil" \
+    --output     distributor-1-identity.json
+```
+
+### `contract-deploy`
+
+```bash
+# Preview the contract transaction without submitting
+glasschain contract-deploy \
+    --contract-id  auto-reorder-amoxicilina \
+    --buyer-id     pharmacy-central \
+    --product-id   07891234567890 \
+    --max-price    9500 \
+    --min-qty      100 \
+    --max-qty      5000 \
+    --max-lead-days 7 \
+    --currency     BRL \
+    --dry-run
+```
+
+### `ledger-inspect`
+
+```bash
+# Show chain status
+glasschain ledger-inspect --endpoint http://localhost:50051
+
+# Inspect a specific block
+glasschain ledger-inspect --endpoint http://localhost:50051 --block 42
+
+# Query asset history by GTIN
+glasschain ledger-inspect --endpoint http://localhost:50051 --gtin 07891234567890
+```
+
+---
+
+## gRPC API Reference (Phase 1 / Phase 5)
+
+**Crate:** `glasschain-rpc`
+**Proto:** `proto/glasschain/v1/glasschain.proto`
+
+Three services are exposed on a single port (default `0.0.0.0:50051`):
+
+### `LedgerService`
+
+| RPC | Description |
+|:----|:------------|
+| `GetBlock` | Retrieve a block by chain index |
+| `StreamBlocks` | Live-stream blocks from a start index |
+| `SubmitTransaction` | Submit a signed or unsigned transaction |
+| `GetChainStatus` | Chain length, tip hash, pending count |
+| `QueryAssetHistory` | All `AssetRegistration` txs for a GTIN/serial |
+| `SubscribeToEvents` | Live stream of `NodeEvent`s |
+| `GetVerifiableLineage` | Full custody chain for an asset ID ✨ Phase 5 |
+
+### `NodeService`
+
+| RPC | Description |
+|:----|:------------|
+| `GetNodeStatus` | Node ID, address, version, chain length, peer count |
+| `GetPeers` | List of known peer addresses |
+| `MineBlock` | Trigger manual PoW mining (dev/testing only) |
+
+### `IdentityService` ✨ Phase 2
+
+| RPC | Description |
+|:----|:------------|
+| `ExchangeCertificate` | Register an org Root CA for peer verification |
+| `VerifyEndorsement` | Validate an `EndorsementProposal` JSON payload |
+
+### Starting the gRPC server
+
+```bash
+# Start node with gRPC enabled
+glasschain-node \
+    --id       node-1 \
+    --listen   0.0.0.0:8000 \
+    --rpc-addr 0.0.0.0:50051 \
+    --org      "PharmaOrg"
 ```
 
 ---
@@ -492,11 +1033,12 @@ let orders = watcher.on_inventory_update(&update);
 
 To plug in a custom component:
 
-1. **Pick the trait** from the table above.
+1. **Pick the trait** from the plugin summary table at the top.
 2. **Create a new crate** or add a module to an existing one.
 3. **Implement the trait** on your struct.
 4. **Wire it in** by passing your implementation to the node/builder.
 5. **Add tests** — use the in-memory defaults as reference implementations.
+6. **Optionally** add `[lints] workspace = true` to inherit the workspace lint config.
 
 All built-in implementations live in their respective crates and can be
 used as templates.
@@ -507,15 +1049,47 @@ used as templates.
 
 ```
 GlassChain/
-├── crates/
-│   ├── glasschain-core/        # Block, Transaction, Ledger, provider traits
-│   ├── glasschain-contracts/   # ContractEngine, WatcherService
-│   ├── glasschain-network/     # TCP P2P node
-│   ├── glasschain-node/        # Interactive REPL binary
-│   ├── glasschain-storage/     # SledStorageProvider
-│   ├── glasschain-identity/    # Identity, Organization, Channel (MSP)
-│   ├── glasschain-vm/          # WasmExecutionProvider (Wasmtime + gas)
-│   ├── glasschain-indexer/     # IndexerProvider, ProvenanceIndex, EventBus
-│   └── glasschain-rpc/         # gRPC service layer (Tonic + Prost)
-└── PLUGIN_KIT.md               # This document
+├── Cargo.toml                  # Workspace manifest (11 crates)
+├── PLUGIN_KIT.md               # This document
+├── README.md                   # Project overview and quick-start
+└── crates/
+    ├── glasschain-core/        # Block, Transaction, Ledger, provider traits, schema
+    ├── glasschain-contracts/   # ContractEngine, WatcherService (ECA triggers)
+    ├── glasschain-network/     # TCP+TLS P2P node + libp2p Swarm (Phase 1)
+    ├── glasschain-node/        # Interactive REPL binary + gRPC wiring
+    ├── glasschain-storage/     # SledStorageProvider (persistent on-disk backend)
+    ├── glasschain-identity/    # Identity, Organization, Channel, EndorsementEngine
+    ├── glasschain-vm/          # WasmExecutionProvider + GasCosts/GasCounter (Phase 4)
+    ├── glasschain-indexer/     # IndexerProvider, ProvenanceIndex, AnalyticalFlattener
+    ├── glasschain-rpc/         # gRPC services: Ledger, Node, Identity (Tonic + Prost)
+    ├── glasschain-sdk/         # High-level Rust client SDK (Phase 6)
+    └── glasschain-cli/         # CLI binary: identity-gen, contract-deploy, ledger-inspect
 ```
+
+### Dependency graph
+
+```
+glasschain-core
+    ├── glasschain-contracts  (uses core + vm)
+    ├── glasschain-storage    (uses core)
+    ├── glasschain-vm         (uses core)
+    └── glasschain-identity   (uses core)
+            │
+            ▼
+    glasschain-indexer        (uses core)
+            │
+            ▼
+    glasschain-network        (uses core + contracts + identity + indexer)
+            │
+            ▼
+    glasschain-rpc            (uses core + network + identity)
+            │
+            ▼
+    glasschain-sdk            (uses core + identity + rpc types)
+            │
+            ▼
+    glasschain-node           (uses all above — the executable)
+    glasschain-cli            (uses core + identity + sdk — the CLI binary)
+```
+
+No circular dependencies exist in the workspace.

@@ -50,12 +50,19 @@
 //! assert!(signed.verify().is_ok());
 //! ```
 
+pub mod cert_verifier;
 pub mod channel;
+pub mod endorsement;
 pub mod error;
 pub mod identity;
 pub mod msp;
 
+pub use cert_verifier::{CertChainVerifier, CertVerificationError, VerificationLevel};
 pub use channel::{Channel, ChannelConfig};
+pub use endorsement::{
+    EndorsementEngine, EndorsementPolicy, EndorsementProposal, EndorsementResult,
+    EndorsementSignature,
+};
 pub use error::IdentityError;
 pub use identity::{Identity, SignedTransaction};
 pub use msp::Organization;

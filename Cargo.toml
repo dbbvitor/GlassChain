@@ -9,6 +9,8 @@ members = [
     "crates/glasschain-vm",
     "crates/glasschain-indexer",
     "crates/glasschain-rpc",
+    "crates/glasschain-sdk",
+    "crates/glasschain-cli",
 ]
 resolver = "2"
 

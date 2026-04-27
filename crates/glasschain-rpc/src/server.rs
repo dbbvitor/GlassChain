@@ -1,13 +1,17 @@
 //! Tonic gRPC server implementations for `LedgerService` and `NodeService`.
 
+use crate::auth::{MspAuthInterceptor, TrustedKeyRegistry};
 use crate::proto::glasschain_v1::{
+    identity_service_server::{IdentityService, IdentityServiceServer},
     ledger_service_server::{LedgerService, LedgerServiceServer},
     node_service_server::{NodeService, NodeServiceServer},
-    GetBlockRequest, GetBlockResponse, GetChainStatusRequest, GetChainStatusResponse,
-    GetNodeStatusRequest, GetNodeStatusResponse, GetPeersRequest, GetPeersResponse,
-    MineBlockRequest, MineBlockResponse, QueryAssetHistoryRequest, QueryAssetHistoryResponse,
-    StreamBlocksRequest, StreamBlocksResponse, SubmitTransactionRequest, SubmitTransactionResponse,
-    SubscribeToEventsRequest, SubscribeToEventsResponse, TransactionProto,
+    CustodyEventProto, ExchangeCertificateRequest, ExchangeCertificateResponse, GetBlockRequest,
+    GetBlockResponse, GetChainStatusRequest, GetChainStatusResponse, GetNodeStatusRequest,
+    GetNodeStatusResponse, GetPeersRequest, GetPeersResponse, GetVerifiableLineageRequest,
+    GetVerifiableLineageResponse, MineBlockRequest, MineBlockResponse, QueryAssetHistoryRequest,
+    QueryAssetHistoryResponse, StreamBlocksRequest, StreamBlocksResponse, SubmitTransactionRequest,
+    SubmitTransactionResponse, SubscribeToEventsRequest, SubscribeToEventsResponse,
+    TransactionProto, VerifyEndorsementRequest, VerifyEndorsementResponse,
 };
 use glasschain_core::{TraceableAssetRegistration, Transaction, TransactionKind};
 use glasschain_identity::SignedTransaction;
@@ -371,6 +375,58 @@ impl LedgerService for ServerState {
         });
         Ok(Response::new(ReceiverStream::new(rx)))
     }
+
+    async fn get_verifiable_lineage(
+        &self,
+        request: Request<GetVerifiableLineageRequest>,
+    ) -> Result<Response<GetVerifiableLineageResponse>, Status> {
+        let asset_id = request.into_inner().asset_id;
+        if asset_id.is_empty() {
+            return Err(Status::invalid_argument("asset_id must not be empty"));
+        }
+        // Phase 5: Full implementation requires wiring glasschain-indexer's
+        // ProvenanceIndex and AnalyticalFlattener to the ServerState.
+        // For now, return a partial response from chain state.
+        let ledger = self.node.shared_ledger();
+        let ledger = ledger.lock().await;
+        let mut custody_chain = Vec::new();
+        let mut record_count = 0u32;
+        for block in &ledger.chain {
+            for tx in &block.transactions {
+                if let TransactionKind::AssetRegistration(reg) = &tx.kind {
+                    // Reconstruct the canonical composite key from the stored
+                    // asset fields and compare with strict equality.  Substring
+                    // matching would let a short GTIN like "0789" accidentally
+                    // match a query for "07891234567890".
+                    let canonical_id = match (&reg.asset.gtin, &reg.asset.serial_number) {
+                        (Some(g), Some(s)) => format!("GTIN:{g}:SN:{s}"),
+                        (Some(g), None) => format!("GTIN:{g}"),
+                        (None, Some(s)) => format!("SN:{s}"),
+                        (None, None) => String::new(),
+                    };
+                    let matches = !canonical_id.is_empty() && canonical_id == asset_id;
+                    if matches {
+                        custody_chain.push(CustodyEventProto {
+                            asset_id: asset_id.clone(),
+                            event_type: reg.event_type.clone(),
+                            custodian_id: reg.asset.custodian_id.clone(),
+                            transaction_id: tx.id.clone(),
+                            block_index: block.index,
+                            timestamp: tx.timestamp,
+                        });
+                        record_count += 1;
+                    }
+                }
+            }
+        }
+        Ok(Response::new(GetVerifiableLineageResponse {
+            asset_id,
+            custody_chain,
+            is_complete: record_count > 0,
+            trust_score_avg: 0.0, // requires indexer wiring
+            total_records: record_count,
+        }))
+    }
 }
 
 // ── NodeService implementation ────────────────────────────────────────────────
@@ -439,24 +495,119 @@ impl NodeService for ServerState {
     }
 }
 
+// ── IdentityService implementation ───────────────────────────────────────────
+
+#[tonic::async_trait]
+impl IdentityService for ServerState {
+    /// Exchange an organization Root CA certificate.
+    ///
+    /// This allows an external organization to register its Root CA with this
+    /// node, enabling future signature verification against the org's PKI.
+    async fn exchange_certificate(
+        &self,
+        request: Request<ExchangeCertificateRequest>,
+    ) -> Result<Response<ExchangeCertificateResponse>, Status> {
+        let req = request.into_inner();
+        if req.org_name.is_empty() || req.root_ca_cert_pem.is_empty() {
+            return Err(Status::invalid_argument(
+                "org_name and root_ca_cert_pem are required",
+            ));
+        }
+        log::info!(
+            "Certificate exchange: org={} node={}",
+            req.org_name,
+            req.node_id
+        );
+        // Phase 2: Full integration requires storing the cert in a trust store
+        // and returning this node's own certificate.  For now, acknowledge receipt.
+        Ok(Response::new(ExchangeCertificateResponse {
+            accepted: true,
+            node_cert_pem: String::new(), // populated once identity integration is complete
+            error: String::new(),
+        }))
+    }
+
+    /// Verify an endorsement proposal against the configured policy.
+    ///
+    /// Accepts a JSON-serialised [`EndorsementProposal`] and returns whether
+    /// the required number of valid endorsements have been collected.
+    async fn verify_endorsement(
+        &self,
+        request: Request<VerifyEndorsementRequest>,
+    ) -> Result<Response<VerifyEndorsementResponse>, Status> {
+        let proposal_json = request.into_inner().proposal_json;
+        if proposal_json.is_empty() {
+            return Err(Status::invalid_argument("proposal_json must not be empty"));
+        }
+        // Phase 2: Full integration would deserialize the EndorsementProposal
+        // and run EndorsementEngine::evaluate().
+        // Return a well-documented stub that explains the expected contract.
+        log::debug!(
+            "verify_endorsement called (proposal_json len={})",
+            proposal_json.len()
+        );
+        Ok(Response::new(VerifyEndorsementResponse {
+            approved: false,
+            proposal_id: String::new(),
+            endorser_count: 0,
+            rejection_reason: "endorsement engine not yet wired to RPC layer".into(),
+        }))
+    }
+}
+
 // ── Server builder ────────────────────────────────────────────────────────────
 
-/// Combined gRPC server exposing both `LedgerService` and `NodeService`.
+/// Combined gRPC server exposing `LedgerService`, `NodeService`, and
+/// `IdentityService`.
 ///
 /// The server wraps a live [`Node`] so that all RPC calls operate on the same
 /// ledger state as the P2P network layer.
+///
+/// Optionally, an [`MspAuthInterceptor`] can be attached (via
+/// [`with_auth`](Self::with_auth)) to enforce per-request ed25519 authentication
+/// on every inbound RPC.
 pub struct GlasschainServer {
     node: Arc<Node>,
+    /// Optional MSP authentication interceptor.
+    auth: Option<MspAuthInterceptor>,
 }
 
 impl GlasschainServer {
-    /// Create a new server backed by the given node.
+    /// Create a new server backed by the given node, with no authentication.
     #[must_use]
     pub const fn new(node: Arc<Node>) -> Self {
-        Self { node }
+        Self { node, auth: None }
+    }
+
+    /// Create a server with MSP authentication.
+    ///
+    /// When `require_auth` is `true`, every inbound RPC must carry the three
+    /// `x-glasschain-*` metadata headers and pass ed25519 signature verification
+    /// against the supplied `registry`.  When `false`, headers are validated if
+    /// present but their absence is allowed (backward-compatible mode).
+    #[must_use]
+    pub fn with_auth(node: Arc<Node>, registry: TrustedKeyRegistry, require_auth: bool) -> Self {
+        let interceptor = if require_auth {
+            MspAuthInterceptor::new_strict(registry)
+        } else {
+            MspAuthInterceptor::new(registry)
+        };
+        Self {
+            node,
+            auth: Some(interceptor),
+        }
     }
 
     /// Start the gRPC server and listen on `addr`.
+    ///
+    /// When an [`MspAuthInterceptor`] was configured via [`with_auth`](Self::with_auth),
+    /// it is attached to every service.  Otherwise the services run without
+    /// authentication middleware.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the underlying tonic transport layer fails to bind to
+    /// `addr` or encounters a fatal error while serving.
     ///
     /// # Example
     /// ```rust,no_run
@@ -478,11 +629,27 @@ impl GlasschainServer {
 
         log::info!("GlassChain gRPC server listening on {addr}");
 
-        Server::builder()
-            .add_service(LedgerServiceServer::new(state.clone()))
-            .add_service(NodeServiceServer::new(state))
-            .serve(addr)
-            .await?;
+        if let Some(auth) = self.auth {
+            Server::builder()
+                .add_service(LedgerServiceServer::with_interceptor(
+                    state.clone(),
+                    auth.clone(),
+                ))
+                .add_service(NodeServiceServer::with_interceptor(
+                    state.clone(),
+                    auth.clone(),
+                ))
+                .add_service(IdentityServiceServer::with_interceptor(state, auth))
+                .serve(addr)
+                .await?;
+        } else {
+            Server::builder()
+                .add_service(LedgerServiceServer::new(state.clone()))
+                .add_service(NodeServiceServer::new(state.clone()))
+                .add_service(IdentityServiceServer::new(state))
+                .serve(addr)
+                .await?;
+        }
 
         Ok(())
     }

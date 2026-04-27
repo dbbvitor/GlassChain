@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod error;
 pub mod ledger;
 pub mod providers;
+pub mod schema;
 pub mod transaction;
 
 pub use asset::{MetadataTrustScore, TraceableAsset, TRUST_SCORE_STANDARD_THRESHOLD};
@@ -12,6 +13,10 @@ pub use error::CoreError;
 pub use ledger::{Ledger, DEFAULT_DIFFICULTY};
 pub use providers::{
     ConsensusProvider, ExecutionProvider, NetworkProvider, PowConsensusProvider, StorageProvider,
+};
+pub use schema::{
+    validate_asset, SchemaValidationReport, SchemaViolation, SncmField, ViolationSeverity,
+    SNCM_SCHEMA,
 };
 pub use transaction::{
     ContractExecution, InventoryUpdate, PurchaseConditions, PurchaseOrder, SmartContractDef,

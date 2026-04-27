@@ -38,7 +38,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TraceableAsset {
     // ── Core identity (GS1 / Anvisa mandatory) ──────────────────────────────
-
     /// Global Trade Item Number (GTIN-14 or EAN-13).
     ///
     /// Required for Anvisa SNCM compliance (RDC 157/2017, Art. 3).
@@ -61,7 +60,6 @@ pub struct TraceableAsset {
     pub serial_number: Option<String>,
 
     // ── Regulatory metadata ─────────────────────────────────────────────────
-
     /// Anvisa product registration number (`MS xxxxxx.xxxxxx`).
     pub anvisa_registration: Option<String>,
 
@@ -69,7 +67,6 @@ pub struct TraceableAsset {
     pub manufacturer_id: Option<String>,
 
     // ── Supply-chain context ────────────────────────────────────────────────
-
     /// Human-readable product name.
     pub product_name: String,
 
@@ -113,7 +110,7 @@ pub const TRUST_SCORE_STANDARD_THRESHOLD: u8 = 80;
 /// This is a lightweight structural check: it verifies the length, separators,
 /// and that the numeric fields are in plausible ranges.  It does not perform a
 /// full calendar validation (e.g., it accepts February 30).
-fn is_valid_iso8601_date(s: &str) -> bool {
+pub(crate) fn is_valid_iso8601_date(s: &str) -> bool {
     // Expected format: "YYYY-MM-DD"
     if s.len() != 10 {
         return false;
@@ -157,11 +154,7 @@ impl MetadataTrustScore {
         } else {
             missing.push("gtin".to_owned());
         }
-        if asset
-            .batch_number
-            .as_deref()
-            .is_some_and(|s| !s.is_empty())
-        {
+        if asset.batch_number.as_deref().is_some_and(|s| !s.is_empty()) {
             score += 20;
         } else {
             missing.push("batch_number".to_owned());
@@ -219,7 +212,7 @@ impl MetadataTrustScore {
     ///
     /// Standard-compliant assets (`is_standard == true`) pay 50 % less gas,
     /// incentivising participants to supply complete regulatory data.
-    #[must_use] 
+    #[must_use]
     pub const fn fee_multiplier(&self) -> f64 {
         if self.is_standard {
             0.5
@@ -279,7 +272,7 @@ mod tests {
         TraceableAsset {
             gtin: Some("07891234567890".into()),
             batch_number: Some("LOTE-A".into()),
-            expiry_date: None, // missing
+            expiry_date: None,   // missing
             serial_number: None, // missing
             ..full_asset()
         }
@@ -310,7 +303,10 @@ mod tests {
         assert_eq!(score.score, 60);
         assert!(!score.is_standard);
         assert!(score.missing_core_fields.iter().any(|f| f == "expiry_date"));
-        assert!(score.missing_core_fields.iter().any(|f| f == "serial_number"));
+        assert!(score
+            .missing_core_fields
+            .iter()
+            .any(|f| f == "serial_number"));
     }
 
     #[test]

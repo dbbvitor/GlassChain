@@ -6,7 +6,9 @@ use glasschain_identity::Organization;
 use glasschain_network::{Node, NodeEvent};
 use glasschain_storage::SledStorageProvider;
 use glasschain_vm::WasmExecutionProvider;
+use glasschain_rpc::GlasschainServer;
 use std::env;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -54,6 +56,8 @@ OPTIONS:
     --org <NAME>            Organization name for issuing an identity-backed TLS certificate.
     --identity-node-id <ID> Node ID to embed in the issued TLS identity certificate.
                             Defaults to the value passed to --id.
+    --rpc-addr <ADDR>       Address to bind the gRPC server (e.g. "0.0.0.0:50051").
+                            When omitted, the gRPC server is not started.
     --help                  Show this help message
 
 INTERACTIVE COMMANDS (after startup):
@@ -115,6 +119,7 @@ async fn main() {
     let mut storage_path: Option<String> = None;
     let mut org_name: Option<String> = None;
     let mut identity_node_id: Option<String> = None;
+    let mut rpc_addr: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -159,6 +164,12 @@ async fn main() {
                 i += 1;
                 if let Some(v) = args.get(i) {
                     identity_node_id = Some(v.clone());
+                }
+            }
+            "--rpc-addr" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    rpc_addr = Some(v.clone());
                 }
             }
             _ => {}
@@ -292,6 +303,25 @@ async fn main() {
     if let Err(e) = node.start(seed_peers).await {
         log::error!("Failed to start node: {e}");
         std::process::exit(1);
+    }
+
+    // ── Optional gRPC server ───────────────────────────────────────────────
+    if let Some(ref addr_str) = rpc_addr {
+        let rpc_node = Arc::clone(&node);
+        match addr_str.parse::<SocketAddr>() {
+            Ok(addr) => {
+                let server = GlasschainServer::new(rpc_node);
+                tokio::spawn(async move {
+                    if let Err(e) = server.serve(addr).await {
+                        log::error!("gRPC server error: {e}");
+                    }
+                });
+                log::info!("gRPC server started on {addr}");
+            }
+            Err(e) => {
+                log::warn!("Invalid --rpc-addr {addr_str:?}: {e} — gRPC server not started");
+            }
+        }
     }
 
     println!("GlassChain node `{node_id}` is running on {listen_addr}");

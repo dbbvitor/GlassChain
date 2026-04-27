@@ -9,13 +9,14 @@ name = "glasschain-node"
 path = "src/main.rs"
 
 [dependencies]
-glasschain-core = { path = "../glasschain-core" }
-glasschain-network = { path = "../glasschain-network" }
+glasschain-core     = { path = "../glasschain-core" }
+glasschain-network  = { path = "../glasschain-network" }
 glasschain-identity = { path = "../glasschain-identity" }
-glasschain-storage = { path = "../glasschain-storage" }
-glasschain-vm = { path = "../glasschain-vm" }
-tokio = { version = "1.52", features = ["full"] }
-log = "0.4"
+glasschain-storage  = { path = "../glasschain-storage" }
+glasschain-vm       = { path = "../glasschain-vm" }
+glasschain-rpc      = { path = "../glasschain-rpc" }
+tokio      = { version = "1.52", features = ["full"] }
+log        = "0.4"
 env_logger = "0.11"
 
 [lints]

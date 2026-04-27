@@ -15,13 +15,39 @@
 //!
 //! Triggers are registered via [`WatcherService::add_trigger`] and evaluated
 //! on every call to [`WatcherService::on_inventory_update`].
+//!
+//! ## Optional WASM Gating
+//!
+//! Each trigger may carry a base64-encoded WASM module in `wasm_code_b64`.
+//! When an [`ExecutionProvider`] is registered via [`WatcherService::set_executor`],
+//! the WASM module is executed before any `PurchaseOrder` is emitted.  The
+//! contract must write `approve = b"1"` via the `set_state` host function for
+//! the order to proceed.
+//!
+//! ## State Persistence
+//!
+//! [`WatcherService::serialize_state`] / [`WatcherService::restore_from_bytes`]
+//! round-trip the runtime inventory and fire-count state through
+//! [`WatcherStateSnapshot`], enabling seamless recovery after a node restart
+//! without requiring a full chain replay.
 
-use glasschain_core::{InventoryUpdate, PurchaseOrder, Transaction, TransactionKind};
+use base64::Engine as _;
+use glasschain_core::{
+    ExecutionProvider, InventoryUpdate, PurchaseOrder, Transaction, TransactionKind,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
+use std::sync::Arc;
+
+// ── InventoryTrigger ──────────────────────────────────────────────────────────
 
 /// Defines when and how the watcher should auto-generate a purchase order.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Derive [`Default`] so that callers constructing the struct with field
+/// initialiser syntax can use `..Default::default()` to zero-fill any fields
+/// added in the future (including `wasm_code_b64`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct InventoryTrigger {
     /// Unique trigger identifier.
     pub trigger_id: String,
@@ -41,13 +67,48 @@ pub struct InventoryTrigger {
     pub currency: String,
     /// Whether this trigger is currently active.
     pub active: bool,
+    /// Optional base64-encoded WASM module used to gate `PurchaseOrder` emission.
+    ///
+    /// When `Some`, the module is executed through the registered
+    /// [`ExecutionProvider`] before a `PurchaseOrder` is generated.  The WASM
+    /// contract **must** call `set_state("approve", "1")` for the order to
+    /// proceed.  Any other value — or the absence of the key — causes the
+    /// trigger to be skipped for this inventory event.
+    ///
+    /// If no executor has been registered via [`WatcherService::set_executor`]
+    /// but this field is `Some`, the trigger fires unconditionally (useful in
+    /// development / test environments without a full VM stack).
+    pub wasm_code_b64: Option<String>,
 }
+
+// ── WatcherStateSnapshot ──────────────────────────────────────────────────────
+
+/// Serializable snapshot of the watcher's runtime state.
+///
+/// Used to persist inventory levels and fire counts across node restarts
+/// via the `StorageProvider` backend.
+///
+/// **Triggers are intentionally excluded** from the snapshot: they are
+/// reconstructed via [`WatcherService::add_trigger`] during chain replay on
+/// startup, which is the canonical source of truth for trigger definitions.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WatcherStateSnapshot {
+    /// Per-product per-owner inventory levels.
+    pub inventory: HashMap<String, HashMap<String, i64>>,
+    /// Per-trigger fire counts (for unique tx ID generation).
+    pub trigger_fire_counts: HashMap<String, u64>,
+}
+
+// ── WatcherService ────────────────────────────────────────────────────────────
 
 /// The Watcher service.
 ///
 /// Tracks per-owner inventory levels and fires registered triggers when
 /// levels fall below their configured thresholds.
-#[derive(Debug, Default)]
+///
+/// `WatcherService` does **not** derive [`Default`] because
+/// `Arc<dyn ExecutionProvider>` does not implement [`Default`].  A manual
+/// implementation is provided instead, delegating to [`WatcherService::new`].
 pub struct WatcherService {
     /// Active triggers keyed by `trigger_id`.
     triggers: HashMap<String, InventoryTrigger>,
@@ -56,17 +117,53 @@ pub struct WatcherService {
     /// Per-trigger fire counter to guarantee unique transaction IDs across
     /// repeated firings of the same trigger.
     trigger_fire_counts: HashMap<String, u64>,
+    /// Optional WASM execution provider for trigger gating.
+    executor: Option<Arc<dyn ExecutionProvider>>,
+}
+
+impl fmt::Debug for WatcherService {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WatcherService")
+            .field("triggers", &self.triggers)
+            .field("inventory", &self.inventory)
+            .field("trigger_fire_counts", &self.trigger_fire_counts)
+            .field(
+                "executor",
+                if self.executor.is_some() {
+                    &"<set>"
+                } else {
+                    &"<none>"
+                },
+            )
+            .finish()
+    }
+}
+
+impl Default for WatcherService {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WatcherService {
     /// Create a new empty watcher service.
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             triggers: HashMap::new(),
             inventory: HashMap::new(),
             trigger_fire_counts: HashMap::new(),
+            executor: None,
         }
+    }
+
+    /// Register a WASM execution provider for trigger gating.
+    ///
+    /// When set, any [`InventoryTrigger`] with a `wasm_code_b64` payload will be
+    /// executed through this provider before a `PurchaseOrder` is generated.
+    /// Triggers without `wasm_code_b64` are always executed unconditionally.
+    pub fn set_executor(&mut self, executor: Arc<dyn ExecutionProvider>) {
+        self.executor = Some(executor);
     }
 
     /// Register an inventory-level trigger.
@@ -89,7 +186,7 @@ impl WatcherService {
     }
 
     /// Return the current inventory level for `(product_id, owner_id)`.
-    #[must_use] 
+    #[must_use]
     pub fn inventory_level(&self, product_id: &str, owner_id: &str) -> i64 {
         self.inventory
             .get(product_id)
@@ -97,6 +194,53 @@ impl WatcherService {
             .copied()
             .unwrap_or(0)
     }
+
+    // ── State persistence ─────────────────────────────────────────────────────
+
+    /// Capture the current runtime state as a [`WatcherStateSnapshot`].
+    ///
+    /// The snapshot captures inventory levels and trigger fire counts —
+    /// everything needed to resume operation after a node restart without
+    /// replaying the chain.
+    #[must_use]
+    pub fn to_snapshot(&self) -> WatcherStateSnapshot {
+        WatcherStateSnapshot {
+            inventory: self.inventory.clone(),
+            trigger_fire_counts: self.trigger_fire_counts.clone(),
+        }
+    }
+
+    /// Serialize the current state as a JSON byte vector for storage.
+    ///
+    /// # Errors
+    /// Returns [`serde_json::Error`] if serialisation fails (unlikely for
+    /// the plain `HashMap` types held by this struct).
+    pub fn serialize_state(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(&self.to_snapshot())
+    }
+
+    /// Restore inventory and fire-count state from a previously captured snapshot.
+    ///
+    /// Triggers are **not** restored from the snapshot — they must be
+    /// re-registered via [`add_trigger`][Self::add_trigger] (they come from
+    /// chain replay on startup).
+    pub fn apply_snapshot(&mut self, snapshot: WatcherStateSnapshot) {
+        self.inventory = snapshot.inventory;
+        self.trigger_fire_counts = snapshot.trigger_fire_counts;
+    }
+
+    /// Deserialize a state snapshot from JSON bytes and apply it.
+    ///
+    /// # Errors
+    /// Returns [`serde_json::Error`] if the bytes are not valid JSON matching
+    /// [`WatcherStateSnapshot`].
+    pub fn restore_from_bytes(&mut self, data: &[u8]) -> Result<(), serde_json::Error> {
+        let snapshot: WatcherStateSnapshot = serde_json::from_slice(data)?;
+        self.apply_snapshot(snapshot);
+        Ok(())
+    }
+
+    // ── Core ECA loop ─────────────────────────────────────────────────────────
 
     /// Process an [`InventoryUpdate`] transaction and return any auto-generated
     /// [`PurchaseOrder`] transactions.
@@ -108,6 +252,10 @@ impl WatcherService {
     ///
     /// Each firing of a trigger increments an internal counter that is embedded
     /// in the transaction ID, guaranteeing unique IDs across repeated firings.
+    ///
+    /// When a trigger carries a `wasm_code_b64` module **and** an executor has
+    /// been registered, the module is executed and must approve the order (see
+    /// the module-level documentation for the exact approval protocol).
     pub fn on_inventory_update(&mut self, update: &InventoryUpdate) -> Vec<Transaction> {
         // Apply the inventory delta.
         let level = self
@@ -161,6 +309,77 @@ impl WatcherService {
                 trigger.reorder_quantity,
             );
 
+            // ── WASM gate (optional) ──────────────────────────────────────────
+            //
+            // If the trigger carries a WASM module, execute it with the current
+            // inventory level as pre-populated state.  The contract must set
+            // `approve = b"1"` to allow the PurchaseOrder to proceed.
+            if let Some(ref wasm_b64) = trigger.wasm_code_b64 {
+                if let Some(ref exec) = self.executor {
+                    // Provide the current inventory level as context.
+                    let mut world_state: HashMap<String, Vec<u8>> = HashMap::new();
+                    world_state.insert(
+                        "inventory_level".to_string(),
+                        new_level.to_string().into_bytes(),
+                    );
+                    world_state.insert(
+                        "threshold".to_string(),
+                        trigger.reorder_threshold.to_string().into_bytes(),
+                    );
+                    world_state.insert(
+                        "product_id".to_string(),
+                        trigger.product_id.as_bytes().to_vec(),
+                    );
+
+                    let wasm_bytes =
+                        match base64::engine::general_purpose::STANDARD.decode(wasm_b64) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                log::warn!(
+                                    "WatcherService: trigger '{}' has invalid base64 wasm: {e}",
+                                    trigger.trigger_id
+                                );
+                                continue; // skip this trigger
+                            }
+                        };
+
+                    // NOTE: execute_with_state signature is
+                    //   (contract_id, payload, initial_state: HashMap, gas_limit)
+                    match exec.execute_with_state(
+                        &trigger.trigger_id,
+                        &wasm_bytes,
+                        world_state,
+                        100_000,
+                    ) {
+                        Ok(mutations) => {
+                            let approved =
+                                mutations.iter().any(|(k, v)| k == "approve" && v == b"1");
+                            if !approved {
+                                log::info!(
+                                    "WatcherService: trigger '{}' WASM denied the PurchaseOrder",
+                                    trigger.trigger_id
+                                );
+                                continue; // WASM said no
+                            }
+                            log::debug!(
+                                "WatcherService: trigger '{}' WASM approved the PurchaseOrder",
+                                trigger.trigger_id
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "WatcherService: trigger '{}' WASM execution failed: {e}. Skipping.",
+                                trigger.trigger_id
+                            );
+                            continue;
+                        }
+                    }
+                }
+                // If no executor is configured but wasm_code_b64 is set, fall
+                // through (treat as approved) so the trigger still fires in
+                // dev/test environments without a full VM stack.
+            }
+
             let tx = Transaction::with_id(
                 format!(
                     "watcher:{}:{}:{}:{}",
@@ -182,12 +401,21 @@ impl WatcherService {
     }
 }
 
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glasschain_vm::WasmExecutionProvider;
+    use std::sync::Arc;
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// Build a minimal trigger with `price_per_unit` expressed in minor
     /// currency units (e.g. cents: 1000 = $10.00).
+    ///
+    /// `wasm_code_b64` defaults to `None` via `..Default::default()`, so all
+    /// callers that don't need WASM gating require no change.
     fn make_trigger(
         id: &str,
         product: &str,
@@ -205,6 +433,7 @@ mod tests {
             price_per_unit: 1000,
             currency: "USD".into(),
             active: true,
+            ..Default::default()
         }
     }
 
@@ -217,9 +446,7 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Inventory accumulation
-    // -------------------------------------------------------------------------
+    // ── Inventory accumulation ────────────────────────────────────────────────
 
     #[test]
     fn test_inventory_accumulates() {
@@ -229,9 +456,7 @@ mod tests {
         assert_eq!(svc.inventory_level("SKU-001", "pharmacy-1"), 150);
     }
 
-    // -------------------------------------------------------------------------
-    // Trigger firing
-    // -------------------------------------------------------------------------
+    // ── Trigger firing ────────────────────────────────────────────────────────
 
     #[test]
     fn test_trigger_fires_below_threshold() {
@@ -306,9 +531,7 @@ mod tests {
         assert_eq!(orders2.len(), 2);
     }
 
-    // -------------------------------------------------------------------------
-    // Transaction ID uniqueness across repeated firings
-    // -------------------------------------------------------------------------
+    // ── Transaction ID uniqueness across repeated firings ─────────────────────
 
     #[test]
     fn test_repeated_trigger_generates_unique_tx_ids() {
@@ -329,6 +552,206 @@ mod tests {
         assert_ne!(
             orders1[0].id, orders2[0].id,
             "repeated trigger firings must produce unique transaction IDs"
+        );
+    }
+
+    // ── WASM gating ───────────────────────────────────────────────────────────
+
+    /// A WASM module that writes `approve = "1"` unconditionally.
+    fn approving_wasm_b64() -> String {
+        let wat = r#"
+(module
+  (import "env" "set_state" (func $set_state (param i32 i32 i32 i32)))
+  (export "execute" (func $execute))
+  (export "memory" (memory 0))
+  (memory 1)
+  (data (i32.const 0) "approve")
+  (data (i32.const 16) "1")
+  (func $execute
+    i32.const 0  i32.const 7
+    i32.const 16 i32.const 1
+    call $set_state
+  )
+)
+"#;
+        let wasm_bytes = wat::parse_str(wat).expect("approving WAT must compile");
+        base64::engine::general_purpose::STANDARD.encode(&wasm_bytes)
+    }
+
+    /// A WASM module that writes `approve = "0"` — explicitly denying the order.
+    fn denying_wasm_b64() -> String {
+        let wat = r#"
+(module
+  (import "env" "set_state" (func $set_state (param i32 i32 i32 i32)))
+  (export "execute" (func $execute))
+  (export "memory" (memory 0))
+  (memory 1)
+  (data (i32.const 0) "approve")
+  (data (i32.const 16) "0")
+  (func $execute
+    i32.const 0  i32.const 7
+    i32.const 16 i32.const 1
+    call $set_state
+  )
+)
+"#;
+        let wasm_bytes = wat::parse_str(wat).expect("denying WAT must compile");
+        base64::engine::general_purpose::STANDARD.encode(&wasm_bytes)
+    }
+
+    /// A trigger that carries a WASM module and whose WASM gate approves the
+    /// order (sets `approve = "1"`) should produce a `PurchaseOrder`.
+    #[test]
+    fn test_wasm_approved_trigger_fires() {
+        let mut svc = WatcherService::new();
+        let executor = Arc::new(WasmExecutionProvider::new().expect("wasmtime engine"));
+        svc.set_executor(executor);
+
+        let trigger = InventoryTrigger {
+            wasm_code_b64: Some(approving_wasm_b64()),
+            ..make_trigger("t-approve", "SKU-WASM", "owner-1", 100, 250)
+        };
+        svc.add_trigger(trigger);
+
+        // Drop inventory below threshold — WASM approves → PO must be emitted.
+        let orders = svc.on_inventory_update(&inv_update("SKU-WASM", "owner-1", 50));
+        assert_eq!(
+            orders.len(),
+            1,
+            "approving WASM gate must allow PurchaseOrder to be generated"
+        );
+        if let TransactionKind::PurchaseOrder(ref po) = orders[0].kind {
+            assert_eq!(po.quantity, 250);
+            assert_eq!(po.product_id, "SKU-WASM");
+        } else {
+            panic!("expected PurchaseOrder, got {:?}", orders[0].kind);
+        }
+    }
+
+    /// A trigger whose WASM gate sets `approve = "0"` must NOT produce any
+    /// `PurchaseOrder`, even though the inventory condition is met.
+    #[test]
+    fn test_wasm_denied_trigger_skipped() {
+        let mut svc = WatcherService::new();
+        let executor = Arc::new(WasmExecutionProvider::new().expect("wasmtime engine"));
+        svc.set_executor(executor);
+
+        let trigger = InventoryTrigger {
+            wasm_code_b64: Some(denying_wasm_b64()),
+            ..make_trigger("t-deny", "SKU-WASM", "owner-1", 100, 250)
+        };
+        svc.add_trigger(trigger);
+
+        // Drop inventory below threshold — WASM denies → no PO.
+        let orders = svc.on_inventory_update(&inv_update("SKU-WASM", "owner-1", 50));
+        assert!(
+            orders.is_empty(),
+            "denying WASM gate must suppress PurchaseOrder generation"
+        );
+    }
+
+    /// When `wasm_code_b64` is set on a trigger but no executor has been
+    /// registered, the trigger must fire unconditionally (dev/test fast-path).
+    #[test]
+    fn test_wasm_no_executor_fires_unconditionally() {
+        let mut svc = WatcherService::new();
+        // Deliberately do NOT call svc.set_executor(…).
+
+        let trigger = InventoryTrigger {
+            // Use the denying WASM bytes — but since there's no executor the
+            // bytes are never evaluated and the trigger should still fire.
+            wasm_code_b64: Some(denying_wasm_b64()),
+            ..make_trigger("t-noexec", "SKU-NOEXEC", "owner-1", 100, 300)
+        };
+        svc.add_trigger(trigger);
+
+        let orders = svc.on_inventory_update(&inv_update("SKU-NOEXEC", "owner-1", 50));
+        assert_eq!(
+            orders.len(),
+            1,
+            "trigger with wasm_code_b64 but no executor must fire unconditionally"
+        );
+    }
+
+    // ── State persistence ─────────────────────────────────────────────────────
+
+    /// Serializing the watcher state and restoring it into a fresh instance
+    /// must reproduce the same inventory levels.
+    #[test]
+    fn test_serialize_deserialize_state() {
+        let mut svc = WatcherService::new();
+        svc.on_inventory_update(&inv_update("SKU-001", "owner-a", 500));
+        svc.on_inventory_update(&inv_update("SKU-001", "owner-a", -120));
+        svc.on_inventory_update(&inv_update("SKU-002", "owner-b", 200));
+
+        let bytes = svc.serialize_state().expect("serialize must succeed");
+        assert!(!bytes.is_empty(), "serialized state must not be empty");
+
+        let mut restored = WatcherService::new();
+        restored
+            .restore_from_bytes(&bytes)
+            .expect("restore must succeed");
+
+        assert_eq!(
+            restored.inventory_level("SKU-001", "owner-a"),
+            380,
+            "SKU-001/owner-a level must be 500 - 120 = 380 after restore"
+        );
+        assert_eq!(
+            restored.inventory_level("SKU-002", "owner-b"),
+            200,
+            "SKU-002/owner-b level must be 200 after restore"
+        );
+        // A product/owner that was never updated must still read as 0.
+        assert_eq!(
+            restored.inventory_level("SKU-999", "owner-x"),
+            0,
+            "unknown product/owner must read as 0"
+        );
+    }
+
+    /// After firing a trigger, the fire count must survive a
+    /// serialize → restore round-trip, ensuring that IDs generated after a
+    /// node restart never collide with IDs generated before it.
+    #[test]
+    fn test_snapshot_preserves_fire_counts() {
+        let mut svc = WatcherService::new();
+        svc.add_trigger(make_trigger("t-count", "SKU-COUNT", "owner-1", 100, 50));
+
+        // Fire the trigger once.
+        let orders = svc.on_inventory_update(&inv_update("SKU-COUNT", "owner-1", 50));
+        assert_eq!(orders.len(), 1, "trigger must fire on first update");
+
+        // Snapshot, then restore into a fresh service.
+        let bytes = svc.serialize_state().expect("serialize must succeed");
+        let mut restored = WatcherService::new();
+        restored
+            .restore_from_bytes(&bytes)
+            .expect("restore must succeed");
+
+        // The fire count for "t-count" must be ≥ 1 in the restored instance.
+        let snapshot = restored.to_snapshot();
+        let count = snapshot
+            .trigger_fire_counts
+            .get("t-count")
+            .copied()
+            .unwrap_or(0);
+        assert!(
+            count >= 1,
+            "restored fire count for 't-count' must be >= 1, got {count}"
+        );
+
+        // Re-register the trigger in the restored watcher and fire it again.
+        // The new transaction ID must differ from the one before the snapshot.
+        restored.add_trigger(make_trigger("t-count", "SKU-COUNT", "owner-1", 100, 50));
+        // Restock so inventory rises above threshold, then drain again.
+        restored.on_inventory_update(&inv_update("SKU-COUNT", "owner-1", 200));
+        let orders2 = restored.on_inventory_update(&inv_update("SKU-COUNT", "owner-1", -200));
+        assert_eq!(orders2.len(), 1, "trigger must fire again after restore");
+
+        assert_ne!(
+            orders[0].id, orders2[0].id,
+            "tx IDs generated across a snapshot boundary must be unique"
         );
     }
 }
