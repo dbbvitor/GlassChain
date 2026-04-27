@@ -111,7 +111,7 @@ quit | exit
 Proto path: `crates/glasschain-rpc/proto/glasschain/v1/glasschain.proto`  
 Package: `glasschain.v1`
 
-The `glasschain-rpc` crate exposes the current gRPC server implementation, but the `glasschain-node` CLI binary does **not** start that server automatically yet. Today, the node binary provides the interactive REPL and P2P networking layer; gRPC serving must be wired in by an embedding binary or integration.
+The `glasschain-rpc` crate exposes the current gRPC server implementation. The `glasschain-node` CLI binary does **not** start that server by default, but it can start `GlasschainServer` when `--rpc-addr` is provided. Without `--rpc-addr`, the node binary runs the interactive REPL and P2P networking layer only.
 
 - `LedgerService`
   - `GetBlock`
