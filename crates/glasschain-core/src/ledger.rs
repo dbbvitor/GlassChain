@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 /// Default Proof-of-Work difficulty (number of leading zero characters required).
 pub const DEFAULT_DIFFICULTY: usize = 2;
 
-/// The GlassChain distributed ledger.
+/// The `GlassChain` distributed ledger.
 ///
 /// Maintains a validated chain of [`Block`]s and a pool of pending
 /// [`Transaction`]s waiting to be committed in the next block.
@@ -16,7 +16,7 @@ pub struct Ledger {
     pub chain: Vec<Block>,
     /// Transactions received but not yet committed to a block.
     pub pending_transactions: Vec<Transaction>,
-    /// PoW difficulty used when mining new blocks.
+    /// `PoW` difficulty used when mining new blocks.
     pub difficulty: usize,
 }
 
@@ -28,8 +28,23 @@ impl Default for Ledger {
 
 impl Ledger {
     /// Create a new ledger, automatically mining the genesis block.
+    ///
+    /// The genesis block uses a **fixed timestamp of `0`** so that every node
+    /// with the same `PoW` difficulty produces an identical genesis hash.  This
+    /// is required for `try_replace_chain` to accept chains from peers that
+    /// were started at different wall-clock times.
+    #[must_use]
     pub fn new(difficulty: usize) -> Self {
-        let mut genesis = Block::new(0, vec![], "0".to_owned());
+        // Build genesis directly with timestamp=0 (canonical, fixed).
+        let mut genesis = Block {
+            index: 0,
+            timestamp: 0,
+            transactions: Vec::new(),
+            previous_hash: "0".to_owned(),
+            nonce: 0,
+            hash: String::new(),
+        };
+        genesis.hash = genesis.calculate_hash();
         genesis.mine(difficulty);
         Self {
             chain: vec![genesis],
@@ -42,6 +57,9 @@ impl Ledger {
     ///
     /// Transactions must have a non-empty `id`; duplicate IDs are silently
     /// ignored to provide idempotency across federated nodes.
+    ///
+    /// # Errors
+    /// Returns `Err(CoreError::InvalidTransaction)` if `tx.id` is empty.
     pub fn add_transaction(&mut self, tx: Transaction) -> Result<(), CoreError> {
         if tx.id.is_empty() {
             return Err(CoreError::InvalidTransaction(
@@ -64,20 +82,22 @@ impl Ledger {
     /// Mine a new block containing all pending transactions.
     ///
     /// Returns the newly mined block (already appended to the chain).
-    /// Returns `Err(CoreError::EmptyLedger)` if the chain is somehow empty.
     ///
     /// **Note:** this method holds no external lock – callers that need to avoid
     /// blocking an async task's mutex should use [`prepare_mining`] /
     /// [`commit_mined_block`] instead.
+    ///
+    /// # Errors
+    /// Returns `Err(CoreError::EmptyLedger)` if the chain is somehow empty.
+    ///
+    /// # Panics
+    /// Panics if the newly pushed block cannot be retrieved from the chain,
+    /// which should never happen in practice.
     pub fn mine_pending_transactions(&mut self) -> Result<&Block, CoreError> {
-        let previous = self
-            .chain
-            .last()
-            .ok_or(CoreError::EmptyLedger)?
-            .clone();
+        let previous = self.chain.last().ok_or(CoreError::EmptyLedger)?.clone();
         let index = previous.index + 1;
         let transactions = std::mem::take(&mut self.pending_transactions);
-        let mut block = Block::new(index, transactions, previous.hash.clone());
+        let mut block = Block::new(index, transactions, previous.hash);
         block.mine(self.difficulty);
         self.chain.push(block);
         Ok(self.chain.last().expect("just pushed"))
@@ -90,12 +110,13 @@ impl Ledger {
     /// commit the mined block via [`commit_mined_block`] (which also handles
     /// restoring transactions on a stale tip) or push the transactions back
     /// manually.
-    pub fn prepare_mining(
-        &mut self,
-    ) -> Result<(u64, String, Vec<Transaction>, usize), CoreError> {
+    ///
+    /// # Errors
+    /// Returns `Err(CoreError::EmptyLedger)` if the chain is empty.
+    pub fn prepare_mining(&mut self) -> Result<(u64, String, Vec<Transaction>, usize), CoreError> {
         let prev = self.chain.last().ok_or(CoreError::EmptyLedger)?.clone();
         let txns = std::mem::take(&mut self.pending_transactions);
-        Ok((prev.index + 1, prev.hash.clone(), txns, self.difficulty))
+        Ok((prev.index + 1, prev.hash, txns, self.difficulty))
     }
 
     /// Append a pre-mined block if `expected_prev_hash` still matches the chain tip.
@@ -103,6 +124,10 @@ impl Ledger {
     /// Returns `true` when the block was appended.  If the chain tip advanced
     /// while mining (a race), the block's transactions are restored to the
     /// pending pool and `false` is returned so the caller can retry.
+    ///
+    /// # Errors
+    /// Returns `Err(CoreError::EmptyLedger)` if the chain is empty when
+    /// checking the current tip hash.
     pub fn commit_mined_block(
         &mut self,
         block: Block,
@@ -127,6 +152,7 @@ impl Ledger {
     }
 
     /// Return a reference to the most recently committed block.
+    #[must_use]
     pub fn latest_block(&self) -> Option<&Block> {
         self.chain.last()
     }
@@ -134,7 +160,12 @@ impl Ledger {
     /// Validate the entire chain from genesis to tip.
     ///
     /// Returns `Ok(())` if every block is internally valid, correctly
-    /// chains to its predecessor, and satisfies the configured PoW target.
+    /// chains to its predecessor, and satisfies the configured `PoW` target.
+    ///
+    /// # Errors
+    /// Returns `Err(CoreError::InvalidBlock)` if any block fails its internal
+    /// hash check, does not chain correctly to its predecessor, or does not
+    /// satisfy the configured Proof-of-Work difficulty target.
     pub fn validate_chain(&self) -> Result<(), CoreError> {
         for i in 1..self.chain.len() {
             let current = &self.chain[i];
@@ -169,6 +200,15 @@ impl Ledger {
         if candidate.len() <= self.chain.len() {
             return false;
         }
+
+        // Reject if genesis blocks differ.
+        if let (Some(local_genesis), Some(cand_genesis)) = (self.chain.first(), candidate.first()) {
+            if local_genesis.hash != cand_genesis.hash {
+                log::warn!("Rejecting candidate chain: genesis hash mismatch");
+                return false;
+            }
+        }
+
         // Validate candidate from scratch (hash integrity + PoW).
         for i in 1..candidate.len() {
             if candidate[i].chains_to(&candidate[i - 1]).is_err() {
@@ -221,7 +261,13 @@ mod tests {
         InventoryUpdate, PurchaseOrder, SupplyOffer, Transaction, TransactionKind,
     };
 
-    fn supply_offer_tx(seller: &str, product: &str, qty: u64, price: f64, lead: u32) -> Transaction {
+    fn supply_offer_tx(
+        seller: &str,
+        product: &str,
+        qty: u64,
+        price: u64,
+        lead: u32,
+    ) -> Transaction {
         Transaction::new(TransactionKind::SupplyOffer(SupplyOffer {
             product_id: product.into(),
             product_name: "Widget".into(),
@@ -288,6 +334,10 @@ mod tests {
         let mut ledger_a = Ledger::new(1);
         let mut ledger_b = Ledger::new(1);
 
+        // Independently created ledgers with the same difficulty should share
+        // the same canonical genesis block (timestamp=0, deterministic hash).
+        assert_eq!(ledger_a.chain[0].hash, ledger_b.chain[0].hash);
+
         ledger_b.add_transaction(inventory_tx("node-x")).unwrap();
         ledger_b.mine_pending_transactions().unwrap();
         ledger_b.add_transaction(inventory_tx("node-y")).unwrap();
@@ -308,13 +358,37 @@ mod tests {
     }
 
     #[test]
+    fn test_try_replace_chain_different_genesis_rejected() {
+        let mut ledger_a = Ledger::new(1);
+
+        // Construct an independent genesis whose hash is guaranteed to differ
+        // from ledger_a's genesis by shifting the timestamp before re-mining.
+        let mut alt_genesis = Block::new(0, vec![], "0".to_owned());
+        alt_genesis.timestamp = alt_genesis.timestamp.wrapping_add(9_999_999);
+        alt_genesis.mine(1);
+
+        // Build two more blocks on top so the candidate chain is longer than
+        // ledger_a (which has only its own genesis block).
+        let mut b1 = Block::new(1, vec![], alt_genesis.hash.clone());
+        b1.mine(1);
+        let mut b2 = Block::new(2, vec![], b1.hash.clone());
+        b2.mine(1);
+
+        let candidate = vec![alt_genesis, b1, b2];
+
+        // The candidate is longer and internally valid, but its genesis hash
+        // does not match ledger_a's genesis — it must be rejected.
+        assert!(!ledger_a.try_replace_chain(candidate));
+    }
+
+    #[test]
     fn test_committed_supply_offers() {
         let mut ledger = Ledger::new(1);
         ledger
-            .add_transaction(supply_offer_tx("s1", "SKU-001", 100, 10.0, 5))
+            .add_transaction(supply_offer_tx("s1", "SKU-001", 100, 1000, 5))
             .unwrap();
         ledger
-            .add_transaction(supply_offer_tx("s2", "SKU-002", 200, 5.0, 3))
+            .add_transaction(supply_offer_tx("s2", "SKU-002", 200, 500, 3))
             .unwrap();
         ledger.mine_pending_transactions().unwrap();
 
@@ -330,7 +404,7 @@ mod tests {
             buyer_id: "buyer-1".into(),
             seller_id: "seller-1".into(),
             quantity: 50,
-            agreed_price_per_unit: 10.0,
+            agreed_price_per_unit: 1000,
             currency: "USD".into(),
             contract_id: None,
         }));

@@ -13,4 +13,12 @@ thiserror = "2.0"
 log = "0.4"
 
 [dev-dependencies]
-wat = "1.0"
+wat = "1.247"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "vm_throughput"
+harness = false
+
+[lints]
+workspace = true

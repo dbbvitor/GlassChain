@@ -1,6 +1,7 @@
 use sha2::{Digest, Sha256};
 
 /// Returns the hex-encoded SHA-256 digest of the supplied bytes.
+#[must_use] 
 pub fn sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);

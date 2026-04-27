@@ -1,0 +1,233 @@
+syntax = "proto3";
+
+package glasschain.v1;
+
+// ─── Ledger Service ────────────────────────────────────────────────────────
+// Primary interface for reading the chain and submitting transactions.
+
+service LedgerService {
+  // Retrieve a single block by its chain index.
+  rpc GetBlock(GetBlockRequest) returns (GetBlockResponse);
+
+  // Stream all blocks from `start_index` onwards (live stream).
+  rpc StreamBlocks(StreamBlocksRequest) returns (stream StreamBlocksResponse);
+
+  // Submit a signed or unsigned transaction to the pending pool.
+  rpc SubmitTransaction(SubmitTransactionRequest) returns (SubmitTransactionResponse);
+
+  // Return the full chain summary (length + tip hash).
+  rpc GetChainStatus(GetChainStatusRequest) returns (GetChainStatusResponse);
+
+  // Return complete history of asset registrations for a GTIN and/or serial.
+  rpc QueryAssetHistory(QueryAssetHistoryRequest) returns (QueryAssetHistoryResponse);
+
+  // Subscribe to live node events (tx accepted, block mined, etc.).
+  rpc SubscribeToEvents(SubscribeToEventsRequest) returns (stream SubscribeToEventsResponse);
+
+  // Return the full verifiable lineage for an asset.
+  rpc GetVerifiableLineage(GetVerifiableLineageRequest) returns (GetVerifiableLineageResponse);
+}
+
+// ─── Node Service ──────────────────────────────────────────────────────────
+// Administrative interface for node management and peer discovery.
+
+service NodeService {
+  // Return the node's identity and status.
+  rpc GetNodeStatus(GetNodeStatusRequest) returns (GetNodeStatusResponse);
+
+  // Return the list of known peer addresses.
+  rpc GetPeers(GetPeersRequest) returns (GetPeersResponse);
+
+  // Trigger manual block mining (dev / testing only).
+  rpc MineBlock(MineBlockRequest) returns (MineBlockResponse);
+}
+
+// ─── Identity Service ──────────────────────────────────────────────────────
+// Certificate exchange and endorsement verification for multi-organisation
+// trust.  Nodes call ExchangeCertificate during the handshake phase and
+// VerifyEndorsement before committing any proposal that requires quorum.
+
+service IdentityService {
+  // Exchange an organization's Root CA certificate for peer verification.
+  rpc ExchangeCertificate(ExchangeCertificateRequest) returns (ExchangeCertificateResponse);
+
+  // Verify an endorsement proposal against the current policy.
+  rpc VerifyEndorsement(VerifyEndorsementRequest) returns (VerifyEndorsementResponse);
+}
+
+// ─── Shared data messages ──────────────────────────────────────────────────
+
+// A transaction payload embedded inside a block or history response.
+message TransactionProto {
+  string id = 1;
+  uint64 timestamp = 2;
+  string kind = 3;
+  // Full JSON payload of the transaction (type-erased for protobuf compatibility).
+  string payload_json = 4;
+}
+
+// ─── LedgerService messages ────────────────────────────────────────────────
+
+message GetBlockRequest {
+  uint64 index = 1;
+}
+
+message GetBlockResponse {
+  uint64 index = 1;
+  string hash = 2;
+  string previous_hash = 3;
+  uint64 timestamp = 4;
+  uint64 nonce = 5;
+  repeated TransactionProto transactions = 6;
+}
+
+message StreamBlocksRequest {
+  uint64 start_index = 1;
+}
+
+message StreamBlocksResponse {
+  uint64 index = 1;
+  string hash = 2;
+  string previous_hash = 3;
+  uint64 timestamp = 4;
+  uint64 nonce = 5;
+  repeated TransactionProto transactions = 6;
+}
+
+message SubmitTransactionRequest {
+  // JSON-serialised glasschain_core::Transaction.
+  string transaction_json = 1;
+  // Optional: JSON-serialised glasschain_identity::SignedTransaction.
+  // When present, the node will verify the signature before accepting.
+  string signed_transaction_json = 2;
+}
+
+message SubmitTransactionResponse {
+  bool accepted = 1;
+  string transaction_id = 2;
+  string error = 3;
+}
+
+message GetChainStatusRequest {}
+
+message GetChainStatusResponse {
+  uint64 chain_length = 1;
+  string tip_hash = 2;
+  uint64 pending_transactions = 3;
+}
+
+message QueryAssetHistoryRequest {
+  string gtin = 1;
+  string serial_number = 2;
+}
+
+message QueryAssetHistoryResponse {
+  repeated TransactionProto transactions = 1;
+}
+
+message SubscribeToEventsRequest {}
+
+message SubscribeToEventsResponse {
+  uint64 timestamp = 1;
+  string event_type = 2;
+  string payload_json = 3;
+}
+
+// ─── NodeService messages ──────────────────────────────────────────────────
+
+message GetNodeStatusRequest {}
+
+message GetNodeStatusResponse {
+  string node_id = 1;
+  string listen_addr = 2;
+  string version = 3;
+  uint64 chain_length = 4;
+  uint64 peer_count = 5;
+}
+
+message GetPeersRequest {}
+
+message GetPeersResponse {
+  repeated string peer_addresses = 1;
+}
+
+message MineBlockRequest {}
+
+message MineBlockResponse {
+  bool success = 1;
+  uint64 block_index = 2;
+  string block_hash = 3;
+  string error = 4;
+}
+
+// ─── IdentityService messages ──────────────────────────────────────────────
+
+message ExchangeCertificateRequest {
+  // Human-readable organisation name (e.g. "fabricante-xyz").
+  string org_name = 1;
+  // PEM-encoded Root CA certificate for the organisation.
+  string root_ca_cert_pem = 2;
+  // Unique identifier of the node presenting the certificate.
+  string node_id = 3;
+}
+
+message ExchangeCertificateResponse {
+  // Whether the certificate was accepted by the receiving node.
+  bool accepted = 1;
+  // PEM-encoded node certificate issued in response (empty on rejection).
+  string node_cert_pem = 2;
+  // Human-readable error message when accepted = false.
+  string error = 3;
+}
+
+message VerifyEndorsementRequest {
+  // JSON-serialised endorsement proposal (type-erased for protobuf compatibility).
+  string proposal_json = 1;
+}
+
+message VerifyEndorsementResponse {
+  // Whether the proposal met the endorsement policy threshold.
+  bool approved = 1;
+  // Identifier of the proposal that was evaluated.
+  string proposal_id = 2;
+  // Number of distinct endorsers that signed the proposal.
+  uint32 endorser_count = 3;
+  // Human-readable rejection reason when approved = false.
+  string rejection_reason = 4;
+}
+
+// ─── Provenance messages ───────────────────────────────────────────────────
+
+message GetVerifiableLineageRequest {
+  // Composite asset identifier (e.g. "GTIN:07891234100016:SN:SN-001").
+  string asset_id = 1;
+}
+
+// Protobuf-compatible representation of a single custody transfer event.
+message CustodyEventProto {
+  // Composite asset identifier.
+  string asset_id = 1;
+  // Type of custody event (e.g. "manufacture", "dispatch", "receive").
+  string event_type = 2;
+  // Node/participant taking custody.
+  string custodian_id = 3;
+  // ID of the transaction that recorded this event.
+  string transaction_id = 4;
+  // Block index that committed this transaction.
+  uint64 block_index = 5;
+  // Unix timestamp of the transaction.
+  uint64 timestamp = 6;
+}
+
+message GetVerifiableLineageResponse {
+  // Composite asset identifier echoed from the request.
+  string asset_id = 1;
+  // Full ordered custody chain for the asset.
+  repeated CustodyEventProto custody_chain = 2;
+  // True if every custody event has a corresponding flat analytical record.
+  bool is_complete = 3;
+  // Average metadata trust score across all flat records (0.0 when none).
+  double trust_score_avg = 4;
+  // Total number of flat analytical records found for this asset.
+  uint32 total_records = 5;
+}

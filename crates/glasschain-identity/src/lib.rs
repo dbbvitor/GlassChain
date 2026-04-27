@@ -1,12 +1,12 @@
-//! Decentralized Identity and Membership Service Provider (MSP) for GlassChain.
+//! Decentralized Identity and Membership Service Provider (MSP) for `GlassChain`.
 //!
-//! This crate implements **Phase 2** of the GlassChain architecture plan:
+//! This crate implements **Phase 2** of the `GlassChain` architecture plan:
 //! a permissioned governance model where **organizations**, not just nodes,
 //! are the primary actors on the ledger.
 //!
 //! ## Design
 //!
-//! Every participant on the GlassChain network is identified by an
+//! Every participant on the `GlassChain` network is identified by an
 //! [`Identity`], which wraps an **ed25519 key pair** and an optional
 //! **X.509 certificate** issued by the organization's Root CA (via `rcgen`).
 //!
@@ -50,12 +50,19 @@
 //! assert!(signed.verify().is_ok());
 //! ```
 
+pub mod cert_verifier;
 pub mod channel;
+pub mod endorsement;
 pub mod error;
 pub mod identity;
 pub mod msp;
 
+pub use cert_verifier::{CertChainVerifier, CertVerificationError, VerificationLevel};
 pub use channel::{Channel, ChannelConfig};
+pub use endorsement::{
+    EndorsementEngine, EndorsementPolicy, EndorsementProposal, EndorsementResult,
+    EndorsementSignature,
+};
 pub use error::IdentityError;
 pub use identity::{Identity, SignedTransaction};
 pub use msp::Organization;

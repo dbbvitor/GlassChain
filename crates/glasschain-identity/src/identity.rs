@@ -1,9 +1,9 @@
 //! Ed25519 identity and signed-transaction wrappers.
 
 use crate::error::IdentityError;
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey, Verifier};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use glasschain_core::Transaction;
-use rand::rngs::OsRng;
+use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 
 /// An on-ledger participant identity, consisting of an ed25519 key pair and a
@@ -22,6 +22,16 @@ pub struct Identity {
     pub certificate_pem: Option<String>,
 }
 
+impl Clone for Identity {
+    fn clone(&self) -> Self {
+        Self {
+            node_id: self.node_id.clone(),
+            signing_key: self.signing_key.clone(),
+            certificate_pem: self.certificate_pem.clone(),
+        }
+    }
+}
+
 impl Identity {
     /// Generate a fresh identity with a randomly-generated ed25519 key pair.
     pub fn generate(node_id: impl Into<String>) -> Self {
@@ -35,24 +45,53 @@ impl Identity {
     }
 
     /// Return the raw 32-byte public key.
+    #[must_use]
     pub fn public_key_bytes(&self) -> [u8; 32] {
         self.signing_key.verifying_key().to_bytes()
     }
 
     /// Return the hex-encoded public key string.
+    #[must_use]
     pub fn public_key_hex(&self) -> String {
         hex::encode(self.public_key_bytes())
     }
 
     /// Return the ed25519 [`VerifyingKey`] for signature verification.
+    #[must_use]
     pub fn verifying_key(&self) -> VerifyingKey {
         self.signing_key.verifying_key()
+    }
+
+    /// Produce an `rcgen::KeyPair` that wraps the **same** ed25519 private key
+    /// used for transaction signing.
+    ///
+    /// This allows the MSP and network layer to issue X.509 certificates whose
+    /// public key is identical to the key that signs on-ledger transactions,
+    /// unifying the two key systems.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(IdentityError::CertGen)` if the ed25519 private key cannot be
+    /// encoded to PKCS#8 DER format or if `rcgen` rejects the key material.
+    pub fn rcgen_key_pair(&self) -> Result<rcgen::KeyPair, crate::error::IdentityError> {
+        use ed25519_dalek::pkcs8::EncodePrivateKey;
+        let pkcs8_doc = self
+            .signing_key
+            .to_pkcs8_der()
+            .map_err(|e| crate::error::IdentityError::CertGen(e.to_string()))?;
+        rcgen::KeyPair::try_from(pkcs8_doc.as_bytes())
+            .map_err(|e| crate::error::IdentityError::CertGen(e.to_string()))
     }
 
     /// Sign a transaction and wrap it in a [`SignedTransaction`].
     ///
     /// The signature covers the canonical JSON serialisation of the
     /// transaction (same bytes as used in the block hash computation).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(IdentityError::Serialization)` if the transaction cannot be
+    /// serialised to canonical JSON.
     pub fn sign_transaction(&self, tx: Transaction) -> Result<SignedTransaction, IdentityError> {
         let canonical = serde_json::to_vec(&tx)?;
         let signature = self.signing_key.sign(&canonical);
@@ -86,6 +125,13 @@ impl SignedTransaction {
     /// Verify the embedded signature against the transaction payload.
     ///
     /// Returns `Ok(())` when the signature is valid.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(IdentityError::InvalidPublicKey)` if the stored public key bytes
+    /// cannot be parsed as a valid ed25519 verifying key, or
+    /// `Err(IdentityError::VerificationFailed)` if the signature bytes are malformed
+    /// or do not match the transaction payload.
     pub fn verify(&self) -> Result<(), IdentityError> {
         let key_bytes: [u8; 32] = self
             .signer_public_key

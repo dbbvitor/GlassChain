@@ -43,7 +43,7 @@ pub struct IndexedTransaction {
 
 /// Abstraction over the analytical storage backend.
 ///
-/// ## Implementing a PostgreSQL adapter (SQLx)
+/// ## Implementing a `PostgreSQL` adapter (`SQLx`)
 /// ```rust,ignore
 /// use sqlx::PgPool;
 /// struct PgIndexer { pool: PgPool }
@@ -58,18 +58,41 @@ pub struct IndexedTransaction {
 /// ```
 pub trait IndexerProvider: Send + Sync {
     /// Index all transactions in a block.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexerError`] if serialization fails or the storage backend errors.
     fn index_block(&self, block: &Block) -> Result<(), IndexerError>;
 
     /// Retrieve an indexed block summary by its chain index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexerError`] if the storage backend errors.
     fn get_block(&self, index: u64) -> Result<Option<IndexedBlock>, IndexerError>;
 
     /// Retrieve an indexed transaction by its ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexerError`] if the storage backend errors.
     fn get_transaction(&self, id: &str) -> Result<Option<IndexedTransaction>, IndexerError>;
 
     /// Return all transaction records for a given block.
-    fn transactions_in_block(&self, block_index: u64) -> Result<Vec<IndexedTransaction>, IndexerError>;
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexerError`] if the storage backend errors.
+    fn transactions_in_block(
+        &self,
+        block_index: u64,
+    ) -> Result<Vec<IndexedTransaction>, IndexerError>;
 
     /// Return the total number of indexed blocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexerError`] if the storage backend errors.
     fn block_count(&self) -> Result<u64, IndexerError>;
 
     /// Human-readable name for this indexer backend.
@@ -89,19 +112,32 @@ pub enum IndexerError {
 ///
 /// This implementation is suitable for testing, development, and single-node
 /// deployments where persistence is handled by the Sled storage layer.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InMemoryIndexer {
     blocks: RwLock<HashMap<u64, IndexedBlock>>,
     transactions: RwLock<HashMap<String, IndexedTransaction>>,
+    /// Secondary index: block index → list of transaction IDs.
+    block_tx_ids: RwLock<HashMap<u64, Vec<String>>>,
 }
 
 impl InMemoryIndexer {
+    #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            blocks: RwLock::new(HashMap::new()),
+            transactions: RwLock::new(HashMap::new()),
+            block_tx_ids: RwLock::new(HashMap::new()),
+        }
     }
 }
 
-fn kind_name(tx: &Transaction) -> &'static str {
+impl Default for InMemoryIndexer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+const fn kind_name(tx: &Transaction) -> &'static str {
     match &tx.kind {
         glasschain_core::TransactionKind::SupplyOffer(_) => "SupplyOffer",
         glasschain_core::TransactionKind::PurchaseOrder(_) => "PurchaseOrder",
@@ -118,18 +154,26 @@ impl IndexerProvider for InMemoryIndexer {
         let block_index = block.index;
         self.blocks.write().unwrap().insert(block_index, ib);
 
-        let mut txns = self.transactions.write().unwrap();
-        for tx in &block.transactions {
-            txns.insert(
-                tx.id.clone(),
-                IndexedTransaction {
-                    id: tx.id.clone(),
-                    block_index,
-                    timestamp: tx.timestamp,
-                    kind: kind_name(tx).to_owned(),
-                    payload_json: serde_json::to_string(tx)?,
-                },
-            );
+        let tx_ids: Vec<String> = block.transactions.iter().map(|t| t.id.clone()).collect();
+        self.block_tx_ids
+            .write()
+            .unwrap()
+            .insert(block_index, tx_ids);
+
+        {
+            let mut txns = self.transactions.write().unwrap();
+            for tx in &block.transactions {
+                txns.insert(
+                    tx.id.clone(),
+                    IndexedTransaction {
+                        id: tx.id.clone(),
+                        block_index,
+                        timestamp: tx.timestamp,
+                        kind: kind_name(tx).to_owned(),
+                        payload_json: serde_json::to_string(tx)?,
+                    },
+                );
+            }
         }
         Ok(())
     }
@@ -142,22 +186,30 @@ impl IndexerProvider for InMemoryIndexer {
         Ok(self.transactions.read().unwrap().get(id).cloned())
     }
 
-    fn transactions_in_block(&self, block_index: u64) -> Result<Vec<IndexedTransaction>, IndexerError> {
-        Ok(self
-            .transactions
-            .read()
-            .unwrap()
-            .values()
-            .filter(|t| t.block_index == block_index)
-            .cloned()
-            .collect())
+    fn transactions_in_block(
+        &self,
+        block_index: u64,
+    ) -> Result<Vec<IndexedTransaction>, IndexerError> {
+        let result = {
+            let ids = self.block_tx_ids.read().unwrap();
+            let txns = self.transactions.read().unwrap();
+            ids.get(&block_index)
+                .map(|id_list| {
+                    id_list
+                        .iter()
+                        .filter_map(|id| txns.get(id).cloned())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Ok(result)
     }
 
     fn block_count(&self) -> Result<u64, IndexerError> {
         Ok(self.blocks.read().unwrap().len() as u64)
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "in-memory"
     }
 }
@@ -224,5 +276,26 @@ mod tests {
     fn test_missing_block_returns_none() {
         let indexer = InMemoryIndexer::new();
         assert!(indexer.get_block(99).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_transactions_in_block_unknown_returns_empty() {
+        let indexer = InMemoryIndexer::new();
+        let txns = indexer.transactions_in_block(42).unwrap();
+        assert!(txns.is_empty());
+    }
+
+    #[test]
+    fn test_transactions_in_block_multiple() {
+        let indexer = InMemoryIndexer::new();
+
+        let tx1 = sample_tx();
+        let tx2 = sample_tx();
+        let mut b = Block::new(2, vec![tx1, tx2], "prevhash".into());
+        b.mine(1);
+        indexer.index_block(&b).unwrap();
+
+        let txns = indexer.transactions_in_block(2).unwrap();
+        assert_eq!(txns.len(), 2);
     }
 }

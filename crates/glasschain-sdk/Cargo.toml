@@ -1,0 +1,23 @@
+[package]
+name = "glasschain-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "High-level Rust SDK for GlassChain — submit transactions and query the ledger in < 10 lines"
+
+[dependencies]
+glasschain-core = { path = "../glasschain-core" }
+glasschain-identity = { path = "../glasschain-identity" }
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
+prost = "0.14"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+log = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[lints]
+workspace = true

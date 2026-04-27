@@ -1,10 +1,42 @@
 use glasschain_core::{
-    InventoryUpdate, PurchaseConditions, PurchaseOrder, SmartContractDef, SupplyOffer, Transaction,
-    TraceableAsset, TraceableAssetRegistration, TransactionKind,
+    InventoryUpdate, PurchaseConditions, PurchaseOrder, SmartContractDef, SupplyOffer,
+    TraceableAsset, TraceableAssetRegistration, Transaction, TransactionKind,
 };
+use glasschain_identity::Organization;
 use glasschain_network::{Node, NodeEvent};
+use glasschain_storage::SledStorageProvider;
+use glasschain_vm::WasmExecutionProvider;
+use glasschain_rpc::GlasschainServer;
 use std::env;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
+
+/// Parse a decimal price string like "12.50" into minor currency units (cents).
+fn parse_price(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() || s.starts_with('-') {
+        return None;
+    }
+    let (whole, frac) = match s.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (s, ""),
+    };
+    if whole.is_empty() || !whole.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    if !frac.chars().all(|c| c.is_ascii_digit()) || frac.len() > 2 {
+        return None;
+    }
+    let units: u64 = whole.parse().ok()?;
+    let frac_units: u64 = match frac.len() {
+        0 => 0,
+        1 => frac.parse::<u64>().ok()? * 10,
+        2 => frac.parse::<u64>().ok()?,
+        _ => return None,
+    };
+    units.checked_mul(100)?.checked_add(frac_units)
+}
 
 /// Print usage information.
 fn usage() {
@@ -19,10 +51,17 @@ OPTIONS:
     --listen <ADDR>         Listen address (default: "0.0.0.0:8000")
     --peer <ADDR>           Seed peer address (repeatable)
     --difficulty <N>        PoW difficulty – number of leading zeros (default: 2)
+    --storage-path <PATH>   Directory for persistent Sled block storage (optional).
+                            When provided, the chain is reloaded from disk on restart.
+    --org <NAME>            Organization name for issuing an identity-backed TLS certificate.
+    --identity-node-id <ID> Node ID to embed in the issued TLS identity certificate.
+                            Defaults to the value passed to --id.
+    --rpc-addr <ADDR>       Address to bind the gRPC server (e.g. "0.0.0.0:50051").
+                            When omitted, the gRPC server is not started.
     --help                  Show this help message
 
 INTERACTIVE COMMANDS (after startup):
-    supply <seller> <product> <qty> <price> <lead_days> <currency>
+    supply   <seller> <product_id> <product_name> <qty> <price> <lead_days> <currency>
         Post a supply offer to the ledger.
 
     order <buyer> <seller> <product> <qty> <price> <currency>
@@ -39,7 +78,10 @@ INTERACTIVE COMMANDS (after startup):
         Use "-" for any optional field to leave it empty.
 
     mine
-        Mine a block with all pending transactions.
+        Mine a block with all pending transactions and wait for completion.
+
+    mine-async
+        Start mining in the background and return immediately.
 
     chain
         Print the current chain summary.
@@ -49,6 +91,8 @@ INTERACTIVE COMMANDS (after startup):
 
     peers
         Print known peers.
+
+    contracts    List all registered smart contracts.
 
     quit / exit
         Shut down the node.
@@ -72,6 +116,10 @@ async fn main() {
     let mut listen_addr = "0.0.0.0:8000".to_owned();
     let mut seed_peers: Vec<String> = Vec::new();
     let mut difficulty = 2usize;
+    let mut storage_path: Option<String> = None;
+    let mut org_name: Option<String> = None;
+    let mut identity_node_id: Option<String> = None;
+    let mut rpc_addr: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -100,14 +148,116 @@ async fn main() {
                     difficulty = v.parse().unwrap_or(2);
                 }
             }
+            "--storage-path" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    storage_path = Some(v.clone());
+                }
+            }
+            "--org" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    org_name = Some(v.clone());
+                }
+            }
+            "--identity-node-id" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    identity_node_id = Some(v.clone());
+                }
+            }
+            "--rpc-addr" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    rpc_addr = Some(v.clone());
+                }
+            }
             _ => {}
         }
         i += 1;
     }
 
-    log::info!("Starting GlassChain node id={node_id}  listen={listen_addr}  difficulty={difficulty}");
+    log::info!(
+        "Starting GlassChain node id={node_id}  listen={listen_addr}  difficulty={difficulty}"
+    );
 
-    let node = Node::new(node_id.clone(), listen_addr.clone(), difficulty);
+    let identity = if let Some(ref org) = org_name {
+        let identity_name = identity_node_id.clone().unwrap_or_else(|| node_id.clone());
+        let mut organization = match Organization::new(org.clone()) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("Failed to create organization `{org}`: {e}");
+                std::process::exit(1);
+            }
+        };
+        let issued_identity = match organization.issue_identity(identity_name.clone()) {
+            Ok(v) => v.clone(),
+            Err(e) => {
+                log::error!(
+                    "Failed to issue identity `{identity_name}` from organization `{org}`: {e}"
+                );
+                std::process::exit(1);
+            }
+        };
+        log::info!(
+            "Using identity-backed TLS certificate for node `{}` issued by organization `{}`",
+            identity_name,
+            org
+        );
+        Some(Arc::new(issued_identity))
+    } else {
+        None
+    };
+
+    // Build the node — optionally backed by persistent Sled storage.
+    let node = if let Some(ref path) = storage_path {
+        log::info!("Using persistent storage at {path}");
+        match SledStorageProvider::open(path) {
+            Ok(storage) => {
+                if let Some(identity) = identity.clone() {
+                    Arc::new(Node::new_with_storage_and_identity(
+                        node_id.clone(),
+                        listen_addr.clone(),
+                        difficulty,
+                        Arc::new(storage),
+                        identity,
+                    ))
+                } else {
+                    Arc::new(Node::new_with_storage(
+                        node_id.clone(),
+                        listen_addr.clone(),
+                        difficulty,
+                        Arc::new(storage),
+                    ))
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to open storage at {path}: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else if let Some(identity) = identity {
+        Arc::new(Node::new_with_identity(
+            node_id.clone(),
+            listen_addr.clone(),
+            difficulty,
+            identity,
+        ))
+    } else {
+        Arc::new(Node::new(node_id.clone(), listen_addr.clone(), difficulty))
+    };
+
+    // Attach the WASM execution provider so contracts with wasm_code_b64 payloads
+    // are evaluated through the Wasmtime sandbox.
+    match WasmExecutionProvider::new() {
+        Ok(executor) => {
+            node.set_execution_provider(Arc::new(executor)).await;
+            log::info!("WASM execution provider enabled");
+        }
+        Err(e) => {
+            log::warn!("WASM execution provider unavailable: {e}");
+        }
+    }
 
     // Spawn event logger.
     let mut events = node.subscribe();
@@ -121,7 +271,10 @@ async fn main() {
                     log::info!("[event] Block mined: index={index} hash={}", &hash[..8]);
                 }
                 NodeEvent::BlockReceived { index, hash } => {
-                    log::info!("[event] Block received from peer: index={index} hash={}", &hash[..8]);
+                    log::info!(
+                        "[event] Block received from peer: index={index} hash={}",
+                        &hash[..8]
+                    );
                 }
                 NodeEvent::PeerConnected(addr) => {
                     log::info!("[event] Peer connected: {addr}");
@@ -133,8 +286,14 @@ async fn main() {
                     contract_id,
                     quantity,
                 } => {
+                    log::info!("[event] Contract {contract_id} auto-executed, qty={quantity}");
+                }
+                NodeEvent::AutonomousTransactionGenerated {
+                    trigger_id,
+                    transaction_id,
+                } => {
                     log::info!(
-                        "[event] Contract {contract_id} auto-executed, qty={quantity}"
+                        "[event] Watcher trigger {trigger_id} generated tx={transaction_id}"
                     );
                 }
             }
@@ -144,6 +303,25 @@ async fn main() {
     if let Err(e) = node.start(seed_peers).await {
         log::error!("Failed to start node: {e}");
         std::process::exit(1);
+    }
+
+    // ── Optional gRPC server ───────────────────────────────────────────────
+    if let Some(ref addr_str) = rpc_addr {
+        let rpc_node = Arc::clone(&node);
+        match addr_str.parse::<SocketAddr>() {
+            Ok(addr) => {
+                let server = GlasschainServer::new(rpc_node);
+                tokio::spawn(async move {
+                    if let Err(e) = server.serve(addr).await {
+                        log::error!("gRPC server error: {e}");
+                    }
+                });
+                log::info!("gRPC server started on {addr}");
+            }
+            Err(e) => {
+                log::warn!("Invalid --rpc-addr {addr_str:?}: {e} — gRPC server not started");
+            }
+        }
     }
 
     println!("GlassChain node `{node_id}` is running on {listen_addr}");
@@ -164,7 +342,7 @@ async fn main() {
             break; // EOF
         }
 
-        let parts: Vec<&str> = line.trim().split_whitespace().collect();
+        let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.is_empty() {
             continue;
         }
@@ -175,33 +353,39 @@ async fn main() {
             }
 
             "supply" => {
-                if parts.len() < 7 {
-                    eprintln!("Usage: supply <seller> <product> <qty> <price> <lead_days> <currency>");
+                if parts.len() < 8 {
+                    eprintln!("Usage: supply <seller> <product_id> <product_name> <qty> <price> <lead_days> <currency>");
                     continue;
                 }
-                let qty: u64 = match parts[3].parse() {
-                    Ok(v) => v,
-                    Err(_) => { eprintln!("Invalid quantity"); continue; }
+                let qty: u64 = if let Ok(v) = parts[4].parse() {
+                    v
+                } else {
+                    eprintln!("Invalid quantity");
+                    continue;
                 };
-                let price: f64 = match parts[4].parse() {
-                    Ok(v) => v,
-                    Err(_) => { eprintln!("Invalid price"); continue; }
+                let price: u64 = if let Some(v) = parse_price(parts[5]) {
+                    v
+                } else {
+                    eprintln!("Invalid price (use decimal like 12.50)");
+                    continue;
                 };
-                let lead: u32 = match parts[5].parse() {
-                    Ok(v) => v,
-                    Err(_) => { eprintln!("Invalid lead_days"); continue; }
+                let lead: u32 = if let Ok(v) = parts[6].parse() {
+                    v
+                } else {
+                    eprintln!("Invalid lead_days");
+                    continue;
                 };
                 let tx = Transaction::new(TransactionKind::SupplyOffer(SupplyOffer {
                     product_id: parts[2].to_owned(),
-                    product_name: parts[2].to_owned(),
+                    product_name: parts[3].to_owned(),
                     seller_id: parts[1].to_owned(),
                     quantity_available: qty,
                     price_per_unit: price,
                     lead_time_days: lead,
-                    currency: parts[6].to_owned(),
+                    currency: parts[7].to_owned(),
                 }));
                 match node.submit_transaction(tx).await {
-                    Ok(_) => println!("Supply offer submitted."),
+                    Ok(()) => println!("Supply offer submitted."),
                     Err(e) => eprintln!("Error: {e}"),
                 }
             }
@@ -211,13 +395,17 @@ async fn main() {
                     eprintln!("Usage: order <buyer> <seller> <product> <qty> <price> <currency>");
                     continue;
                 }
-                let qty: u64 = match parts[4].parse() {
-                    Ok(v) => v,
-                    Err(_) => { eprintln!("Invalid quantity"); continue; }
+                let qty: u64 = if let Ok(v) = parts[4].parse() {
+                    v
+                } else {
+                    eprintln!("Invalid quantity");
+                    continue;
                 };
-                let price: f64 = match parts[5].parse() {
-                    Ok(v) => v,
-                    Err(_) => { eprintln!("Invalid price"); continue; }
+                let price: u64 = if let Some(v) = parse_price(parts[5]) {
+                    v
+                } else {
+                    eprintln!("Invalid price");
+                    continue;
                 };
                 let tx = Transaction::new(TransactionKind::PurchaseOrder(PurchaseOrder {
                     product_id: parts[3].to_owned(),
@@ -229,7 +417,7 @@ async fn main() {
                     contract_id: None,
                 }));
                 match node.submit_transaction(tx).await {
-                    Ok(_) => println!("Purchase order submitted."),
+                    Ok(()) => println!("Purchase order submitted."),
                     Err(e) => eprintln!("Error: {e}"),
                 }
             }
@@ -241,21 +429,29 @@ async fn main() {
                     );
                     continue;
                 }
-                let max_price: f64 = match parts[4].parse() {
-                    Ok(v) => v,
-                    Err(_) => { eprintln!("Invalid max_price"); continue; }
+                let max_price: u64 = if let Some(v) = parse_price(parts[4]) {
+                    v
+                } else {
+                    eprintln!("Invalid max_price");
+                    continue;
                 };
-                let min_qty: u64 = match parts[5].parse() {
-                    Ok(v) => v,
-                    Err(_) => { eprintln!("Invalid min_qty"); continue; }
+                let min_qty: u64 = if let Ok(v) = parts[5].parse() {
+                    v
+                } else {
+                    eprintln!("Invalid min_qty");
+                    continue;
                 };
-                let max_qty: u64 = match parts[6].parse() {
-                    Ok(v) => v,
-                    Err(_) => { eprintln!("Invalid max_qty"); continue; }
+                let max_qty: u64 = if let Ok(v) = parts[6].parse() {
+                    v
+                } else {
+                    eprintln!("Invalid max_qty");
+                    continue;
                 };
-                let max_lead: u32 = match parts[7].parse() {
-                    Ok(v) => v,
-                    Err(_) => { eprintln!("Invalid max_lead"); continue; }
+                let max_lead: u32 = if let Ok(v) = parts[7].parse() {
+                    v
+                } else {
+                    eprintln!("Invalid max_lead");
+                    continue;
                 };
                 let tx = Transaction::new(TransactionKind::ContractCreation(SmartContractDef {
                     contract_id: parts[1].to_owned(),
@@ -270,9 +466,10 @@ async fn main() {
                         currency: parts[8].to_owned(),
                         auto_execute: true,
                     },
+                    wasm_code_b64: None,
                 }));
                 match node.submit_transaction(tx).await {
-                    Ok(_) => println!("Smart contract created."),
+                    Ok(()) => println!("Smart contract created."),
                     Err(e) => eprintln!("Error: {e}"),
                 }
             }
@@ -282,9 +479,11 @@ async fn main() {
                     eprintln!("Usage: inventory <owner> <product> <delta> <reason>");
                     continue;
                 }
-                let delta: i64 = match parts[3].parse() {
-                    Ok(v) => v,
-                    Err(_) => { eprintln!("Invalid delta"); continue; }
+                let delta: i64 = if let Ok(v) = parts[3].parse() {
+                    v
+                } else {
+                    eprintln!("Invalid delta");
+                    continue;
                 };
                 let reason = parts[4..].join(" ");
                 let tx = Transaction::new(TransactionKind::InventoryUpdate(InventoryUpdate {
@@ -294,7 +493,7 @@ async fn main() {
                     reason,
                 }));
                 match node.submit_transaction(tx).await {
-                    Ok(_) => println!("Inventory update submitted."),
+                    Ok(()) => println!("Inventory update submitted."),
                     Err(e) => eprintln!("Error: {e}"),
                 }
             }
@@ -306,9 +505,11 @@ async fn main() {
                     );
                     continue;
                 }
-                let qty: u64 = match parts[7].parse() {
-                    Ok(v) => v,
-                    Err(_) => { eprintln!("Invalid qty"); continue; }
+                let qty: u64 = if let Ok(v) = parts[7].parse() {
+                    v
+                } else {
+                    eprintln!("Invalid qty");
+                    continue;
                 };
                 let opt = |s: &str| if s == "-" { None } else { Some(s.to_owned()) };
                 let asset = TraceableAsset {
@@ -339,16 +540,25 @@ async fn main() {
                     },
                 ));
                 match node.submit_transaction(tx).await {
-                    Ok(_) => println!("Asset registration submitted."),
+                    Ok(()) => println!("Asset registration submitted."),
                     Err(e) => eprintln!("Error: {e}"),
                 }
             }
 
-            "mine" => {
-                match node.mine().await {
-                    Ok(_) => println!("Block mined."),
-                    Err(e) => eprintln!("Error: {e}"),
-                }
+            "mine" => match node.mine().await {
+                Ok(()) => println!("Block mined."),
+                Err(e) => eprintln!("Error mining: {e}"),
+            },
+
+            "mine-async" => {
+                let node_ref = Arc::clone(&node);
+                tokio::spawn(async move {
+                    match node_ref.mine_async().await {
+                        Ok(()) => println!("Block mined."),
+                        Err(e) => eprintln!("Error mining: {e}"),
+                    }
+                });
+                println!("Mining started in the background…");
             }
 
             "chain" => {
@@ -367,7 +577,10 @@ async fn main() {
 
             "pending" => {
                 let ledger = node.ledger_snapshot().await;
-                println!("Pending transactions: {}", ledger.pending_transactions.len());
+                println!(
+                    "Pending transactions: {}",
+                    ledger.pending_transactions.len()
+                );
                 for tx in &ledger.pending_transactions {
                     let kind = match &tx.kind {
                         TransactionKind::SupplyOffer(_) => "SupplyOffer",
@@ -389,6 +602,26 @@ async fn main() {
                     println!("Known peers ({}):", peers.len());
                     for p in peers {
                         println!("  {p}");
+                    }
+                }
+            }
+
+            "contracts" => {
+                let summaries = node.contract_summaries().await;
+                if summaries.is_empty() {
+                    println!("No contracts registered.");
+                } else {
+                    println!("Contracts ({}):", summaries.len());
+                    for s in &summaries {
+                        println!(
+                            "  [{}] buyer={} product={} status={} purchased={}/{}",
+                            s.id,
+                            s.buyer_id,
+                            s.product_id,
+                            s.status,
+                            s.quantity_purchased,
+                            s.max_quantity
+                        );
                     }
                 }
             }

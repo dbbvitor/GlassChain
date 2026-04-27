@@ -1,0 +1,92 @@
+# GlassChain — Clippy configuration
+# https://doc.rust-lang.org/clippy/configuration.html
+#
+# Picked up automatically by `cargo clippy`; applies to every crate in the
+# workspace.  The [workspace.lints.clippy] table in Cargo.toml activates all
+# four lint groups (all, pedantic, nursery, cargo) at warn level.  This file
+# configures the numeric thresholds and boolean toggles that control how strict
+# each individual lint is.
+
+# ── Toolchain ─────────────────────────────────────────────────────────────────
+
+# Minimum Supported Rust Version.  Clippy uses this to suppress suggestions
+# that rely on APIs or language features not available before this release.
+msrv = "1.95.0"
+
+# ── Function / type size limits ───────────────────────────────────────────────
+
+# Maximum number of lines allowed in a single function body before
+# clippy::too_many_lines fires.  100 is the pedantic default.
+too-many-lines-threshold = 100
+
+# Maximum number of parameters a function may have before
+# clippy::too_many_arguments fires.  7 is the pedantic default.
+too-many-arguments-threshold = 7
+
+# Maximum cyclomatic / cognitive complexity score before
+# clippy::cognitive_complexity fires.
+cognitive-complexity-threshold = 25
+
+# Maximum number of `bool` fields allowed in a struct before
+# clippy::struct_excessive_bools fires.
+max-struct-bools = 3
+
+# Maximum number of `bool` parameters allowed in a function before
+# clippy::fn_params_excessive_bools fires.
+max-fn-params-bools = 3
+
+# Minimum character count for a binding name below which
+# clippy::min_ident_chars fires (e.g., single-letter names like `x`).
+# 2 allows two-letter names such as `id`, `tx`, `rx` which are idiomatic.
+min-ident-chars-threshold = 2
+
+# ── Copy / pass-by-value thresholds ───────────────────────────────────────────
+
+# Types at or below this byte size are flagged as "trivially copyable" by
+# clippy::trivially_copy_pass_by_ref, suggesting they be passed by value.
+trivial-copy-size-limit = 8
+
+# Types larger than this byte size are flagged by clippy::large_types_passed_by_value,
+# suggesting they be passed by reference.
+pass-by-value-size-limit = 256
+
+# Enum variants larger than this number of bytes trigger the suggestion to box
+# the large variant (clippy::large_enum_variant).
+enum-variant-size-threshold = 200
+
+# ── Numeric literal formatting ────────────────────────────────────────────────
+
+# Enforce `_` separators in numeric literals above this value for readability
+# (e.g. 1_000_000 rather than 1000000).
+literal-representation-threshold = 10000
+
+# ── Nesting ───────────────────────────────────────────────────────────────────
+
+# Maximum block nesting depth before clippy::excessive_nesting fires.
+excessive-nesting-threshold = 10
+
+# ── Test helpers ──────────────────────────────────────────────────────────────
+
+# Allow .expect() inside #[test] functions.  Test panics produce clear failure
+# messages and avoiding .expect() in tests hurts readability with no benefit.
+allow-expect-in-tests = true
+
+# Allow .unwrap() inside #[test] functions for the same reason.
+allow-unwrap-in-tests = true
+
+# Allow panic!() inside #[test] functions.
+allow-panic-in-tests = true
+
+# Allow dbg!() inside #[test] functions.
+allow-dbg-in-tests = true
+
+# Allow print!/println! inside #[test] functions.
+allow-print-in-tests = true
+
+# ── API design ────────────────────────────────────────────────────────────────
+
+# When true, Clippy suppresses suggestions that would change the signature of
+# publicly exported items (to avoid breaking downstream users).  Set to false
+# so the full picture is visible even for public APIs — we want to know about
+# every improvement opportunity and can choose when to act on it.
+avoid-breaking-exported-api = false

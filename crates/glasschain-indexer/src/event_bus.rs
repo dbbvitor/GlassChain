@@ -73,13 +73,23 @@ pub enum EventBusError {
 
 /// Abstraction over a message broker / event streaming system.
 ///
-/// Implement this trait to route GlassChain events to Kafka, Redpanda,
-/// RabbitMQ, or any other message bus.
+/// Implement this trait to route `GlassChain` events to Kafka, Redpanda,
+/// `RabbitMQ`, or any other message bus.
 pub trait EventBusProvider: Send + Sync {
     /// Publish a single event to the bus.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`EventBusError`] if the event could not be serialized or
+    /// delivered to the underlying broker.
     fn publish(&self, event: IndexerEvent) -> Result<(), EventBusError>;
 
     /// Publish all transactions in a block to the bus.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`EventBusError`] if any per-transaction or block-level event
+    /// could not be serialized or delivered to the underlying broker.
     fn publish_block(&self, block: &Block) -> Result<(), EventBusError> {
         for tx in &block.transactions {
             let kind = match &tx.kind {
@@ -138,6 +148,7 @@ impl Default for InMemoryEventBus {
 
 impl InMemoryEventBus {
     /// Create a new in-memory bus with the given channel buffer capacity.
+    #[must_use]
     pub fn new(capacity: usize) -> Self {
         let (sender, _) = broadcast::channel(capacity);
         Self {
@@ -152,6 +163,10 @@ impl InMemoryEventBus {
     }
 
     /// Return a snapshot of all events published so far.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal event-log [`Mutex`] is poisoned.
     pub fn event_log(&self) -> Vec<IndexerEvent> {
         self.log.lock().unwrap().clone()
     }
@@ -165,7 +180,7 @@ impl EventBusProvider for InMemoryEventBus {
         Ok(())
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "in-memory"
     }
 }
