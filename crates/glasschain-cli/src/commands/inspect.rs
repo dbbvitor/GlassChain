@@ -57,10 +57,7 @@ pub async fn run(args: LedgerInspectArgs) -> anyhow::Result<()> {
         println!("  Action   : GetBlock");
         println!("  gRPC     : LedgerService.GetBlock {{ index: {index} }}");
         println!();
-        println!(
-            "  Would send GetBlock(index={index}) to {}",
-            args.endpoint,
-        );
+        println!("  Would send GetBlock(index={index}) to {}", args.endpoint,);
         log::info!(
             "ledger-inspect: would query GetBlock(index={index}) at {}",
             args.endpoint,
@@ -72,16 +69,14 @@ pub async fn run(args: LedgerInspectArgs) -> anyhow::Result<()> {
         if let Some(ref serial) = args.serial {
             println!("  Serial   : {serial}");
             println!(
-                "  gRPC     : LedgerService.QueryAssetHistory {{ gtin: \"{gtin}\", serial: \"{serial}\" }}"
+                "  gRPC     : LedgerService.QueryAssetHistory {{ gtin: \"{gtin}\", serial_number: \"{serial}\" }}"
             );
             log::info!(
-                "ledger-inspect: would query QueryAssetHistory(gtin={gtin}, serial={serial}) at {}",
+                "ledger-inspect: would query QueryAssetHistory(gtin={gtin}, serial_number={serial}) at {}",
                 args.endpoint,
             );
         } else {
-            println!(
-                "  gRPC     : LedgerService.QueryAssetHistory {{ gtin: \"{gtin}\" }}"
-            );
+            println!("  gRPC     : LedgerService.QueryAssetHistory {{ gtin: \"{gtin}\" }}");
             log::info!(
                 "ledger-inspect: would query QueryAssetHistory(gtin={gtin}) at {}",
                 args.endpoint,
@@ -97,10 +92,7 @@ pub async fn run(args: LedgerInspectArgs) -> anyhow::Result<()> {
         println!("  Action   : GetChainStatus");
         println!("  gRPC     : LedgerService.GetChainStatus {{}}");
         println!();
-        println!(
-            "  Would send GetChainStatus to {}",
-            args.endpoint,
-        );
+        println!("  Would send GetChainStatus to {}", args.endpoint,);
         log::info!(
             "ledger-inspect: would query GetChainStatus at {}",
             args.endpoint,

@@ -109,7 +109,7 @@ pub fn run(args: ContractDeployArgs) -> Result<()> {
         println!("Example (grpcurl):");
         println!(
             "  grpcurl -d '{{\"transaction_json\": ...}}' \
-             <NODE_HOST>:<NODE_PORT> glasschain.LedgerService/SubmitTransaction"
+             <NODE_HOST>:<NODE_PORT> glasschain.v1.LedgerService/SubmitTransaction"
         );
     }
 

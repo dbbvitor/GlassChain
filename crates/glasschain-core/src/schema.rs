@@ -199,6 +199,15 @@ pub fn validate_asset(asset: &TraceableAsset) -> SchemaValidationReport {
         opt.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
     }
 
+    // `expiry_date` is present-but-invalid when it is `Some(non-empty)` yet
+    // fails the ISO-8601 format check.  We track this separately so the
+    // violation message can say "invalid format" rather than "missing or empty",
+    // which would be misleading for a field the caller did supply a value for.
+    let expiry_date_present_but_invalid = asset
+        .expiry_date
+        .as_deref()
+        .is_some_and(|s| !s.is_empty() && !is_valid_iso8601_date(s));
+
     // Map every schema slot to its corresponding asset field value.
     // We evaluate all `is_present` calls up-front to avoid borrowing `asset`
     // inside the mutable closure below.
@@ -229,11 +238,18 @@ pub fn validate_asset(asset: &TraceableAsset) -> SchemaValidationReport {
                 } else {
                     (ViolationSeverity::Warning, "Recommended")
                 };
+                // For `expiry_date`, distinguish between "missing/empty" and
+                // "present but wrong format" so operators get an actionable message.
+                let problem = if field.name == "expiry_date" && expiry_date_present_but_invalid {
+                    "invalid format (expected YYYY-MM-DD)"
+                } else {
+                    "missing or empty"
+                };
                 violations.push(SchemaViolation {
                     field: field.name.to_owned(),
                     message: format!(
-                        "{} field '{}' is missing or empty. {}",
-                        prefix, field.name, field.description
+                        "{} field '{}' is {}. {}",
+                        prefix, field.name, problem, field.description
                     ),
                     severity,
                 });

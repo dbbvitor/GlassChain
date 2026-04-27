@@ -334,10 +334,9 @@ mod tests {
         let mut ledger_a = Ledger::new(1);
         let mut ledger_b = Ledger::new(1);
 
-        // Give ledger_b the same genesis as ledger_a so the genesis-equality
-        // check passes (both are created at the same instant; if they differ
-        // in practice we deliberately share the genesis block here).
-        ledger_b.chain[0] = ledger_a.chain[0].clone();
+        // Independently created ledgers with the same difficulty should share
+        // the same canonical genesis block (timestamp=0, deterministic hash).
+        assert_eq!(ledger_a.chain[0].hash, ledger_b.chain[0].hash);
 
         ledger_b.add_transaction(inventory_tx("node-x")).unwrap();
         ledger_b.mine_pending_transactions().unwrap();
