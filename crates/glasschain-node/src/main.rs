@@ -11,11 +11,28 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// Parse a decimal price string like "12.50" into minor currency units (cents).
 fn parse_price(s: &str) -> Option<u64> {
-    let f: f64 = s.parse().ok()?;
-    if f < 0.0 {
+    let s = s.trim();
+    if s.is_empty() || s.starts_with('-') {
         return None;
     }
-    Some((f * 100.0).round() as u64)
+    let (whole, frac) = match s.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (s, ""),
+    };
+    if whole.is_empty() || !whole.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    if !frac.chars().all(|c| c.is_ascii_digit()) || frac.len() > 2 {
+        return None;
+    }
+    let units: u64 = whole.parse().ok()?;
+    let frac_units: u64 = match frac.len() {
+        0 => 0,
+        1 => frac.parse::<u64>().ok()? * 10,
+        2 => frac.parse::<u64>().ok()?,
+        _ => return None,
+    };
+    units.checked_mul(100)?.checked_add(frac_units)
 }
 
 /// Print usage information.

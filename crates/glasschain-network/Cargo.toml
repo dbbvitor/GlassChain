@@ -20,5 +20,9 @@ rcgen = "0.14"
 [dev-dependencies]
 env_logger = "0.11"
 
+[features]
+default = []
+insecure-tls = []
+
 [lints]
 workspace = true

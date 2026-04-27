@@ -75,7 +75,7 @@ cargo run --release -p glasschain-node -- --id node-2 --listen 0.0.0.0:8001 --pe
 ## Interactive CLI Commands
 
 ```text
-supply   <seller> <product> <qty> <price> <lead_days> <currency>
+supply   <seller> <product_id> <product_name> <qty> <price> <lead_days> <currency>
 order    <buyer> <seller> <product> <qty> <price> <currency>
 contract <contract_id> <buyer> <product> <max_price> <min_qty> <max_qty> <max_lead> <currency>
 inventory <owner> <product> <delta> <reason>
@@ -93,7 +93,8 @@ quit | exit
 
 ## gRPC API (Current)
 
-Proto path: `crates/glasschain-rpc/proto/glasschain.proto`
+Proto path: `crates/glasschain-rpc/proto/glasschain/v1/glasschain.proto`  
+Package: `glasschain.v1`
 
 - `LedgerService`
   - `GetBlock`
@@ -138,7 +139,7 @@ Example contract condition payload:
 
 ```json
 {
-  "max_price_per_unit": 15.0,
+  "max_price_per_unit": 1500,
   "min_quantity": 100,
   "max_quantity": 500,
   "max_lead_time_days": 10,
@@ -147,6 +148,8 @@ Example contract condition payload:
   "auto_execute": true
 }
 ```
+
+`max_price_per_unit` uses minor currency units (e.g. `1500` = `$15.00`).
 
 ---
 

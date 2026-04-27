@@ -11,8 +11,6 @@ use tokio::net::TcpStream;
 /// via a boxed trait object so the same type can be used for both transports.
 pub struct PeerReader {
     stream: Box<dyn AsyncRead + Unpin + Send>,
-    /// Remote peer's node identifier (set after the `Hello` handshake).
-    pub peer_id: Option<String>,
     /// Remote peer's `"host:port"` address string.
     pub address: String,
 }
@@ -21,7 +19,6 @@ impl PeerReader {
     pub fn new(stream: impl AsyncRead + Unpin + Send + 'static, address: String) -> Self {
         Self {
             stream: Box::new(stream),
-            peer_id: None,
             address,
         }
     }

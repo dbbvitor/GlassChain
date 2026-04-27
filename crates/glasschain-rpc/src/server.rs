@@ -80,9 +80,6 @@ fn now_unix() -> u64 {
 #[derive(Clone)]
 struct ServerState {
     node: Arc<Node>,
-    /// Broadcast channel for RPC-specific events (separate from the node's
-    /// internal event channel so each subscriber gets all events).
-    event_tx: tokio::sync::broadcast::Sender<SubscribeToEventsResponse>,
 }
 
 // ── LedgerService implementation ──────────────────────────────────────────────
@@ -153,7 +150,11 @@ impl LedgerService for ServerState {
                         }
                     }
                     Ok(_) => {}
-                    Err(_) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        log::warn!("stream_blocks lagged; skipped {skipped} events");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
@@ -194,11 +195,6 @@ impl LedgerService for ServerState {
             let tx_id = signed.transaction.id.clone();
             return match self.node.submit_transaction(signed.transaction).await {
                 Ok(()) => {
-                    let _ = self.event_tx.send(SubscribeToEventsResponse {
-                        timestamp: now_unix(),
-                        event_type: "transaction_accepted".into(),
-                        payload_json: serde_json::json!({ "transaction_id": tx_id }).to_string(),
-                    });
                     Ok(Response::new(SubmitTransactionResponse {
                         accepted: true,
                         transaction_id: tx_id,
@@ -227,11 +223,6 @@ impl LedgerService for ServerState {
         let tx_id = tx.id.clone();
         match self.node.submit_transaction(tx).await {
             Ok(()) => {
-                let _ = self.event_tx.send(SubscribeToEventsResponse {
-                    timestamp: now_unix(),
-                    event_type: "transaction_accepted".into(),
-                    payload_json: serde_json::json!({ "transaction_id": tx_id }).to_string(),
-                });
                 Ok(Response::new(SubmitTransactionResponse {
                     accepted: true,
                     transaction_id: tx_id,
@@ -307,7 +298,15 @@ impl LedgerService for ServerState {
         let mut node_rx = self.node.subscribe();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         tokio::spawn(async move {
-            while let Ok(evt) = node_rx.recv().await {
+            loop {
+                let evt = match node_rx.recv().await {
+                    Ok(evt) => evt,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        log::warn!("subscribe_to_events lagged; skipped {skipped} events");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
                 let resp = match &evt {
                     NodeEvent::TransactionAccepted(t) => SubscribeToEventsResponse {
                         timestamp: now_unix(),
@@ -418,15 +417,6 @@ impl NodeService for ServerState {
                 let ledger = self.node.shared_ledger();
                 let ledger = ledger.lock().await;
                 if let Some(block) = ledger.chain.last() {
-                    let _ = self.event_tx.send(SubscribeToEventsResponse {
-                        timestamp: now_unix(),
-                        event_type: "block_mined".into(),
-                        payload_json: serde_json::json!({
-                            "block_index": block.index,
-                            "block_hash": block.hash
-                        })
-                        .to_string(),
-                    });
                     Ok(Response::new(MineBlockResponse {
                         success: true,
                         block_index: block.index,
@@ -487,11 +477,7 @@ impl GlasschainServer {
     /// }
     /// ```
     pub async fn serve(self, addr: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-        let (event_tx, _) = tokio::sync::broadcast::channel(1024);
-        let state = ServerState {
-            node: self.node,
-            event_tx,
-        };
+        let state = ServerState { node: self.node };
 
         log::info!("GlassChain gRPC server listening on {addr}");
 

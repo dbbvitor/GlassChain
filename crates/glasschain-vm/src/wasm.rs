@@ -47,6 +47,194 @@ impl WasmExecutionProvider {
             .map_err(|e| CoreError::Execution(format!("wasmtime engine: {e}")))?;
         Ok(Self { engine })
     }
+
+    fn build_linker(
+        &self,
+        host_state: &Arc<Mutex<HostState>>,
+    ) -> Result<Linker<Arc<Mutex<HostState>>>, CoreError> {
+        let mut linker: Linker<Arc<Mutex<HostState>>> = Linker::new(&self.engine);
+
+        linker
+            .func_wrap(
+                "env",
+                "set_state",
+                |mut caller: wasmtime::Caller<'_, Arc<Mutex<HostState>>>,
+                 key_ptr: i32,
+                 key_len: i32,
+                 val_ptr: i32,
+                 val_len: i32| {
+                    let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
+                        return;
+                    };
+                    let data = mem.data(&caller);
+                    let kp = usize::try_from(key_ptr).unwrap_or(usize::MAX);
+                    let kl = usize::try_from(key_len).unwrap_or(usize::MAX);
+                    let vp = usize::try_from(val_ptr).unwrap_or(usize::MAX);
+                    let vl = usize::try_from(val_len).unwrap_or(usize::MAX);
+                    if kp.checked_add(kl).is_none_or(|end| end > data.len())
+                        || vp.checked_add(vl).is_none_or(|end| end > data.len())
+                    {
+                        return;
+                    }
+                    let key = String::from_utf8_lossy(&data[kp..kp + kl]).to_string();
+                    let val = data[vp..vp + vl].to_vec();
+                    caller.data().lock().unwrap().mutations.push((key, val));
+                },
+            )
+            .map_err(|e| CoreError::Execution(format!("linker set_state: {e}")))?;
+
+        {
+            let hs_clone = Arc::clone(host_state);
+            linker
+                .func_wrap(
+                    "env",
+                    "get_state_len",
+                    move |mut caller: wasmtime::Caller<'_, Arc<Mutex<HostState>>>,
+                          key_ptr: i32,
+                          key_len: i32|
+                          -> i32 {
+                        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory")
+                        else {
+                            return -1;
+                        };
+                        let data = mem.data(&caller);
+                        let kp = usize::try_from(key_ptr).unwrap_or(usize::MAX);
+                        let kl = usize::try_from(key_len).unwrap_or(usize::MAX);
+                        if kp.checked_add(kl).is_none_or(|end| end > data.len()) {
+                            return -1;
+                        }
+                        let key = String::from_utf8_lossy(&data[kp..kp + kl]).to_string();
+                        hs_clone
+                            .lock()
+                            .unwrap()
+                            .world_state
+                            .get(&key)
+                            .map_or(-1, |v| i32::try_from(v.len()).unwrap_or(-1))
+                    },
+                )
+                .map_err(|e| CoreError::Execution(format!("linker get_state_len: {e}")))?;
+        }
+
+        {
+            let hs_clone_get = Arc::clone(host_state);
+            linker
+                .func_wrap(
+                    "env",
+                    "get_state",
+                    move |mut caller: wasmtime::Caller<'_, Arc<Mutex<HostState>>>,
+                          key_ptr: i32,
+                          key_len: i32,
+                          val_ptr: i32,
+                          val_buf_len: i32|
+                          -> i32 {
+                        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory")
+                        else {
+                            return -1;
+                        };
+
+                        let kp = usize::try_from(key_ptr).unwrap_or(usize::MAX);
+                        let kl = usize::try_from(key_len).unwrap_or(usize::MAX);
+                        let vp = usize::try_from(val_ptr).unwrap_or(usize::MAX);
+                        let vbl = usize::try_from(val_buf_len).unwrap_or(usize::MAX);
+
+                        let key = {
+                            let data = mem.data(&caller);
+                            if kp.checked_add(kl).is_none_or(|end| end > data.len()) {
+                                return -1;
+                            }
+                            String::from_utf8_lossy(&data[kp..kp + kl]).to_string()
+                        };
+
+                        let value = {
+                            let hs = hs_clone_get.lock().unwrap();
+                            match hs.world_state.get(&key) {
+                                Some(v) => v.clone(),
+                                None => return -1,
+                            }
+                        };
+
+                        if value.len() > vbl {
+                            return -2;
+                        }
+
+                        let data_mut = mem.data_mut(&mut caller);
+                        if vp
+                            .checked_add(value.len())
+                            .is_none_or(|end| end > data_mut.len())
+                        {
+                            return -1;
+                        }
+                        data_mut[vp..vp + value.len()].copy_from_slice(&value);
+                        i32::try_from(value.len()).unwrap_or(-1)
+                    },
+                )
+                .map_err(|e| CoreError::Execution(format!("linker get_state: {e}")))?;
+        }
+
+        Ok(linker)
+    }
+
+    fn execute_internal(
+        &self,
+        contract_id: &str,
+        payload: &[u8],
+        initial_state: HashMap<String, Vec<u8>>,
+        gas_limit: u64,
+    ) -> Result<Vec<(String, Vec<u8>)>, CoreError> {
+        let module = Module::new(&self.engine, payload)
+            .map_err(|e| CoreError::Execution(format!("wasm compile [{contract_id}]: {e}")))?;
+
+        let host_state = Arc::new(Mutex::new(HostState {
+            world_state: initial_state,
+            mutations: Vec::new(),
+            key_buf: Vec::new(),
+            val_buf: Vec::new(),
+        }));
+        let linker = self.build_linker(&host_state)?;
+
+        let mut store = Store::new(&self.engine, Arc::clone(&host_state));
+        store
+            .set_fuel(gas_limit)
+            .map_err(|e| CoreError::Execution(format!("set_fuel: {e}")))?;
+
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .map_err(|e| CoreError::Execution(format!("wasm instantiate [{contract_id}]: {e}")))?;
+
+        let execute_fn = instance
+            .get_typed_func::<(), ()>(&mut store, "execute")
+            .map_err(|e| {
+                CoreError::Execution(format!("wasm export 'execute' [{contract_id}]: {e}"))
+            })?;
+
+        match execute_fn.call(&mut store, ()) {
+            Ok(()) => {}
+            Err(e) => {
+                let is_fuel_exhaustion = e
+                    .downcast_ref::<wasmtime::Trap>()
+                    .is_some_and(|t| *t == wasmtime::Trap::OutOfFuel)
+                    || store.get_fuel().unwrap_or(1) == 0;
+                if is_fuel_exhaustion {
+                    let used = gas_limit.saturating_sub(store.get_fuel().unwrap_or(0));
+                    return Err(CoreError::GasExhausted {
+                        used,
+                        limit: gas_limit,
+                    });
+                }
+                return Err(CoreError::Execution(format!(
+                    "wasm execution [{contract_id}]: {e}"
+                )));
+            }
+        }
+
+        let mutations = host_state.lock().unwrap().mutations.clone();
+        log::debug!(
+            "WasmExecutionProvider: contract={contract_id} mutations={} fuel_remaining={}",
+            mutations.len(),
+            store.get_fuel().unwrap_or(0)
+        );
+        Ok(mutations)
+    }
 }
 
 impl Default for WasmExecutionProvider {
@@ -79,194 +267,7 @@ impl ExecutionProvider for WasmExecutionProvider {
         payload: &[u8],
         gas_limit: u64,
     ) -> Result<Vec<(String, Vec<u8>)>, CoreError> {
-        let module = Module::new(&self.engine, payload)
-            .map_err(|e| CoreError::Execution(format!("wasm compile [{contract_id}]: {e}")))?;
-
-        let host_state = Arc::new(Mutex::new(HostState {
-            world_state: HashMap::new(),
-            mutations: Vec::new(),
-            key_buf: Vec::new(),
-            val_buf: Vec::new(),
-        }));
-
-        let mut linker: Linker<Arc<Mutex<HostState>>> = Linker::new(&self.engine);
-
-        // ── Host function: set_state(key_ptr, key_len, val_ptr, val_len) ──────
-        {
-            linker
-                .func_wrap(
-                    "env",
-                    "set_state",
-                    |mut caller: wasmtime::Caller<'_, Arc<Mutex<HostState>>>,
-                     key_ptr: i32,
-                     key_len: i32,
-                     val_ptr: i32,
-                     val_len: i32| {
-                        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory")
-                        else {
-                            return;
-                        };
-                        let data = mem.data(&caller);
-                        let kp = usize::try_from(key_ptr).unwrap_or(usize::MAX);
-                        let kl = usize::try_from(key_len).unwrap_or(usize::MAX);
-                        let vp = usize::try_from(val_ptr).unwrap_or(usize::MAX);
-                        let vl = usize::try_from(val_len).unwrap_or(usize::MAX);
-                        if kp.checked_add(kl).is_none_or(|end| end > data.len())
-                            || vp.checked_add(vl).is_none_or(|end| end > data.len())
-                        {
-                            return;
-                        }
-                        let key = String::from_utf8_lossy(&data[kp..kp + kl]).to_string();
-                        let val = data[vp..vp + vl].to_vec();
-                        caller.data().lock().unwrap().mutations.push((key, val));
-                    },
-                )
-                .map_err(|e| CoreError::Execution(format!("linker set_state: {e}")))?;
-        }
-
-        // ── Host function: get_state_len(key_ptr, key_len) -> i32 ────────────
-        //    Returns the byte length of the stored value, or -1 if not found.
-        {
-            let hs_clone = Arc::clone(&host_state);
-            linker
-                .func_wrap(
-                    "env",
-                    "get_state_len",
-                    move |mut caller: wasmtime::Caller<'_, Arc<Mutex<HostState>>>,
-                          key_ptr: i32,
-                          key_len: i32|
-                          -> i32 {
-                        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory")
-                        else {
-                            return -1;
-                        };
-                        let data = mem.data(&caller);
-                        let kp = usize::try_from(key_ptr).unwrap_or(usize::MAX);
-                        let kl = usize::try_from(key_len).unwrap_or(usize::MAX);
-                        if kp.checked_add(kl).is_none_or(|end| end > data.len()) {
-                            return -1;
-                        }
-                        let key = String::from_utf8_lossy(&data[kp..kp + kl]).to_string();
-                        hs_clone
-                            .lock()
-                            .unwrap()
-                            .world_state
-                            .get(&key)
-                            .map_or(-1, |v| i32::try_from(v.len()).unwrap_or(-1))
-                    },
-                )
-                .map_err(|e| CoreError::Execution(format!("linker get_state_len: {e}")))?;
-        }
-
-        // ── Host function: get_state(key_ptr, key_len, val_ptr, val_buf_len) -> i32 ──
-        //    Returns: bytes written on success; -1 if key not found or key pointer
-        //    out of bounds; -2 if the destination buffer is too small.
-        {
-            let hs_clone_get = Arc::clone(&host_state);
-            linker
-                .func_wrap(
-                    "env",
-                    "get_state",
-                    move |mut caller: wasmtime::Caller<'_, Arc<Mutex<HostState>>>,
-                          key_ptr: i32,
-                          key_len: i32,
-                          val_ptr: i32,
-                          val_buf_len: i32|
-                          -> i32 {
-                        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory")
-                        else {
-                            return -1;
-                        };
-
-                        let kp = usize::try_from(key_ptr).unwrap_or(usize::MAX);
-                        let kl = usize::try_from(key_len).unwrap_or(usize::MAX);
-                        let vp = usize::try_from(val_ptr).unwrap_or(usize::MAX);
-                        let vbl = usize::try_from(val_buf_len).unwrap_or(usize::MAX);
-
-                        // Read key bytes — immutable borrow, dropped at end of block.
-                        let key = {
-                            let data = mem.data(&caller);
-                            if kp.checked_add(kl).is_none_or(|end| end > data.len()) {
-                                return -1;
-                            }
-                            String::from_utf8_lossy(&data[kp..kp + kl]).to_string()
-                        };
-
-                        // Look up the value; clone it so we hold no lock across the
-                        // mutable memory borrow below.
-                        let value = {
-                            let hs = hs_clone_get.lock().unwrap();
-                            match hs.world_state.get(&key) {
-                                Some(v) => v.clone(),
-                                None => return -1,
-                            }
-                        };
-
-                        // Reject the call if the caller's buffer is too small.
-                        if value.len() > vbl {
-                            return -2;
-                        }
-
-                        // Write value into WASM memory — mutable borrow taken *after*
-                        // the immutable data borrow above has been dropped.
-                        let data_mut = mem.data_mut(&mut caller);
-                        if vp
-                            .checked_add(value.len())
-                            .is_none_or(|end| end > data_mut.len())
-                        {
-                            return -1;
-                        }
-                        data_mut[vp..vp + value.len()].copy_from_slice(&value);
-                        i32::try_from(value.len()).unwrap_or(-1)
-                    },
-                )
-                .map_err(|e| CoreError::Execution(format!("linker get_state: {e}")))?;
-        }
-
-        let mut store = Store::new(&self.engine, Arc::clone(&host_state));
-        store
-            .set_fuel(gas_limit)
-            .map_err(|e| CoreError::Execution(format!("set_fuel: {e}")))?;
-
-        let instance = linker
-            .instantiate(&mut store, &module)
-            .map_err(|e| CoreError::Execution(format!("wasm instantiate [{contract_id}]: {e}")))?;
-
-        let execute_fn = instance
-            .get_typed_func::<(), ()>(&mut store, "execute")
-            .map_err(|e| {
-                CoreError::Execution(format!("wasm export 'execute' [{contract_id}]: {e}"))
-            })?;
-
-        match execute_fn.call(&mut store, ()) {
-            Ok(()) => {}
-            Err(e) => {
-                // Check if this is a fuel-exhaustion trap via wasmtime's
-                // Trap enum (most reliable) or by checking remaining fuel.
-                let is_fuel_exhaustion = e
-                    .downcast_ref::<wasmtime::Trap>()
-                    .is_some_and(|t| *t == wasmtime::Trap::OutOfFuel)
-                    || store.get_fuel().unwrap_or(1) == 0;
-                if is_fuel_exhaustion {
-                    let used = gas_limit.saturating_sub(store.get_fuel().unwrap_or(0));
-                    return Err(CoreError::GasExhausted {
-                        used,
-                        limit: gas_limit,
-                    });
-                }
-                return Err(CoreError::Execution(format!(
-                    "wasm execution [{contract_id}]: {e}"
-                )));
-            }
-        }
-
-        let mutations = host_state.lock().unwrap().mutations.clone();
-        log::debug!(
-            "WasmExecutionProvider: contract={contract_id} mutations={} fuel_remaining={}",
-            mutations.len(),
-            store.get_fuel().unwrap_or(0)
-        );
-        Ok(mutations)
+        self.execute_internal(contract_id, payload, HashMap::new(), gas_limit)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -277,170 +278,7 @@ impl ExecutionProvider for WasmExecutionProvider {
         initial_state: std::collections::HashMap<String, Vec<u8>>,
         gas_limit: u64,
     ) -> Result<Vec<(String, Vec<u8>)>, CoreError> {
-        // Identical to `execute` except we pre-populate world_state.
-        let module = Module::new(&self.engine, payload)
-            .map_err(|e| CoreError::Execution(format!("wasm compile [{contract_id}]: {e}")))?;
-
-        let host_state = Arc::new(Mutex::new(HostState {
-            world_state: initial_state, // ← pre-populated
-            mutations: Vec::new(),
-            key_buf: Vec::new(),
-            val_buf: Vec::new(),
-        }));
-
-        let mut linker: Linker<Arc<Mutex<HostState>>> = Linker::new(&self.engine);
-
-        // ── set_state ─────────────────────────────────────────────────────────
-        linker
-            .func_wrap(
-                "env",
-                "set_state",
-                |mut caller: wasmtime::Caller<'_, Arc<Mutex<HostState>>>,
-                 key_ptr: i32,
-                 key_len: i32,
-                 val_ptr: i32,
-                 val_len: i32| {
-                    let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory") else {
-                        return;
-                    };
-                    let data = mem.data(&caller);
-                    let kp = usize::try_from(key_ptr).unwrap_or(usize::MAX);
-                    let kl = usize::try_from(key_len).unwrap_or(usize::MAX);
-                    let vp = usize::try_from(val_ptr).unwrap_or(usize::MAX);
-                    let vl = usize::try_from(val_len).unwrap_or(usize::MAX);
-                    if kp.checked_add(kl).is_none_or(|end| end > data.len())
-                        || vp.checked_add(vl).is_none_or(|end| end > data.len())
-                    {
-                        return;
-                    }
-                    let key = String::from_utf8_lossy(&data[kp..kp + kl]).to_string();
-                    let val = data[vp..vp + vl].to_vec();
-                    caller.data().lock().unwrap().mutations.push((key, val));
-                },
-            )
-            .map_err(|e| CoreError::Execution(format!("linker set_state: {e}")))?;
-
-        // ── get_state_len ─────────────────────────────────────────────────────
-        {
-            let hs_clone = Arc::clone(&host_state);
-            linker
-                .func_wrap(
-                    "env",
-                    "get_state_len",
-                    move |mut caller: wasmtime::Caller<'_, Arc<Mutex<HostState>>>,
-                          key_ptr: i32,
-                          key_len: i32|
-                          -> i32 {
-                        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory")
-                        else {
-                            return -1;
-                        };
-                        let data = mem.data(&caller);
-                        let kp = usize::try_from(key_ptr).unwrap_or(usize::MAX);
-                        let kl = usize::try_from(key_len).unwrap_or(usize::MAX);
-                        if kp.checked_add(kl).is_none_or(|end| end > data.len()) {
-                            return -1;
-                        }
-                        let key = String::from_utf8_lossy(&data[kp..kp + kl]).to_string();
-                        hs_clone
-                            .lock()
-                            .unwrap()
-                            .world_state
-                            .get(&key)
-                            .map_or(-1, |v| i32::try_from(v.len()).unwrap_or(-1))
-                    },
-                )
-                .map_err(|e| CoreError::Execution(format!("linker get_state_len: {e}")))?;
-        }
-
-        // ── get_state ─────────────────────────────────────────────────────────
-        {
-            let hs_clone2 = Arc::clone(&host_state);
-            linker
-                .func_wrap(
-                    "env",
-                    "get_state",
-                    move |mut caller: wasmtime::Caller<'_, Arc<Mutex<HostState>>>,
-                          key_ptr: i32,
-                          key_len: i32,
-                          val_ptr: i32,
-                          val_buf_len: i32|
-                          -> i32 {
-                        let Some(wasmtime::Extern::Memory(mem)) = caller.get_export("memory")
-                        else {
-                            return -1;
-                        };
-                        let key = {
-                            let data = mem.data(&caller);
-                            let kp = usize::try_from(key_ptr).unwrap_or(usize::MAX);
-                            let kl = usize::try_from(key_len).unwrap_or(usize::MAX);
-                            if kp.checked_add(kl).is_none_or(|end| end > data.len()) {
-                                return -1;
-                            }
-                            String::from_utf8_lossy(&data[kp..kp + kl]).to_string()
-                        };
-                        let val = match hs_clone2.lock().unwrap().world_state.get(&key) {
-                            Some(v) => v.clone(),
-                            None => return -1,
-                        };
-                        let vp = usize::try_from(val_ptr).unwrap_or(usize::MAX);
-                        let vl = usize::try_from(val_buf_len).unwrap_or(usize::MAX);
-                        if val.len() > vl {
-                            return -2;
-                        }
-                        {
-                            let data_mut = mem.data_mut(&mut caller);
-                            if vp
-                                .checked_add(val.len())
-                                .is_none_or(|end| end > data_mut.len())
-                            {
-                                return -1;
-                            }
-                            data_mut[vp..vp + val.len()].copy_from_slice(&val);
-                        }
-                        i32::try_from(val.len()).unwrap_or(-1)
-                    },
-                )
-                .map_err(|e| CoreError::Execution(format!("linker get_state: {e}")))?;
-        }
-
-        let mut store = Store::new(&self.engine, Arc::clone(&host_state));
-        store
-            .set_fuel(gas_limit)
-            .map_err(|e| CoreError::Execution(format!("set_fuel: {e}")))?;
-
-        let instance = linker
-            .instantiate(&mut store, &module)
-            .map_err(|e| CoreError::Execution(format!("wasm instantiate [{contract_id}]: {e}")))?;
-
-        let execute_fn = instance
-            .get_typed_func::<(), ()>(&mut store, "execute")
-            .map_err(|e| {
-                CoreError::Execution(format!("wasm export 'execute' [{contract_id}]: {e}"))
-            })?;
-
-        match execute_fn.call(&mut store, ()) {
-            Ok(()) => {}
-            Err(e) => {
-                let is_fuel_exhaustion = e
-                    .downcast_ref::<wasmtime::Trap>()
-                    .is_some_and(|t| *t == wasmtime::Trap::OutOfFuel)
-                    || store.get_fuel().unwrap_or(1) == 0;
-                if is_fuel_exhaustion {
-                    let used = gas_limit.saturating_sub(store.get_fuel().unwrap_or(0));
-                    return Err(CoreError::GasExhausted {
-                        used,
-                        limit: gas_limit,
-                    });
-                }
-                return Err(CoreError::Execution(format!(
-                    "wasm execution [{contract_id}]: {e}"
-                )));
-            }
-        }
-
-        let mutations = host_state.lock().unwrap().mutations.clone();
-        Ok(mutations)
+        self.execute_internal(contract_id, payload, initial_state, gas_limit)
     }
 
     fn name(&self) -> &'static str {
@@ -559,7 +397,7 @@ mod tests {
         // The contract must execute without returning an Err — get_state returning
         // -1 for a missing key must NOT cause a trap or a Rust-level error.
         let result = provider.execute("get-state-test", &wasm, 10_000);
-        assert!(result.is_ok(), "expected Ok(()), got {result:?}");
+        assert!(result.is_ok(), "expected Ok(mutations), got {result:?}");
         // No mutations were written, so the mutations list must be empty.
         assert!(result.unwrap().is_empty());
     }

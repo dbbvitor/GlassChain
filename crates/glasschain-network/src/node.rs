@@ -15,7 +15,7 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{error::TrySendError, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{broadcast, Mutex};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -131,7 +131,7 @@ struct NodeState {
     watcher: WatcherService,
     known_peers: HashSet<String>,
     /// Per-peer write channels; keyed by the peer's stable listen address.
-    peer_senders: HashMap<String, UnboundedSender<Message>>,
+    peer_senders: HashMap<String, Sender<Message>>,
 }
 
 // ── Node ──────────────────────────────────────────────────────────────────────
@@ -212,8 +212,12 @@ impl Node {
                         break;
                     }
                 }
-                if valid && chain.len() > 1 {
-                    let chain_ok = chain
+                if valid && !chain.is_empty() {
+                    let genesis_ok = chain[0].is_valid()
+                        && chain[0].has_valid_pow(difficulty)
+                        && chain[0].previous_hash == "0";
+                    let chain_ok = genesis_ok
+                        && chain
                         .windows(2)
                         .all(|w| w[1].chains_to(&w[0]).is_ok() && w[1].has_valid_pow(difficulty));
                     if chain_ok {
@@ -305,15 +309,33 @@ impl Node {
             .with_single_cert(vec![cert_der], key_der)
             .expect("server TLS config");
 
-        let client_cfg = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
-            .with_no_client_auth();
+        let client_cfg = if Self::insecure_tls_allowed() {
+            log::warn!(
+                "Network TLS certificate verification is disabled (dev mode). \
+                 Use trusted roots in production."
+            );
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
+                .with_no_client_auth()
+        } else {
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth()
+        };
 
         NodeTls {
             acceptor: Arc::new(TlsAcceptor::from(Arc::new(server_cfg))),
             connector: Arc::new(TlsConnector::from(Arc::new(client_cfg))),
         }
+    }
+
+    /// Insecure verifier is allowed only in debug builds, via feature flag,
+    /// or explicitly via `GLASSCHAIN_INSECURE_TLS=1`.
+    fn insecure_tls_allowed() -> bool {
+        cfg!(debug_assertions)
+            || cfg!(feature = "insecure-tls")
+            || std::env::var("GLASSCHAIN_INSECURE_TLS").is_ok_and(|v| v == "1")
     }
 
     /// Attach a WASM execution provider to the contract engine.
@@ -496,11 +518,6 @@ impl Node {
         };
 
         if appended {
-            // Persist the newly mined block so it survives a restart.
-            if let Err(e) = self.storage.put_block(&block) {
-                log::warn!("Storage: failed to persist block {}: {e}", block.index);
-            }
-
             let generated = Self::after_block_commit(
                 &self.ledger,
                 &self.state,
@@ -544,7 +561,7 @@ impl Node {
 
     /// Broadcast a message to all connected peers via their persistent write channels.
     async fn broadcast(&self, message: Message) {
-        let senders: Vec<UnboundedSender<Message>> = {
+        let senders: Vec<Sender<Message>> = {
             self.state
                 .lock()
                 .await
@@ -554,7 +571,13 @@ impl Node {
                 .collect()
         };
         for sender in senders {
-            let _ = sender.send(message.clone());
+            match sender.try_send(message.clone()) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    log::warn!("Dropping outbound message: peer channel full");
+                }
+                Err(TrySendError::Closed(_)) => {}
+            }
         }
     }
 
@@ -638,7 +661,7 @@ async fn handle_peer(
     dial_tx: UnboundedSender<String>,
     storage: Arc<dyn StorageProvider>,
 ) {
-    let (write_tx, mut write_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    let (write_tx, mut write_rx): (Sender<Message>, Receiver<Message>) = tokio::sync::mpsc::channel(256);
 
     {
         let waddr = addr.clone();
@@ -660,7 +683,7 @@ async fn handle_peer(
         version: PROTOCOL_VERSION.to_owned(),
         listen_addr: listen_addr.clone(),
     };
-    if write_tx.send(hello).is_err() {
+    if write_tx.try_send(hello).is_err() {
         log::warn!("Failed to queue Hello for {addr}");
         return;
     }
@@ -785,7 +808,7 @@ async fn process_message(
     ledger: &Arc<Mutex<Ledger>>,
     state: &Arc<Mutex<NodeState>>,
     _node_id: &str,
-    write_tx: &UnboundedSender<Message>,
+    write_tx: &Sender<Message>,
     event_tx: &broadcast::Sender<NodeEvent>,
     current_stable_addr: Option<&str>,
     listen_addr: &str,
@@ -823,7 +846,7 @@ async fn process_message(
 
             let local_len = ledger.lock().await.chain.len() as u64;
             if chain_length > local_len {
-                let _ = write_tx.send(Message::RequestChain);
+                let _ = write_tx.try_send(Message::RequestChain);
             }
 
             MessageEffect {
@@ -865,10 +888,11 @@ async fn process_message(
                 }
             }
 
-            let senders: Vec<_> = state.lock().await.peer_senders.values().cloned().collect();
+            let senders: Vec<Sender<Message>> =
+                state.lock().await.peer_senders.values().cloned().collect();
             for gen_tx in generated {
                 for s in &senders {
-                    let _ = s.send(Message::Transaction(gen_tx.clone()));
+                    let _ = s.try_send(Message::Transaction(gen_tx.clone()));
                 }
             }
             MessageEffect::default()
@@ -920,9 +944,6 @@ async fn process_message(
                     l.pending_transactions
                         .retain(|t| !committed.contains(t.id.as_str()));
                     l.chain.push(block.clone());
-                    if let Err(e) = storage.put_block(&block) {
-                        log::warn!("Storage: failed to persist block {}: {e}", block.index);
-                    }
                 }
 
                 let generated = Node::after_block_commit(
@@ -935,10 +956,11 @@ async fn process_message(
                     hash: block.hash.clone(),
                 });
 
-                let senders: Vec<_> = state.lock().await.peer_senders.values().cloned().collect();
+                let senders: Vec<Sender<Message>> =
+                    state.lock().await.peer_senders.values().cloned().collect();
                 for tx in generated {
                     for s in &senders {
-                        let _ = s.send(Message::Transaction(tx.clone()));
+                        let _ = s.try_send(Message::Transaction(tx.clone()));
                     }
                 }
             } else {
@@ -949,7 +971,7 @@ async fn process_message(
 
         Message::RequestChain => {
             let chain = ledger.lock().await.chain.clone();
-            let _ = write_tx.send(Message::Chain(chain));
+            let _ = write_tx.try_send(Message::Chain(chain));
             MessageEffect::default()
         }
 
@@ -991,7 +1013,7 @@ async fn process_message(
                 .filter(|p| p.as_str() != exclude.as_str())
                 .cloned()
                 .collect();
-            let _ = write_tx.send(Message::Peers(peers));
+            let _ = write_tx.try_send(Message::Peers(peers));
             MessageEffect::default()
         }
 

@@ -7,6 +7,9 @@ use glasschain_core::{
 };
 use std::collections::HashMap;
 
+/// Default gas budget for WASM gate evaluation in `evaluate_supply_offer`.
+const DEFAULT_WASM_GATE_GAS_LIMIT: u64 = 50_000;
+
 /// The smart-contract execution engine.
 ///
 /// Stores all registered contracts in memory and evaluates them whenever a new
@@ -162,7 +165,12 @@ impl ContractEngine {
                             initial.insert("offer".to_string(), offer_json);
                         }
                         let exec_id = format!("wasm:{}:{}", contract.id(), offer_tx_id);
-                        match executor.execute_with_state(&exec_id, &wasm_bytes, initial, 50_000) {
+                        match executor.execute_with_state(
+                            &exec_id,
+                            &wasm_bytes,
+                            initial,
+                            DEFAULT_WASM_GATE_GAS_LIMIT,
+                        ) {
                             Ok(mutations) => {
                                 let approved = mutations
                                     .iter()
