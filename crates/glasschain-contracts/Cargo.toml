@@ -7,7 +7,7 @@ description = "Smart contracts engine for GlassChain – enables automated suppl
 [dependencies]
 glasschain-core = { path = "../glasschain-core" }
 glasschain-vm   = { path = "../glasschain-vm" }
-wat     = "1.247"
+wat     = "1.248"
 serde   = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror  = "2.0"

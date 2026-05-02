@@ -13,7 +13,7 @@ thiserror = "2.0"
 log = "0.4"
 
 [dev-dependencies]
-wat = "1.247"
+wat = "1.248"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]
