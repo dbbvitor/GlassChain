@@ -11,9 +11,8 @@ glasschain-identity = { path = "../glasschain-identity" }
 tonic = { version = "0.14", features = ["transport"] }
 tonic-prost = "0.14"
 prost = "0.14"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
-serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 log = "0.4"
@@ -22,9 +21,6 @@ hex = "0.4"
 
 [build-dependencies]
 tonic-prost-build = "0.14"
-
-[dev-dependencies]
-tokio = { version = "1", features = ["full"] }
 
 [lints]
 workspace = true

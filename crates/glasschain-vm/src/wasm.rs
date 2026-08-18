@@ -10,16 +10,11 @@ use wasmtime::{Config, Engine, Linker, Module, Store};
 /// The contract reads and writes key-value pairs through host functions.
 /// All mutations are collected in `mutations` and returned after the contract
 /// returns, allowing the node to commit them atomically.
-#[allow(dead_code)]
 struct HostState {
     /// Read-only snapshot of the World State (passed in before execution).
     world_state: HashMap<String, Vec<u8>>,
     /// Key-value mutations produced by this execution.
     mutations: Vec<(String, Vec<u8>)>,
-    /// Key and value exchange buffers (backing the host-function linear memory).
-    /// Reserved for future host-function extensions (e.g. bulk state reads).
-    key_buf: Vec<u8>,
-    val_buf: Vec<u8>,
 }
 
 /// Wasmtime-based [`ExecutionProvider`] with deterministic gas metering.
@@ -187,8 +182,6 @@ impl WasmExecutionProvider {
         let host_state = Arc::new(Mutex::new(HostState {
             world_state: initial_state,
             mutations: Vec::new(),
-            key_buf: Vec::new(),
-            val_buf: Vec::new(),
         }));
         let linker = self.build_linker(&host_state)?;
 

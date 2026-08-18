@@ -245,6 +245,35 @@ pub struct Node {
 }
 
 impl Node {
+    fn with_components(
+        node_id: String,
+        listen_addr: String,
+        ledger: Arc<Mutex<Ledger>>,
+        storage: Arc<dyn StorageProvider>,
+        identity: Option<Arc<Identity>>,
+    ) -> Self {
+        let (event_tx, _) = broadcast::channel(256);
+        Self {
+            node_id,
+            listen_addr,
+            ledger,
+            state: Arc::new(Mutex::new(NodeState {
+                engine: ContractEngine::new(),
+                watcher: WatcherService::new(),
+                known_peers: HashSet::new(),
+                peer_senders: HashMap::new(),
+                peer_registry: PeerRegistry::new(),
+                cert_verifier: None,
+                identity: identity.clone(),
+            })),
+            event_tx,
+            indexer: Arc::new(InMemoryIndexer::new()),
+            event_bus: Arc::new(InMemoryEventBus::new(4096)),
+            storage,
+            tls: Arc::new(Self::build_tls(identity)),
+        }
+    }
+
     /// Create a new node.
     ///
     /// * `node_id`     – unique identifier for this node (e.g. a UUID or hostname)
@@ -255,26 +284,13 @@ impl Node {
         listen_addr: impl Into<String>,
         difficulty: usize,
     ) -> Self {
-        let (event_tx, _) = broadcast::channel(256);
-        Self {
-            node_id: node_id.into(),
-            listen_addr: listen_addr.into(),
-            ledger: Arc::new(Mutex::new(Ledger::new(difficulty))),
-            state: Arc::new(Mutex::new(NodeState {
-                engine: ContractEngine::new(),
-                watcher: WatcherService::new(),
-                known_peers: HashSet::new(),
-                peer_senders: HashMap::new(),
-                peer_registry: PeerRegistry::new(),
-                cert_verifier: None,
-                identity: None,
-            })),
-            event_tx,
-            indexer: Arc::new(InMemoryIndexer::new()),
-            event_bus: Arc::new(InMemoryEventBus::new(4096)),
-            storage: Arc::new(InMemoryStorageProvider::new()),
-            tls: Arc::new(Self::build_tls(None)),
-        }
+        Self::with_components(
+            node_id.into(),
+            listen_addr.into(),
+            Arc::new(Mutex::new(Ledger::new(difficulty))),
+            Arc::new(InMemoryStorageProvider::new()),
+            None,
+        )
     }
 
     /// Restore a [`Ledger`] from `storage`, validating the full chain on the
@@ -323,27 +339,7 @@ impl Node {
         storage: Arc<dyn StorageProvider>,
     ) -> Self {
         let ledger = Self::restore_ledger(&storage, difficulty);
-
-        let (event_tx, _) = broadcast::channel(256);
-        Self {
-            node_id: node_id.into(),
-            listen_addr: listen_addr.into(),
-            ledger,
-            state: Arc::new(Mutex::new(NodeState {
-                engine: ContractEngine::new(),
-                watcher: WatcherService::new(),
-                known_peers: HashSet::new(),
-                peer_senders: HashMap::new(),
-                peer_registry: PeerRegistry::new(),
-                cert_verifier: None,
-                identity: None,
-            })),
-            event_tx,
-            indexer: Arc::new(InMemoryIndexer::new()),
-            event_bus: Arc::new(InMemoryEventBus::new(4096)),
-            storage,
-            tls: Arc::new(Self::build_tls(None)),
-        }
+        Self::with_components(node_id.into(), listen_addr.into(), ledger, storage, None)
     }
 
     /// Create a new node with an identity-backed TLS certificate.
@@ -353,28 +349,13 @@ impl Node {
         difficulty: usize,
         identity: Arc<Identity>,
     ) -> Self {
-        let node_id = node_id.into();
-        let listen_addr = listen_addr.into();
-        let (event_tx, _) = broadcast::channel(256);
-        Self {
-            node_id,
-            listen_addr,
-            ledger: Arc::new(Mutex::new(Ledger::new(difficulty))),
-            state: Arc::new(Mutex::new(NodeState {
-                engine: ContractEngine::new(),
-                watcher: WatcherService::new(),
-                known_peers: HashSet::new(),
-                peer_senders: HashMap::new(),
-                peer_registry: PeerRegistry::new(),
-                cert_verifier: None,
-                identity: Some(Arc::clone(&identity)),
-            })),
-            event_tx,
-            indexer: Arc::new(InMemoryIndexer::new()),
-            event_bus: Arc::new(InMemoryEventBus::new(4096)),
-            storage: Arc::new(InMemoryStorageProvider::new()),
-            tls: Arc::new(Self::build_tls(Some(Arc::clone(&identity)))),
-        }
+        Self::with_components(
+            node_id.into(),
+            listen_addr.into(),
+            Arc::new(Mutex::new(Ledger::new(difficulty))),
+            Arc::new(InMemoryStorageProvider::new()),
+            Some(identity),
+        )
     }
 
     /// Create a persistent node with an identity-backed TLS certificate.
@@ -385,31 +366,14 @@ impl Node {
         storage: Arc<dyn StorageProvider>,
         identity: Arc<Identity>,
     ) -> Self {
-        let node_id = node_id.into();
-        let listen_addr = listen_addr.into();
-
         let ledger = Self::restore_ledger(&storage, difficulty);
-
-        let (event_tx, _) = broadcast::channel(256);
-        Self {
-            node_id,
-            listen_addr,
+        Self::with_components(
+            node_id.into(),
+            listen_addr.into(),
             ledger,
-            state: Arc::new(Mutex::new(NodeState {
-                engine: ContractEngine::new(),
-                watcher: WatcherService::new(),
-                known_peers: HashSet::new(),
-                peer_senders: HashMap::new(),
-                peer_registry: PeerRegistry::new(),
-                cert_verifier: None,
-                identity: Some(Arc::clone(&identity)),
-            })),
-            event_tx,
-            indexer: Arc::new(InMemoryIndexer::new()),
-            event_bus: Arc::new(InMemoryEventBus::new(4096)),
             storage,
-            tls: Arc::new(Self::build_tls(Some(Arc::clone(&identity)))),
-        }
+            Some(identity),
+        )
     }
 
     /// Subscribe to node events (transactions, blocks, peers, contracts).

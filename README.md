@@ -141,7 +141,9 @@ Current trust model:
 - **Identity-backed mode:** same as default, plus the TLS certificate is derived from the node's identity key so that transport and transaction identity share one key pair.
 - **Insecure mode:** only when explicitly enabled with `GLASSCHAIN_INSECURE_TLS=1` or the matching build feature.
 
-> **Note:** TOFU trust is address-bound and in-memory. There is no shared CA, no certificate-chain validation, and no trust persistence across process restarts. A peer that changes its listen address is treated as a new peer. These are known limitations, not bugs.
+> **Note:** TOFU trust is address-bound and in-memory. There is no shared CA between organizations and no trust persistence across process restarts. A peer that changes its listen address is treated as a new peer. These are known limitations, not bugs.
+>
+> Certificate-chain validation itself *is* implemented — `glasschain-identity`'s `CertChainVerifier` verifies a peer certificate against an organization Root CA using `rustls-webpki`, rejecting forged and tampered certificates — but it is not yet attached to the peer handshake, so it does not currently constrain the transport.
 
 Message types:
 

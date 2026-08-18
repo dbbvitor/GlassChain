@@ -46,8 +46,7 @@ pub struct LedgerInspectArgs {
 ///
 /// Currently infallible.  Future releases will return errors when the gRPC
 /// call to the remote node fails.
-#[allow(clippy::unused_async)] // intentionally async — will drive tonic in a future release
-pub async fn run(args: LedgerInspectArgs) -> anyhow::Result<()> {
+pub fn run(args: LedgerInspectArgs) -> anyhow::Result<()> {
     println!("GlassChain Ledger Inspector");
     println!("  Endpoint : {}", args.endpoint);
     println!();

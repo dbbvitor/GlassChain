@@ -64,12 +64,7 @@ fn bench_10_triggers_one_product(c: &mut Criterion) {
             || {
                 let mut svc = WatcherService::new();
                 for i in 0..10_i64 {
-                    svc.add_trigger(make_trigger(
-                        &format!("t{i}"),
-                        "P-001",
-                        "owner",
-                        i * 10,
-                    ));
+                    svc.add_trigger(make_trigger(&format!("t{i}"), "P-001", "owner", i * 10));
                 }
                 svc
             },
@@ -107,11 +102,8 @@ fn bench_1000_triggers_throughput(c: &mut Criterion) {
                 // Each product drops below its threshold → all 1 000 triggers fire
                 for i in 0u64..1_000 {
                     let product = format!("PROD-{i:04}");
-                    let orders = svc.on_inventory_update(black_box(&inv_update(
-                        &product,
-                        "warehouse",
-                        -10,
-                    )));
+                    let orders =
+                        svc.on_inventory_update(black_box(&inv_update(&product, "warehouse", -10)));
                     black_box(orders);
                 }
             },

@@ -4,9 +4,9 @@ use glasschain_core::{
 };
 use glasschain_identity::Organization;
 use glasschain_network::{Node, NodeEvent};
+use glasschain_rpc::GlasschainServer;
 use glasschain_storage::SledStorageProvider;
 use glasschain_vm::WasmExecutionProvider;
-use glasschain_rpc::GlasschainServer;
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;

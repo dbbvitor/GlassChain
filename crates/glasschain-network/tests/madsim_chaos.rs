@@ -94,7 +94,9 @@ async fn test_madsim_single_node_mines_within_time_budget() {
     let node = Node::new("madsim-node-1", &addr, 1);
     node.start(vec![]).await.unwrap();
 
-    node.submit_transaction(inv_tx("owner-1", 100)).await.unwrap();
+    node.submit_transaction(inv_tx("owner-1", 100))
+        .await
+        .unwrap();
 
     // Under madsim we advance simulated time; under real Tokio we simply wait.
     #[cfg(madsim)]
@@ -138,13 +140,22 @@ async fn test_madsim_application_layer_partition_and_merge() {
     node_b.start(vec![]).await.unwrap();
 
     // A builds a longer chain.
-    node_a.submit_transaction(inv_tx("a-owner", 50)).await.unwrap();
+    node_a
+        .submit_transaction(inv_tx("a-owner", 50))
+        .await
+        .unwrap();
     node_a.mine().await.unwrap();
-    node_a.submit_transaction(inv_tx("a-owner", 50)).await.unwrap();
+    node_a
+        .submit_transaction(inv_tx("a-owner", 50))
+        .await
+        .unwrap();
     node_a.mine().await.unwrap();
 
     // B builds a shorter chain.
-    node_b.submit_transaction(inv_tx("b-owner", 10)).await.unwrap();
+    node_b
+        .submit_transaction(inv_tx("b-owner", 10))
+        .await
+        .unwrap();
     node_b.mine().await.unwrap();
 
     #[cfg(madsim)]
@@ -212,7 +223,10 @@ async fn test_madsim_node_crash_and_rejoin() {
     let addr_secondary = free_addr();
     {
         let node_secondary = Node::new("secondary-v1", &addr_secondary, 1);
-        node_secondary.start(vec![addr_primary.clone()]).await.unwrap();
+        node_secondary
+            .start(vec![addr_primary.clone()])
+            .await
+            .unwrap();
 
         #[cfg(madsim)]
         sim_time::advance(Duration::from_millis(300)).await;
@@ -245,10 +259,7 @@ async fn test_madsim_node_crash_and_rejoin() {
     // A new node re-joins and adopts the full chain.
     let addr_rejoin = free_addr();
     let node_rejoin = Node::new("secondary-v2", &addr_rejoin, 1);
-    node_rejoin
-        .start(vec![addr_primary.clone()])
-        .await
-        .unwrap();
+    node_rejoin.start(vec![addr_primary.clone()]).await.unwrap();
 
     #[cfg(madsim)]
     sim_time::advance(Duration::from_millis(400)).await;
@@ -517,7 +528,10 @@ async fn test_madsim_partition_reference_implementation() {
     let node_a = Arc::new(Node::new("ref-a", &addr_a, 1));
     node_a.start(vec![]).await.unwrap();
 
-    node_a.submit_transaction(inv_tx("ref-a-pre", 10)).await.unwrap();
+    node_a
+        .submit_transaction(inv_tx("ref-a-pre", 10))
+        .await
+        .unwrap();
     node_a.mine().await.unwrap();
 
     let addr_b = free_addr();
@@ -535,12 +549,21 @@ async fn test_madsim_partition_reference_implementation() {
     // ── Partition: A and B mine independently (no peer connection) ────────
     // Application-layer partition: new node C connects only to A, new node D
     // connects only to B — their chains diverge.
-    node_a.submit_transaction(inv_tx("ref-a-partition", 20)).await.unwrap();
+    node_a
+        .submit_transaction(inv_tx("ref-a-partition", 20))
+        .await
+        .unwrap();
     node_a.mine().await.unwrap();
 
-    node_b.submit_transaction(inv_tx("ref-b-partition", 30)).await.unwrap();
+    node_b
+        .submit_transaction(inv_tx("ref-b-partition", 30))
+        .await
+        .unwrap();
     node_b.mine().await.unwrap();
-    node_b.submit_transaction(inv_tx("ref-b-partition-2", 30)).await.unwrap();
+    node_b
+        .submit_transaction(inv_tx("ref-b-partition-2", 30))
+        .await
+        .unwrap();
     node_b.mine().await.unwrap();
 
     // ── Post-partition: longest chain wins (B has more blocks) ───────────

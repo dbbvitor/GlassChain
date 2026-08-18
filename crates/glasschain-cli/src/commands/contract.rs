@@ -131,11 +131,9 @@ pub fn run(args: ContractDeployArgs) -> Result<()> {
 
     // Validate that a well-formed Transaction was produced by round-tripping
     // the JSON (cheap, catches any edge-case serialisation bugs at runtime).
-    let _: Transaction = serde_json::from_str(&tx_json)?;
-    if let Ok(tx) = serde_json::from_str::<Transaction>(&tx_json) {
-        if matches!(tx.kind, TransactionKind::ContractCreation(_)) {
-            log::info!("Contract transaction validated — tx_id={}", tx.id);
-        }
+    let tx: Transaction = serde_json::from_str(&tx_json)?;
+    if matches!(&tx.kind, TransactionKind::ContractCreation(_)) {
+        log::info!("Contract transaction validated — tx_id={}", tx.id);
     }
 
     Ok(())

@@ -136,7 +136,11 @@ pub fn run(args: IdentityGenArgs) -> Result<()> {
     println!("  Public Key   : {}", doc.public_key_hex);
     println!(
         "  Certificate  : {}",
-        if doc.has_certificate { "present (X.509 / ed25519)" } else { "none (standalone key pair)" }
+        if doc.has_certificate {
+            "present (X.509 / ed25519)"
+        } else {
+            "none (standalone key pair)"
+        }
     );
     if let Some(ref org) = doc.organization {
         println!("  Organisation : {org}");
