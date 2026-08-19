@@ -64,17 +64,29 @@ impl WasmExecutionProvider {
                         return;
                     };
                     let data = mem.data(&caller);
-                    let kp = usize::try_from(key_ptr).unwrap_or(usize::MAX);
-                    let kl = usize::try_from(key_len).unwrap_or(usize::MAX);
-                    let vp = usize::try_from(val_ptr).unwrap_or(usize::MAX);
-                    let vl = usize::try_from(val_len).unwrap_or(usize::MAX);
-                    if kp.checked_add(kl).is_none_or(|end| end > data.len())
-                        || vp.checked_add(vl).is_none_or(|end| end > data.len())
-                    {
+                    let Ok(kp) = usize::try_from(key_ptr) else {
+                        return;
+                    };
+                    let Ok(kl) = usize::try_from(key_len) else {
+                        return;
+                    };
+                    let Ok(vp) = usize::try_from(val_ptr) else {
+                        return;
+                    };
+                    let Ok(vl) = usize::try_from(val_len) else {
+                        return;
+                    };
+                    let Some(kend) = kp.checked_add(kl) else {
+                        return;
+                    };
+                    let Some(vend) = vp.checked_add(vl) else {
+                        return;
+                    };
+                    if kend > data.len() || vend > data.len() {
                         return;
                     }
-                    let key = String::from_utf8_lossy(&data[kp..kp + kl]).to_string();
-                    let val = data[vp..vp + vl].to_vec();
+                    let key = String::from_utf8_lossy(&data[kp..kend]).to_string();
+                    let val = data[vp..vend].to_vec();
                     caller.data().lock().unwrap().mutations.push((key, val));
                 },
             )
@@ -95,12 +107,19 @@ impl WasmExecutionProvider {
                             return -1;
                         };
                         let data = mem.data(&caller);
-                        let kp = usize::try_from(key_ptr).unwrap_or(usize::MAX);
-                        let kl = usize::try_from(key_len).unwrap_or(usize::MAX);
-                        if kp.checked_add(kl).is_none_or(|end| end > data.len()) {
+                        let Ok(kp) = usize::try_from(key_ptr) else {
+                            return -1;
+                        };
+                        let Ok(kl) = usize::try_from(key_len) else {
+                            return -1;
+                        };
+                        let Some(end) = kp.checked_add(kl) else {
+                            return -1;
+                        };
+                        if end > data.len() {
                             return -1;
                         }
-                        let key = String::from_utf8_lossy(&data[kp..kp + kl]).to_string();
+                        let key = String::from_utf8_lossy(&data[kp..end]).to_string();
                         hs_clone
                             .lock()
                             .unwrap()
@@ -129,17 +148,28 @@ impl WasmExecutionProvider {
                             return -1;
                         };
 
-                        let kp = usize::try_from(key_ptr).unwrap_or(usize::MAX);
-                        let kl = usize::try_from(key_len).unwrap_or(usize::MAX);
-                        let vp = usize::try_from(val_ptr).unwrap_or(usize::MAX);
-                        let vbl = usize::try_from(val_buf_len).unwrap_or(usize::MAX);
+                        let Ok(kp) = usize::try_from(key_ptr) else {
+                            return -1;
+                        };
+                        let Ok(kl) = usize::try_from(key_len) else {
+                            return -1;
+                        };
+                        let Ok(vp) = usize::try_from(val_ptr) else {
+                            return -1;
+                        };
+                        let Ok(vbl) = usize::try_from(val_buf_len) else {
+                            return -1;
+                        };
 
                         let key = {
                             let data = mem.data(&caller);
-                            if kp.checked_add(kl).is_none_or(|end| end > data.len()) {
+                            let Some(end) = kp.checked_add(kl) else {
+                                return -1;
+                            };
+                            if end > data.len() {
                                 return -1;
                             }
-                            String::from_utf8_lossy(&data[kp..kp + kl]).to_string()
+                            String::from_utf8_lossy(&data[kp..end]).to_string()
                         };
 
                         let value = {
@@ -155,13 +185,13 @@ impl WasmExecutionProvider {
                         }
 
                         let data_mut = mem.data_mut(&mut caller);
-                        if vp
-                            .checked_add(value.len())
-                            .is_none_or(|end| end > data_mut.len())
-                        {
+                        let Some(end) = vp.checked_add(value.len()) else {
+                            return -1;
+                        };
+                        if end > data_mut.len() {
                             return -1;
                         }
-                        data_mut[vp..vp + value.len()].copy_from_slice(&value);
+                        data_mut[vp..end].copy_from_slice(&value);
                         i32::try_from(value.len()).unwrap_or(-1)
                     },
                 )
