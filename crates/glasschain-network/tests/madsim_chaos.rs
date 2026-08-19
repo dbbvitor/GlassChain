@@ -65,6 +65,33 @@ fn inv_tx(owner: &str, delta: i64) -> Transaction {
     }))
 }
 
+/// Poll `node`'s chain length until it reaches `want`, returning the last
+/// length observed.
+///
+/// Peer sync latency is unbounded in wall-clock terms: a TLS handshake plus the
+/// initial chain transfer routinely exceeds half a second on a loaded CI runner
+/// (Windows in particular). Sleeping for a fixed guess and asserting once makes
+/// every sync assertion in this file a coin flip; polling to a generous ceiling
+/// keeps the assertion meaningful while removing the flake.
+async fn await_chain_len(node: &Node, want: usize) -> usize {
+    const STEP: Duration = Duration::from_millis(50);
+    const CEILING: Duration = Duration::from_secs(10);
+
+    let mut len = 0;
+    for _ in 0..(CEILING.as_millis() / STEP.as_millis()) {
+        len = node.ledger_snapshot().await.chain.len();
+        if len >= want {
+            return len;
+        }
+
+        #[cfg(madsim)]
+        sim_time::advance(STEP).await;
+        #[cfg(not(madsim))]
+        sleep(STEP).await;
+    }
+    len
+}
+
 fn make_trigger(id: &str, product: &str, owner: &str, threshold: i64) -> InventoryTrigger {
     InventoryTrigger {
         trigger_id: id.into(),
@@ -179,11 +206,9 @@ async fn test_madsim_application_layer_partition_and_merge() {
 
     #[cfg(madsim)]
     sim_time::advance(Duration::from_millis(500)).await;
-    #[cfg(not(madsim))]
-    sleep(Duration::from_millis(600)).await;
 
-    let len_c = node_c.ledger_snapshot().await.chain.len();
-    let len_d = node_d.ledger_snapshot().await.chain.len();
+    let len_c = await_chain_len(&node_c, len_a).await;
+    let len_d = await_chain_len(&node_d, len_b).await;
 
     assert!(
         len_c >= len_a,
@@ -230,10 +255,8 @@ async fn test_madsim_node_crash_and_rejoin() {
 
         #[cfg(madsim)]
         sim_time::advance(Duration::from_millis(300)).await;
-        #[cfg(not(madsim))]
-        sleep(Duration::from_millis(400)).await;
 
-        let len = node_secondary.ledger_snapshot().await.chain.len();
+        let len = await_chain_len(&node_secondary, 2).await;
         assert!(len >= 2, "secondary must have synced (got {len} blocks)");
     }
     // `node_secondary` is dropped here — simulating a crash.
@@ -263,10 +286,8 @@ async fn test_madsim_node_crash_and_rejoin() {
 
     #[cfg(madsim)]
     sim_time::advance(Duration::from_millis(400)).await;
-    #[cfg(not(madsim))]
-    sleep(Duration::from_millis(500)).await;
 
-    let rejoin_len = node_rejoin.ledger_snapshot().await.chain.len();
+    let rejoin_len = await_chain_len(&node_rejoin, chain_after).await;
     assert!(
         rejoin_len >= chain_after,
         "rejoining node must sync the full chain (expected ≥{chain_after}, got {rejoin_len})"
@@ -537,10 +558,8 @@ async fn test_madsim_partition_reference_implementation() {
 
     #[cfg(madsim)]
     sim_time::advance(Duration::from_millis(300)).await;
-    #[cfg(not(madsim))]
-    sleep(Duration::from_millis(400)).await;
 
-    let len_b_synced = node_b.ledger_snapshot().await.chain.len();
+    let len_b_synced = await_chain_len(&node_b, 2).await;
     assert!(len_b_synced >= 2, "B must sync A's block before partition");
 
     // ── Partition: A and B mine independently (no peer connection) ────────
@@ -578,10 +597,8 @@ async fn test_madsim_partition_reference_implementation() {
 
     #[cfg(madsim)]
     sim_time::advance(Duration::from_millis(400)).await;
-    #[cfg(not(madsim))]
-    sleep(Duration::from_millis(500)).await;
 
-    let len_e = node_e.ledger_snapshot().await.chain.len();
+    let len_e = await_chain_len(&node_e, chain_len_b).await;
     assert!(
         len_e >= chain_len_b,
         "E (connected to B) must adopt B's chain: E={len_e} B={chain_len_b}"
