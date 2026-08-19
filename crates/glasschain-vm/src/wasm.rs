@@ -38,9 +38,6 @@ impl WasmExecutionProvider {
     pub fn new() -> Result<Self, CoreError> {
         let mut config = Config::new();
         config.consume_fuel(true);
-        config.wasm_gc(false);
-        config.wasm_exceptions(false);
-        config.wasm_function_references(false);
         let engine = Engine::new(&config)
             .map_err(|e| CoreError::Execution(format!("wasmtime engine: {e}")))?;
         Ok(Self { engine })
@@ -364,9 +361,7 @@ mod tests {
     fn test_hello_world_contract() {
         let provider = WasmExecutionProvider::new().unwrap();
         let wasm = compile_wat(hello_world_wat());
-        let mutations = provider
-            .execute("hello-contract", &wasm, 10_000)
-            .expect("hello-contract execution failed");
+        let mutations = provider.execute("hello-contract", &wasm, 10_000).unwrap();
         assert_eq!(mutations.len(), 1);
         assert_eq!(mutations[0].0, "hello");
         assert_eq!(mutations[0].1, b"world");
