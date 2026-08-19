@@ -33,12 +33,15 @@
 
 use base64::Engine as _;
 use glasschain_core::{
-    ExecutionProvider, InventoryUpdate, PurchaseOrder, Transaction, TransactionKind,
+    ExecutionLimits, ExecutionProvider, InventoryUpdate, PurchaseOrder, Transaction,
+    TransactionKind,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+
+const DEFAULT_WASM_GATE_LIMIT: u64 = 100_000;
 
 // ── InventoryTrigger ──────────────────────────────────────────────────────────
 
@@ -345,13 +348,11 @@ impl WatcherService {
                             }
                         };
 
-                    // NOTE: execute_with_state signature is
-                    //   (contract_id, payload, initial_state: HashMap, gas_limit)
                     match exec.execute_with_state(
                         &trigger.trigger_id,
                         &wasm_bytes,
                         world_state,
-                        100_000,
+                        ExecutionLimits::new(DEFAULT_WASM_GATE_LIMIT, DEFAULT_WASM_GATE_LIMIT),
                     ) {
                         Ok(mutations) => {
                             let approved =

@@ -1,9 +1,12 @@
 //! # `GlassChain` libp2p Swarm
 //!
-//! This module implements a Kademlia DHT + Gossipsub peer-to-peer networking
-//! layer for `GlassChain` using [`libp2p`] as the underlying transport and
-//! protocol stack. It runs in parallel with the legacy TLS/TCP transport and
-//! is designed to progressively replace it.
+//! This module implements an **experimental** Kademlia DHT + Gossipsub
+//! peer-to-peer networking layer for `GlassChain` using [`libp2p`] as the
+//! underlying transport and protocol stack.
+//!
+//! **Status:** The swarm is currently unwired from every `GlassChain` binary. It
+//! is retained as the planned substrate for selective-disclosure dissemination
+//! and reconciliation; do not treat it as the active node transport yet.
 //!
 //! ## Transport Stack
 //!

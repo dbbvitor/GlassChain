@@ -195,10 +195,8 @@ cargo fmt -- crates/glasschain-sdk/src/client.rs
 ### Clippy strictness
 
 `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
-currently fails on existing Cargo metadata and pedantic/nursery diagnostics.
-CI intentionally treats warnings as errors with `-D warnings`; clear the existing
-backlog before expecting the strict gate to pass. Do not weaken the gate to hide
-unrelated warnings.
+is the CI gate and currently passes. Keep it clean; do not weaken the gate or
+hide unrelated warnings with broad `#[allow]` attributes.
 
 ---
 
@@ -230,12 +228,13 @@ Treat these as invariants, not suggestions:
   `glasschain-network`) disables verification. It is a **local-debugging escape
   hatch only**. Never make it the default, never widen its reach, and never add
   new env-var kill switches for security controls.
-- **Certificate chain validation exists but is not wired to the transport.**
+- **TOFU is the deliberate current trust default.**
   `glasschain-identity`'s `CertChainVerifier` performs a real `rustls-webpki`
   chain check against an organisation Root CA and defaults to
-  `VerificationLevel::Full`. However, `Node.cert_verifier` is `None` in all four
-  constructors, so the peer handshake still relies on TOFU alone. Do not describe
-  the transport as CA-verified until that field is populated.
+  `VerificationLevel::Full`, but `Node.cert_verifier` remains `None` in all four
+  constructors. Keep the peer handshake described as TOFU-only until a shared or
+  multi-organization trust model is chosen; do not silently enable local-CA
+  verification, which would reject peers from other organizations.
 - **Known, accepted limitations** (documented in README — do not "fix" them
   silently as part of an unrelated change): TOFU trust is address-bound and
   in-memory, there is no shared CA across organisations, and there is no trust
@@ -244,6 +243,22 @@ Treat these as invariants, not suggestions:
   at runtime by `glasschain-identity`.
 - Signing is ed25519 (`ed25519-dalek`), hashing is SHA-256. Don't swap primitives
   without an explicit request.
+
+---
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live in GitHub Issues for `dbbvitor/GlassChain`; use the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Use the default canonical triage labels: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repository using root-level `CONTEXT.md` and `docs/adr/`. See `docs/agents/domain.md`.
 
 ---
 
@@ -265,6 +280,8 @@ Rules:
   that spans more than a couple of files, and reference it as you implement.
 - Record non-obvious discoveries (a subtle invariant, a footgun, why an approach
   failed) in `.agents/memories/<topic>.md` so the next session doesn't rediscover them.
+- Use subagents for broad exploration when that reduces context churn; keep their
+  write scopes disjoint.
 - Keep `.agents/` files short and current. Delete or archive a plan once it ships —
   stale plans are worse than no plans.
 - **Never put source code, secrets, or generated build output in `.agents/`.**

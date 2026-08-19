@@ -1,10 +1,10 @@
-//! Deterministic gas metering.
+//! Deterministic gas accounting for contract execution.
 //!
-//! `GlassChain` uses Wasmtime's **fuel** feature for WASM instruction metering.
-//! This module also provides higher-level per-operation cost tables
-//! ([`GasCosts`]) and a stateful [`GasCounter`] that tracks gas consumption,
-//! state-access operation counts, and call-stack depth for reentrancy
-//! protection during smart-contract execution.
+//! `GlassChain` uses Wasmtime's **fuel** feature for WASM instruction metering
+//! and [`GasCounter`] for an independent host-operation budget. [`GasCosts`]
+//! defines the operation charges used for invocation, state reads, and state
+//! writes. The call-depth guard remains available for future recursive contract
+//! calls but is not wired into the current execution path.
 //!
 //! ## Typical Usage
 //!
@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 // ── GasReport ────────────────────────────────────────────────────────────────
 
-/// Gas usage report returned after contract execution completes (or is halted).
+/// Standalone gas usage report for callers that use [`GasCounter`] directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GasReport {
     /// Gas units consumed during this execution.
@@ -79,10 +79,11 @@ pub struct GasCosts {
     pub per_byte_read: u64,
     /// Additional gas charged per byte **written** to state storage.
     pub per_byte_write: u64,
-    /// Maximum allowed call-stack depth.
+    /// Maximum allowed call-stack depth for future recursive contract calls.
     ///
-    /// `push_call` returns an error when `call_depth` would exceed this value,
-    /// acting as an anti-reentrancy guard.
+    /// `push_call` returns an error when `call_depth` would exceed this value.
+    /// The current Wasmtime provider does not invoke it because contracts cannot
+    /// recursively call other contracts.
     pub max_call_depth: u32,
 }
 
@@ -133,8 +134,8 @@ impl GasCosts {
 /// `GasCounter` tracks:
 /// - Total gas consumed (`used`) against a hard `limit`.
 /// - The number of discrete state-read and state-write operations.
-/// - The current call-stack depth, which is bounded by
-///   [`GasCosts::max_call_depth`] to prevent reentrancy attacks.
+/// - The current call-stack depth, when a caller explicitly uses the optional
+///   [`push_call`][Self::push_call] guard for recursive execution.
 ///
 /// # Example
 ///

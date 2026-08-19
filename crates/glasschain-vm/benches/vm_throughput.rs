@@ -10,10 +10,14 @@
 //! cost centre in the execution pipeline.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use glasschain_core::ExecutionProvider;
+use glasschain_core::{ExecutionLimits, ExecutionProvider};
 use glasschain_vm::WasmExecutionProvider;
 use std::collections::HashMap;
 use wat::parse_str;
+
+const fn limits(value: u64) -> ExecutionLimits {
+    ExecutionLimits::new(value, value)
+}
 
 // ── WAT fixtures ─────────────────────────────────────────────────────────────
 
@@ -83,7 +87,7 @@ fn bench_single_noop_execution(c: &mut Criterion) {
             let result = executor.execute(
                 black_box("approve-contract"),
                 black_box(&wasm),
-                black_box(100_000),
+                black_box(limits(100_000)),
             );
             black_box(result.unwrap());
         });
@@ -99,7 +103,7 @@ fn bench_state_write_execution(c: &mut Criterion) {
             let result = executor.execute(
                 black_box("state-contract"),
                 black_box(&wasm),
-                black_box(100_000),
+                black_box(limits(100_000)),
             );
             black_box(result.unwrap());
         });
@@ -115,7 +119,7 @@ fn bench_compute_loop_execution(c: &mut Criterion) {
             let result = executor.execute(
                 black_box("compute-contract"),
                 black_box(&wasm),
-                black_box(1_000_000),
+                black_box(limits(1_000_000)),
             );
             black_box(result.unwrap());
         });
@@ -136,7 +140,7 @@ fn bench_throughput_1000_invocations(c: &mut Criterion) {
                 let result = executor.execute(
                     black_box(contract_id.as_str()),
                     black_box(&wasm),
-                    black_box(50_000),
+                    black_box(limits(50_000)),
                 );
                 black_box(result.unwrap());
             }
@@ -164,7 +168,7 @@ fn bench_execute_with_state(c: &mut Criterion) {
                 black_box("stateful-contract"),
                 black_box(&wasm),
                 black_box(world_state.clone()),
-                black_box(100_000),
+                black_box(limits(100_000)),
             );
             black_box(result.unwrap());
         });

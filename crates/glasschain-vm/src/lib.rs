@@ -2,8 +2,8 @@
 //!
 //! This crate implements the [`ExecutionProvider`] trait using **Wasmtime**,
 //! a fast, safe, standards-compliant WebAssembly runtime from the Bytecode
-//! Alliance.  It also implements **deterministic gas metering** via Wasmtime's
-//! built-in fuel consumption mechanism.
+//! Alliance. It enforces independent instruction-fuel and host-operation gas
+//! budgets.
 //!
 //! ## Design
 //!
@@ -26,8 +26,9 @@
 //! ## Gas metering
 //!
 //! Wasmtime's "fuel" feature deducts one unit of fuel per WASM instruction.
-//! The caller provides a `gas_limit`; if the contract exhausts all fuel before
-//! returning, the runtime returns [`CoreError::GasExhausted`].
+//! The caller provides [`ExecutionLimits`] with separate fuel and operation-gas
+//! budgets. Host state reads and writes use [`gas::GasCounter`]; exhausting
+//! either budget returns [`CoreError::GasExhausted`].
 //!
 //! ## Safety
 //!

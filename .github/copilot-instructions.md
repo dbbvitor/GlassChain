@@ -29,9 +29,9 @@ Notes that will save you a failed run:
 
 - A first clean build downloads and compiles `wasmtime`, `libp2p`, and `tonic`;
   expect several minutes. Subsequent builds are fast.
-- `cargo fmt --all --check` currently passes. Clippy with `-D warnings` exposes
-  existing Cargo metadata and pedantic/nursery diagnostics. Do not weaken the CI
-  gates; format only files you touched when making unrelated changes.
+- `cargo fmt --all --check` and clippy with `-D warnings` currently pass. Do not
+  weaken the CI gates; format only files you touched when making unrelated
+  changes.
 - Never run `cargo run -p glasschain-node` in an automated step: it starts an
   interactive REPL that blocks on stdin. Use the integration tests in
   `crates/glasschain-network/tests/` instead.
