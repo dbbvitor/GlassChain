@@ -1,5 +1,5 @@
 # The audit job denies all warnings. These are known transitive or legacy
-a# dependencies with no compatible migration in the current workspace graph:
+# dependencies with no compatible migration in the current workspace graph:
 # - libp2p 0.56.0 -> libp2p-mdns 0.48.0 pins hickory-proto 0.25.2;
 # - sled, criterion, madsim, and rustls-pemfile retain unmaintained crates;
 # - madsim is test-only, while the others are transitive or compatibility APIs.
