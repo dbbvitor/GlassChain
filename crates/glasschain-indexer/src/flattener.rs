@@ -705,12 +705,10 @@ mod tests {
         assert!(compliant[0].is_standard_compliant);
 
         // Verify the non-compliant record is not included
-        let non_compliant_ids: Vec<&str> = flattener
+        assert!(flattener
             .low_trust_records()
             .iter()
-            .map(|r| r.transaction_id.as_str())
-            .collect();
-        assert!(non_compliant_ids.contains(&"tx-minimal"));
+            .any(|record| record.transaction_id == "tx-minimal"));
     }
 
     // ── Test 6: low_trust_records returns records with trust_score < 80 ───────

@@ -22,7 +22,7 @@
 //!    fast-forward through delays that would normally take seconds.
 //! 2. **Reproducible seeds** — every `#[madsim::test]` run is seeded so
 //!    failures are fully reproducible (`MADSIM_TEST_SEED=<n> cargo test …`).
-//! 3. **Application-layer partition simulation** — the existing GlassChain
+//! 3. **Application-layer partition simulation** — the existing `GlassChain`
 //!    `Node` infrastructure is used to model network splits by controlling
 //!    which peers are dialled rather than patching the TCP stack.
 //! 4. **High-frequency watcher stress** — 1 000 autonomous inventory triggers
@@ -283,7 +283,7 @@ async fn test_madsim_node_crash_and_rejoin() {
 #[cfg_attr(madsim, madsim::test)]
 #[cfg_attr(not(madsim), tokio::test)]
 async fn test_madsim_1000_autonomous_triggers_stress() {
-    const N: u64 = 1_000;
+    const N: usize = 1_000;
 
     let mut watcher = WatcherService::new();
     for i in 0..N {
@@ -312,10 +312,7 @@ async fn test_madsim_1000_autonomous_triggers_stress() {
 
     let elapsed = t0.elapsed();
 
-    assert_eq!(
-        total_orders, N as usize,
-        "all {N} triggers must fire exactly once"
-    );
+    assert_eq!(total_orders, N, "all {N} triggers must fire exactly once");
 
     // Under real Tokio (no madsim), assert the throughput target.
     // Under madsim, time is virtual so the wall-clock assertion is skipped.
@@ -358,7 +355,7 @@ async fn test_madsim_1000_autonomous_triggers_stress() {
             assert!(inserted, "duplicate transaction ID: {}", order.id);
         }
     }
-    assert_eq!(all_ids.len(), N as usize, "all {N} tx IDs must be unique");
+    assert_eq!(all_ids.len(), N, "all {N} tx IDs must be unique");
 }
 
 /// Verify that SNCM trust-score nudge mechanics hold under concurrent
@@ -459,12 +456,13 @@ async fn test_madsim_sncm_nudge_under_simulated_load() {
 #[cfg_attr(madsim, madsim::test)]
 #[cfg_attr(not(madsim), tokio::test)]
 async fn test_madsim_event_bus_ordering_under_simulated_time() {
+    const ROUNDS: usize = 3;
+
     let addr = free_addr();
     let node = Arc::new(Node::new("event-order", &addr, 1));
     let mut rx = node.subscribe();
     node.start(vec![]).await.unwrap();
 
-    const ROUNDS: usize = 3;
     for round in 0..ROUNDS {
         node.submit_transaction(inv_tx(&format!("owner-{round}"), 10))
             .await
@@ -497,8 +495,7 @@ async fn test_madsim_event_bus_ordering_under_simulated_time() {
     for w in mined_indices.windows(2) {
         assert!(
             w[1] > w[0],
-            "block indices must be strictly increasing: {:?}",
-            mined_indices
+            "block indices must be strictly increasing: {mined_indices:?}"
         );
     }
 }
@@ -567,11 +564,11 @@ async fn test_madsim_partition_reference_implementation() {
     node_b.mine().await.unwrap();
 
     // ── Post-partition: longest chain wins (B has more blocks) ───────────
-    let len_a_final = node_a.ledger_snapshot().await.chain.len();
-    let len_b_final = node_b.ledger_snapshot().await.chain.len();
+    let chain_len_a = node_a.ledger_snapshot().await.chain.len();
+    let chain_len_b = node_b.ledger_snapshot().await.chain.len();
     assert!(
-        len_b_final > len_a_final,
-        "B must be ahead: B={len_b_final} A={len_a_final}"
+        chain_len_b > chain_len_a,
+        "B must be ahead: B={chain_len_b} A={chain_len_a}"
     );
 
     // A new node connects to B and adopts B's longer chain.
@@ -586,8 +583,8 @@ async fn test_madsim_partition_reference_implementation() {
 
     let len_e = node_e.ledger_snapshot().await.chain.len();
     assert!(
-        len_e >= len_b_final,
-        "E (connected to B) must adopt B's chain: E={len_e} B={len_b_final}"
+        len_e >= chain_len_b,
+        "E (connected to B) must adopt B's chain: E={len_e} B={chain_len_b}"
     );
     assert!(node_e.ledger_snapshot().await.validate_chain().is_ok());
 

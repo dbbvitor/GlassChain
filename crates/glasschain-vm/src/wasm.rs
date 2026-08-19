@@ -43,6 +43,8 @@ impl WasmExecutionProvider {
         Ok(Self { engine })
     }
 
+    // The host import registrations are kept together so their ABI stays visible.
+    #[allow(clippy::too_many_lines)]
     fn build_linker(
         &self,
         host_state: &Arc<Mutex<HostState>>,

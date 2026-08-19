@@ -1,0 +1,9 @@
+# libp2p 0.56.0 -> libp2p-mdns 0.48.0 pins hickory-proto 0.25.2.
+# No released libp2p version currently permits hickory-proto 0.26.1, and
+# RUSTSEC-2026-0118 has no fixed release. Revisit these exceptions when the
+# libp2p mDNS dependency moves to a fixed Hickory version.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0118",
+    "RUSTSEC-2026-0119",
+]

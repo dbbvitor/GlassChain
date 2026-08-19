@@ -1,7 +1,7 @@
-//! # GlassChain libp2p Swarm
+//! # `GlassChain` libp2p Swarm
 //!
 //! This module implements a Kademlia DHT + Gossipsub peer-to-peer networking
-//! layer for GlassChain using [`libp2p`] as the underlying transport and
+//! layer for `GlassChain` using [`libp2p`] as the underlying transport and
 //! protocol stack. It runs in parallel with the legacy TLS/TCP transport and
 //! is designed to progressively replace it.
 //!
@@ -74,7 +74,7 @@ pub const TOPIC_BLOCKS: &str = "glasschain/blocks";
 
 // ── Network Behaviour ─────────────────────────────────────────────────────────
 
-/// Combined libp2p [`NetworkBehaviour`] for every GlassChain swarm node.
+/// Combined libp2p [`NetworkBehaviour`] for every `GlassChain` swarm node.
 ///
 /// The four sub-behaviours are composed via the derive macro, which generates
 /// the `GlasschainBehaviourEvent` dispatch enum automatically — one variant per
@@ -98,6 +98,8 @@ pub struct GlasschainBehaviour {
 /// Each variant is dispatched inside the event loop via an MPSC channel.
 /// Use the async helper methods on [`LibP2pNode`] to enqueue commands rather
 /// than sending to the channel directly.
+// Keep transaction and block payloads inline to preserve this public command API.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum SwarmCommand {
     /// Connect to a remote peer at the given multiaddress.
@@ -116,6 +118,8 @@ pub enum SwarmCommand {
 ///
 /// Retrieve events via [`LibP2pNode::try_recv_event`] (non-blocking) or by
 /// locking [`LibP2pNode::event_rx`] and calling `recv().await`.
+// Keep transaction and block payloads inline to preserve this public event API.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum SwarmNodeEvent {
     /// A new peer-to-peer connection has been established.
@@ -156,7 +160,7 @@ pub struct LibP2pConfig {
 
 // ── Node handle ───────────────────────────────────────────────────────────────
 
-/// A running libp2p node participating in the GlassChain P2P network.
+/// A running libp2p node participating in the `GlassChain` P2P network.
 ///
 /// `LibP2pNode::new` constructs the swarm, binds the listen address, and
 /// spawns a background Tokio task that drives the event loop. All further
@@ -699,18 +703,22 @@ mod tests {
 
         let connected = SwarmNodeEvent::PeerConnected(peer_id);
         let cloned = connected.clone();
+        assert!(format!("{connected:?}").contains("PeerConnected"));
         assert!(format!("{cloned:?}").contains("PeerConnected"));
 
         let disconnected = SwarmNodeEvent::PeerDisconnected(peer_id);
         let cloned = disconnected.clone();
+        assert!(format!("{disconnected:?}").contains("PeerDisconnected"));
         assert!(format!("{cloned:?}").contains("PeerDisconnected"));
 
         let routing = SwarmNodeEvent::RoutingTableUpdated;
         let cloned = routing.clone();
+        assert!(format!("{routing:?}").contains("RoutingTableUpdated"));
         assert!(format!("{cloned:?}").contains("RoutingTableUpdated"));
 
         let error = SwarmNodeEvent::Error("test error message".to_string());
         let cloned = error.clone();
+        assert!(format!("{error:?}").contains("test error message"));
         assert!(format!("{cloned:?}").contains("test error message"));
     }
 }

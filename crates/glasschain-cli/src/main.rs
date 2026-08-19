@@ -83,7 +83,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::IdentityGen(args) => commands::identity::run(args)?,
         Commands::ContractDeploy(args) => commands::contract::run(args)?,
-        Commands::LedgerInspect(args) => commands::inspect::run(args)?,
+        Commands::LedgerInspect(args) => commands::inspect::run(&args),
     }
 
     Ok(())

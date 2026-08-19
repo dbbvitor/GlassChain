@@ -1,4 +1,4 @@
-//! Performance benchmarks for the GlassChain WatcherService (Phase 4 ECA engine).
+//! Performance benchmarks for the `GlassChain` `WatcherService` (Phase 4 ECA engine).
 //!
 //! Run with:
 //! ```text

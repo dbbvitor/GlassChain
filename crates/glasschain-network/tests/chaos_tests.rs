@@ -190,10 +190,10 @@ async fn test_concurrent_mining_longest_chain_wins() {
         .unwrap();
     node_a.mine().await.unwrap();
 
-    let len_b_before = node_b.ledger_snapshot().await.chain.len();
-    let len_a_before = node_a.ledger_snapshot().await.chain.len();
-    assert_eq!(len_b_before, 3, "node B should have 3 blocks");
-    assert_eq!(len_a_before, 2, "node A should have 2 blocks");
+    let remote_chain_blocks = node_b.ledger_snapshot().await.chain.len();
+    let local_chain_blocks = node_a.ledger_snapshot().await.chain.len();
+    assert_eq!(remote_chain_blocks, 3, "node B should have 3 blocks");
+    assert_eq!(local_chain_blocks, 2, "node A should have 2 blocks");
 
     // Connect A to B. A should adopt B's longer chain.
     // We simulate by starting a new node that connects to B and check it gets B's chain.

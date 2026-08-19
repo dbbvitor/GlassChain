@@ -9,6 +9,8 @@ pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 /// Messages are serialised as JSON and framed with a 4-byte big-endian length
 /// prefix, so each variant must be small enough to fit within
 /// [`MAX_MESSAGE_SIZE`].
+// Inline payloads preserve the stable JSON protocol shape and public API.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "msg", content = "data")]
 pub enum Message {

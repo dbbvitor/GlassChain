@@ -3,6 +3,11 @@ name = "glasschain-network"
 version = "0.1.0"
 edition = "2021"
 description = "P2P network protocol for federated GlassChain transactions"
+license = "Apache-2.0"
+repository = "https://github.com/dbbvitor/GlassChain"
+readme = "../../README.md"
+keywords = ["blockchain", "supply-chain", "distributed-ledger"]
+categories = ["network-programming", "asynchronous", "cryptography"]
 
 [dependencies]
 glasschain-core       = { path = "../glasschain-core" }
@@ -24,7 +29,7 @@ log          = "0.4"
 tokio-rustls = "0.26"
 rustls       = { version = "0.23", features = ["ring"] }
 rcgen        = "0.14"
-libp2p       = { version = "0.55", features = [
+libp2p       = { version = "0.56.0", features = [
     "gossipsub",
     "kad",
     "tcp",

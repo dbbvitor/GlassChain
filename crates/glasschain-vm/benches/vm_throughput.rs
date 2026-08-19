@@ -1,4 +1,4 @@
-//! Performance benchmarks for the GlassChain WASM execution engine.
+//! Performance benchmarks for the `GlassChain` WASM execution engine.
 //!
 //! Run with:
 //! ```text

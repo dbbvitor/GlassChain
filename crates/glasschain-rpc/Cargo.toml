@@ -3,13 +3,18 @@ name = "glasschain-rpc"
 version = "0.1.0"
 edition = "2021"
 description = "gRPC service layer for GlassChain (Phase 1 – Tonic + Prost)"
+license = "Apache-2.0"
+repository = "https://github.com/dbbvitor/GlassChain"
+readme = "../../README.md"
+keywords = ["blockchain", "supply-chain", "distributed-ledger"]
+categories = ["network-programming", "asynchronous", "cryptography"]
 
 [dependencies]
 glasschain-core = { path = "../glasschain-core" }
 glasschain-network = { path = "../glasschain-network" }
 glasschain-identity = { path = "../glasschain-identity" }
-tonic = { version = "0.14", features = ["transport"] }
-tonic-prost = "0.14"
+tonic = { version = "0.14.6", features = ["transport"] }
+tonic-prost = "0.14.6"
 prost = "0.14"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -20,7 +25,7 @@ ed25519-dalek = { version = "2.2", features = ["rand_core"] }
 hex = "0.4"
 
 [build-dependencies]
-tonic-prost-build = "0.14"
+tonic-prost-build = "0.14.6"
 
 [lints]
 workspace = true
