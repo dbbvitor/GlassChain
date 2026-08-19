@@ -1,26 +1,27 @@
-# The audit job denies all warnings. These are known transitive or legacy
+# The audit job denies all warnings. These are the remaining transitive
 # dependencies with no compatible migration in the current workspace graph:
 # - libp2p 0.56.0 -> libp2p-mdns 0.48.0 pins hickory-proto 0.25.2;
-# - sled, criterion, madsim, and rustls-pemfile retain unmaintained crates;
-# - madsim is test-only, while the others are transitive or compatibility APIs.
-# Revisit every exception when its upstream dependency offers a compatible fix.
+#   RUSTSEC-2026-0118 has no fix, while RUSTSEC-2026-0119 requires 0.26.1.
+# - sled 0.34.7 (latest stable, 2021) pins fxhash 0.2.1 and parking_lot 0.11
+#   -> instant; only the sled 1.0 alpha drops both.
+# - libp2p's if-watch 3.2.2 caps netlink-packet-core at 0.8.x, which pulls
+#   unmaintained paste; netlink-packet-core 0.9.0 is paste-free.
+# Revisit every exception when an upstream dependency offers a compatible fix.
 [output]
 # Keep the audit strict: informational, unsound, and yanked findings fail CI.
 quiet = false
 deny = ["warnings"]
 
 [yanked]
-# The CI command passes --no-yanked because the lockfile is checked separately
-# by Cargo; yanked crates should not make this audit nondeterministic.
-enabled = false
+# Keep yanked-crate checks enabled; --deny warnings makes them fail CI.
+enabled = true
+update_index = true
 
 [advisories]
 ignore = [
     "RUSTSEC-2026-0118",
     "RUSTSEC-2026-0119",
-    "RUSTSEC-2025-0141",
     "RUSTSEC-2025-0057",
     "RUSTSEC-2024-0384",
     "RUSTSEC-2024-0436",
-    "RUSTSEC-2025-0134",
 ]

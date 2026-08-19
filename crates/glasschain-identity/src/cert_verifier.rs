@@ -35,6 +35,7 @@
 
 use crate::error::IdentityError;
 use crate::msp::Organization;
+use rustls_pki_types::{pem::PemObject, CertificateDer};
 use serde::{Deserialize, Serialize};
 use x509_cert::{
     der::{Decode, Encode},
@@ -200,10 +201,7 @@ impl CertChainVerifier {
     ) -> Result<Self, CertVerificationError> {
         let org_name = org_name.into();
 
-        let mut reader = std::io::BufReader::new(root_ca_pem.as_bytes());
-        let root_der = rustls_pemfile::certs(&mut reader)
-            .next()
-            .ok_or_else(|| CertVerificationError::PemError("no certificate block in PEM".into()))?
+        let root_der = CertificateDer::from_pem_slice(root_ca_pem.as_bytes())
             .map_err(|e| CertVerificationError::PemError(e.to_string()))?;
 
         Self::from_der(org_name, root_der.as_ref())
@@ -375,10 +373,7 @@ impl CertChainVerifier {
     /// Returns [`CertVerificationError::PemError`] if decoding fails, or any
     /// error from [`verify_cert_der`](Self::verify_cert_der).
     pub fn verify_cert_pem(&self, peer_cert_pem: &str) -> Result<(), CertVerificationError> {
-        let mut reader = std::io::BufReader::new(peer_cert_pem.as_bytes());
-        let der = rustls_pemfile::certs(&mut reader)
-            .next()
-            .ok_or_else(|| CertVerificationError::PemError("no certificate block in PEM".into()))?
+        let der = CertificateDer::from_pem_slice(peer_cert_pem.as_bytes())
             .map_err(|e| CertVerificationError::PemError(e.to_string()))?;
 
         self.verify_cert_der(der.as_ref())
@@ -522,8 +517,7 @@ mod tests {
         let mut org = Organization::new("RoundTripOrg").unwrap();
 
         // Decode the Root CA PEM to raw DER bytes.
-        let mut reader = std::io::BufReader::new(org.root_ca_cert_pem.as_bytes());
-        let root_der = rustls_pemfile::certs(&mut reader).next().unwrap().unwrap();
+        let root_der = CertificateDer::from_pem_slice(org.root_ca_cert_pem.as_bytes()).unwrap();
 
         // Build verifier from DER and confirm it has the right org name.
         let verifier = CertChainVerifier::from_der("RoundTripOrg", root_der.as_ref()).unwrap();
@@ -547,8 +541,7 @@ mod tests {
         assert!(verifier.verify_cert_pem(&cert_pem).is_ok());
 
         // Confirm the underlying DER path also works for the same cert.
-        let mut reader = std::io::BufReader::new(cert_pem.as_bytes());
-        let der = rustls_pemfile::certs(&mut reader).next().unwrap().unwrap();
+        let der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap();
         assert!(verifier.verify_cert_der(der.as_ref()).is_ok());
     }
 
@@ -594,8 +587,7 @@ mod tests {
         let (org, cert_pem) = org_with_member("PharmaOrg", "node-tamper");
         let verifier = CertChainVerifier::from_org(&org).unwrap();
 
-        let mut reader = std::io::BufReader::new(cert_pem.as_bytes());
-        let der = rustls_pemfile::certs(&mut reader).next().unwrap().unwrap();
+        let der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap();
         let mut tampered = der.as_ref().to_vec();
 
         // The signature BIT STRING terminates the certificate, so corrupting the
