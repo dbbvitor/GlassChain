@@ -1,14 +1,11 @@
+use crate::approval_gate::{ApprovalGate, ApprovalGatePolicy, GateDecision};
 use crate::contract::{Contract, ContractStatus};
 use crate::error::ContractError;
-use base64::prelude::*;
 use glasschain_core::{
-    Block, ContractExecution, ExecutionLimits, PurchaseOrder, SmartContractDef, SupplyOffer,
-    Transaction, TransactionKind,
+    Block, ContractExecution, PurchaseOrder, SmartContractDef, SupplyOffer, Transaction,
+    TransactionKind,
 };
 use std::collections::HashMap;
-
-/// Default fuel and operation-gas budget for WASM gate evaluation.
-const DEFAULT_WASM_GATE_LIMIT: u64 = 50_000;
 
 /// The smart-contract execution engine.
 ///
@@ -31,6 +28,13 @@ impl std::fmt::Debug for ContractEngine {
             .field("executor", &self.executor.as_ref().map(|_| "<executor>"))
             .finish()
     }
+}
+
+struct PurchasePlan {
+    purchase_order: Transaction,
+    execution: Transaction,
+    quantity: u64,
+    total_price: u64,
 }
 
 impl ContractEngine {
@@ -80,6 +84,129 @@ impl ContractEngine {
     /// Return an iterator over all contracts.
     pub fn contracts(&self) -> impl Iterator<Item = &Contract> {
         self.contracts.values()
+    }
+
+    fn offer_matches(contract: &Contract, offer: &SupplyOffer) -> bool {
+        let conditions = contract.conditions();
+        if contract.product_id() != offer.product_id || conditions.currency != offer.currency {
+            return false;
+        }
+        if offer.price_per_unit > conditions.max_price_per_unit {
+            log::debug!(
+                "Contract {}: price {} exceeds max {}",
+                contract.id(),
+                offer.price_per_unit,
+                conditions.max_price_per_unit
+            );
+            return false;
+        }
+        if offer.lead_time_days > conditions.max_lead_time_days {
+            log::debug!(
+                "Contract {}: lead time {} exceeds max {}",
+                contract.id(),
+                offer.lead_time_days,
+                conditions.max_lead_time_days
+            );
+            return false;
+        }
+        if offer.quantity_available < conditions.min_quantity {
+            log::debug!(
+                "Contract {}: available qty {} below min {}",
+                contract.id(),
+                offer.quantity_available,
+                conditions.min_quantity
+            );
+            return false;
+        }
+        conditions
+            .preferred_seller_id
+            .as_ref()
+            .is_none_or(|preferred| preferred == &offer.seller_id)
+    }
+
+    fn prepare_purchase(
+        contract: &Contract,
+        offer: &SupplyOffer,
+        offer_tx_id: &str,
+    ) -> Option<PurchasePlan> {
+        let conditions = contract.conditions();
+        let remaining_budget = conditions
+            .max_quantity
+            .saturating_sub(contract.quantity_purchased);
+        if remaining_budget == 0 {
+            return None;
+        }
+
+        let quantity = remaining_budget
+            .min(offer.quantity_available)
+            .min(conditions.max_quantity);
+        let total_price = quantity.saturating_mul(offer.price_per_unit);
+        let purchase_order = Transaction::with_id(
+            format!("po:{}-{}", contract.id(), offer_tx_id),
+            TransactionKind::PurchaseOrder(PurchaseOrder {
+                product_id: offer.product_id.clone(),
+                buyer_id: contract.buyer_id().to_owned(),
+                seller_id: offer.seller_id.clone(),
+                quantity,
+                agreed_price_per_unit: offer.price_per_unit,
+                currency: offer.currency.clone(),
+                contract_id: Some(contract.id().to_owned()),
+            }),
+        );
+        let execution = Transaction::with_id(
+            format!("exec:{}-{}", contract.id(), offer_tx_id),
+            TransactionKind::ContractExecution(ContractExecution {
+                contract_id: contract.id().to_owned(),
+                purchase_order_tx_id: purchase_order.id.clone(),
+                buyer_id: contract.buyer_id().to_owned(),
+                seller_id: offer.seller_id.clone(),
+                product_id: offer.product_id.clone(),
+                quantity,
+                total_price,
+                currency: offer.currency.clone(),
+            }),
+        );
+
+        Some(PurchasePlan {
+            purchase_order,
+            execution,
+            quantity,
+            total_price,
+        })
+    }
+
+    fn apply_purchase(
+        contract: &mut Contract,
+        offer: &SupplyOffer,
+        plan: PurchasePlan,
+        offer_tx_id: &str,
+        generated: &mut Vec<Transaction>,
+    ) {
+        log::info!(
+            "Contract {} auto-executed: {} × {} @ {} {} from {} (total {})",
+            contract.id(),
+            plan.quantity,
+            offer.product_id,
+            offer.price_per_unit,
+            offer.currency,
+            offer.seller_id,
+            plan.total_price
+        );
+
+        contract.quantity_purchased += plan.quantity;
+        contract.execution_count += 1;
+        if contract.quantity_purchased >= contract.conditions().max_quantity {
+            contract.status = ContractStatus::Fulfilled;
+            log::info!("Contract {} fulfilled", contract.id());
+        }
+
+        log::debug!(
+            "Contract {} emitted purchase for offer {}",
+            contract.id(),
+            offer_tx_id
+        );
+        generated.push(plan.purchase_order);
+        generated.push(plan.execution);
     }
 
     /// Cancel a contract by ID, preventing further automatic executions.
@@ -135,16 +262,12 @@ impl ContractEngine {
     /// required to record the automatic purchase.
     ///
     /// Returns the list of generated transactions (may be empty).
-    #[allow(clippy::too_many_lines)]
     pub fn evaluate_supply_offer(
         &mut self,
         offer: &SupplyOffer,
         offer_tx_id: &str,
     ) -> Vec<Transaction> {
         let mut generated = Vec::new();
-
-        // Clone the executor Arc before the loop so that the mutable borrow of
-        // `self.contracts` does not conflict with reading `self.executor`.
         let executor_opt = self.executor.clone();
 
         for contract in self.contracts.values_mut() {
@@ -152,107 +275,38 @@ impl ContractEngine {
                 continue;
             }
 
-            // WASM gate: if the contract carries a WASM payload and the engine has
-            // an executor, run the module with the offer as JSON world-state.
-            // The contract signals approval by writing "approve" → b"1".
+            // An active WASM gate must approve before standard condition matching.
             if let (Some(ref wasm_b64), Some(ref executor)) =
                 (&contract.definition.wasm_code_b64, &executor_opt)
             {
-                match BASE64_STANDARD.decode(wasm_b64) {
-                    Ok(wasm_bytes) => {
-                        let mut initial = std::collections::HashMap::new();
-                        if let Ok(offer_json) = serde_json::to_vec(offer) {
-                            initial.insert("offer".to_string(), offer_json);
-                        }
-                        let exec_id = format!("wasm:{}:{}", contract.id(), offer_tx_id);
-                        match executor.execute_with_state(
-                            &exec_id,
-                            &wasm_bytes,
-                            initial,
-                            ExecutionLimits::new(DEFAULT_WASM_GATE_LIMIT, DEFAULT_WASM_GATE_LIMIT),
-                        ) {
-                            Ok(mutations) => {
-                                let approved = mutations
-                                    .iter()
-                                    .any(|(k, v)| k == "approve" && v.as_slice() == b"1");
-                                if !approved {
-                                    log::debug!(
-                                        "Contract {}: WASM gate denied offer {}",
-                                        contract.id(),
-                                        offer_tx_id
-                                    );
-                                    continue;
-                                }
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "Contract {}: WASM execution error for offer {}: {e}",
-                                    contract.id(),
-                                    offer_tx_id
-                                );
-                                continue;
-                            }
-                        }
-                    }
-                    Err(e) => {
+                let initial_state = serde_json::to_vec(offer)
+                    .map(|offer_json| {
+                        let mut state = HashMap::new();
+                        state.insert("offer".to_string(), offer_json);
+                        state
+                    })
+                    .map_err(|error| error.to_string());
+                let execution_id = format!("wasm:{}:{}", contract.id(), offer_tx_id);
+                let gate =
+                    ApprovalGate::new(executor.as_ref(), ApprovalGatePolicy::ContractEvaluation);
+                match gate.evaluate(&execution_id, wasm_b64, initial_state) {
+                    GateDecision::Approved => {}
+                    GateDecision::Denied { reason } => {
                         log::warn!(
-                            "Contract {}: cannot decode wasm_code_b64: {e}",
-                            contract.id()
+                            "Contract {}: WASM gate denied offer {}: {reason}",
+                            contract.id(),
+                            offer_tx_id
                         );
+                        continue;
                     }
                 }
             }
 
-            let conditions = &contract.definition.conditions;
-
-            // Filter by product.
-            if contract.definition.product_id != offer.product_id {
+            if !Self::offer_matches(contract, offer) {
                 continue;
             }
 
-            // Filter by currency.
-            if conditions.currency != offer.currency {
-                continue;
-            }
-
-            // Check conditions.
-            if offer.price_per_unit > conditions.max_price_per_unit {
-                log::debug!(
-                    "Contract {}: price {} exceeds max {}",
-                    contract.id(),
-                    offer.price_per_unit,
-                    conditions.max_price_per_unit
-                );
-                continue;
-            }
-            if offer.lead_time_days > conditions.max_lead_time_days {
-                log::debug!(
-                    "Contract {}: lead time {} exceeds max {}",
-                    contract.id(),
-                    offer.lead_time_days,
-                    conditions.max_lead_time_days
-                );
-                continue;
-            }
-            if offer.quantity_available < conditions.min_quantity {
-                log::debug!(
-                    "Contract {}: available qty {} below min {}",
-                    contract.id(),
-                    offer.quantity_available,
-                    conditions.min_quantity
-                );
-                continue;
-            }
-
-            // Optional seller preference.
-            if let Some(ref preferred) = conditions.preferred_seller_id {
-                if *preferred != offer.seller_id {
-                    continue;
-                }
-            }
-
-            if !conditions.auto_execute {
-                // Conditions met but auto-execution disabled: just log.
+            if !contract.conditions().auto_execute {
                 log::info!(
                     "Contract {} conditions met for offer {} but auto_execute=false",
                     contract.id(),
@@ -261,78 +315,11 @@ impl ContractEngine {
                 continue;
             }
 
-            // Determine order quantity (capped at contract max_quantity and
-            // what the seller has available).
-            let remaining_budget = conditions
-                .max_quantity
-                .saturating_sub(contract.quantity_purchased);
-            if remaining_budget == 0 {
+            let Some(plan) = Self::prepare_purchase(contract, offer, offer_tx_id) else {
                 contract.status = ContractStatus::Fulfilled;
                 continue;
-            }
-            let order_qty = remaining_budget
-                .min(offer.quantity_available)
-                .min(conditions.max_quantity);
-
-            // Saturating multiply avoids overflow on large orders.
-            let total_price = order_qty.saturating_mul(offer.price_per_unit);
-
-            // Use deterministic IDs derived from the contract and offer so that
-            // all nodes evaluating the same offer generate identical transaction
-            // IDs.  The idempotency check in `Ledger::add_transaction` then
-            // suppresses the duplicates that would otherwise arise from multiple
-            // nodes auto-executing the same contract+offer pair.
-            let po_id = format!("po:{}-{}", contract.id(), offer_tx_id);
-            let exec_id = format!("exec:{}-{}", contract.id(), offer_tx_id);
-
-            let po_tx = Transaction::with_id(
-                po_id,
-                TransactionKind::PurchaseOrder(PurchaseOrder {
-                    product_id: offer.product_id.clone(),
-                    buyer_id: contract.buyer_id().to_owned(),
-                    seller_id: offer.seller_id.clone(),
-                    quantity: order_qty,
-                    agreed_price_per_unit: offer.price_per_unit,
-                    currency: offer.currency.clone(),
-                    contract_id: Some(contract.id().to_owned()),
-                }),
-            );
-
-            let exec_tx = Transaction::with_id(
-                exec_id,
-                TransactionKind::ContractExecution(ContractExecution {
-                    contract_id: contract.id().to_owned(),
-                    purchase_order_tx_id: po_tx.id.clone(),
-                    buyer_id: contract.buyer_id().to_owned(),
-                    seller_id: offer.seller_id.clone(),
-                    product_id: offer.product_id.clone(),
-                    quantity: order_qty,
-                    total_price,
-                    currency: offer.currency.clone(),
-                }),
-            );
-
-            log::info!(
-                "Contract {} auto-executed: {} × {} @ {} {} from {} (total {})",
-                contract.id(),
-                order_qty,
-                offer.product_id,
-                offer.price_per_unit,
-                offer.currency,
-                offer.seller_id,
-                total_price
-            );
-
-            contract.quantity_purchased += order_qty;
-            contract.execution_count += 1;
-
-            if contract.quantity_purchased >= conditions.max_quantity {
-                contract.status = ContractStatus::Fulfilled;
-                log::info!("Contract {} fulfilled", contract.id());
-            }
-
-            generated.push(po_tx);
-            generated.push(exec_tx);
+            };
+            Self::apply_purchase(contract, offer, plan, offer_tx_id, &mut generated);
         }
 
         generated
@@ -496,6 +483,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_matching_offer_preserves_quantity_cap_and_transaction_order() {
+        let mut engine = ContractEngine::new();
+        engine
+            .register_contract(make_contract(
+                "c1", "buyer-1", "SKU-001", 1500, 10, 10, 30, true,
+            ))
+            .unwrap();
+
+        let txs = engine.evaluate_supply_offer(
+            &make_offer("seller-1", "SKU-001", 100, 1200, 7),
+            "offer-tx-1",
+        );
+        assert_eq!(txs.len(), 2);
+
+        let TransactionKind::PurchaseOrder(order) = &txs[0].kind else {
+            panic!("expected PurchaseOrder first");
+        };
+        assert_eq!(order.quantity, 30);
+
+        let TransactionKind::ContractExecution(execution) = &txs[1].kind else {
+            panic!("expected ContractExecution second");
+        };
+        assert_eq!(execution.purchase_order_tx_id, txs[0].id);
+        assert_eq!(execution.quantity, 30);
+        assert_eq!(
+            engine.get_contract("c1").unwrap().status,
+            ContractStatus::Fulfilled
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Offer evaluation — rejection paths
     // -------------------------------------------------------------------------
@@ -648,6 +666,7 @@ mod tests {
 mod wasm_tests {
     use super::*;
 
+    use base64::prelude::*;
     use glasschain_core::{PurchaseConditions, SmartContractDef, SupplyOffer};
     use glasschain_vm::WasmExecutionProvider;
     use std::sync::Arc;
@@ -677,6 +696,20 @@ mod wasm_tests {
   (data (i32.const 7) "0")
   (func (export "execute")
     (call $set_state (i32.const 0) (i32.const 7) (i32.const 7) (i32.const 1))
+  )
+)
+"#;
+        let wasm = wat::parse_str(wat).expect("WAT compile");
+        BASE64_STANDARD.encode(&wasm)
+    }
+
+    fn exhausting_wasm_b64() -> String {
+        let wat = r#"
+(module
+  (func (export "execute")
+    (loop $forever
+      (br $forever)
+    )
   )
 )
 "#;
@@ -733,6 +766,30 @@ mod wasm_tests {
         engine.set_executor(executor);
         engine
             .register_contract(contract_def(Some(denying_wasm_b64())))
+            .unwrap();
+        let txs = engine.evaluate_supply_offer(&offer(), "offer-1");
+        assert!(txs.is_empty());
+    }
+
+    #[test]
+    fn test_exhausted_wasm_gate_denies_offer() {
+        let executor = Arc::new(WasmExecutionProvider::new().expect("wasmtime"));
+        let mut engine = ContractEngine::new();
+        engine.set_executor(executor);
+        engine
+            .register_contract(contract_def(Some(exhausting_wasm_b64())))
+            .unwrap();
+        let txs = engine.evaluate_supply_offer(&offer(), "offer-1");
+        assert!(txs.is_empty());
+    }
+
+    #[test]
+    fn test_invalid_wasm_gate_denies_offer() {
+        let executor = Arc::new(WasmExecutionProvider::new().expect("wasmtime"));
+        let mut engine = ContractEngine::new();
+        engine.set_executor(executor);
+        engine
+            .register_contract(contract_def(Some("not-base64".into())))
             .unwrap();
         let txs = engine.evaluate_supply_offer(&offer(), "offer-1");
         assert!(txs.is_empty());
