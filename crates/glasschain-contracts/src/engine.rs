@@ -2,13 +2,13 @@ use crate::contract::{Contract, ContractStatus};
 use crate::error::ContractError;
 use base64::prelude::*;
 use glasschain_core::{
-    Block, ContractExecution, PurchaseOrder, SmartContractDef, SupplyOffer, Transaction,
-    TransactionKind,
+    Block, ContractExecution, ExecutionLimits, PurchaseOrder, SmartContractDef, SupplyOffer,
+    Transaction, TransactionKind,
 };
 use std::collections::HashMap;
 
-/// Default gas budget for WASM gate evaluation in `evaluate_supply_offer`.
-const DEFAULT_WASM_GATE_GAS_LIMIT: u64 = 50_000;
+/// Default fuel and operation-gas budget for WASM gate evaluation.
+const DEFAULT_WASM_GATE_LIMIT: u64 = 50_000;
 
 /// The smart-contract execution engine.
 ///
@@ -169,7 +169,7 @@ impl ContractEngine {
                             &exec_id,
                             &wasm_bytes,
                             initial,
-                            DEFAULT_WASM_GATE_GAS_LIMIT,
+                            ExecutionLimits::new(DEFAULT_WASM_GATE_LIMIT, DEFAULT_WASM_GATE_LIMIT),
                         ) {
                             Ok(mutations) => {
                                 let approved = mutations
