@@ -221,13 +221,19 @@ impl WasmExecutionProvider {
         let linker = self.build_linker(&host_state)?;
 
         let mut store = Store::new(&self.engine, Arc::clone(&host_state));
+        // Instantiation is runtime setup, not contract execution. In particular,
+        // Wasmtime meters memory initialization and data-segment copies.
         store
-            .set_fuel(gas_limit)
-            .map_err(|e| CoreError::Execution(format!("set_fuel: {e}")))?;
+            .set_fuel(u64::MAX)
+            .map_err(|e| CoreError::Execution(format!("set_fuel (instantiate): {e}")))?;
 
         let instance = linker
             .instantiate(&mut store, &module)
             .map_err(|e| CoreError::Execution(format!("wasm instantiate [{contract_id}]: {e}")))?;
+
+        store
+            .set_fuel(gas_limit)
+            .map_err(|e| CoreError::Execution(format!("set_fuel: {e}")))?;
 
         let execute_fn = instance
             .get_typed_func::<(), ()>(&mut store, "execute")
@@ -358,7 +364,9 @@ mod tests {
     fn test_hello_world_contract() {
         let provider = WasmExecutionProvider::new().unwrap();
         let wasm = compile_wat(hello_world_wat());
-        let mutations = provider.execute("hello-contract", &wasm, 10_000).unwrap();
+        let mutations = provider
+            .execute("hello-contract", &wasm, 10_000)
+            .expect("hello-contract execution failed");
         assert_eq!(mutations.len(), 1);
         assert_eq!(mutations[0].0, "hello");
         assert_eq!(mutations[0].1, b"world");
@@ -393,6 +401,25 @@ mod tests {
         );
         let mutations = provider.execute("noop-contract", &wasm, 10_000).unwrap();
         assert!(mutations.is_empty());
+    }
+
+    #[test]
+    fn test_memory_initialization_does_not_consume_contract_gas() {
+        let provider = WasmExecutionProvider::new().unwrap();
+        let wasm = compile_wat(
+            r#"
+(module
+  (memory (export "memory") 16)
+  (data (i32.const 0) "initialized")
+  (func (export "execute"))
+)
+"#,
+        );
+        let result = provider.execute("memory-init-contract", &wasm, 100);
+        assert!(
+            result.is_ok(),
+            "runtime setup must not consume contract gas: {result:?}"
+        );
     }
 
     /// Verify that calling `get_state` for a key that was never written into
