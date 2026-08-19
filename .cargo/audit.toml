@@ -1,11 +1,12 @@
 # The audit job denies all warnings. These are known transitive or legacy
-# dependencies with no compatible migration in the current workspace graph:
+a# dependencies with no compatible migration in the current workspace graph:
 # - libp2p 0.56.0 -> libp2p-mdns 0.48.0 pins hickory-proto 0.25.2;
 # - sled, criterion, madsim, and rustls-pemfile retain unmaintained crates;
 # - madsim is test-only, while the others are transitive or compatibility APIs.
 # Revisit every exception when its upstream dependency offers a compatible fix.
 [output]
 # Keep the audit strict: informational, unsound, and yanked findings fail CI.
+quiet = false
 deny = ["warnings"]
 
 [yanked]
