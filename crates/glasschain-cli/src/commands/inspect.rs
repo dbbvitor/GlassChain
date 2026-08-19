@@ -46,8 +46,7 @@ pub struct LedgerInspectArgs {
 ///
 /// Currently infallible.  Future releases will return errors when the gRPC
 /// call to the remote node fails.
-#[allow(clippy::unused_async)] // intentionally async — will drive tonic in a future release
-pub async fn run(args: LedgerInspectArgs) -> anyhow::Result<()> {
+pub fn run(args: &LedgerInspectArgs) {
     println!("GlassChain Ledger Inspector");
     println!("  Endpoint : {}", args.endpoint);
     println!();
@@ -57,7 +56,7 @@ pub async fn run(args: LedgerInspectArgs) -> anyhow::Result<()> {
         println!("  Action   : GetBlock");
         println!("  gRPC     : LedgerService.GetBlock {{ index: {index} }}");
         println!();
-        println!("  Would send GetBlock(index={index}) to {}", args.endpoint,);
+        println!("  Would send GetBlock(index={index}) to {}", args.endpoint);
         log::info!(
             "ledger-inspect: would query GetBlock(index={index}) at {}",
             args.endpoint,
@@ -92,7 +91,7 @@ pub async fn run(args: LedgerInspectArgs) -> anyhow::Result<()> {
         println!("  Action   : GetChainStatus");
         println!("  gRPC     : LedgerService.GetChainStatus {{}}");
         println!();
-        println!("  Would send GetChainStatus to {}", args.endpoint,);
+        println!("  Would send GetChainStatus to {}", args.endpoint);
         log::info!(
             "ledger-inspect: would query GetChainStatus at {}",
             args.endpoint,
@@ -101,6 +100,4 @@ pub async fn run(args: LedgerInspectArgs) -> anyhow::Result<()> {
 
     println!();
     println!("Tip: pass --block N, --gtin <GTIN>, or omit flags for chain status.");
-
-    Ok(())
 }

@@ -1,0 +1,175 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust with rustfmt
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: -D warnings
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust with clippy
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95
+          components: clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ github.job }}
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    needs: [fmt, clippy]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      RUSTFLAGS: -D warnings
+      RUSTDOCFLAGS: -D warnings
+      # The network integration tests allocate ephemeral loopback ports and
+      # use real TLS handshakes; serial libtest execution avoids cross-test
+      # port races on slower macOS and Windows runners. Criterion benches do
+      # not consume this setting.
+      RUST_TEST_THREADS: 1
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ github.job }}
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      - name: Check all targets
+        run: cargo check --workspace --all-targets --all-features --locked
+
+      - name: Run all tests
+        run: cargo test --workspace --all-targets --all-features --locked
+
+  coverage:
+    name: Code coverage
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ github.job }}
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      - name: Install cargo-tarpaulin
+        run: cargo install --locked cargo-tarpaulin
+
+      - name: Generate coverage report
+        run: cargo tarpaulin --verbose --workspace --all-features --all-targets --locked --timeout 120 --out xml
+
+      - name: Upload coverage to Codecov
+        if: ${{ env.CODECOV_TOKEN != '' }}
+        uses: codecov/codecov-action@v7
+        with:
+          files: cobertura.xml
+          fail_ci_if_error: true
+          token: ${{ env.CODECOV_TOKEN }}
+
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95
+
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      - name: Audit Rust dependencies
+        run: cargo audit --deny warnings --file Cargo.lock

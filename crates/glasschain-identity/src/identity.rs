@@ -201,13 +201,13 @@ mod tests {
 
     #[test]
     fn test_wrong_key_fails_verification() {
-        let signer = Identity::generate("node-1");
+        let identity = Identity::generate("node-1");
         let impostor = Identity::generate("node-2");
         let tx = sample_tx();
-        let mut signed = signer.sign_transaction(tx).unwrap();
+        let mut signed_tx = identity.sign_transaction(tx).unwrap();
         // Replace with impostor's public key
-        signed.signer_public_key = impostor.public_key_bytes().to_vec();
-        assert!(signed.verify().is_err());
+        signed_tx.signer_public_key = impostor.public_key_bytes().to_vec();
+        assert!(signed_tx.verify().is_err());
     }
 
     #[test]

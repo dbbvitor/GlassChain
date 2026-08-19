@@ -224,10 +224,7 @@ impl MspAuthInterceptor {
     /// 5. Hex-decode `x-glasschain-auth-sig` to exactly 64 bytes; reject if malformed.
     /// 6. Look up `x-glasschain-node-id` in the registry; reject if unknown.
     /// 7. Verify the ed25519 signature over `"{node_id}:{timestamp}"` bytes.
-    fn verify_request(
-        &self,
-        metadata: &tonic::metadata::MetadataMap,
-    ) -> Result<(), tonic::Status> {
+    fn verify_request(&self, metadata: &tonic::metadata::MetadataMap) -> Result<(), tonic::Status> {
         let node_id_mv = metadata.get("x-glasschain-node-id");
         let ts_mv = metadata.get("x-glasschain-auth-ts");
         let sig_mv = metadata.get("x-glasschain-auth-sig");
@@ -245,23 +242,17 @@ impl MspAuthInterceptor {
         }
 
         // All three headers must be present and valid ASCII.
-        let node_id = node_id_mv
-            .and_then(|mv| mv.to_str().ok())
-            .ok_or_else(|| {
-                tonic::Status::unauthenticated("missing or invalid x-glasschain-node-id")
-            })?;
+        let node_id = node_id_mv.and_then(|mv| mv.to_str().ok()).ok_or_else(|| {
+            tonic::Status::unauthenticated("missing or invalid x-glasschain-node-id")
+        })?;
 
-        let ts_str = ts_mv
-            .and_then(|mv| mv.to_str().ok())
-            .ok_or_else(|| {
-                tonic::Status::unauthenticated("missing or invalid x-glasschain-auth-ts")
-            })?;
+        let ts_str = ts_mv.and_then(|mv| mv.to_str().ok()).ok_or_else(|| {
+            tonic::Status::unauthenticated("missing or invalid x-glasschain-auth-ts")
+        })?;
 
-        let sig_hex = sig_mv
-            .and_then(|mv| mv.to_str().ok())
-            .ok_or_else(|| {
-                tonic::Status::unauthenticated("missing or invalid x-glasschain-auth-sig")
-            })?;
+        let sig_hex = sig_mv.and_then(|mv| mv.to_str().ok()).ok_or_else(|| {
+            tonic::Status::unauthenticated("missing or invalid x-glasschain-auth-sig")
+        })?;
 
         // Parse the timestamp as decimal Unix seconds.
         let ts: u64 = ts_str
@@ -306,10 +297,7 @@ impl MspAuthInterceptor {
 }
 
 impl tonic::service::Interceptor for MspAuthInterceptor {
-    fn call(
-        &mut self,
-        request: tonic::Request<()>,
-    ) -> Result<tonic::Request<()>, tonic::Status> {
+    fn call(&mut self, request: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
         self.verify_request(request.metadata())?;
         Ok(request)
     }

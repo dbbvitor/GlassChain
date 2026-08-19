@@ -1,6 +1,6 @@
 //! SNCM Asset Schema Validation.
 //!
-//! This module implements **Phase 3** of the GlassChain plan: a deterministic
+//! This module implements **Phase 3** of the `GlassChain` plan: a deterministic
 //! schema-compliance checker for [`TraceableAsset`] records against the
 //! Brazilian Anvisa **SNCM** requirements (RDC 157/2017).
 //!
@@ -191,13 +191,13 @@ impl SchemaValidationReport {
 /// to prevent the two mechanisms from silently diverging.
 #[must_use]
 pub fn validate_asset(asset: &TraceableAsset) -> SchemaValidationReport {
+    // Returns `true` if the `Option<String>` is `Some` and non-empty.
+    fn is_present(value: Option<&str>) -> bool {
+        value.is_some_and(|value| !value.is_empty())
+    }
+
     let mut violations: Vec<SchemaViolation> = Vec::new();
     let mut field_count_present: usize = 0;
-
-    // Returns `true` if the `Option<String>` is `Some` and non-empty.
-    fn is_present(opt: &Option<String>) -> bool {
-        opt.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
-    }
 
     // `expiry_date` is present-but-invalid when it is `Some(non-empty)` yet
     // fails the ISO-8601 format check.  We track this separately so the
@@ -212,8 +212,8 @@ pub fn validate_asset(asset: &TraceableAsset) -> SchemaValidationReport {
     // We evaluate all `is_present` calls up-front to avoid borrowing `asset`
     // inside the mutable closure below.
     let presences: [bool; 6] = [
-        is_present(&asset.gtin),
-        is_present(&asset.batch_number),
+        is_present(asset.gtin.as_deref()),
+        is_present(asset.batch_number.as_deref()),
         // expiry_date must be non-empty AND conform to YYYY-MM-DD (ISO-8601).
         // Mirrors the rule in `MetadataTrustScore::compute` so that both
         // mechanisms agree on what constitutes a valid expiry date.
@@ -221,9 +221,9 @@ pub fn validate_asset(asset: &TraceableAsset) -> SchemaValidationReport {
             .expiry_date
             .as_deref()
             .is_some_and(is_valid_iso8601_date),
-        is_present(&asset.serial_number),
-        is_present(&asset.anvisa_registration),
-        is_present(&asset.manufacturer_id),
+        is_present(asset.serial_number.as_deref()),
+        is_present(asset.anvisa_registration.as_deref()),
+        is_present(asset.manufacturer_id.as_deref()),
     ];
 
     {
@@ -436,7 +436,7 @@ mod tests {
     #[test]
     fn test_empty_string_gtin_critical() {
         let mut asset = full_asset();
-        asset.gtin = Some("".into()); // Some("") is treated as absent
+        asset.gtin = Some(String::new()); // Some("") is treated as absent
         let report = validate_asset(&asset);
         assert!(
             !report.is_compliant,

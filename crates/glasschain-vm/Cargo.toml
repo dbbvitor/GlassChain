@@ -3,10 +3,15 @@ name = "glasschain-vm"
 version = "0.1.0"
 edition = "2021"
 description = "WASM execution runtime and gas metering for GlassChain smart contracts (Phase 4)"
+license = "Apache-2.0"
+repository = "https://github.com/dbbvitor/GlassChain"
+readme = "../../README.md"
+keywords = ["blockchain", "supply-chain", "distributed-ledger"]
+categories = ["network-programming", "asynchronous", "cryptography"]
 
 [dependencies]
 glasschain-core = { path = "../glasschain-core" }
-wasmtime = "44.0.0"
+wasmtime = "47.0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
@@ -14,7 +19,7 @@ log = "0.4"
 
 [dev-dependencies]
 wat = "1.247"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = "0.5"
 
 [[bench]]
 name = "vm_throughput"

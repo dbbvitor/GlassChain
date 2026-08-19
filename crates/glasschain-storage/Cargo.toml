@@ -3,6 +3,11 @@ name = "glasschain-storage"
 version = "0.1.0"
 edition = "2021"
 description = "Pluggable storage backends for GlassChain (Sled, in-memory)"
+license = "Apache-2.0"
+repository = "https://github.com/dbbvitor/GlassChain"
+readme = "../../README.md"
+keywords = ["blockchain", "supply-chain", "distributed-ledger"]
+categories = ["network-programming", "asynchronous", "cryptography"]
 
 [dependencies]
 glasschain-core = { path = "../glasschain-core" }

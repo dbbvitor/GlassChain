@@ -10,16 +10,11 @@ use wasmtime::{Config, Engine, Linker, Module, Store};
 /// The contract reads and writes key-value pairs through host functions.
 /// All mutations are collected in `mutations` and returned after the contract
 /// returns, allowing the node to commit them atomically.
-#[allow(dead_code)]
 struct HostState {
     /// Read-only snapshot of the World State (passed in before execution).
     world_state: HashMap<String, Vec<u8>>,
     /// Key-value mutations produced by this execution.
     mutations: Vec<(String, Vec<u8>)>,
-    /// Key and value exchange buffers (backing the host-function linear memory).
-    /// Reserved for future host-function extensions (e.g. bulk state reads).
-    key_buf: Vec<u8>,
-    val_buf: Vec<u8>,
 }
 
 /// Wasmtime-based [`ExecutionProvider`] with deterministic gas metering.
@@ -48,6 +43,8 @@ impl WasmExecutionProvider {
         Ok(Self { engine })
     }
 
+    // The host import registrations are kept together so their ABI stays visible.
+    #[allow(clippy::too_many_lines)]
     fn build_linker(
         &self,
         host_state: &Arc<Mutex<HostState>>,
@@ -67,17 +64,29 @@ impl WasmExecutionProvider {
                         return;
                     };
                     let data = mem.data(&caller);
-                    let kp = usize::try_from(key_ptr).unwrap_or(usize::MAX);
-                    let kl = usize::try_from(key_len).unwrap_or(usize::MAX);
-                    let vp = usize::try_from(val_ptr).unwrap_or(usize::MAX);
-                    let vl = usize::try_from(val_len).unwrap_or(usize::MAX);
-                    if kp.checked_add(kl).is_none_or(|end| end > data.len())
-                        || vp.checked_add(vl).is_none_or(|end| end > data.len())
-                    {
+                    let Ok(kp) = usize::try_from(key_ptr) else {
+                        return;
+                    };
+                    let Ok(kl) = usize::try_from(key_len) else {
+                        return;
+                    };
+                    let Ok(vp) = usize::try_from(val_ptr) else {
+                        return;
+                    };
+                    let Ok(vl) = usize::try_from(val_len) else {
+                        return;
+                    };
+                    let Some(kend) = kp.checked_add(kl) else {
+                        return;
+                    };
+                    let Some(vend) = vp.checked_add(vl) else {
+                        return;
+                    };
+                    if kend > data.len() || vend > data.len() {
                         return;
                     }
-                    let key = String::from_utf8_lossy(&data[kp..kp + kl]).to_string();
-                    let val = data[vp..vp + vl].to_vec();
+                    let key = String::from_utf8_lossy(&data[kp..kend]).to_string();
+                    let val = data[vp..vend].to_vec();
                     caller.data().lock().unwrap().mutations.push((key, val));
                 },
             )
@@ -98,12 +107,19 @@ impl WasmExecutionProvider {
                             return -1;
                         };
                         let data = mem.data(&caller);
-                        let kp = usize::try_from(key_ptr).unwrap_or(usize::MAX);
-                        let kl = usize::try_from(key_len).unwrap_or(usize::MAX);
-                        if kp.checked_add(kl).is_none_or(|end| end > data.len()) {
+                        let Ok(kp) = usize::try_from(key_ptr) else {
+                            return -1;
+                        };
+                        let Ok(kl) = usize::try_from(key_len) else {
+                            return -1;
+                        };
+                        let Some(end) = kp.checked_add(kl) else {
+                            return -1;
+                        };
+                        if end > data.len() {
                             return -1;
                         }
-                        let key = String::from_utf8_lossy(&data[kp..kp + kl]).to_string();
+                        let key = String::from_utf8_lossy(&data[kp..end]).to_string();
                         hs_clone
                             .lock()
                             .unwrap()
@@ -132,17 +148,28 @@ impl WasmExecutionProvider {
                             return -1;
                         };
 
-                        let kp = usize::try_from(key_ptr).unwrap_or(usize::MAX);
-                        let kl = usize::try_from(key_len).unwrap_or(usize::MAX);
-                        let vp = usize::try_from(val_ptr).unwrap_or(usize::MAX);
-                        let vbl = usize::try_from(val_buf_len).unwrap_or(usize::MAX);
+                        let Ok(kp) = usize::try_from(key_ptr) else {
+                            return -1;
+                        };
+                        let Ok(kl) = usize::try_from(key_len) else {
+                            return -1;
+                        };
+                        let Ok(vp) = usize::try_from(val_ptr) else {
+                            return -1;
+                        };
+                        let Ok(vbl) = usize::try_from(val_buf_len) else {
+                            return -1;
+                        };
 
                         let key = {
                             let data = mem.data(&caller);
-                            if kp.checked_add(kl).is_none_or(|end| end > data.len()) {
+                            let Some(end) = kp.checked_add(kl) else {
+                                return -1;
+                            };
+                            if end > data.len() {
                                 return -1;
                             }
-                            String::from_utf8_lossy(&data[kp..kp + kl]).to_string()
+                            String::from_utf8_lossy(&data[kp..end]).to_string()
                         };
 
                         let value = {
@@ -158,13 +185,13 @@ impl WasmExecutionProvider {
                         }
 
                         let data_mut = mem.data_mut(&mut caller);
-                        if vp
-                            .checked_add(value.len())
-                            .is_none_or(|end| end > data_mut.len())
-                        {
+                        let Some(end) = vp.checked_add(value.len()) else {
+                            return -1;
+                        };
+                        if end > data_mut.len() {
                             return -1;
                         }
-                        data_mut[vp..vp + value.len()].copy_from_slice(&value);
+                        data_mut[vp..end].copy_from_slice(&value);
                         i32::try_from(value.len()).unwrap_or(-1)
                     },
                 )
@@ -187,19 +214,23 @@ impl WasmExecutionProvider {
         let host_state = Arc::new(Mutex::new(HostState {
             world_state: initial_state,
             mutations: Vec::new(),
-            key_buf: Vec::new(),
-            val_buf: Vec::new(),
         }));
         let linker = self.build_linker(&host_state)?;
 
         let mut store = Store::new(&self.engine, Arc::clone(&host_state));
+        // Instantiation is runtime setup, not contract execution. In particular,
+        // Wasmtime meters memory initialization and data-segment copies.
         store
-            .set_fuel(gas_limit)
-            .map_err(|e| CoreError::Execution(format!("set_fuel: {e}")))?;
+            .set_fuel(u64::MAX)
+            .map_err(|e| CoreError::Execution(format!("set_fuel (instantiate): {e}")))?;
 
         let instance = linker
             .instantiate(&mut store, &module)
             .map_err(|e| CoreError::Execution(format!("wasm instantiate [{contract_id}]: {e}")))?;
+
+        store
+            .set_fuel(gas_limit)
+            .map_err(|e| CoreError::Execution(format!("set_fuel: {e}")))?;
 
         let execute_fn = instance
             .get_typed_func::<(), ()>(&mut store, "execute")
@@ -365,6 +396,25 @@ mod tests {
         );
         let mutations = provider.execute("noop-contract", &wasm, 10_000).unwrap();
         assert!(mutations.is_empty());
+    }
+
+    #[test]
+    fn test_memory_initialization_does_not_consume_contract_gas() {
+        let provider = WasmExecutionProvider::new().unwrap();
+        let wasm = compile_wat(
+            r#"
+(module
+  (memory (export "memory") 16)
+  (data (i32.const 0) "initialized")
+  (func (export "execute"))
+)
+"#,
+        );
+        let result = provider.execute("memory-init-contract", &wasm, 100);
+        assert!(
+            result.is_ok(),
+            "runtime setup must not consume contract gas: {result:?}"
+        );
     }
 
     /// Verify that calling `get_state` for a key that was never written into

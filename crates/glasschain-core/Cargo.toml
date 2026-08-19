@@ -3,11 +3,16 @@ name = "glasschain-core"
 version = "0.1.0"
 edition = "2021"
 description = "Core blockchain primitives for GlassChain distributed ledger"
+license = "Apache-2.0"
+repository = "https://github.com/dbbvitor/GlassChain"
+readme = "../../README.md"
+keywords = ["blockchain", "supply-chain", "distributed-ledger"]
+categories = ["network-programming", "asynchronous", "cryptography"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.11"
+sha2 = "0.10"
 hex = "0.4"
 uuid = { version = "1.23", features = ["v4"] }
 thiserror = "2.0"

@@ -4,10 +4,11 @@ use glasschain_core::{
 };
 use glasschain_identity::Organization;
 use glasschain_network::{Node, NodeEvent};
+use glasschain_rpc::GlasschainServer;
 use glasschain_storage::SledStorageProvider;
 use glasschain_vm::WasmExecutionProvider;
-use glasschain_rpc::GlasschainServer;
 use std::env;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -100,6 +101,7 @@ INTERACTIVE COMMANDS (after startup):
     );
 }
 
+#[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -181,7 +183,7 @@ async fn main() {
         "Starting GlassChain node id={node_id}  listen={listen_addr}  difficulty={difficulty}"
     );
 
-    let identity = if let Some(ref org) = org_name {
+    let identity = org_name.as_ref().map(|org| {
         let identity_name = identity_node_id.clone().unwrap_or_else(|| node_id.clone());
         let mut organization = match Organization::new(org.clone()) {
             Ok(v) => v,
@@ -200,52 +202,54 @@ async fn main() {
             }
         };
         log::info!(
-            "Using identity-backed TLS certificate for node `{}` issued by organization `{}`",
-            identity_name,
-            org
+            "Using identity-backed TLS certificate for node `{identity_name}` issued by organization `{org}`"
         );
-        Some(Arc::new(issued_identity))
-    } else {
-        None
-    };
+        Arc::new(issued_identity)
+    });
 
     // Build the node — optionally backed by persistent Sled storage.
-    let node = if let Some(ref path) = storage_path {
-        log::info!("Using persistent storage at {path}");
-        match SledStorageProvider::open(path) {
-            Ok(storage) => {
-                if let Some(identity) = identity.clone() {
-                    Arc::new(Node::new_with_storage_and_identity(
+    let node = storage_path.as_ref().map_or_else(
+        || {
+            identity.clone().map_or_else(
+                || Arc::new(Node::new(node_id.clone(), listen_addr.clone(), difficulty)),
+                |identity| {
+                    Arc::new(Node::new_with_identity(
                         node_id.clone(),
                         listen_addr.clone(),
                         difficulty,
-                        Arc::new(storage),
                         identity,
                     ))
-                } else {
-                    Arc::new(Node::new_with_storage(
-                        node_id.clone(),
-                        listen_addr.clone(),
-                        difficulty,
-                        Arc::new(storage),
-                    ))
+                },
+            )
+        },
+        |path| {
+            log::info!("Using persistent storage at {path}");
+            match SledStorageProvider::open(path) {
+                Ok(storage) => {
+                    if let Some(identity) = identity.clone() {
+                        Arc::new(Node::new_with_storage_and_identity(
+                            node_id.clone(),
+                            listen_addr.clone(),
+                            difficulty,
+                            Arc::new(storage),
+                            identity,
+                        ))
+                    } else {
+                        Arc::new(Node::new_with_storage(
+                            node_id.clone(),
+                            listen_addr.clone(),
+                            difficulty,
+                            Arc::new(storage),
+                        ))
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to open storage at {path}: {e}");
+                    std::process::exit(1);
                 }
             }
-            Err(e) => {
-                log::error!("Failed to open storage at {path}: {e}");
-                std::process::exit(1);
-            }
-        }
-    } else if let Some(identity) = identity {
-        Arc::new(Node::new_with_identity(
-            node_id.clone(),
-            listen_addr.clone(),
-            difficulty,
-            identity,
-        ))
-    } else {
-        Arc::new(Node::new(node_id.clone(), listen_addr.clone(), difficulty))
-    };
+        },
+    );
 
     // Attach the WASM execution provider so contracts with wasm_code_b64 payloads
     // are evaluated through the Wasmtime sandbox.
@@ -335,7 +339,6 @@ async fn main() {
     loop {
         line.clear();
         print!("> ");
-        use std::io::Write;
         let _ = std::io::stdout().flush();
 
         if reader.read_line(&mut line).await.unwrap_or(0) == 0 {

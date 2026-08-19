@@ -256,6 +256,8 @@ impl WatcherService {
     /// When a trigger carries a `wasm_code_b64` module **and** an executor has
     /// been registered, the module is executed and must approve the order (see
     /// the module-level documentation for the exact approval protocol).
+    // Keep the event-condition-action evaluation in one transaction path.
+    #[allow(clippy::too_many_lines)]
     pub fn on_inventory_update(&mut self, update: &InventoryUpdate) -> Vec<Transaction> {
         // Apply the inventory delta.
         let level = self

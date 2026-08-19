@@ -272,9 +272,7 @@ impl GlasschainClient {
             originator_id: originator_id.to_owned(),
             purchase_order_ref: None,
         };
-        log::info!(
-            "Building AssetRegistration tx: event={event_type}, originator={originator_id}"
-        );
+        log::info!("Building AssetRegistration tx: event={event_type}, originator={originator_id}");
         let tx = Transaction::new(TransactionKind::AssetRegistration(registration));
         Ok(serde_json::to_string_pretty(&tx)?)
     }
@@ -393,13 +391,7 @@ mod tests {
     #[test]
     fn test_build_supply_offer_json() {
         let json = GlasschainClient::build_supply_offer_tx(
-            "seller-1",
-            "SKU-001",
-            "Widget A",
-            500,
-            1_250,
-            7,
-            "USD",
+            "seller-1", "SKU-001", "Widget A", 500, 1_250, 7, "USD",
         )
         .unwrap();
         let tx: Transaction = serde_json::from_str(&json).unwrap();
@@ -422,8 +414,7 @@ mod tests {
     fn test_build_asset_registration_json() {
         let asset = full_asset();
         let json =
-            GlasschainClient::build_asset_registration_tx("my-node", asset, "MANUFACTURE")
-                .unwrap();
+            GlasschainClient::build_asset_registration_tx("my-node", asset, "MANUFACTURE").unwrap();
         let tx: Transaction = serde_json::from_str(&json).unwrap();
         assert!(
             matches!(tx.kind, TransactionKind::AssetRegistration(_)),
@@ -432,10 +423,7 @@ mod tests {
         if let TransactionKind::AssetRegistration(reg) = &tx.kind {
             assert_eq!(reg.originator_id, "my-node");
             assert_eq!(reg.event_type, "MANUFACTURE");
-            assert_eq!(
-                reg.asset.gtin.as_deref(),
-                Some("07891234567890"),
-            );
+            assert_eq!(reg.asset.gtin.as_deref(), Some("07891234567890"),);
         }
     }
 
@@ -483,13 +471,10 @@ mod tests {
     /// endpoint and node ID correctly.
     #[test]
     fn test_client_config_builder() {
-        let config = GlasschainClientConfig::new("http://localhost:9000")
-            .with_node_id("warehouse-node-1");
+        let config =
+            GlasschainClientConfig::new("http://localhost:9000").with_node_id("warehouse-node-1");
         assert_eq!(config.endpoint, "http://localhost:9000");
-        assert_eq!(
-            config.node_id.as_deref(),
-            Some("warehouse-node-1"),
-        );
+        assert_eq!(config.node_id.as_deref(), Some("warehouse-node-1"),);
 
         // Config without a node_id should have None.
         let bare = GlasschainClientConfig::new("http://remote:9000");

@@ -7,14 +7,19 @@
 //!
 //! ## Trust model
 //!
-//! Phase 1 (current) implements **structural verification**:
+//! [`VerificationLevel::Full`] — the default — performs:
 //!
 //! 1. The peer cert's `Issuer` DN must byte-match the Root CA's `Subject` DN.
 //! 2. The peer cert must be within its stated validity period.
+//! 3. The Root CA's signature over the peer cert's TBS bytes must verify,
+//!    anchoring the peer cert cryptographically to this organisation's CA.
 //!
-//! Phase 2 will add full **cryptographic signature verification** (ECDSA-P256 /
-//! Ed25519 over the TBS bytes using the Root CA's public key) once the
-//! `rustls-webpki` integration is complete.
+//! Step 3 is what makes the check meaningful: a Distinguished Name is attacker
+//! chosen data, so any party can mint a certificate whose `Issuer` DN matches
+//! ours. Only the signature proves our CA actually issued it.
+//!
+//! [`VerificationLevel::Structural`] drops step 3. It exists for tests and for
+//! diagnosing DN-encoding mismatches — not as a deployment posture.
 //!
 //! ## Usage
 //!
@@ -30,6 +35,7 @@
 
 use crate::error::IdentityError;
 use crate::msp::Organization;
+use rustls_pki_types::{pem::PemObject, CertificateDer};
 use serde::{Deserialize, Serialize};
 use x509_cert::{
     der::{Decode, Encode},
@@ -41,19 +47,40 @@ use x509_cert::{
 /// Controls how strictly peer certificates are verified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VerificationLevel {
-    /// Verify issuer DN + validity period only (no cryptographic sig check).
+    /// Verify issuer DN + validity period only — **no cryptographic sig check**.
     ///
-    /// Suitable for development and private permissioned networks where the
-    /// Root CA PEM is distributed out-of-band and implicitly trusted.
+    /// This proves nothing about issuance: a Distinguished Name is not a secret,
+    /// so anyone can self-sign a certificate that passes. Use only in tests, or
+    /// to isolate a DN-encoding problem from a signature problem.
     Structural,
 
-    /// Full cryptographic chain verification.
+    /// Full cryptographic chain verification — the default.
     ///
-    /// Requires matching Extended Key Usage (EKU) extensions and performs an
-    /// ECDSA/EdDSA signature check over the TBS certificate bytes.
-    /// Reserved for future implementation via `rustls-webpki`.
+    /// Everything [`Structural`](Self::Structural) does, plus an ECDSA/EdDSA
+    /// signature check over the TBS certificate bytes using the Root CA's
+    /// public key, performed by `rustls-webpki`.
     Full,
 }
+
+impl Default for VerificationLevel {
+    /// Defaults to [`Full`](Self::Full) — secure by default.
+    fn default() -> Self {
+        Self::Full
+    }
+}
+
+/// Signature algorithms accepted on a peer certificate.
+///
+/// Covers what `rcgen` can emit for a Root CA: it defaults to ECDSA-P256-SHA256,
+/// and `GlassChain` identities use Ed25519. P-384 is included so an operator can
+/// raise the CA's curve without a code change. Deliberately excludes RSA and
+/// SHA-1: nothing in this workspace issues them, and narrowing the set narrows
+/// the downgrade surface.
+const SUPPORTED_SIG_ALGS: &[&dyn rustls_pki_types::SignatureVerificationAlgorithm] = &[
+    webpki::ring::ECDSA_P256_SHA256,
+    webpki::ring::ECDSA_P384_SHA384,
+    webpki::ring::ED25519,
+];
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
@@ -84,6 +111,14 @@ pub enum CertVerificationError {
     #[error("certificate expired or not yet valid")]
     InvalidValidity,
 
+    /// The Root CA's signature over the peer certificate did not verify.
+    ///
+    /// Raised only at [`VerificationLevel::Full`]. A certificate can match the
+    /// issuer DN and still fail here — that is precisely the forgery the
+    /// structural check cannot detect.
+    #[error("certificate chain verification failed: {0}")]
+    SignatureInvalid(String),
+
     /// PEM decoding or I/O failure while reading a PEM block.
     #[error("PEM decoding failed: {0}")]
     PemError(String),
@@ -113,11 +148,10 @@ impl From<CertVerificationError> for IdentityError {
 ///
 /// ## Security note
 ///
-/// The default [`VerificationLevel::Structural`] mode checks the issuer DN and
-/// validity window but does **not** verify the Root CA's cryptographic signature
-/// over the TBS bytes.  This is intentional for Phase 1 private networks where
-/// the Root CA PEM is pre-shared out-of-band.  See [`VerificationLevel::Full`]
-/// for the roadmap item that will close this gap.
+/// Defaults to [`VerificationLevel::Full`], which cryptographically anchors the
+/// peer certificate to this organisation's Root CA. Lowering `level` to
+/// [`VerificationLevel::Structural`] reduces the check to a Distinguished Name
+/// comparison that any party can satisfy by self-signing; do that only in tests.
 pub struct CertChainVerifier {
     /// Root CA `Subject` DN re-encoded as raw DER bytes.
     ///
@@ -127,8 +161,8 @@ pub struct CertChainVerifier {
 
     /// Full DER encoding of the Root CA certificate.
     ///
-    /// Retained for future use in cryptographic signature verification
-    /// ([`VerificationLevel::Full`]).
+    /// Used as the trust anchor for signature verification at
+    /// [`VerificationLevel::Full`].
     root_cert_der: Vec<u8>,
 
     /// Human-readable organisation name, used in error messages.
@@ -167,10 +201,7 @@ impl CertChainVerifier {
     ) -> Result<Self, CertVerificationError> {
         let org_name = org_name.into();
 
-        let mut reader = std::io::BufReader::new(root_ca_pem.as_bytes());
-        let root_der = rustls_pemfile::certs(&mut reader)
-            .next()
-            .ok_or_else(|| CertVerificationError::PemError("no certificate block in PEM".into()))?
+        let root_der = CertificateDer::from_pem_slice(root_ca_pem.as_bytes())
             .map_err(|e| CertVerificationError::PemError(e.to_string()))?;
 
         Self::from_der(org_name, root_der.as_ref())
@@ -202,8 +233,18 @@ impl CertChainVerifier {
             root_subject_der,
             root_cert_der: root_ca_der.to_vec(),
             org_name: org_name.into(),
-            level: VerificationLevel::Structural,
+            level: VerificationLevel::default(),
         })
+    }
+
+    /// Override the verification level.
+    ///
+    /// Only useful for lowering to [`VerificationLevel::Structural`] in tests;
+    /// [`VerificationLevel::Full`] is already the default.
+    #[must_use]
+    pub const fn with_level(mut self, level: VerificationLevel) -> Self {
+        self.level = level;
+        self
     }
 }
 
@@ -218,8 +259,11 @@ impl CertChainVerifier {
     /// 2. Re-encode the cert's `Issuer` DN and compare it byte-for-byte with
     ///    the Root CA's `Subject` DN.
     /// 3. Check that `SystemTime::now()` falls inside the cert's validity window.
+    /// 4. At [`VerificationLevel::Full`], verify the Root CA's signature over
+    ///    the certificate.
     ///
-    /// Cryptographic signature verification is tracked as a TODO below.
+    /// Steps 2 and 3 run first so that a misconfigured peer produces a specific,
+    /// actionable error rather than a generic chain-verification failure.
     ///
     /// # Errors
     ///
@@ -261,21 +305,60 @@ impl CertChainVerifier {
             return Err(CertVerificationError::InvalidValidity);
         }
 
-        // ── TODO: cryptographic signature verification ───────────────────────
-        // Full ECDSA-P256 / Ed25519 signature verification over the TBS cert
-        // bytes using the Root CA's public key is deferred to the production
-        // implementation (Phase 2 via rustls-webpki).
-        //
-        // The structural issuer match above provides meaningful security for
-        // private networks where the Root CA PEM is distributed out-of-band;
-        // an attacker cannot forge a cert with a matching Subject DN without
-        // also controlling the DER encoding, but cryptographic binding is still
-        // strongly preferred for any internet-facing deployment.
+        // ── 4. Cryptographic chain verification ──────────────────────────────
+        if self.level == VerificationLevel::Full {
+            self.verify_signature(peer_cert_der)?;
+        }
 
         log::debug!(
-            "cert_verifier: structural verification passed for cert issued by '{}'",
+            "cert_verifier: {:?} verification passed for cert issued by '{}'",
+            self.level,
             self.org_name,
         );
+
+        Ok(())
+    }
+
+    /// Verify the Root CA's signature over `peer_cert_der`.
+    ///
+    /// Builds a one-hop path from the peer certificate to this organisation's
+    /// Root CA. There are no intermediates: [`Organization::issue_identity`]
+    /// signs member certificates directly with the root.
+    ///
+    /// Revocation is not checked — there is no CRL or OCSP distribution point in
+    /// the ledger's trust model today. Membership revocation is a governance
+    /// concern that belongs in the MSP, not in TLS certificate validation.
+    fn verify_signature(&self, peer_cert_der: &[u8]) -> Result<(), CertVerificationError> {
+        let root_der = rustls_pki_types::CertificateDer::from(self.root_cert_der.as_slice());
+        let anchor = webpki::anchor_from_trusted_cert(&root_der)
+            .map_err(|e| CertVerificationError::SignatureInvalid(e.to_string()))?;
+
+        let peer_der = rustls_pki_types::CertificateDer::from(peer_cert_der);
+        let end_entity = webpki::EndEntityCert::try_from(&peer_der)
+            .map_err(|e| CertVerificationError::ParseError(e.to_string()))?;
+
+        let now = rustls_pki_types::UnixTime::since_unix_epoch(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default(),
+        );
+
+        // `GlassChain` certificates carry no Extended Key Usage extension, and
+        // RFC 5280 treats an absent EKU as unconstrained, so this argument does
+        // not currently reject anything. It is `client_auth` rather than
+        // `server_auth` because a peer dialling out is the case that must keep
+        // working; if EKUs are ever added, they must include clientAuth.
+        end_entity
+            .verify_for_usage(
+                SUPPORTED_SIG_ALGS,
+                &[anchor],
+                &[],
+                now,
+                webpki::KeyUsage::client_auth(),
+                None,
+                None,
+            )
+            .map_err(|e| CertVerificationError::SignatureInvalid(e.to_string()))?;
 
         Ok(())
     }
@@ -290,10 +373,7 @@ impl CertChainVerifier {
     /// Returns [`CertVerificationError::PemError`] if decoding fails, or any
     /// error from [`verify_cert_der`](Self::verify_cert_der).
     pub fn verify_cert_pem(&self, peer_cert_pem: &str) -> Result<(), CertVerificationError> {
-        let mut reader = std::io::BufReader::new(peer_cert_pem.as_bytes());
-        let der = rustls_pemfile::certs(&mut reader)
-            .next()
-            .ok_or_else(|| CertVerificationError::PemError("no certificate block in PEM".into()))?
+        let der = CertificateDer::from_pem_slice(peer_cert_pem.as_bytes())
             .map_err(|e| CertVerificationError::PemError(e.to_string()))?;
 
         self.verify_cert_der(der.as_ref())
@@ -307,9 +387,8 @@ impl CertChainVerifier {
 
     /// Returns the raw DER bytes of the Root CA certificate.
     ///
-    /// Retained primarily for future [`VerificationLevel::Full`] support, where
-    /// the Root CA's public key will be extracted from these bytes to perform a
-    /// cryptographic signature check over the peer certificate's TBS bytes.
+    /// This is the trust anchor used for signature verification at
+    /// [`VerificationLevel::Full`], exposed so callers can redistribute it.
     #[must_use]
     pub fn root_ca_der(&self) -> &[u8] {
         &self.root_cert_der
@@ -337,6 +416,18 @@ mod tests {
         (org, cert_pem)
     }
 
+    /// Create two independent organisations that share a name, and therefore an
+    /// byte-identical Root CA Distinguished Name, but hold unrelated CA keys.
+    ///
+    /// This is the forgery the structural check cannot see: an attacker picks
+    /// the victim's org name, self-signs their own CA, and issues themselves a
+    /// member certificate whose `Issuer` DN matches the real one exactly.
+    fn impostor_pair(org_name: &str) -> (Organization, String) {
+        let genuine = Organization::new(org_name).unwrap();
+        let (_, impostor_cert_pem) = org_with_member(org_name, "impostor");
+        (genuine, impostor_cert_pem)
+    }
+
     // ── 1. Construction from Organization ────────────────────────────────────
 
     #[test]
@@ -345,7 +436,11 @@ mod tests {
         let verifier = CertChainVerifier::from_org(&org).unwrap();
 
         assert_eq!(verifier.org_name(), "PharmaOrg");
-        assert_eq!(verifier.level, VerificationLevel::Structural);
+        assert_eq!(
+            verifier.level,
+            VerificationLevel::Full,
+            "verification must be cryptographic by default"
+        );
         assert!(!verifier.root_subject_der.is_empty());
         assert!(!verifier.root_cert_der.is_empty());
     }
@@ -359,7 +454,7 @@ mod tests {
 
         assert!(
             verifier.verify_cert_pem(&cert_pem).is_ok(),
-            "a cert issued by the org's own CA should pass structural verification"
+            "a cert issued by the org's own CA should pass full verification"
         );
     }
 
@@ -422,11 +517,7 @@ mod tests {
         let mut org = Organization::new("RoundTripOrg").unwrap();
 
         // Decode the Root CA PEM to raw DER bytes.
-        let mut reader = std::io::BufReader::new(org.root_ca_cert_pem.as_bytes());
-        let root_der = rustls_pemfile::certs(&mut reader)
-            .next()
-            .unwrap()
-            .unwrap();
+        let root_der = CertificateDer::from_pem_slice(org.root_ca_cert_pem.as_bytes()).unwrap();
 
         // Build verifier from DER and confirm it has the right org name.
         let verifier = CertChainVerifier::from_der("RoundTripOrg", root_der.as_ref()).unwrap();
@@ -450,11 +541,68 @@ mod tests {
         assert!(verifier.verify_cert_pem(&cert_pem).is_ok());
 
         // Confirm the underlying DER path also works for the same cert.
-        let mut reader = std::io::BufReader::new(cert_pem.as_bytes());
-        let der = rustls_pemfile::certs(&mut reader)
-            .next()
-            .unwrap()
-            .unwrap();
+        let der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap();
         assert!(verifier.verify_cert_der(der.as_ref()).is_ok());
+    }
+
+    // ── 8. A CA impersonating our DN is rejected ──────────────────────────────
+
+    #[test]
+    fn test_impostor_ca_with_identical_dn_is_rejected() {
+        let (genuine, impostor_cert_pem) = impostor_pair("PharmaOrg");
+        let verifier = CertChainVerifier::from_org(&genuine).unwrap();
+
+        let err = verifier
+            .verify_cert_pem(&impostor_cert_pem)
+            .expect_err("a cert from a foreign CA must be rejected even when the DN matches");
+
+        assert!(
+            matches!(err, CertVerificationError::SignatureInvalid(_)),
+            "expected SignatureInvalid, got {err}"
+        );
+    }
+
+    // ── 9. Structural mode is knowingly weaker ────────────────────────────────
+
+    #[test]
+    fn test_structural_level_accepts_impostor() {
+        let (genuine, impostor_cert_pem) = impostor_pair("PharmaOrg");
+        let verifier = CertChainVerifier::from_org(&genuine)
+            .unwrap()
+            .with_level(VerificationLevel::Structural);
+
+        // Documents the exact gap that VerificationLevel::Full closes. If this
+        // ever starts failing, the two levels have stopped being distinguishable
+        // and one of them is redundant.
+        assert!(
+            verifier.verify_cert_pem(&impostor_cert_pem).is_ok(),
+            "structural verification compares DNs only, so the impostor passes"
+        );
+    }
+
+    // ── 10. Bit-flipped signature is rejected ─────────────────────────────────
+
+    #[test]
+    fn test_tampered_certificate_is_rejected() {
+        let (org, cert_pem) = org_with_member("PharmaOrg", "node-tamper");
+        let verifier = CertChainVerifier::from_org(&org).unwrap();
+
+        let der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap();
+        let mut tampered = der.as_ref().to_vec();
+
+        // The signature BIT STRING terminates the certificate, so corrupting the
+        // final byte invalidates the signature while leaving every DER length
+        // prefix intact — the cert still parses, it just no longer verifies.
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0xFF;
+
+        let err = verifier
+            .verify_cert_der(&tampered)
+            .expect_err("a tampered certificate must be rejected");
+
+        assert!(
+            matches!(err, CertVerificationError::SignatureInvalid(_)),
+            "expected SignatureInvalid, got {err}"
+        );
     }
 }

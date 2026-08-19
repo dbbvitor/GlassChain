@@ -25,6 +25,8 @@ use tokio::sync::{broadcast, Mutex};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 /// Events emitted by the node that callers may observe.
+// Keep transaction payloads inline to preserve the public event API.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum NodeEvent {
     /// A new transaction was accepted into the pending pool.
@@ -229,6 +231,7 @@ impl PeerRegistry {
 /// The **ledger** is stored in a separate `Arc<Mutex<Ledger>>` so it can be
 /// accessed directly by the gRPC server without going through the full node
 /// state lock.
+#[allow(clippy::struct_field_names)]
 pub struct Node {
     pub node_id: String,
     listen_addr: String,
@@ -245,6 +248,35 @@ pub struct Node {
 }
 
 impl Node {
+    fn with_components(
+        node_id: String,
+        listen_addr: String,
+        ledger: Arc<Mutex<Ledger>>,
+        storage: Arc<dyn StorageProvider>,
+        identity: Option<Arc<Identity>>,
+    ) -> Self {
+        let (event_tx, _) = broadcast::channel(256);
+        Self {
+            node_id,
+            listen_addr,
+            ledger,
+            state: Arc::new(Mutex::new(NodeState {
+                engine: ContractEngine::new(),
+                watcher: WatcherService::new(),
+                known_peers: HashSet::new(),
+                peer_senders: HashMap::new(),
+                peer_registry: PeerRegistry::new(),
+                cert_verifier: None,
+                identity: identity.clone(),
+            })),
+            event_tx,
+            indexer: Arc::new(InMemoryIndexer::new()),
+            event_bus: Arc::new(InMemoryEventBus::new(4096)),
+            storage,
+            tls: Arc::new(Self::build_tls(identity)),
+        }
+    }
+
     /// Create a new node.
     ///
     /// * `node_id`     – unique identifier for this node (e.g. a UUID or hostname)
@@ -255,26 +287,13 @@ impl Node {
         listen_addr: impl Into<String>,
         difficulty: usize,
     ) -> Self {
-        let (event_tx, _) = broadcast::channel(256);
-        Self {
-            node_id: node_id.into(),
-            listen_addr: listen_addr.into(),
-            ledger: Arc::new(Mutex::new(Ledger::new(difficulty))),
-            state: Arc::new(Mutex::new(NodeState {
-                engine: ContractEngine::new(),
-                watcher: WatcherService::new(),
-                known_peers: HashSet::new(),
-                peer_senders: HashMap::new(),
-                peer_registry: PeerRegistry::new(),
-                cert_verifier: None,
-                identity: None,
-            })),
-            event_tx,
-            indexer: Arc::new(InMemoryIndexer::new()),
-            event_bus: Arc::new(InMemoryEventBus::new(4096)),
-            storage: Arc::new(InMemoryStorageProvider::new()),
-            tls: Arc::new(Self::build_tls(None)),
-        }
+        Self::with_components(
+            node_id.into(),
+            listen_addr.into(),
+            Arc::new(Mutex::new(Ledger::new(difficulty))),
+            Arc::new(InMemoryStorageProvider::new()),
+            None,
+        )
     }
 
     /// Restore a [`Ledger`] from `storage`, validating the full chain on the
@@ -283,7 +302,7 @@ impl Node {
     fn restore_ledger(storage: &Arc<dyn StorageProvider>, difficulty: usize) -> Arc<Mutex<Ledger>> {
         let mut l = Ledger::new(difficulty);
         if let Ok(Some(latest_idx)) = storage.latest_block_index() {
-            let mut chain = Vec::with_capacity((latest_idx + 1) as usize);
+            let mut chain = Vec::new();
             let mut valid = true;
             for i in 0..=latest_idx {
                 if let Ok(Some(block)) = storage.get_block(i) {
@@ -323,27 +342,7 @@ impl Node {
         storage: Arc<dyn StorageProvider>,
     ) -> Self {
         let ledger = Self::restore_ledger(&storage, difficulty);
-
-        let (event_tx, _) = broadcast::channel(256);
-        Self {
-            node_id: node_id.into(),
-            listen_addr: listen_addr.into(),
-            ledger,
-            state: Arc::new(Mutex::new(NodeState {
-                engine: ContractEngine::new(),
-                watcher: WatcherService::new(),
-                known_peers: HashSet::new(),
-                peer_senders: HashMap::new(),
-                peer_registry: PeerRegistry::new(),
-                cert_verifier: None,
-                identity: None,
-            })),
-            event_tx,
-            indexer: Arc::new(InMemoryIndexer::new()),
-            event_bus: Arc::new(InMemoryEventBus::new(4096)),
-            storage,
-            tls: Arc::new(Self::build_tls(None)),
-        }
+        Self::with_components(node_id.into(), listen_addr.into(), ledger, storage, None)
     }
 
     /// Create a new node with an identity-backed TLS certificate.
@@ -353,28 +352,13 @@ impl Node {
         difficulty: usize,
         identity: Arc<Identity>,
     ) -> Self {
-        let node_id = node_id.into();
-        let listen_addr = listen_addr.into();
-        let (event_tx, _) = broadcast::channel(256);
-        Self {
-            node_id,
-            listen_addr,
-            ledger: Arc::new(Mutex::new(Ledger::new(difficulty))),
-            state: Arc::new(Mutex::new(NodeState {
-                engine: ContractEngine::new(),
-                watcher: WatcherService::new(),
-                known_peers: HashSet::new(),
-                peer_senders: HashMap::new(),
-                peer_registry: PeerRegistry::new(),
-                cert_verifier: None,
-                identity: Some(Arc::clone(&identity)),
-            })),
-            event_tx,
-            indexer: Arc::new(InMemoryIndexer::new()),
-            event_bus: Arc::new(InMemoryEventBus::new(4096)),
-            storage: Arc::new(InMemoryStorageProvider::new()),
-            tls: Arc::new(Self::build_tls(Some(Arc::clone(&identity)))),
-        }
+        Self::with_components(
+            node_id.into(),
+            listen_addr.into(),
+            Arc::new(Mutex::new(Ledger::new(difficulty))),
+            Arc::new(InMemoryStorageProvider::new()),
+            Some(identity),
+        )
     }
 
     /// Create a persistent node with an identity-backed TLS certificate.
@@ -385,31 +369,14 @@ impl Node {
         storage: Arc<dyn StorageProvider>,
         identity: Arc<Identity>,
     ) -> Self {
-        let node_id = node_id.into();
-        let listen_addr = listen_addr.into();
-
         let ledger = Self::restore_ledger(&storage, difficulty);
-
-        let (event_tx, _) = broadcast::channel(256);
-        Self {
-            node_id,
-            listen_addr,
+        Self::with_components(
+            node_id.into(),
+            listen_addr.into(),
             ledger,
-            state: Arc::new(Mutex::new(NodeState {
-                engine: ContractEngine::new(),
-                watcher: WatcherService::new(),
-                known_peers: HashSet::new(),
-                peer_senders: HashMap::new(),
-                peer_registry: PeerRegistry::new(),
-                cert_verifier: None,
-                identity: Some(Arc::clone(&identity)),
-            })),
-            event_tx,
-            indexer: Arc::new(InMemoryIndexer::new()),
-            event_bus: Arc::new(InMemoryEventBus::new(4096)),
             storage,
-            tls: Arc::new(Self::build_tls(Some(Arc::clone(&identity)))),
-        }
+            Some(identity),
+        )
     }
 
     /// Subscribe to node events (transactions, blocks, peers, contracts).
@@ -458,32 +425,35 @@ impl Node {
         // Ensure the ring crypto provider is installed (required by rustls 0.23).
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let (cert_der, key_der) = if let Some(identity) = identity {
-            let key_pair = identity
-                .rcgen_key_pair()
-                .expect("TLS key generation from identity");
-            let mut params = rcgen::CertificateParams::new(vec!["glasschain-node".to_string()])
-                .expect("TLS cert params");
-            let mut dn = rcgen::DistinguishedName::new();
-            dn.push(rcgen::DnType::CommonName, identity.node_id.clone());
-            params.distinguished_name = dn;
-            let cert = params
-                .self_signed(&key_pair)
-                .expect("TLS self-signed cert from identity");
-            (
-                cert.der().clone(),
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der())),
-            )
-        } else {
-            let key_pair = rcgen::KeyPair::generate().expect("TLS key generation");
-            let params = rcgen::CertificateParams::new(vec!["glasschain-node".to_string()])
-                .expect("TLS cert params");
-            let cert = params.self_signed(&key_pair).expect("TLS self-signed cert");
-            (
-                cert.der().clone(),
-                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der())),
-            )
-        };
+        let (cert_der, key_der) = identity.map_or_else(
+            || {
+                let key_pair = rcgen::KeyPair::generate().expect("TLS key generation");
+                let params = rcgen::CertificateParams::new(vec!["glasschain-node".to_string()])
+                    .expect("TLS cert params");
+                let cert = params.self_signed(&key_pair).expect("TLS self-signed cert");
+                (
+                    cert.der().clone(),
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der())),
+                )
+            },
+            |identity| {
+                let key_pair = identity
+                    .rcgen_key_pair()
+                    .expect("TLS key generation from identity");
+                let mut params = rcgen::CertificateParams::new(vec!["glasschain-node".to_string()])
+                    .expect("TLS cert params");
+                let mut dn = rcgen::DistinguishedName::new();
+                dn.push(rcgen::DnType::CommonName, identity.node_id.clone());
+                params.distinguished_name = dn;
+                let cert = params
+                    .self_signed(&key_pair)
+                    .expect("TLS self-signed cert from identity");
+                (
+                    cert.der().clone(),
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pair.serialize_der())),
+                )
+            },
+        );
 
         let cert_fingerprint = sha256(cert_der.as_ref());
 
@@ -610,6 +580,12 @@ impl Node {
     /// Start the node: rebuild runtime state, spawn a TCP listener task, and connect to seed peers.
     ///
     /// Returns immediately; all network activity runs in background tasks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError`] if the listening address cannot be bound.
+    // Keep listener setup and connection fan-out in one lifecycle method.
+    #[allow(clippy::too_many_lines)]
     pub async fn start(&self, seed_peers: Vec<String>) -> Result<(), NetworkError> {
         Self::rebuild_runtime_state_from_chain(&self.ledger, &self.state, &self.storage).await;
 
@@ -687,14 +663,11 @@ impl Node {
                                 return;
                             }
                             let local_cert = tls2.cert_der.as_ref();
-                            let cert_len = match u32::try_from(local_cert.len()) {
-                                Ok(v) => v,
-                                Err(_) => {
-                                    log::warn!(
-                                        "Local TLS certificate too large to advertise to {addr}"
-                                    );
-                                    return;
-                                }
+                            let Ok(cert_len) = u32::try_from(local_cert.len()) else {
+                                log::warn!(
+                                    "Local TLS certificate too large to advertise to {addr}"
+                                );
+                                return;
                             };
                             if let Err(e) = tokio::io::AsyncWriteExt::write_all(
                                 &mut stream,
@@ -760,6 +733,8 @@ impl Node {
     }
 
     /// Spawn the dial-queue consumer task.
+    // The task needs each shared node component to service outbound peers.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_dial_queue(
         mut dial_rx: UnboundedReceiver<String>,
         dial_tx: UnboundedSender<String>,
@@ -793,6 +768,10 @@ impl Node {
     }
 
     /// Submit a transaction to the local pending pool and broadcast it to peers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError`] if the transaction cannot be added locally.
     pub async fn submit_transaction(&self, tx: Transaction) -> Result<(), NetworkError> {
         {
             let mut ledger = self.ledger.lock().await;
@@ -801,10 +780,11 @@ impl Node {
 
         let generated = {
             let mut s = self.state.lock().await;
-            let mut gen = Vec::new();
-            if let TransactionKind::SupplyOffer(ref offer) = tx.kind {
-                gen = s.engine.evaluate_supply_offer(offer, &tx.id);
-            }
+            let gen = if let TransactionKind::SupplyOffer(ref offer) = tx.kind {
+                s.engine.evaluate_supply_offer(offer, &tx.id)
+            } else {
+                Vec::new()
+            };
             if let TransactionKind::ContractCreation(ref def) = tx.kind {
                 let _ = s.engine.register_contract(def.clone());
             }
@@ -839,6 +819,10 @@ impl Node {
     }
 
     /// Mine a new block containing all pending transactions and broadcast it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError`] if mining preparation or commit fails.
     pub async fn mine_async(&self) -> Result<(), NetworkError> {
         let (index, prev_hash, transactions, difficulty) = {
             let mut ledger = self.ledger.lock().await;
@@ -883,6 +867,10 @@ impl Node {
     ///
     /// This is the synchronous convenience wrapper for callers that want the
     /// original blocking semantics while still reusing the async mining path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError`] if the mining operation fails.
     pub async fn mine(&self) -> Result<(), NetworkError> {
         self.mine_async().await
     }
@@ -916,11 +904,10 @@ impl Node {
         };
         for sender in senders {
             match sender.try_send(message.clone()) {
-                Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
                     log::warn!("Dropping outbound message: peer channel full");
                 }
-                Err(TrySendError::Closed(_)) => {}
+                Ok(()) | Err(TrySendError::Closed(_)) => {}
             }
         }
     }
@@ -1160,6 +1147,8 @@ async fn handle_peer(
 }
 
 /// Connect outbound to `peer_addr`, wrap in TLS, and run the peer handle loop.
+// Each argument is a shared component required by the peer lifecycle task.
+#[allow(clippy::too_many_arguments)]
 async fn connect_to_peer(
     peer_addr: String,
     listen_addr: String,
@@ -1178,12 +1167,9 @@ async fn connect_to_peer(
             log::info!("Connected to peer {peer_addr}");
 
             let local_cert = tls.cert_der.as_ref();
-            let cert_len = match u32::try_from(local_cert.len()) {
-                Ok(v) => v,
-                Err(_) => {
-                    log::warn!("Local TLS certificate too large to advertise to {peer_addr}");
-                    return;
-                }
+            let Ok(cert_len) = u32::try_from(local_cert.len()) else {
+                log::warn!("Local TLS certificate too large to advertise to {peer_addr}");
+                return;
             };
             if let Err(e) =
                 tokio::io::AsyncWriteExt::write_all(&mut stream, &cert_len.to_be_bytes()).await
@@ -1277,6 +1263,8 @@ struct MessageEffect {
     disconnect: bool,
 }
 
+// This function is the single peer-message state machine; keep its branches together.
+#[allow(clippy::too_many_lines)]
 async fn process_message(
     msg: Message,
     addr: &str,
@@ -1413,10 +1401,11 @@ async fn process_message(
             }
             let generated = {
                 let mut s = ctx.state.lock().await;
-                let mut gen = Vec::new();
-                if let TransactionKind::SupplyOffer(ref offer) = tx.kind {
-                    gen = s.engine.evaluate_supply_offer(offer, &tx.id);
-                }
+                let gen = if let TransactionKind::SupplyOffer(ref offer) = tx.kind {
+                    s.engine.evaluate_supply_offer(offer, &tx.id)
+                } else {
+                    Vec::new()
+                };
                 if let TransactionKind::ContractCreation(ref def) = tx.kind {
                     s.engine.load_from_ledger(def.clone());
                 }
@@ -1485,17 +1474,17 @@ async fn process_message(
             let (should_append, too_far_ahead) = {
                 let l = ctx.ledger.lock().await;
                 let expected = l.chain.len() as u64;
-                if block.index == expected {
-                    if let Some(prev) = l.chain.last() {
-                        let diff = l.difficulty;
+                let result = if block.index == expected {
+                    let diff = l.difficulty;
+                    l.chain.last().map_or((false, false), |prev| {
                         let valid = block.chains_to(prev).is_ok() && block.has_valid_pow(diff);
                         (valid, false)
-                    } else {
-                        (false, false)
-                    }
+                    })
                 } else {
                     (false, block.index > expected)
-                }
+                };
+                drop(l);
+                result
             };
 
             if too_far_ahead {

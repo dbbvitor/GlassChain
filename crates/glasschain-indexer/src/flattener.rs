@@ -41,7 +41,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlatAssetRecord {
     // ── Chain provenance ───────────────────────────────────────────────────
-
     /// Chain index of the block that committed this transaction.
     pub block_index: u64,
 
@@ -58,7 +57,6 @@ pub struct FlatAssetRecord {
     pub transaction_timestamp: u64,
 
     // ── Asset identity (GS1 / SNCM fields) ────────────────────────────────
-
     /// Global Trade Item Number (GTIN-14 or EAN-13).
     ///
     /// Required for Anvisa SNCM compliance (RDC 157/2017).
@@ -86,7 +84,6 @@ pub struct FlatAssetRecord {
     pub manufacturer_id: Option<String>,
 
     // ── Asset context ──────────────────────────────────────────────────────
-
     /// Human-readable product name.
     pub product_name: String,
 
@@ -103,7 +100,6 @@ pub struct FlatAssetRecord {
     pub quantity: u64,
 
     // ── Event context ──────────────────────────────────────────────────────
-
     /// Type of supply-chain event (e.g. `"manufacture"`, `"dispatch"`, `"receive"`).
     pub event_type: String,
 
@@ -114,7 +110,6 @@ pub struct FlatAssetRecord {
     pub purchase_order_ref: Option<String>,
 
     // ── Computed trust score ───────────────────────────────────────────────
-
     /// Metadata trust score in \[0, 100\], computed from GS1 / SNCM field completeness.
     pub trust_score: u8,
 
@@ -300,10 +295,7 @@ impl AnalyticalFlattener {
     /// in the "Low Trust" analytics bucket.
     #[must_use]
     pub fn low_trust_records(&self) -> Vec<&FlatAssetRecord> {
-        self.records
-            .iter()
-            .filter(|r| r.trust_score < 80)
-            .collect()
+        self.records.iter().filter(|r| r.trust_score < 80).collect()
     }
 
     /// Return the sum of `quantity` across all records that have the given GTIN.
@@ -428,8 +420,7 @@ impl VerifiableLineage {
         provenance: &ProvenanceIndex,
         flattener: &AnalyticalFlattener,
     ) -> Self {
-        let custody_chain: Vec<CustodyEvent> =
-            provenance.get_custody_chain(asset_id).to_vec();
+        let custody_chain: Vec<CustodyEvent> = provenance.get_custody_chain(asset_id).to_vec();
 
         let flat_records: Vec<FlatAssetRecord> =
             extract_gtin(asset_id).map_or_else(Vec::new, |gtin| {
@@ -523,11 +514,7 @@ mod tests {
 
     /// Build an [`IndexedTransaction`] carrying a [`TraceableAssetRegistration`]
     /// payload serialised as JSON — the format expected by `flatten_transaction`.
-    fn make_asset_tx(
-        asset: TraceableAsset,
-        event_type: &str,
-        tx_id: &str,
-    ) -> IndexedTransaction {
+    fn make_asset_tx(asset: TraceableAsset, event_type: &str, tx_id: &str) -> IndexedTransaction {
         let reg = TraceableAssetRegistration {
             asset,
             event_type: event_type.into(),
@@ -617,9 +604,8 @@ mod tests {
             kind: "SupplyOffer".to_owned(),
             payload_json: "{}".to_owned(),
         };
-        let err =
-            AnalyticalFlattener::flatten_transaction(&tx, 1, "abc123", 1_700_000_000)
-                .expect_err("should return an error for non-AssetRegistration kind");
+        let err = AnalyticalFlattener::flatten_transaction(&tx, 1, "abc123", 1_700_000_000)
+            .expect_err("should return an error for non-AssetRegistration kind");
 
         assert!(
             matches!(err, FlattenerError::NotAssetRegistration),
@@ -679,13 +665,24 @@ mod tests {
         flattener.ingest_indexed_block(&block, &[tx1, tx2, tx3]);
 
         let by_target_gtin = flattener.records_by_gtin("07891234100016");
-        assert_eq!(by_target_gtin.len(), 2, "expected 2 records for the target GTIN");
+        assert_eq!(
+            by_target_gtin.len(),
+            2,
+            "expected 2 records for the target GTIN"
+        );
 
         let by_other_gtin = flattener.records_by_gtin("99999999999999");
-        assert_eq!(by_other_gtin.len(), 1, "expected 1 record for the other GTIN");
+        assert_eq!(
+            by_other_gtin.len(),
+            1,
+            "expected 1 record for the other GTIN"
+        );
 
         let by_unknown = flattener.records_by_gtin("00000000000000");
-        assert!(by_unknown.is_empty(), "expected no records for an unknown GTIN");
+        assert!(
+            by_unknown.is_empty(),
+            "expected no records for an unknown GTIN"
+        );
     }
 
     // ── Test 5: standard_compliant_records filters by trust_score >= 80 ───────
@@ -708,12 +705,10 @@ mod tests {
         assert!(compliant[0].is_standard_compliant);
 
         // Verify the non-compliant record is not included
-        let non_compliant_ids: Vec<&str> = flattener
+        assert!(flattener
             .low_trust_records()
             .iter()
-            .map(|r| r.transaction_id.as_str())
-            .collect();
-        assert!(non_compliant_ids.contains(&"tx-minimal"));
+            .any(|record| record.transaction_id == "tx-minimal"));
     }
 
     // ── Test 6: low_trust_records returns records with trust_score < 80 ───────
@@ -797,22 +792,26 @@ mod tests {
         let row_col_count = row.split(',').count();
 
         assert_eq!(
-            header_col_count,
-            row_col_count,
+            header_col_count, row_col_count,
             "header has {header_col_count} columns but row splits into \
              {row_col_count} comma-separated parts"
         );
 
         // Exact column count sanity check — FlatAssetRecord has 22 fields
         assert_eq!(
-            header_col_count,
-            22,
+            header_col_count, 22,
             "FlatAssetRecord must produce exactly 22 CSV columns"
         );
 
         // Spot-check a few values are present in the row
-        assert!(row.contains("07891234100016"), "GTIN must appear in the row");
-        assert!(row.contains("Dipirona 500mg"), "product_name must appear in the row");
+        assert!(
+            row.contains("07891234100016"),
+            "GTIN must appear in the row"
+        );
+        assert!(
+            row.contains("Dipirona 500mg"),
+            "product_name must appear in the row"
+        );
         assert!(row.contains("100"), "trust_score must appear in the row");
     }
 }

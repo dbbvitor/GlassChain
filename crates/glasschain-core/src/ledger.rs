@@ -392,8 +392,7 @@ mod tests {
             .unwrap();
         ledger.mine_pending_transactions().unwrap();
 
-        let offers: Vec<_> = ledger.committed_supply_offers().collect();
-        assert_eq!(offers.len(), 2);
+        assert_eq!(ledger.committed_supply_offers().count(), 2);
     }
 
     #[test]

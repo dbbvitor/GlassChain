@@ -398,6 +398,8 @@ mod tests {
 
     /// Build a contract definition with prices expressed in minor currency units
     /// (e.g. cents: 1500 = $15.00).
+    // Keep this test builder aligned with the contract fields it exercises.
+    #[allow(clippy::too_many_arguments)]
     fn make_contract(
         id: &str,
         buyer: &str,
