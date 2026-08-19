@@ -38,6 +38,9 @@ impl WasmExecutionProvider {
     pub fn new() -> Result<Self, CoreError> {
         let mut config = Config::new();
         config.consume_fuel(true);
+        config.wasm_gc(false);
+        config.wasm_exceptions(false);
+        config.wasm_function_references(false);
         let engine = Engine::new(&config)
             .map_err(|e| CoreError::Execution(format!("wasmtime engine: {e}")))?;
         Ok(Self { engine })
