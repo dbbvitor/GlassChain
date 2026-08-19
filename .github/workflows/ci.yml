@@ -2,8 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, rework]
+    branches: [main]
   pull_request:
+    branches: [main]
   workflow_dispatch:
 
 env:
@@ -78,6 +79,11 @@ jobs:
     env:
       RUSTFLAGS: -D warnings
       RUSTDOCFLAGS: -D warnings
+      # The network integration tests allocate ephemeral loopback ports and
+      # use real TLS handshakes; serial libtest execution avoids cross-test
+      # port races on slower macOS and Windows runners. Criterion benches do
+      # not consume this setting.
+      RUST_TEST_THREADS: 1
 
     steps:
       - uses: actions/checkout@v7
@@ -110,6 +116,8 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
     steps:
       - uses: actions/checkout@v7
@@ -138,11 +146,12 @@ jobs:
         run: cargo tarpaulin --verbose --workspace --all-features --all-targets --locked --timeout 120 --out xml
 
       - name: Upload coverage to Codecov
+        if: ${{ env.CODECOV_TOKEN != '' }}
         uses: codecov/codecov-action@v7
         with:
           files: cobertura.xml
           fail_ci_if_error: true
-          token: ${{ secrets.CODECOV_TOKEN }}
+          token: ${{ env.CODECOV_TOKEN }}
 
   audit:
     name: Security audit
@@ -150,13 +159,17 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-      checks: write
 
     steps:
       - uses: actions/checkout@v7
 
-      - name: Audit Rust dependencies
-        uses: rustsec/audit-check@v2
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2026-0118,RUSTSEC-2026-0119
+          toolchain: 1.95
+
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      - name: Audit Rust dependencies
+        run: cargo audit --no-yanked --deny warnings --file Cargo.lock
