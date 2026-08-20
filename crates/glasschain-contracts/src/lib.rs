@@ -2,6 +2,8 @@ mod approval_gate;
 pub mod contract;
 pub mod engine;
 pub mod error;
+#[cfg(test)]
+pub mod test_wasm;
 pub mod watcher;
 
 pub use contract::{Contract, ContractStatus};

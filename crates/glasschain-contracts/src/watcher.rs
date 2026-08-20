@@ -383,7 +383,7 @@ impl WatcherService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
+    use crate::test_wasm::{approving_wasm_b64, denying_wasm_b64};
     use glasschain_vm::WasmExecutionProvider;
     use std::sync::Arc;
 
@@ -536,47 +536,6 @@ mod tests {
     // ── WASM gating ───────────────────────────────────────────────────────────
 
     /// A WASM module that writes `approve = "1"` unconditionally.
-    fn approving_wasm_b64() -> String {
-        let wat = r#"
-(module
-  (import "env" "set_state" (func $set_state (param i32 i32 i32 i32)))
-  (export "execute" (func $execute))
-  (export "memory" (memory 0))
-  (memory 1)
-  (data (i32.const 0) "approve")
-  (data (i32.const 16) "1")
-  (func $execute
-    i32.const 0  i32.const 7
-    i32.const 16 i32.const 1
-    call $set_state
-  )
-)
-"#;
-        let wasm_bytes = wat::parse_str(wat).expect("approving WAT must compile");
-        base64::engine::general_purpose::STANDARD.encode(&wasm_bytes)
-    }
-
-    /// A WASM module that writes `approve = "0"` — explicitly denying the order.
-    fn denying_wasm_b64() -> String {
-        let wat = r#"
-(module
-  (import "env" "set_state" (func $set_state (param i32 i32 i32 i32)))
-  (export "execute" (func $execute))
-  (export "memory" (memory 0))
-  (memory 1)
-  (data (i32.const 0) "approve")
-  (data (i32.const 16) "0")
-  (func $execute
-    i32.const 0  i32.const 7
-    i32.const 16 i32.const 1
-    call $set_state
-  )
-)
-"#;
-        let wasm_bytes = wat::parse_str(wat).expect("denying WAT must compile");
-        base64::engine::general_purpose::STANDARD.encode(&wasm_bytes)
-    }
-
     /// A trigger that carries a WASM module and whose WASM gate approves the
     /// order (sets `approve = "1"`) should produce a `PurchaseOrder`.
     #[test]
