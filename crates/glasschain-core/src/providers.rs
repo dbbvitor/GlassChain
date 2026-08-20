@@ -111,7 +111,27 @@ pub trait StorageProvider: Send + Sync {
     fn name(&self) -> &str;
 }
 
-/// Abstraction over the smart-contract execution environment.
+/// Independent instruction and host-operation budgets for one contract execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutionLimits {
+    /// Maximum instruction-fuel budget for the execution provider.
+    pub fuel_limit: u64,
+    /// Maximum gas charged for host state operations.
+    pub operation_gas_limit: u64,
+}
+
+impl ExecutionLimits {
+    /// Create execution limits with independent fuel and operation budgets.
+    #[must_use]
+    pub const fn new(fuel_limit: u64, operation_gas_limit: u64) -> Self {
+        Self {
+            fuel_limit,
+            operation_gas_limit,
+        }
+    }
+}
+
+/// Abstraction over a smart-contract execution backend.
 ///
 /// Implementors may execute contracts as native Rust closures, WASM modules
 /// (via Wasmtime), or any other sandboxed runtime.  The execution provider
@@ -123,17 +143,18 @@ pub trait ExecutionProvider: Send + Sync {
     ///
     /// `payload` is an opaque byte slice whose interpretation is provider-
     /// specific (e.g., a WASM module, a Lua script, or JSON instructions).
-    /// `gas_limit` caps the computational budget; the provider should return
-    /// [`CoreError::GasExhausted`] if the contract exceeds it.
+    /// `limits` independently caps instruction execution and host operations.
+    /// The provider should return [`CoreError::GasExhausted`] when either
+    /// budget is exceeded.
     ///
     /// # Errors
-    /// Returns `Err(CoreError::GasExhausted)` if the contract exceeds
-    /// `gas_limit`, or `Err` for any other execution failure.
+    /// Returns `Err(CoreError::GasExhausted)` if either limit is exceeded, or
+    /// `Err` for any other execution failure.
     fn execute(
         &self,
         contract_id: &str,
         payload: &[u8],
-        gas_limit: u64,
+        limits: ExecutionLimits,
     ) -> Result<Vec<(String, Vec<u8>)>, CoreError>;
 
     /// Execute a contract with a pre-populated world-state snapshot.
@@ -146,17 +167,17 @@ pub trait ExecutionProvider: Send + Sync {
     /// Override in concrete providers to expose the snapshot to contracts.
     ///
     /// # Errors
-    /// Returns `Err(CoreError::GasExhausted)` if the contract exceeds
-    /// `gas_limit`, or `Err` for any other execution failure.
+    /// Returns `Err(CoreError::GasExhausted)` if either limit is exceeded, or
+    /// `Err` for any other execution failure.
     fn execute_with_state(
         &self,
         contract_id: &str,
         payload: &[u8],
         initial_state: std::collections::HashMap<String, Vec<u8>>,
-        gas_limit: u64,
+        limits: ExecutionLimits,
     ) -> Result<Vec<(String, Vec<u8>)>, CoreError> {
         let _ = initial_state;
-        self.execute(contract_id, payload, gas_limit)
+        self.execute(contract_id, payload, limits)
     }
 
     /// Human-readable identifier for this execution implementation.
@@ -424,5 +445,23 @@ mod consensus_tests {
         block.hash = block.calculate_hash(); // re-hash so it's internally valid
                                              // Chains_to should fail even with correct hash if pow is recalculated
         assert!(provider.validate_block(&block, &g).is_err());
+    }
+
+    #[test]
+    fn test_pow_validate_block_rejects_insufficient_pow() {
+        let g = genesis();
+        // Block chains correctly to genesis but its hash does not satisfy a
+        // stricter PoW target (difficulty 2).
+        let mut block = Block::new(1, vec![], g.hash.clone());
+        while block.hash.starts_with("00") {
+            block.nonce = block.nonce.wrapping_add(1);
+            block.hash = block.calculate_hash();
+        }
+        let strict = PowConsensusProvider::new(2);
+        let err = strict.validate_block(&block, &g).unwrap_err();
+        assert!(matches!(
+            err,
+            CoreError::InvalidBlock(msg) if msg.contains("PoW difficulty 2")
+        ));
     }
 }

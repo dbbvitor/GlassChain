@@ -49,7 +49,7 @@ forks and no changes to the rest of the stack.
 | 2 | Storage | `StorageProvider` | `glasschain-core` | Core |
 | 3 | Execution (WASM) | `ExecutionProvider` | `glasschain-core` | 4 |
 | 4 | Network (TCP) | `NetworkProvider` | `glasschain-core` | Core |
-| 4b | Network (libp2p) | `LibP2pNode` | `glasschain-network` | 1 |
+| 4b | Network (libp2p, experimental) | `LibP2pNode` | `glasschain-network` | 1 (unwired) |
 | 5 | Indexer | `IndexerProvider` | `glasschain-indexer` | 5 |
 | 6 | Event Bus | `EventBusProvider` | `glasschain-indexer` | 5 |
 | 7 | Identity / MSP | `Identity`, `Organization` | `glasschain-identity` | 2 |
@@ -189,12 +189,17 @@ impl StorageProvider for RocksDbStorageProvider {
 ### Trait contract
 
 ```rust
+pub struct ExecutionLimits {
+    pub fuel_limit: u64,
+    pub operation_gas_limit: u64,
+}
+
 pub trait ExecutionProvider: Send + Sync {
     fn execute(
         &self,
         contract_id: &str,
         payload: &[u8],
-        gas_limit: u64,
+        limits: ExecutionLimits,
     ) -> Result<Vec<(String, Vec<u8>)>, CoreError>;
 
     fn name(&self) -> &str;
@@ -203,7 +208,7 @@ pub trait ExecutionProvider: Send + Sync {
 
 ### Built-in implementation
 
-`WasmExecutionProvider` (crate `glasschain-vm`) — Wasmtime with fuel-based gas metering.
+`WasmExecutionProvider` (crate `glasschain-vm`) — Wasmtime with independent instruction-fuel and host-operation gas budgets. The existing mutation result is unchanged; budget exhaustion identifies which meter failed.
 
 ### Contract module interface
 
@@ -267,12 +272,12 @@ All messages are length-prefixed JSON over TLS with TOFU certificate pinning.
 
 ---
 
-## 4b. Network Plugin — libp2p Swarm (`LibP2pNode`) ✨ Phase 1
+## 4b. Network Plugin — libp2p Swarm (`LibP2pNode`) — Experimental
 
 **Crate:** `glasschain-network`
 **Struct:** `glasschain_network::LibP2pNode`
 
-The `LibP2pNode` provides a production-grade P2P transport using:
+The `LibP2pNode` is an experimental, currently unwired P2P transport reserved for the selective-disclosure roadmap. It is not connected to any GlassChain binary yet. When wired, it will provide:
 - **Kademlia DHT** for decentralized peer discovery (no bootstrap server required)
 - **Gossipsub** for efficient fan-out propagation of transactions and blocks
 - **Identify** for protocol negotiation and address advertisement
@@ -787,78 +792,63 @@ complement each other:
 ## 10. Gas Metering (Phase 4) ✨
 
 **Crate:** `glasschain-vm`
-**Types:** `GasCosts`, `GasCounter`, `GasReport`
+**Types:** `ExecutionLimits`, `GasCosts`, `GasCounter`, `GasReport`
+
+Each execution has two independent budgets:
+
+- **Fuel limit**: one Wasmtime fuel unit per WASM instruction.
+- **Operation-gas limit**: host state operations charged by `GasCounter`.
+
+Exhausting either budget returns `CoreError::GasExhausted` with a meter
+  discriminator. The execution result remains the list of state mutations; a
+  `GasReport` is a standalone type and is not returned by `ExecutionProvider`.
+
+```rust
+use glasschain_core::ExecutionLimits;
+
+let limits = ExecutionLimits::new(
+    50_000, // fuel_limit
+    50_000, // operation_gas_limit
+);
+executor.execute("contract-id", &wasm, limits)?;
+```
 
 ### Per-operation cost table (`GasCosts`)
 
 ```rust
 use glasschain_vm::gas::GasCosts;
 
-// Default cost table
 let costs = GasCosts::default_costs();
 // base_execution: 1_000
 // state_read:     50  + 1 per byte
 // state_write:    200 + 2 per byte
-// max_call_depth: 8   (anti-reentrancy guard)
-
-// Custom cost table for high-throughput nodes
-let custom = GasCosts {
-    base_execution: 500,
-    state_read: 25,
-    state_write: 100,
-    per_byte_read: 1,
-    per_byte_write: 1,
-    max_call_depth: 4,
-};
+// max_call_depth: 8 (reserved for future recursive calls)
 ```
 
-### Tracking gas during execution (`GasCounter`)
+The live Wasmtime provider charges `base_execution` once, state reads by the
+bytes returned, state writes by the bytes written, and `get_state_len` by the
+flat read cost. Custom schedules remain available through `GasCounter` for
+future network or fee-policy work.
 
-```rust
-use glasschain_vm::gas::GasCounter;
+### `GasCounter` and deferred depth guard
 
-let mut counter = GasCounter::new(100_000);
+`GasCounter` is the operation-gas implementation used privately by
+`WasmExecutionProvider`. Its `push_call` / `pop_call` methods remain available
+for direct users, but recursive contract calls do not exist in the current
+runtime, so the depth guard is intentionally deferred. `GasReport` can be used
+by direct `GasCounter` callers for standalone accounting.
 
-// Charge for execution start
-counter.charge(counter.costs().base_execution)?;
+### Recommended limits
 
-// Charge for a state read (100 bytes)
-counter.charge_state_read(100)?;
+The current callers start with equal values for both budgets:
 
-// Charge for a state write (50 bytes)
-counter.charge_state_write(50)?;
-
-// Anti-reentrancy: track call depth
-counter.push_call()?;   // depth 1
-counter.push_call()?;   // depth 2
-// ...
-counter.pop_call();
-
-// Get report
-let report = counter.to_report(true);
-println!("Gas used: {}/{} ({:.0}%)", report.gas_used, report.gas_limit,
-         report.utilisation() * 100.0);
-```
-
-### Anti-reentrancy depth guard
-
-```rust
-let mut counter = GasCounter::new(1_000_000);
-for _ in 0..8 {
-    counter.push_call().expect("within depth limit");
-}
-assert!(counter.push_call().is_err()); // depth 9 → rejected
-```
-
-### Recommended gas limits
-
-| Contract type | Recommended `gas_limit` |
-|:--------------|:------------------------|
-| Simple state write | 10,000 |
-| Inventory reorder logic | 50,000 |
-| Complex aggregation | 500,000 |
-| Autonomous PurchaseOrder generation | 100,000 |
-| Maximum allowed | 10,000,000 |
+| Contract type | `fuel_limit` | `operation_gas_limit` |
+|:--------------|-------------:|----------------------:|
+| Simple state write | 10,000 | 10,000 |
+| Inventory reorder logic | 50,000 | 50,000 |
+| Complex aggregation | 500,000 | 500,000 |
+| Autonomous PurchaseOrder generation | 100,000 | 100,000 |
+| Maximum allowed | 10,000,000 | 10,000,000 |
 
 ---
 
@@ -1055,7 +1045,7 @@ GlassChain/
 └── crates/
     ├── glasschain-core/        # Block, Transaction, Ledger, provider traits, schema
     ├── glasschain-contracts/   # ContractEngine, WatcherService (ECA triggers)
-    ├── glasschain-network/     # TCP+TLS P2P node + libp2p Swarm (Phase 1)
+    ├── glasschain-network/     # TCP+TLS P2P node + experimental unwired libp2p Swarm
     ├── glasschain-node/        # Interactive REPL binary + gRPC wiring
     ├── glasschain-storage/     # SledStorageProvider (persistent on-disk backend)
     ├── glasschain-identity/    # Identity, Organization, Channel, EndorsementEngine

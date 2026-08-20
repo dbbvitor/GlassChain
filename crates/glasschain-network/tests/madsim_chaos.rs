@@ -22,7 +22,7 @@
 //!    fast-forward through delays that would normally take seconds.
 //! 2. **Reproducible seeds** — every `#[madsim::test]` run is seeded so
 //!    failures are fully reproducible (`MADSIM_TEST_SEED=<n> cargo test …`).
-//! 3. **Application-layer partition simulation** — the existing GlassChain
+//! 3. **Application-layer partition simulation** — the existing `GlassChain`
 //!    `Node` infrastructure is used to model network splits by controlling
 //!    which peers are dialled rather than patching the TCP stack.
 //! 4. **High-frequency watcher stress** — 1 000 autonomous inventory triggers
@@ -65,6 +65,33 @@ fn inv_tx(owner: &str, delta: i64) -> Transaction {
     }))
 }
 
+/// Poll `node`'s chain length until it reaches `want`, returning the last
+/// length observed.
+///
+/// Peer sync latency is unbounded in wall-clock terms: a TLS handshake plus the
+/// initial chain transfer routinely exceeds half a second on a loaded CI runner
+/// (Windows in particular). Sleeping for a fixed guess and asserting once makes
+/// every sync assertion in this file a coin flip; polling to a generous ceiling
+/// keeps the assertion meaningful while removing the flake.
+async fn await_chain_len(node: &Node, want: usize) -> usize {
+    const STEP: Duration = Duration::from_millis(50);
+    const CEILING: Duration = Duration::from_secs(10);
+
+    let mut len = 0;
+    for _ in 0..(CEILING.as_millis() / STEP.as_millis()) {
+        len = node.ledger_snapshot().await.chain.len();
+        if len >= want {
+            return len;
+        }
+
+        #[cfg(madsim)]
+        sim_time::advance(STEP).await;
+        #[cfg(not(madsim))]
+        sleep(STEP).await;
+    }
+    len
+}
+
 fn make_trigger(id: &str, product: &str, owner: &str, threshold: i64) -> InventoryTrigger {
     InventoryTrigger {
         trigger_id: id.into(),
@@ -94,7 +121,9 @@ async fn test_madsim_single_node_mines_within_time_budget() {
     let node = Node::new("madsim-node-1", &addr, 1);
     node.start(vec![]).await.unwrap();
 
-    node.submit_transaction(inv_tx("owner-1", 100)).await.unwrap();
+    node.submit_transaction(inv_tx("owner-1", 100))
+        .await
+        .unwrap();
 
     // Under madsim we advance simulated time; under real Tokio we simply wait.
     #[cfg(madsim)]
@@ -138,13 +167,22 @@ async fn test_madsim_application_layer_partition_and_merge() {
     node_b.start(vec![]).await.unwrap();
 
     // A builds a longer chain.
-    node_a.submit_transaction(inv_tx("a-owner", 50)).await.unwrap();
+    node_a
+        .submit_transaction(inv_tx("a-owner", 50))
+        .await
+        .unwrap();
     node_a.mine().await.unwrap();
-    node_a.submit_transaction(inv_tx("a-owner", 50)).await.unwrap();
+    node_a
+        .submit_transaction(inv_tx("a-owner", 50))
+        .await
+        .unwrap();
     node_a.mine().await.unwrap();
 
     // B builds a shorter chain.
-    node_b.submit_transaction(inv_tx("b-owner", 10)).await.unwrap();
+    node_b
+        .submit_transaction(inv_tx("b-owner", 10))
+        .await
+        .unwrap();
     node_b.mine().await.unwrap();
 
     #[cfg(madsim)]
@@ -168,11 +206,9 @@ async fn test_madsim_application_layer_partition_and_merge() {
 
     #[cfg(madsim)]
     sim_time::advance(Duration::from_millis(500)).await;
-    #[cfg(not(madsim))]
-    sleep(Duration::from_millis(600)).await;
 
-    let len_c = node_c.ledger_snapshot().await.chain.len();
-    let len_d = node_d.ledger_snapshot().await.chain.len();
+    let len_c = await_chain_len(&node_c, len_a).await;
+    let len_d = await_chain_len(&node_d, len_b).await;
 
     assert!(
         len_c >= len_a,
@@ -212,14 +248,15 @@ async fn test_madsim_node_crash_and_rejoin() {
     let addr_secondary = free_addr();
     {
         let node_secondary = Node::new("secondary-v1", &addr_secondary, 1);
-        node_secondary.start(vec![addr_primary.clone()]).await.unwrap();
+        node_secondary
+            .start(vec![addr_primary.clone()])
+            .await
+            .unwrap();
 
         #[cfg(madsim)]
         sim_time::advance(Duration::from_millis(300)).await;
-        #[cfg(not(madsim))]
-        sleep(Duration::from_millis(400)).await;
 
-        let len = node_secondary.ledger_snapshot().await.chain.len();
+        let len = await_chain_len(&node_secondary, 2).await;
         assert!(len >= 2, "secondary must have synced (got {len} blocks)");
     }
     // `node_secondary` is dropped here — simulating a crash.
@@ -245,17 +282,12 @@ async fn test_madsim_node_crash_and_rejoin() {
     // A new node re-joins and adopts the full chain.
     let addr_rejoin = free_addr();
     let node_rejoin = Node::new("secondary-v2", &addr_rejoin, 1);
-    node_rejoin
-        .start(vec![addr_primary.clone()])
-        .await
-        .unwrap();
+    node_rejoin.start(vec![addr_primary.clone()]).await.unwrap();
 
     #[cfg(madsim)]
     sim_time::advance(Duration::from_millis(400)).await;
-    #[cfg(not(madsim))]
-    sleep(Duration::from_millis(500)).await;
 
-    let rejoin_len = node_rejoin.ledger_snapshot().await.chain.len();
+    let rejoin_len = await_chain_len(&node_rejoin, chain_after).await;
     assert!(
         rejoin_len >= chain_after,
         "rejoining node must sync the full chain (expected ≥{chain_after}, got {rejoin_len})"
@@ -272,7 +304,7 @@ async fn test_madsim_node_crash_and_rejoin() {
 #[cfg_attr(madsim, madsim::test)]
 #[cfg_attr(not(madsim), tokio::test)]
 async fn test_madsim_1000_autonomous_triggers_stress() {
-    const N: u64 = 1_000;
+    const N: usize = 1_000;
 
     let mut watcher = WatcherService::new();
     for i in 0..N {
@@ -301,10 +333,7 @@ async fn test_madsim_1000_autonomous_triggers_stress() {
 
     let elapsed = t0.elapsed();
 
-    assert_eq!(
-        total_orders, N as usize,
-        "all {N} triggers must fire exactly once"
-    );
+    assert_eq!(total_orders, N, "all {N} triggers must fire exactly once");
 
     // Under real Tokio (no madsim), assert the throughput target.
     // Under madsim, time is virtual so the wall-clock assertion is skipped.
@@ -347,7 +376,7 @@ async fn test_madsim_1000_autonomous_triggers_stress() {
             assert!(inserted, "duplicate transaction ID: {}", order.id);
         }
     }
-    assert_eq!(all_ids.len(), N as usize, "all {N} tx IDs must be unique");
+    assert_eq!(all_ids.len(), N, "all {N} tx IDs must be unique");
 }
 
 /// Verify that SNCM trust-score nudge mechanics hold under concurrent
@@ -448,12 +477,13 @@ async fn test_madsim_sncm_nudge_under_simulated_load() {
 #[cfg_attr(madsim, madsim::test)]
 #[cfg_attr(not(madsim), tokio::test)]
 async fn test_madsim_event_bus_ordering_under_simulated_time() {
+    const ROUNDS: usize = 3;
+
     let addr = free_addr();
     let node = Arc::new(Node::new("event-order", &addr, 1));
     let mut rx = node.subscribe();
     node.start(vec![]).await.unwrap();
 
-    const ROUNDS: usize = 3;
     for round in 0..ROUNDS {
         node.submit_transaction(inv_tx(&format!("owner-{round}"), 10))
             .await
@@ -486,8 +516,7 @@ async fn test_madsim_event_bus_ordering_under_simulated_time() {
     for w in mined_indices.windows(2) {
         assert!(
             w[1] > w[0],
-            "block indices must be strictly increasing: {:?}",
-            mined_indices
+            "block indices must be strictly increasing: {mined_indices:?}"
         );
     }
 }
@@ -517,7 +546,10 @@ async fn test_madsim_partition_reference_implementation() {
     let node_a = Arc::new(Node::new("ref-a", &addr_a, 1));
     node_a.start(vec![]).await.unwrap();
 
-    node_a.submit_transaction(inv_tx("ref-a-pre", 10)).await.unwrap();
+    node_a
+        .submit_transaction(inv_tx("ref-a-pre", 10))
+        .await
+        .unwrap();
     node_a.mine().await.unwrap();
 
     let addr_b = free_addr();
@@ -526,29 +558,36 @@ async fn test_madsim_partition_reference_implementation() {
 
     #[cfg(madsim)]
     sim_time::advance(Duration::from_millis(300)).await;
-    #[cfg(not(madsim))]
-    sleep(Duration::from_millis(400)).await;
 
-    let len_b_synced = node_b.ledger_snapshot().await.chain.len();
+    let len_b_synced = await_chain_len(&node_b, 2).await;
     assert!(len_b_synced >= 2, "B must sync A's block before partition");
 
     // ── Partition: A and B mine independently (no peer connection) ────────
     // Application-layer partition: new node C connects only to A, new node D
     // connects only to B — their chains diverge.
-    node_a.submit_transaction(inv_tx("ref-a-partition", 20)).await.unwrap();
+    node_a
+        .submit_transaction(inv_tx("ref-a-partition", 20))
+        .await
+        .unwrap();
     node_a.mine().await.unwrap();
 
-    node_b.submit_transaction(inv_tx("ref-b-partition", 30)).await.unwrap();
+    node_b
+        .submit_transaction(inv_tx("ref-b-partition", 30))
+        .await
+        .unwrap();
     node_b.mine().await.unwrap();
-    node_b.submit_transaction(inv_tx("ref-b-partition-2", 30)).await.unwrap();
+    node_b
+        .submit_transaction(inv_tx("ref-b-partition-2", 30))
+        .await
+        .unwrap();
     node_b.mine().await.unwrap();
 
     // ── Post-partition: longest chain wins (B has more blocks) ───────────
-    let len_a_final = node_a.ledger_snapshot().await.chain.len();
-    let len_b_final = node_b.ledger_snapshot().await.chain.len();
+    let chain_len_a = node_a.ledger_snapshot().await.chain.len();
+    let chain_len_b = node_b.ledger_snapshot().await.chain.len();
     assert!(
-        len_b_final > len_a_final,
-        "B must be ahead: B={len_b_final} A={len_a_final}"
+        chain_len_b > chain_len_a,
+        "B must be ahead: B={chain_len_b} A={chain_len_a}"
     );
 
     // A new node connects to B and adopts B's longer chain.
@@ -558,13 +597,11 @@ async fn test_madsim_partition_reference_implementation() {
 
     #[cfg(madsim)]
     sim_time::advance(Duration::from_millis(400)).await;
-    #[cfg(not(madsim))]
-    sleep(Duration::from_millis(500)).await;
 
-    let len_e = node_e.ledger_snapshot().await.chain.len();
+    let len_e = await_chain_len(&node_e, chain_len_b).await;
     assert!(
-        len_e >= len_b_final,
-        "E (connected to B) must adopt B's chain: E={len_e} B={len_b_final}"
+        len_e >= chain_len_b,
+        "E (connected to B) must adopt B's chain: E={len_e} B={chain_len_b}"
     );
     assert!(node_e.ledger_snapshot().await.validate_chain().is_ok());
 

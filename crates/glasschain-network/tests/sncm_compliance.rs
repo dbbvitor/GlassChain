@@ -103,7 +103,10 @@ fn sncm_full_compliance_scores_100() {
 fn sncm_missing_serial_is_flagged() {
     let asset = incomplete_asset("fabricante-xyz");
     let score = MetadataTrustScore::compute(&asset);
-    assert!(score.missing_core_fields.iter().any(|f| f == "serial_number"));
+    assert!(score
+        .missing_core_fields
+        .iter()
+        .any(|f| f == "serial_number"));
     assert!(score.score < TRUST_SCORE_STANDARD_THRESHOLD);
     assert!(!score.is_standard);
 }
@@ -121,7 +124,10 @@ fn sncm_missing_batch_is_flagged() {
     let mut asset = dipirona_asset("fab", "001");
     asset.batch_number = None;
     let score = MetadataTrustScore::compute(&asset);
-    assert!(score.missing_core_fields.iter().any(|f| f == "batch_number"));
+    assert!(score
+        .missing_core_fields
+        .iter()
+        .any(|f| f == "batch_number"));
 }
 
 #[test]
@@ -269,7 +275,11 @@ async fn sncm_non_compliant_asset_accepted_but_low_trust() {
     let node = Node::new("sncm-low-trust-node", &addr, 1);
     node.start(vec![]).await.unwrap();
 
-    let non_compliant_tx = asset_tx(incomplete_asset("unknown-supplier"), "manufacture", "unknown-supplier");
+    let non_compliant_tx = asset_tx(
+        incomplete_asset("unknown-supplier"),
+        "manufacture",
+        "unknown-supplier",
+    );
 
     // The ledger should accept the transaction (nudge, not hard failure).
     node.submit_transaction(non_compliant_tx).await.unwrap();
@@ -283,9 +293,15 @@ async fn sncm_non_compliant_asset_accepted_but_low_trust() {
     assert_eq!(block1.transactions.len(), 1);
     if let TransactionKind::AssetRegistration(ref reg) = block1.transactions[0].kind {
         let score = MetadataTrustScore::compute(&reg.asset);
-        assert!(!score.is_standard, "non-compliant asset should not be standard");
         assert!(
-            score.missing_core_fields.iter().any(|f| f == "serial_number"),
+            !score.is_standard,
+            "non-compliant asset should not be standard"
+        );
+        assert!(
+            score
+                .missing_core_fields
+                .iter()
+                .any(|f| f == "serial_number"),
             "serial_number should be flagged"
         );
     } else {
@@ -342,10 +358,7 @@ async fn sncm_chain_syncs_between_manufacturer_and_pharmacy_nodes() {
     // Pharmacy node connects and syncs.
     let addr_pharmacy = free_addr();
     let node_pharmacy = Node::new("node-farmacia", &addr_pharmacy, 1);
-    node_pharmacy
-        .start(vec![addr_mfr.clone()])
-        .await
-        .unwrap();
+    node_pharmacy.start(vec![addr_mfr.clone()]).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(600)).await;
 

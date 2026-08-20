@@ -70,23 +70,20 @@ enum Commands {
 
 // ── Entry point ────────────────────────────────────────────────────────────────
 
-/// Async entry point — initialises logging and dispatches to the chosen subcommand.
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Entry point — initialises logging and dispatches to the chosen subcommand.
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Initialise env_logger with the user-supplied level (or the default "info").
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(&cli.log_level),
-    )
-    .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(&cli.log_level))
+        .init();
 
     log::debug!("glasschain CLI starting — command: {:?}", cli.command);
 
     match cli.command {
-        Commands::IdentityGen(args) => commands::identity::run(args)?,
-        Commands::ContractDeploy(args) => commands::contract::run(args)?,
-        Commands::LedgerInspect(args) => commands::inspect::run(args).await?,
+        Commands::IdentityGen(args) => commands::identity::run(args, &mut std::io::stdout())?,
+        Commands::ContractDeploy(args) => commands::contract::run(args, &mut std::io::stdout())?,
+        Commands::LedgerInspect(args) => commands::inspect::run(&args, &mut std::io::stdout())?,
     }
 
     Ok(())

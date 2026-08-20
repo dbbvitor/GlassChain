@@ -4,10 +4,11 @@ use glasschain_core::{
 };
 use glasschain_identity::Organization;
 use glasschain_network::{Node, NodeEvent};
+use glasschain_rpc::GlasschainServer;
 use glasschain_storage::SledStorageProvider;
 use glasschain_vm::WasmExecutionProvider;
-use glasschain_rpc::GlasschainServer;
 use std::env;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -100,6 +101,238 @@ INTERACTIVE COMMANDS (after startup):
     );
 }
 
+/// A parsed, validated REPL command. The stdin loop executes the payload while
+/// parsing and validation live here so they can be unit-tested without a node.
+#[derive(Debug, PartialEq, Eq)]
+enum ReplCommand {
+    Help,
+    Supply {
+        seller: String,
+        product_id: String,
+        product_name: String,
+        qty: u64,
+        price: u64,
+        lead_days: u32,
+        currency: String,
+    },
+    Order {
+        buyer: String,
+        seller: String,
+        product: String,
+        qty: u64,
+        price: u64,
+        currency: String,
+    },
+    Contract {
+        contract_id: String,
+        buyer: String,
+        product: String,
+        max_price: u64,
+        min_qty: u64,
+        max_qty: u64,
+        max_lead: u32,
+        currency: String,
+    },
+    Inventory {
+        owner: String,
+        product: String,
+        delta: i64,
+        reason: String,
+    },
+    Asset {
+        originator: String,
+        product_name: String,
+        gtin: Option<String>,
+        batch: Option<String>,
+        expiry: Option<String>,
+        serial: Option<String>,
+        qty: u64,
+        event_type: String,
+    },
+    Mine,
+    MineAsync,
+    Chain,
+    Pending,
+    Peers,
+    Contracts,
+    Quit,
+}
+
+/// Parse and validate one REPL line into a command. `Ok(None)` means the line
+/// was blank; `Err(msg)` carries the exact message the REPL prints for a bad
+/// command (usage lines and numeric-parse errors), preserving prior behavior.
+#[allow(clippy::too_many_lines)]
+fn parse_command(line: &str) -> Result<Option<ReplCommand>, String> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    let Some(&cmd) = parts.first() else {
+        return Ok(None);
+    };
+
+    match cmd {
+        "help" | "?" => Ok(Some(ReplCommand::Help)),
+
+        "supply" => {
+            if parts.len() < 8 {
+                return Err(
+                    "Usage: supply <seller> <product_id> <product_name> <qty> <price> <lead_days> <currency>"
+                        .to_owned(),
+                );
+            }
+            let qty: u64 = if let Ok(v) = parts[4].parse() {
+                v
+            } else {
+                return Err("Invalid quantity".to_owned());
+            };
+            let price: u64 = if let Some(v) = parse_price(parts[5]) {
+                v
+            } else {
+                return Err("Invalid price (use decimal like 12.50)".to_owned());
+            };
+            let lead: u32 = if let Ok(v) = parts[6].parse() {
+                v
+            } else {
+                return Err("Invalid lead_days".to_owned());
+            };
+            Ok(Some(ReplCommand::Supply {
+                seller: parts[1].to_owned(),
+                product_id: parts[2].to_owned(),
+                product_name: parts[3].to_owned(),
+                qty,
+                price,
+                lead_days: lead,
+                currency: parts[7].to_owned(),
+            }))
+        }
+
+        "order" => {
+            if parts.len() < 7 {
+                return Err(
+                    "Usage: order <buyer> <seller> <product> <qty> <price> <currency>".to_owned(),
+                );
+            }
+            let qty: u64 = if let Ok(v) = parts[4].parse() {
+                v
+            } else {
+                return Err("Invalid quantity".to_owned());
+            };
+            let price: u64 = if let Some(v) = parse_price(parts[5]) {
+                v
+            } else {
+                return Err("Invalid price".to_owned());
+            };
+            Ok(Some(ReplCommand::Order {
+                buyer: parts[1].to_owned(),
+                seller: parts[2].to_owned(),
+                product: parts[3].to_owned(),
+                qty,
+                price,
+                currency: parts[6].to_owned(),
+            }))
+        }
+
+        "contract" => {
+            if parts.len() < 9 {
+                return Err(
+                    "Usage: contract <contract_id> <buyer> <product> <max_price> <min_qty> <max_qty> <max_lead> <currency>"
+                        .to_owned(),
+                );
+            }
+            let max_price: u64 = if let Some(v) = parse_price(parts[4]) {
+                v
+            } else {
+                return Err("Invalid max_price".to_owned());
+            };
+            let min_qty: u64 = if let Ok(v) = parts[5].parse() {
+                v
+            } else {
+                return Err("Invalid min_qty".to_owned());
+            };
+            let max_qty: u64 = if let Ok(v) = parts[6].parse() {
+                v
+            } else {
+                return Err("Invalid max_qty".to_owned());
+            };
+            let max_lead: u32 = if let Ok(v) = parts[7].parse() {
+                v
+            } else {
+                return Err("Invalid max_lead".to_owned());
+            };
+            Ok(Some(ReplCommand::Contract {
+                contract_id: parts[1].to_owned(),
+                buyer: parts[2].to_owned(),
+                product: parts[3].to_owned(),
+                max_price,
+                min_qty,
+                max_qty,
+                max_lead,
+                currency: parts[8].to_owned(),
+            }))
+        }
+
+        "inventory" => {
+            if parts.len() < 5 {
+                return Err("Usage: inventory <owner> <product> <delta> <reason>".to_owned());
+            }
+            let delta: i64 = if let Ok(v) = parts[3].parse() {
+                v
+            } else {
+                return Err("Invalid delta".to_owned());
+            };
+            let reason = parts[4..].join(" ");
+            Ok(Some(ReplCommand::Inventory {
+                owner: parts[1].to_owned(),
+                product: parts[2].to_owned(),
+                delta,
+                reason,
+            }))
+        }
+
+        "asset" => {
+            if parts.len() < 9 {
+                return Err(
+                    "Usage: asset <originator> <product_name> <gtin> <batch> <expiry> <serial> <qty> <event_type>"
+                        .to_owned(),
+                );
+            }
+            let qty: u64 = if let Ok(v) = parts[7].parse() {
+                v
+            } else {
+                return Err("Invalid qty".to_owned());
+            };
+            let opt = |val: &str| {
+                if val == "-" {
+                    None
+                } else {
+                    Some(val.to_owned())
+                }
+            };
+            Ok(Some(ReplCommand::Asset {
+                originator: parts[1].to_owned(),
+                product_name: parts[2].to_owned(),
+                gtin: opt(parts[3]),
+                batch: opt(parts[4]),
+                expiry: opt(parts[5]),
+                serial: opt(parts[6]),
+                qty,
+                event_type: parts[8].to_owned(),
+            }))
+        }
+
+        "mine" => Ok(Some(ReplCommand::Mine)),
+        "mine-async" => Ok(Some(ReplCommand::MineAsync)),
+        "chain" => Ok(Some(ReplCommand::Chain)),
+        "pending" => Ok(Some(ReplCommand::Pending)),
+        "peers" => Ok(Some(ReplCommand::Peers)),
+        "contracts" => Ok(Some(ReplCommand::Contracts)),
+        "quit" | "exit" => Ok(Some(ReplCommand::Quit)),
+
+        other => Err(format!(
+            "Unknown command: {other:?}. Type 'help' for usage."
+        )),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -181,7 +414,7 @@ async fn main() {
         "Starting GlassChain node id={node_id}  listen={listen_addr}  difficulty={difficulty}"
     );
 
-    let identity = if let Some(ref org) = org_name {
+    let identity = org_name.as_ref().map(|org| {
         let identity_name = identity_node_id.clone().unwrap_or_else(|| node_id.clone());
         let mut organization = match Organization::new(org.clone()) {
             Ok(v) => v,
@@ -200,52 +433,54 @@ async fn main() {
             }
         };
         log::info!(
-            "Using identity-backed TLS certificate for node `{}` issued by organization `{}`",
-            identity_name,
-            org
+            "Using identity-backed TLS certificate for node `{identity_name}` issued by organization `{org}`"
         );
-        Some(Arc::new(issued_identity))
-    } else {
-        None
-    };
+        Arc::new(issued_identity)
+    });
 
     // Build the node — optionally backed by persistent Sled storage.
-    let node = if let Some(ref path) = storage_path {
-        log::info!("Using persistent storage at {path}");
-        match SledStorageProvider::open(path) {
-            Ok(storage) => {
-                if let Some(identity) = identity.clone() {
-                    Arc::new(Node::new_with_storage_and_identity(
+    let node = storage_path.as_ref().map_or_else(
+        || {
+            identity.clone().map_or_else(
+                || Arc::new(Node::new(node_id.clone(), listen_addr.clone(), difficulty)),
+                |identity| {
+                    Arc::new(Node::new_with_identity(
                         node_id.clone(),
                         listen_addr.clone(),
                         difficulty,
-                        Arc::new(storage),
                         identity,
                     ))
-                } else {
-                    Arc::new(Node::new_with_storage(
-                        node_id.clone(),
-                        listen_addr.clone(),
-                        difficulty,
-                        Arc::new(storage),
-                    ))
+                },
+            )
+        },
+        |path| {
+            log::info!("Using persistent storage at {path}");
+            match SledStorageProvider::open(path) {
+                Ok(storage) => {
+                    if let Some(identity) = identity.clone() {
+                        Arc::new(Node::new_with_storage_and_identity(
+                            node_id.clone(),
+                            listen_addr.clone(),
+                            difficulty,
+                            Arc::new(storage),
+                            identity,
+                        ))
+                    } else {
+                        Arc::new(Node::new_with_storage(
+                            node_id.clone(),
+                            listen_addr.clone(),
+                            difficulty,
+                            Arc::new(storage),
+                        ))
+                    }
+                }
+                Err(e) => {
+                    log::error!("Failed to open storage at {path}: {e}");
+                    std::process::exit(1);
                 }
             }
-            Err(e) => {
-                log::error!("Failed to open storage at {path}: {e}");
-                std::process::exit(1);
-            }
-        }
-    } else if let Some(identity) = identity {
-        Arc::new(Node::new_with_identity(
-            node_id.clone(),
-            listen_addr.clone(),
-            difficulty,
-            identity,
-        ))
-    } else {
-        Arc::new(Node::new(node_id.clone(), listen_addr.clone(), difficulty))
-    };
+        },
+    );
 
     // Attach the WASM execution provider so contracts with wasm_code_b64 payloads
     // are evaluated through the Wasmtime sandbox.
@@ -335,54 +570,41 @@ async fn main() {
     loop {
         line.clear();
         print!("> ");
-        use std::io::Write;
         let _ = std::io::stdout().flush();
 
         if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
             break; // EOF
         }
 
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() {
-            continue;
-        }
-
-        match parts[0] {
-            "help" | "?" => {
-                usage();
+        let cmd = match parse_command(&line) {
+            Ok(Some(cmd)) => cmd,
+            Ok(None) => continue,
+            Err(msg) => {
+                eprintln!("{msg}");
+                continue;
             }
+        };
 
-            "supply" => {
-                if parts.len() < 8 {
-                    eprintln!("Usage: supply <seller> <product_id> <product_name> <qty> <price> <lead_days> <currency>");
-                    continue;
-                }
-                let qty: u64 = if let Ok(v) = parts[4].parse() {
-                    v
-                } else {
-                    eprintln!("Invalid quantity");
-                    continue;
-                };
-                let price: u64 = if let Some(v) = parse_price(parts[5]) {
-                    v
-                } else {
-                    eprintln!("Invalid price (use decimal like 12.50)");
-                    continue;
-                };
-                let lead: u32 = if let Ok(v) = parts[6].parse() {
-                    v
-                } else {
-                    eprintln!("Invalid lead_days");
-                    continue;
-                };
+        match cmd {
+            ReplCommand::Help => usage(),
+
+            ReplCommand::Supply {
+                seller,
+                product_id,
+                product_name,
+                qty,
+                price,
+                lead_days,
+                currency,
+            } => {
                 let tx = Transaction::new(TransactionKind::SupplyOffer(SupplyOffer {
-                    product_id: parts[2].to_owned(),
-                    product_name: parts[3].to_owned(),
-                    seller_id: parts[1].to_owned(),
+                    product_id,
+                    product_name,
+                    seller_id: seller,
                     quantity_available: qty,
                     price_per_unit: price,
-                    lead_time_days: lead,
-                    currency: parts[7].to_owned(),
+                    lead_time_days: lead_days,
+                    currency,
                 }));
                 match node.submit_transaction(tx).await {
                     Ok(()) => println!("Supply offer submitted."),
@@ -390,30 +612,21 @@ async fn main() {
                 }
             }
 
-            "order" => {
-                if parts.len() < 7 {
-                    eprintln!("Usage: order <buyer> <seller> <product> <qty> <price> <currency>");
-                    continue;
-                }
-                let qty: u64 = if let Ok(v) = parts[4].parse() {
-                    v
-                } else {
-                    eprintln!("Invalid quantity");
-                    continue;
-                };
-                let price: u64 = if let Some(v) = parse_price(parts[5]) {
-                    v
-                } else {
-                    eprintln!("Invalid price");
-                    continue;
-                };
+            ReplCommand::Order {
+                buyer,
+                seller,
+                product,
+                qty,
+                price,
+                currency,
+            } => {
                 let tx = Transaction::new(TransactionKind::PurchaseOrder(PurchaseOrder {
-                    product_id: parts[3].to_owned(),
-                    buyer_id: parts[1].to_owned(),
-                    seller_id: parts[2].to_owned(),
+                    product_id: product,
+                    buyer_id: buyer,
+                    seller_id: seller,
                     quantity: qty,
                     agreed_price_per_unit: price,
-                    currency: parts[6].to_owned(),
+                    currency,
                     contract_id: None,
                 }));
                 match node.submit_transaction(tx).await {
@@ -422,48 +635,27 @@ async fn main() {
                 }
             }
 
-            "contract" => {
-                if parts.len() < 9 {
-                    eprintln!(
-                        "Usage: contract <contract_id> <buyer> <product> <max_price> <min_qty> <max_qty> <max_lead> <currency>"
-                    );
-                    continue;
-                }
-                let max_price: u64 = if let Some(v) = parse_price(parts[4]) {
-                    v
-                } else {
-                    eprintln!("Invalid max_price");
-                    continue;
-                };
-                let min_qty: u64 = if let Ok(v) = parts[5].parse() {
-                    v
-                } else {
-                    eprintln!("Invalid min_qty");
-                    continue;
-                };
-                let max_qty: u64 = if let Ok(v) = parts[6].parse() {
-                    v
-                } else {
-                    eprintln!("Invalid max_qty");
-                    continue;
-                };
-                let max_lead: u32 = if let Ok(v) = parts[7].parse() {
-                    v
-                } else {
-                    eprintln!("Invalid max_lead");
-                    continue;
-                };
+            ReplCommand::Contract {
+                contract_id,
+                buyer,
+                product,
+                max_price,
+                min_qty,
+                max_qty,
+                max_lead,
+                currency,
+            } => {
                 let tx = Transaction::new(TransactionKind::ContractCreation(SmartContractDef {
-                    contract_id: parts[1].to_owned(),
-                    buyer_id: parts[2].to_owned(),
-                    product_id: parts[3].to_owned(),
+                    contract_id,
+                    buyer_id: buyer,
+                    product_id: product,
                     conditions: PurchaseConditions {
                         max_price_per_unit: max_price,
                         min_quantity: min_qty,
                         max_quantity: max_qty,
                         max_lead_time_days: max_lead,
                         preferred_seller_id: None,
-                        currency: parts[8].to_owned(),
+                        currency,
                         auto_execute: true,
                     },
                     wasm_code_b64: None,
@@ -474,21 +666,15 @@ async fn main() {
                 }
             }
 
-            "inventory" => {
-                if parts.len() < 5 {
-                    eprintln!("Usage: inventory <owner> <product> <delta> <reason>");
-                    continue;
-                }
-                let delta: i64 = if let Ok(v) = parts[3].parse() {
-                    v
-                } else {
-                    eprintln!("Invalid delta");
-                    continue;
-                };
-                let reason = parts[4..].join(" ");
+            ReplCommand::Inventory {
+                owner,
+                product,
+                delta,
+                reason,
+            } => {
                 let tx = Transaction::new(TransactionKind::InventoryUpdate(InventoryUpdate {
-                    owner_id: parts[1].to_owned(),
-                    product_id: parts[2].to_owned(),
+                    owner_id: owner,
+                    product_id: product,
                     quantity_delta: delta,
                     reason,
                 }));
@@ -498,29 +684,25 @@ async fn main() {
                 }
             }
 
-            "asset" => {
-                if parts.len() < 9 {
-                    eprintln!(
-                        "Usage: asset <originator> <product_name> <gtin> <batch> <expiry> <serial> <qty> <event_type>"
-                    );
-                    continue;
-                }
-                let qty: u64 = if let Ok(v) = parts[7].parse() {
-                    v
-                } else {
-                    eprintln!("Invalid qty");
-                    continue;
-                };
-                let opt = |s: &str| if s == "-" { None } else { Some(s.to_owned()) };
+            ReplCommand::Asset {
+                originator,
+                product_name,
+                gtin,
+                batch,
+                expiry,
+                serial,
+                qty,
+                event_type,
+            } => {
                 let asset = TraceableAsset {
-                    gtin: opt(parts[3]),
-                    batch_number: opt(parts[4]),
-                    expiry_date: opt(parts[5]),
-                    serial_number: opt(parts[6]),
+                    gtin,
+                    batch_number: batch,
+                    expiry_date: expiry,
+                    serial_number: serial,
                     anvisa_registration: None,
                     manufacturer_id: None,
-                    product_name: parts[2].to_owned(),
-                    custodian_id: parts[1].to_owned(),
+                    product_name,
+                    custodian_id: originator.clone(),
                     country_of_origin: None,
                     storage_temp_celsius: None,
                     quantity: qty,
@@ -534,8 +716,8 @@ async fn main() {
                 let tx = Transaction::new(TransactionKind::AssetRegistration(
                     TraceableAssetRegistration {
                         asset,
-                        event_type: parts[8].to_owned(),
-                        originator_id: parts[1].to_owned(),
+                        event_type,
+                        originator_id: originator,
                         purchase_order_ref: None,
                     },
                 ));
@@ -545,12 +727,12 @@ async fn main() {
                 }
             }
 
-            "mine" => match node.mine().await {
+            ReplCommand::Mine => match node.mine().await {
                 Ok(()) => println!("Block mined."),
                 Err(e) => eprintln!("Error mining: {e}"),
             },
 
-            "mine-async" => {
+            ReplCommand::MineAsync => {
                 let node_ref = Arc::clone(&node);
                 tokio::spawn(async move {
                     match node_ref.mine_async().await {
@@ -561,7 +743,7 @@ async fn main() {
                 println!("Mining started in the background…");
             }
 
-            "chain" => {
+            ReplCommand::Chain => {
                 let ledger = node.ledger_snapshot().await;
                 println!("Chain length: {} blocks", ledger.chain.len());
                 for block in &ledger.chain {
@@ -575,7 +757,7 @@ async fn main() {
                 }
             }
 
-            "pending" => {
+            ReplCommand::Pending => {
                 let ledger = node.ledger_snapshot().await;
                 println!(
                     "Pending transactions: {}",
@@ -594,7 +776,7 @@ async fn main() {
                 }
             }
 
-            "peers" => {
+            ReplCommand::Peers => {
                 let peers = node.known_peers().await;
                 if peers.is_empty() {
                     println!("No connected peers.");
@@ -606,7 +788,7 @@ async fn main() {
                 }
             }
 
-            "contracts" => {
+            ReplCommand::Contracts => {
                 let summaries = node.contract_summaries().await;
                 if summaries.is_empty() {
                     println!("No contracts registered.");
@@ -626,14 +808,269 @@ async fn main() {
                 }
             }
 
-            "quit" | "exit" => {
+            ReplCommand::Quit => {
                 println!("Shutting down.");
                 break;
             }
+        }
+    }
+}
 
-            other => {
-                eprintln!("Unknown command: {other:?}. Type 'help' for usage.");
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_command, parse_price, ReplCommand};
+
+    #[test]
+    fn parse_price_accepts_whole_number() {
+        assert_eq!(parse_price("12"), Some(1200));
+        assert_eq!(parse_price("0"), Some(0));
+        // Leading/trailing whitespace is trimmed.
+        assert_eq!(parse_price(" 7 "), Some(700));
+    }
+
+    #[test]
+    fn parse_price_accepts_one_digit_fraction() {
+        assert_eq!(parse_price("12.5"), Some(1250));
+        assert_eq!(parse_price("0.1"), Some(10));
+    }
+
+    #[test]
+    fn parse_price_accepts_two_digit_fraction() {
+        assert_eq!(parse_price("12.50"), Some(1250));
+        assert_eq!(parse_price("9.99"), Some(999));
+        assert_eq!(parse_price("0.05"), Some(5));
+    }
+
+    #[test]
+    fn parse_price_rejects_three_digit_fraction() {
+        assert_eq!(parse_price("12.500"), None);
+        assert_eq!(parse_price("1.234"), None);
+    }
+
+    #[test]
+    fn parse_price_rejects_negative() {
+        assert_eq!(parse_price("-12.50"), None);
+        assert_eq!(parse_price("-1"), None);
+    }
+
+    #[test]
+    fn parse_price_rejects_empty_or_garbage() {
+        assert_eq!(parse_price(""), None);
+        assert_eq!(parse_price("   "), None);
+        assert_eq!(parse_price("abc"), None);
+        assert_eq!(parse_price("12.x"), None);
+        assert_eq!(parse_price("1.2.3"), None);
+        assert_eq!(parse_price(".5"), None);
+        assert_eq!(parse_price("+1"), None);
+    }
+
+    #[test]
+    fn parse_price_rejects_overflow() {
+        // `u64::MAX` in minor units is the largest accepted value.
+        assert_eq!(parse_price("184467440737095516.15"), Some(u64::MAX));
+        // `whole * 100` exceeds `u64::MAX` (checked_mul).
+        assert_eq!(parse_price("184467440737095517"), None);
+        // `whole * 100 + frac` exceeds `u64::MAX` (checked_add).
+        assert_eq!(parse_price("184467440737095516.16"), None);
+        // The whole part itself exceeds `u64::MAX` (parse fails).
+        assert_eq!(parse_price("18446744073709551616"), None);
+    }
+
+    #[test]
+    fn parse_command_blank_line_is_none() {
+        assert_eq!(parse_command(""), Ok(None));
+        assert_eq!(parse_command("   \n"), Ok(None));
+        assert_eq!(parse_command("\t \n"), Ok(None));
+    }
+
+    #[test]
+    fn parse_command_help() {
+        assert_eq!(parse_command("help"), Ok(Some(ReplCommand::Help)));
+        assert_eq!(parse_command("?"), Ok(Some(ReplCommand::Help)));
+        // Extra tokens are ignored, matching the inline `parts[0]` match.
+        assert_eq!(parse_command("help extra"), Ok(Some(ReplCommand::Help)));
+    }
+
+    #[test]
+    fn parse_command_supply() {
+        assert_eq!(
+            parse_command("supply acme p1 Widget 100 12.50 3 USD"),
+            Ok(Some(ReplCommand::Supply {
+                seller: "acme".to_owned(),
+                product_id: "p1".to_owned(),
+                product_name: "Widget".to_owned(),
+                qty: 100,
+                price: 1250,
+                lead_days: 3,
+                currency: "USD".to_owned(),
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_command_order() {
+        assert_eq!(
+            parse_command("order buyer seller p1 5 9.99 USD"),
+            Ok(Some(ReplCommand::Order {
+                buyer: "buyer".to_owned(),
+                seller: "seller".to_owned(),
+                product: "p1".to_owned(),
+                qty: 5,
+                price: 999,
+                currency: "USD".to_owned(),
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_command_contract() {
+        assert_eq!(
+            parse_command("contract c1 buyer p1 12.50 10 50 7 USD"),
+            Ok(Some(ReplCommand::Contract {
+                contract_id: "c1".to_owned(),
+                buyer: "buyer".to_owned(),
+                product: "p1".to_owned(),
+                max_price: 1250,
+                min_qty: 10,
+                max_qty: 50,
+                max_lead: 7,
+                currency: "USD".to_owned(),
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_command_inventory_joins_reason_words() {
+        let cmd = parse_command("inventory acme p1 -5 damaged in transit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cmd,
+            ReplCommand::Inventory {
+                owner: "acme".to_owned(),
+                product: "p1".to_owned(),
+                delta: -5,
+                reason: "damaged in transit".to_owned(),
             }
+        );
+    }
+
+    #[test]
+    fn parse_command_asset_dash_placeholder() {
+        let cmd = parse_command("asset acme Widget - - - - 5 RECEIVED")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cmd,
+            ReplCommand::Asset {
+                originator: "acme".to_owned(),
+                product_name: "Widget".to_owned(),
+                gtin: None,
+                batch: None,
+                expiry: None,
+                serial: None,
+                qty: 5,
+                event_type: "RECEIVED".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_command_asset_keeps_non_dash_values() {
+        let cmd = parse_command("asset acme Widget 789012345678 42 2026-01-01 SN-1 5 RECEIVED")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cmd,
+            ReplCommand::Asset {
+                originator: "acme".to_owned(),
+                product_name: "Widget".to_owned(),
+                gtin: Some("789012345678".to_owned()),
+                batch: Some("42".to_owned()),
+                expiry: Some("2026-01-01".to_owned()),
+                serial: Some("SN-1".to_owned()),
+                qty: 5,
+                event_type: "RECEIVED".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_command_simple_commands() {
+        for (line, cmd) in [
+            ("mine", ReplCommand::Mine),
+            ("mine-async", ReplCommand::MineAsync),
+            ("chain", ReplCommand::Chain),
+            ("pending", ReplCommand::Pending),
+            ("peers", ReplCommand::Peers),
+            ("contracts", ReplCommand::Contracts),
+        ] {
+            assert_eq!(parse_command(line), Ok(Some(cmd)));
+        }
+    }
+
+    #[test]
+    fn parse_command_quit() {
+        assert_eq!(parse_command("quit"), Ok(Some(ReplCommand::Quit)));
+        assert_eq!(parse_command("exit"), Ok(Some(ReplCommand::Quit)));
+    }
+
+    #[test]
+    fn parse_command_unknown() {
+        assert_eq!(
+            parse_command("frobnicate x"),
+            Err("Unknown command: \"frobnicate\". Type 'help' for usage.".to_owned())
+        );
+    }
+
+    #[test]
+    fn parse_command_arity_errors() {
+        assert_eq!(
+            parse_command("supply acme p1 Widget 100 12.50"),
+            Err("Usage: supply <seller> <product_id> <product_name> <qty> <price> <lead_days> <currency>".to_owned())
+        );
+        assert_eq!(
+            parse_command("order buyer seller p1 5"),
+            Err("Usage: order <buyer> <seller> <product> <qty> <price> <currency>".to_owned())
+        );
+        assert_eq!(
+            parse_command("contract c1 buyer p1 12.50"),
+            Err("Usage: contract <contract_id> <buyer> <product> <max_price> <min_qty> <max_qty> <max_lead> <currency>".to_owned())
+        );
+        assert_eq!(
+            parse_command("inventory acme p1"),
+            Err("Usage: inventory <owner> <product> <delta> <reason>".to_owned())
+        );
+        assert_eq!(
+            parse_command("asset acme Widget"),
+            Err("Usage: asset <originator> <product_name> <gtin> <batch> <expiry> <serial> <qty> <event_type>".to_owned())
+        );
+    }
+
+    #[test]
+    fn parse_command_numeric_errors() {
+        for (line, msg) in [
+            ("supply acme p1 Widget abc 12.50 3 USD", "Invalid quantity"),
+            (
+                "supply acme p1 Widget 100 banana 3 USD",
+                "Invalid price (use decimal like 12.50)",
+            ),
+            ("supply acme p1 Widget 100 12.50 x USD", "Invalid lead_days"),
+            ("order buyer seller p1 abc 9.99 USD", "Invalid quantity"),
+            ("order buyer seller p1 5 banana USD", "Invalid price"),
+            (
+                "contract c1 buyer p1 banana 10 50 7 USD",
+                "Invalid max_price",
+            ),
+            ("contract c1 buyer p1 12.50 x 50 7 USD", "Invalid min_qty"),
+            ("contract c1 buyer p1 12.50 10 x 7 USD", "Invalid max_qty"),
+            ("contract c1 buyer p1 12.50 10 50 x USD", "Invalid max_lead"),
+            ("inventory acme p1 abc damaged", "Invalid delta"),
+            ("asset acme Widget 789 42 2026 1 x RECEIVED", "Invalid qty"),
+        ] {
+            assert_eq!(parse_command(line), Err(msg.to_owned()));
         }
     }
 }

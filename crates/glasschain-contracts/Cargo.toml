@@ -3,11 +3,14 @@ name = "glasschain-contracts"
 version = "0.1.0"
 edition = "2021"
 description = "Smart contracts engine for GlassChain – enables automated supply-chain purchases"
+license = "Apache-2.0"
+repository = "https://github.com/dbbvitor/GlassChain"
+readme = "../../README.md"
+keywords = ["blockchain", "supply-chain", "distributed-ledger"]
+categories = ["network-programming", "asynchronous", "cryptography"]
 
 [dependencies]
 glasschain-core = { path = "../glasschain-core" }
-glasschain-vm   = { path = "../glasschain-vm" }
-wat     = "1.247"
 serde   = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror  = "2.0"
@@ -16,9 +19,9 @@ base64     = "0.22"
 
 [dev-dependencies]
 env_logger = "0.11"
-base64     = "0.22"
-criterion  = { version = "0.5", features = ["html_reports"] }
+wat = "1.247"
 glasschain-vm = { path = "../glasschain-vm" }
+criterion  = "0.5"
 
 [[bench]]
 name = "watcher_throughput"

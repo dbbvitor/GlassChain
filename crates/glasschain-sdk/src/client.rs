@@ -272,9 +272,7 @@ impl GlasschainClient {
             originator_id: originator_id.to_owned(),
             purchase_order_ref: None,
         };
-        log::info!(
-            "Building AssetRegistration tx: event={event_type}, originator={originator_id}"
-        );
+        log::info!("Building AssetRegistration tx: event={event_type}, originator={originator_id}");
         let tx = Transaction::new(TransactionKind::AssetRegistration(registration));
         Ok(serde_json::to_string_pretty(&tx)?)
     }
@@ -393,13 +391,7 @@ mod tests {
     #[test]
     fn test_build_supply_offer_json() {
         let json = GlasschainClient::build_supply_offer_tx(
-            "seller-1",
-            "SKU-001",
-            "Widget A",
-            500,
-            1_250,
-            7,
-            "USD",
+            "seller-1", "SKU-001", "Widget A", 500, 1_250, 7, "USD",
         )
         .unwrap();
         let tx: Transaction = serde_json::from_str(&json).unwrap();
@@ -422,8 +414,7 @@ mod tests {
     fn test_build_asset_registration_json() {
         let asset = full_asset();
         let json =
-            GlasschainClient::build_asset_registration_tx("my-node", asset, "MANUFACTURE")
-                .unwrap();
+            GlasschainClient::build_asset_registration_tx("my-node", asset, "MANUFACTURE").unwrap();
         let tx: Transaction = serde_json::from_str(&json).unwrap();
         assert!(
             matches!(tx.kind, TransactionKind::AssetRegistration(_)),
@@ -432,10 +423,7 @@ mod tests {
         if let TransactionKind::AssetRegistration(reg) = &tx.kind {
             assert_eq!(reg.originator_id, "my-node");
             assert_eq!(reg.event_type, "MANUFACTURE");
-            assert_eq!(
-                reg.asset.gtin.as_deref(),
-                Some("07891234567890"),
-            );
+            assert_eq!(reg.asset.gtin.as_deref(), Some("07891234567890"),);
         }
     }
 
@@ -461,6 +449,75 @@ mod tests {
         }
     }
 
+    /// `build_inventory_update_tx` should produce JSON that round-trips to a
+    /// `Transaction` carrying an `InventoryUpdate` payload (including a
+    /// negative `quantity_delta` for consumption).
+    #[test]
+    fn test_build_inventory_update_json() {
+        let json = GlasschainClient::build_inventory_update_tx(
+            "owner-1",
+            "SKU-001",
+            -25,
+            "production consumption",
+        )
+        .unwrap();
+        let tx: Transaction = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(tx.kind, TransactionKind::InventoryUpdate(_)),
+            "expected InventoryUpdate variant, got {tx:?}",
+        );
+        if let TransactionKind::InventoryUpdate(update) = &tx.kind {
+            assert_eq!(update.owner_id, "owner-1");
+            assert_eq!(update.product_id, "SKU-001");
+            assert_eq!(update.quantity_delta, -25);
+            assert_eq!(update.reason, "production consumption");
+        }
+    }
+
+    /// `build_smart_contract_tx` should construct a `ContractCreation`
+    /// transaction carrying the supplied [`PurchaseConditions`], with no WASM
+    /// bytecode attached.
+    #[test]
+    fn test_build_smart_contract_json() {
+        let conditions = PurchaseConditions {
+            max_price_per_unit: 1_250,
+            min_quantity: 100,
+            max_quantity: 1_000,
+            max_lead_time_days: 7,
+            preferred_seller_id: Some("seller-1".into()),
+            currency: "USD".into(),
+            auto_execute: true,
+        };
+        let json = GlasschainClient::build_smart_contract_tx(
+            "contract-1",
+            "buyer-1",
+            "SKU-001",
+            conditions,
+        )
+        .unwrap();
+        let tx: Transaction = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(tx.kind, TransactionKind::ContractCreation(_)),
+            "expected ContractCreation variant, got {tx:?}",
+        );
+        if let TransactionKind::ContractCreation(contract) = &tx.kind {
+            assert_eq!(contract.contract_id, "contract-1");
+            assert_eq!(contract.buyer_id, "buyer-1");
+            assert_eq!(contract.product_id, "SKU-001");
+            assert!(contract.wasm_code_b64.is_none());
+            assert_eq!(contract.conditions.max_price_per_unit, 1_250);
+            assert_eq!(contract.conditions.min_quantity, 100);
+            assert_eq!(contract.conditions.max_quantity, 1_000);
+            assert_eq!(contract.conditions.max_lead_time_days, 7);
+            assert_eq!(
+                contract.conditions.preferred_seller_id.as_deref(),
+                Some("seller-1"),
+            );
+            assert_eq!(contract.conditions.currency, "USD");
+            assert!(contract.conditions.auto_execute);
+        }
+    }
+
     /// A fully-populated asset must yield a trust score of exactly 100 and
     /// be flagged as standard-compliant.
     #[test]
@@ -483,13 +540,10 @@ mod tests {
     /// endpoint and node ID correctly.
     #[test]
     fn test_client_config_builder() {
-        let config = GlasschainClientConfig::new("http://localhost:9000")
-            .with_node_id("warehouse-node-1");
+        let config =
+            GlasschainClientConfig::new("http://localhost:9000").with_node_id("warehouse-node-1");
         assert_eq!(config.endpoint, "http://localhost:9000");
-        assert_eq!(
-            config.node_id.as_deref(),
-            Some("warehouse-node-1"),
-        );
+        assert_eq!(config.node_id.as_deref(), Some("warehouse-node-1"),);
 
         // Config without a node_id should have None.
         let bare = GlasschainClientConfig::new("http://remote:9000");

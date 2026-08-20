@@ -10,8 +10,11 @@
 //! - **Concurrent mining**: two nodes mine simultaneously and resolve via
 //!   longest-chain rule.
 
-use glasschain_core::{InventoryUpdate, MetadataTrustScore, TraceableAsset, Transaction, TransactionKind, TRUST_SCORE_STANDARD_THRESHOLD};
 use glasschain_contracts::{InventoryTrigger, WatcherService};
+use glasschain_core::{
+    InventoryUpdate, MetadataTrustScore, TraceableAsset, Transaction, TransactionKind,
+    TRUST_SCORE_STANDARD_THRESHOLD,
+};
 use glasschain_network::{Node, NodeEvent};
 use std::sync::Arc;
 use std::time::Duration;
@@ -187,10 +190,10 @@ async fn test_concurrent_mining_longest_chain_wins() {
         .unwrap();
     node_a.mine().await.unwrap();
 
-    let len_b_before = node_b.ledger_snapshot().await.chain.len();
-    let len_a_before = node_a.ledger_snapshot().await.chain.len();
-    assert_eq!(len_b_before, 3, "node B should have 3 blocks");
-    assert_eq!(len_a_before, 2, "node A should have 2 blocks");
+    let remote_chain_blocks = node_b.ledger_snapshot().await.chain.len();
+    let local_chain_blocks = node_a.ledger_snapshot().await.chain.len();
+    assert_eq!(remote_chain_blocks, 3, "node B should have 3 blocks");
+    assert_eq!(local_chain_blocks, 2, "node A should have 2 blocks");
 
     // Connect A to B. A should adopt B's longer chain.
     // We simulate by starting a new node that connects to B and check it gets B's chain.
@@ -327,18 +330,20 @@ async fn test_recall_simulation_manufacturer_to_pharmacy() {
     let ledger = manufacturer.ledger_snapshot().await;
     assert_eq!(ledger.chain.len(), 2, "Genesis + 1 data block");
     let data_block = &ledger.chain[1];
-    assert_eq!(data_block.transactions.len(), 3, "All 3 custody events in block");
+    assert_eq!(
+        data_block.transactions.len(),
+        3,
+        "All 3 custody events in block"
+    );
 
     // Verify the GTIN is findable across the chain
-    let found_gtin = ledger.chain.iter()
-        .flat_map(|b| &b.transactions)
-        .any(|tx| {
-            if let TransactionKind::AssetRegistration(reg) = &tx.kind {
-                reg.asset.gtin.as_deref() == Some(gtin)
-            } else {
-                false
-            }
-        });
+    let found_gtin = ledger.chain.iter().flat_map(|b| &b.transactions).any(|tx| {
+        if let TransactionKind::AssetRegistration(reg) = &tx.kind {
+            reg.asset.gtin.as_deref() == Some(gtin)
+        } else {
+            false
+        }
+    });
     assert!(found_gtin, "GTIN {gtin} must be findable in the chain");
 }
 
@@ -350,16 +355,16 @@ async fn test_high_frequency_autonomous_inventory() {
     let mut watcher = WatcherService::new();
     for i in 0..10u64 {
         watcher.add_trigger(InventoryTrigger {
-            trigger_id:       format!("trigger-{i}"),
-            owner_id:         "warehouse-central".into(),
-            product_id:       format!("PROD-{i:03}"),
+            trigger_id: format!("trigger-{i}"),
+            owner_id: "warehouse-central".into(),
+            product_id: format!("PROD-{i:03}"),
             reorder_threshold: 5,
             reorder_quantity: 100,
-            seller_id:        "supplier-auto".into(),
-            price_per_unit:   1000,
-            currency:         "BRL".into(),
-            active:           true,
-            wasm_code_b64:    None,
+            seller_id: "supplier-auto".into(),
+            price_per_unit: 1000,
+            currency: "BRL".into(),
+            active: true,
+            wasm_code_b64: None,
         });
     }
 
@@ -367,10 +372,10 @@ async fn test_high_frequency_autonomous_inventory() {
     let mut total_orders = 0;
     for i in 0..10u64 {
         let update = InventoryUpdate {
-            product_id:     format!("PROD-{i:03}"),
-            owner_id:       "warehouse-central".into(),
+            product_id: format!("PROD-{i:03}"),
+            owner_id: "warehouse-central".into(),
             quantity_delta: -10, // inventory 0 → -10, which is ≤ threshold 5
-            reason:         "autonomous depletion test".into(),
+            reason: "autonomous depletion test".into(),
         };
         let orders = watcher.on_inventory_update(&update);
         total_orders += orders.len();
@@ -382,42 +387,52 @@ async fn test_high_frequency_autonomous_inventory() {
     let mut second_round = 0;
     for i in 0..10u64 {
         let update = InventoryUpdate {
-            product_id:     format!("PROD-{i:03}"),
-            owner_id:       "warehouse-central".into(),
+            product_id: format!("PROD-{i:03}"),
+            owner_id: "warehouse-central".into(),
             quantity_delta: -100,
-            reason:         "second depletion".into(),
+            reason: "second depletion".into(),
         };
         let orders = watcher.on_inventory_update(&update);
         second_round += orders.len();
     }
-    assert_eq!(second_round, 10, "All 10 triggers fire again on second drop");
+    assert_eq!(
+        second_round, 10,
+        "All 10 triggers fire again on second drop"
+    );
 
     // IDs across the two rounds must be unique (fire counter increments)
     // Verify by collecting all IDs from a fresh single-trigger run
     let mut watcher2 = WatcherService::new();
     watcher2.add_trigger(InventoryTrigger {
-        trigger_id:       "t-unique".into(),
-        owner_id:         "owner".into(),
-        product_id:       "P-UNIQUE".into(),
+        trigger_id: "t-unique".into(),
+        owner_id: "owner".into(),
+        product_id: "P-UNIQUE".into(),
         reorder_threshold: 0,
         reorder_quantity: 10,
-        seller_id:        "s".into(),
-        price_per_unit:   100,
-        currency:         "BRL".into(),
-        active:           true,
-        wasm_code_b64:    None,
+        seller_id: "s".into(),
+        price_per_unit: 100,
+        currency: "BRL".into(),
+        active: true,
+        wasm_code_b64: None,
     });
     let fire1 = watcher2.on_inventory_update(&InventoryUpdate {
-        product_id: "P-UNIQUE".into(), owner_id: "owner".into(),
-        quantity_delta: -1, reason: "r".into(),
+        product_id: "P-UNIQUE".into(),
+        owner_id: "owner".into(),
+        quantity_delta: -1,
+        reason: "r".into(),
     });
     let fire2 = watcher2.on_inventory_update(&InventoryUpdate {
-        product_id: "P-UNIQUE".into(), owner_id: "owner".into(),
-        quantity_delta: -1, reason: "r".into(),
+        product_id: "P-UNIQUE".into(),
+        owner_id: "owner".into(),
+        quantity_delta: -1,
+        reason: "r".into(),
     });
     assert_eq!(fire1.len(), 1);
     assert_eq!(fire2.len(), 1);
-    assert_ne!(fire1[0].id, fire2[0].id, "repeated firings must yield unique tx IDs");
+    assert_ne!(
+        fire1[0].id, fire2[0].id,
+        "repeated firings must yield unique tx IDs"
+    );
 }
 
 /// Validates that asset schema validation (Phase 3 Nudge engine) works correctly
@@ -440,7 +455,10 @@ async fn test_schema_validation_in_network_context() {
     };
     let score = MetadataTrustScore::compute(&compliant);
     assert!(score.score >= TRUST_SCORE_STANDARD_THRESHOLD);
-    assert!((score.fee_multiplier() - 0.5).abs() < f64::EPSILON, "Standard asset pays 50% fee");
+    assert!(
+        (score.fee_multiplier() - 0.5).abs() < f64::EPSILON,
+        "Standard asset pays 50% fee"
+    );
 
     // Non-compliant asset — missing all SNCM fields
     let non_compliant = TraceableAsset {
@@ -458,8 +476,15 @@ async fn test_schema_validation_in_network_context() {
     };
     let nc_score = MetadataTrustScore::compute(&non_compliant);
     assert!(nc_score.score < TRUST_SCORE_STANDARD_THRESHOLD);
-    assert!((nc_score.fee_multiplier() - 1.0).abs() < f64::EPSILON, "Non-standard pays 100% fee");
+    assert!(
+        (nc_score.fee_multiplier() - 1.0).abs() < f64::EPSILON,
+        "Non-standard pays 100% fee"
+    );
 
     // Both assets are accepted (nudge model — no hard rejection)
-    assert_eq!(nc_score.missing_core_fields.len(), 4, "All 4 core fields missing");
+    assert_eq!(
+        nc_score.missing_core_fields.len(),
+        4,
+        "All 4 core fields missing"
+    );
 }

@@ -90,3 +90,36 @@ allow-print-in-tests = true
 # so the full picture is visible even for public APIs — we want to know about
 # every improvement opportunity and can choose when to act on it.
 avoid-breaking-exported-api = false
+
+# These duplicate transitive versions come from independent platform and
+# networking dependency trees; direct dependency versions cannot unify them.
+allowed-duplicate-crates = [
+    "bitflags",
+    "embedded-io",
+    "foldhash",
+    "getrandom",
+    "hashbrown",
+    "hashlink",
+    "thiserror",
+    "thiserror-impl",
+    "wasm-encoder",
+    "wasmparser",
+    "windows-sys",
+    "wit-bindgen",
+    "wit-parser",
+    "winnow",
+    "itertools",
+    "parking_lot",
+    "parking_lot_core",
+    "redox_syscall",
+    "r-efi",
+    "rand",
+    "rand_chacha",
+    "rand_core",
+    "rcgen",
+    "socket2",
+    "syn",
+    "unsigned-varint",
+    "x509-parser",
+    "yamux",
+]

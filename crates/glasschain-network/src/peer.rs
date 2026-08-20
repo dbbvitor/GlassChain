@@ -23,6 +23,9 @@ impl PeerReader {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns [`NetworkError`] when the frame cannot be read or decoded.
     pub async fn receive(&mut self) -> Result<Message, NetworkError> {
         let mut len_buf = [0u8; 4];
         match self.stream.read_exact(&mut len_buf).await {
@@ -68,6 +71,9 @@ impl PeerWriter {
         }
     }
 
+    /// # Errors
+    ///
+    /// Returns [`NetworkError`] when the message cannot be encoded or written.
     pub async fn send(&mut self, message: &Message) -> Result<(), NetworkError> {
         let payload = serde_json::to_vec(message)?;
         if payload.len() > MAX_MESSAGE_SIZE {
@@ -76,7 +82,10 @@ impl PeerWriter {
                 max: MAX_MESSAGE_SIZE,
             });
         }
-        let len = payload.len() as u32;
+        let len = u32::try_from(payload.len()).map_err(|_| NetworkError::MessageTooLarge {
+            size: payload.len(),
+            max: MAX_MESSAGE_SIZE,
+        })?;
         self.stream.write_all(&len.to_be_bytes()).await?;
         self.stream.write_all(&payload).await?;
         Ok(())
@@ -126,6 +135,10 @@ impl PeerConnection {
     }
 
     /// Send a [`Message`] to the remote peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError`] when the message cannot be encoded or written.
     pub async fn send(&mut self, message: &Message) -> Result<(), NetworkError> {
         let payload = serde_json::to_vec(message)?;
         if payload.len() > MAX_MESSAGE_SIZE {
@@ -134,13 +147,20 @@ impl PeerConnection {
                 max: MAX_MESSAGE_SIZE,
             });
         }
-        let len = payload.len() as u32;
+        let len = u32::try_from(payload.len()).map_err(|_| NetworkError::MessageTooLarge {
+            size: payload.len(),
+            max: MAX_MESSAGE_SIZE,
+        })?;
         self.stream.write_all(&len.to_be_bytes()).await?;
         self.stream.write_all(&payload).await?;
         Ok(())
     }
 
     /// Receive the next [`Message`] from the remote peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError`] when the frame cannot be read or decoded.
     pub async fn receive(&mut self) -> Result<Message, NetworkError> {
         let mut len_buf = [0u8; 4];
         match self.stream.read_exact(&mut len_buf).await {
@@ -167,5 +187,57 @@ impl PeerConnection {
         }
         let message = serde_json::from_slice(&buf)?;
         Ok(message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn test_framed_roundtrip() {
+        let (client, server) = duplex(1024);
+        let mut writer = PeerWriter::new(client, "peer:8000".into());
+        let mut reader = PeerReader::new(server, "peer:8000".into());
+
+        writer
+            .send(&Message::Goodbye {
+                reason: "bye".into(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            reader.receive().await.unwrap(),
+            Message::Goodbye { reason } if reason == "bye"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_oversized_frame_rejected() {
+        let (mut client, server) = duplex(1024);
+        let mut reader = PeerReader::new(server, "peer:8000".into());
+
+        client
+            .write_all(
+                &(u32::try_from(MAX_MESSAGE_SIZE).expect("16 MiB fits u32") + 1).to_be_bytes(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            reader.receive().await,
+            Err(NetworkError::MessageTooLarge { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_clean_eof_maps_to_disconnect() {
+        let (client, server) = duplex(64);
+        let mut reader = PeerReader::new(server, "peer:8000".into());
+        drop(client);
+        assert!(matches!(
+            reader.receive().await,
+            Err(NetworkError::PeerDisconnected(_))
+        ));
     }
 }

@@ -392,8 +392,7 @@ mod tests {
             .unwrap();
         ledger.mine_pending_transactions().unwrap();
 
-        let offers: Vec<_> = ledger.committed_supply_offers().collect();
-        assert_eq!(offers.len(), 2);
+        assert_eq!(ledger.committed_supply_offers().count(), 2);
     }
 
     #[test]
@@ -411,5 +410,189 @@ mod tests {
         ledger.add_transaction(po_tx).unwrap();
         ledger.mine_pending_transactions().unwrap();
         assert!(ledger.validate_chain().is_ok());
+    }
+
+    #[test]
+    fn test_add_transaction_rejects_empty_id() {
+        let mut ledger = Ledger::new(1);
+        let tx = Transaction::with_id(
+            "",
+            TransactionKind::InventoryUpdate(InventoryUpdate {
+                product_id: "SKU-001".into(),
+                owner_id: "node-1".into(),
+                quantity_delta: 50,
+                reason: "test".into(),
+            }),
+        );
+        assert!(matches!(
+            ledger.add_transaction(tx),
+            Err(CoreError::InvalidTransaction(_))
+        ));
+        assert!(ledger.pending_transactions.is_empty());
+    }
+
+    #[test]
+    fn test_add_committed_transaction_is_idempotent() {
+        let mut ledger = Ledger::new(1);
+        let tx = Transaction::with_id(
+            "tx-committed",
+            TransactionKind::InventoryUpdate(InventoryUpdate {
+                product_id: "SKU-001".into(),
+                owner_id: "node-1".into(),
+                quantity_delta: 50,
+                reason: "test".into(),
+            }),
+        );
+        ledger.add_transaction(tx.clone()).unwrap();
+        ledger.mine_pending_transactions().unwrap();
+        assert_eq!(ledger.chain[1].transactions.len(), 1);
+
+        // Re-adding an already-committed transaction must be a silent no-op.
+        assert!(ledger.add_transaction(tx).is_ok());
+        assert!(ledger.pending_transactions.is_empty());
+        assert_eq!(ledger.chain.len(), 2);
+        assert_eq!(ledger.chain[1].transactions.len(), 1);
+    }
+
+    #[test]
+    fn test_prepare_mining_snapshots_and_drains_pending() {
+        let mut ledger = Ledger::new(2);
+        let first = inventory_tx("node-1");
+        let second = inventory_tx("node-2");
+        ledger.add_transaction(first.clone()).unwrap();
+        ledger.add_transaction(second.clone()).unwrap();
+
+        let (index, prev_hash, txns, difficulty) = ledger.prepare_mining().unwrap();
+
+        assert_eq!(index, 1);
+        assert_eq!(prev_hash, ledger.chain[0].hash);
+        assert_eq!(txns, vec![first, second]);
+        assert_eq!(difficulty, 2);
+        assert!(ledger.pending_transactions.is_empty());
+    }
+
+    #[test]
+    fn test_commit_mined_block_appends_when_tip_matches() {
+        let mut ledger = Ledger::new(1);
+        ledger.add_transaction(inventory_tx("node-1")).unwrap();
+
+        let (index, prev_hash, txns, difficulty) = ledger.prepare_mining().unwrap();
+        let mut block = Block::new(index, txns, prev_hash.clone());
+        block.mine(difficulty);
+
+        assert!(ledger.commit_mined_block(block, &prev_hash).unwrap());
+        assert_eq!(ledger.chain.len(), 2);
+        assert_eq!(ledger.chain[1].index, 1);
+        assert!(ledger.pending_transactions.is_empty());
+        assert!(ledger.validate_chain().is_ok());
+    }
+
+    #[test]
+    fn test_commit_mined_block_stale_tip_restores_transactions() {
+        let mut ledger = Ledger::new(1);
+        let tx = inventory_tx("node-1");
+        ledger.add_transaction(tx.clone()).unwrap();
+
+        let (index, prev_hash, txns, difficulty) = ledger.prepare_mining().unwrap();
+        let mut stale_block = Block::new(index, txns, prev_hash.clone());
+        stale_block.mine(difficulty);
+
+        // The tip advances to a different block while the one above is mining.
+        ledger.add_transaction(inventory_tx("node-2")).unwrap();
+        ledger.mine_pending_transactions().unwrap();
+
+        assert!(!ledger.commit_mined_block(stale_block, &prev_hash).unwrap());
+        assert_eq!(ledger.chain.len(), 2);
+        // stale_block's transactions were restored to the pending pool.
+        assert_eq!(ledger.pending_transactions, vec![tx]);
+    }
+
+    #[test]
+    fn test_validate_chain_rejects_block_pow_failure() {
+        let mut ledger = Ledger::new(1);
+        ledger.add_transaction(inventory_tx("node-1")).unwrap();
+        ledger.mine_pending_transactions().unwrap();
+
+        // Re-validate under a stricter difficulty. Block 1 still chains to
+        // genesis but no longer satisfies the PoW target, so the mid-chain
+        // PoW branch must fire.
+        let mut b1 = ledger.chain[1].clone();
+        while b1.hash.starts_with("00") {
+            b1.nonce = b1.nonce.wrapping_add(1);
+            b1.hash = b1.calculate_hash();
+        }
+        ledger.chain[1] = b1;
+        ledger.difficulty = 2;
+
+        let err = ledger.validate_chain().unwrap_err();
+        assert!(matches!(
+            err,
+            CoreError::InvalidBlock(msg) if msg.contains("PoW difficulty 2")
+        ));
+    }
+
+    #[test]
+    fn test_validate_chain_rejects_invalid_genesis() {
+        let mut ledger = Ledger::new(1);
+        ledger.chain[0].hash = "tampered".into();
+        let err = ledger.validate_chain().unwrap_err();
+        assert!(matches!(
+            err,
+            CoreError::InvalidBlock(msg) if msg.contains("genesis block hash is invalid")
+        ));
+    }
+
+    #[test]
+    fn test_validate_chain_rejects_genesis_pow_failure() {
+        let mut ledger = Ledger::new(1);
+        // Adjust genesis's nonce so its hash is valid but does not satisfy a
+        // stricter difficulty-2 target.
+        let mut genesis = ledger.chain[0].clone();
+        while genesis.hash.starts_with("00") {
+            genesis.nonce = genesis.nonce.wrapping_add(1);
+            genesis.hash = genesis.calculate_hash();
+        }
+        ledger.chain[0] = genesis;
+        ledger.difficulty = 2;
+
+        let err = ledger.validate_chain().unwrap_err();
+        assert!(matches!(
+            err,
+            CoreError::InvalidBlock(msg) if msg.contains("genesis block does not satisfy PoW difficulty")
+        ));
+    }
+
+    #[test]
+    fn test_try_replace_chain_rejects_invalid_chain_link() {
+        let mut ledger = Ledger::new(1);
+        let genesis = ledger.chain[0].clone();
+
+        // b1 carries a wrong previous_hash, so chains_to fails even though the
+        // candidate is longer than the local chain.
+        let mut b1 = Block::new(1, vec![], "not-the-genesis-hash".into());
+        b1.mine(1);
+        let mut b2 = Block::new(2, vec![], b1.hash.clone());
+        b2.mine(1);
+
+        assert!(!ledger.try_replace_chain(vec![genesis, b1, b2]));
+    }
+
+    #[test]
+    fn test_try_replace_chain_rejects_pow_failure() {
+        let mut ledger = Ledger::new(1);
+        ledger.difficulty = 2;
+        let genesis = ledger.chain[0].clone();
+
+        // b1 chains correctly to genesis but its hash does not satisfy the
+        // stricter difficulty-2 target.
+        let mut b1 = Block::new(1, vec![], genesis.hash.clone());
+        while b1.hash.starts_with("00") {
+            b1.nonce = b1.nonce.wrapping_add(1);
+            b1.hash = b1.calculate_hash();
+        }
+        let mut b2 = Block::new(2, vec![], b1.hash.clone());
+        b2.mine(1);
+
+        assert!(!ledger.try_replace_chain(vec![genesis, b1, b2]));
     }
 }

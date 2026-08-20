@@ -1,10 +1,10 @@
-//! Deterministic gas metering.
+//! Deterministic gas accounting for contract execution.
 //!
-//! `GlassChain` uses Wasmtime's **fuel** feature for WASM instruction metering.
-//! This module also provides higher-level per-operation cost tables
-//! ([`GasCosts`]) and a stateful [`GasCounter`] that tracks gas consumption,
-//! state-access operation counts, and call-stack depth for reentrancy
-//! protection during smart-contract execution.
+//! `GlassChain` uses Wasmtime's **fuel** feature for WASM instruction metering
+//! and [`GasCounter`] for an independent host-operation budget. [`GasCosts`]
+//! defines the operation charges used for invocation, state reads, and state
+//! writes. The call-depth guard remains available for future recursive contract
+//! calls but is not wired into the current execution path.
 //!
 //! ## Typical Usage
 //!
@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 // ── GasReport ────────────────────────────────────────────────────────────────
 
-/// Gas usage report returned after contract execution completes (or is halted).
+/// Standalone gas usage report for callers that use [`GasCounter`] directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GasReport {
     /// Gas units consumed during this execution.
@@ -79,10 +79,11 @@ pub struct GasCosts {
     pub per_byte_read: u64,
     /// Additional gas charged per byte **written** to state storage.
     pub per_byte_write: u64,
-    /// Maximum allowed call-stack depth.
+    /// Maximum allowed call-stack depth for future recursive contract calls.
     ///
-    /// `push_call` returns an error when `call_depth` would exceed this value,
-    /// acting as an anti-reentrancy guard.
+    /// `push_call` returns an error when `call_depth` would exceed this value.
+    /// The current Wasmtime provider does not invoke it because contracts cannot
+    /// recursively call other contracts.
     pub max_call_depth: u32,
 }
 
@@ -113,7 +114,7 @@ impl GasCosts {
     ///
     /// Formula: `state_read + per_byte_read × byte_count`.
     #[must_use]
-    pub fn total_state_read_cost(&self, byte_count: u64) -> u64 {
+    pub const fn total_state_read_cost(&self, byte_count: u64) -> u64 {
         self.state_read + self.per_byte_read * byte_count
     }
 
@@ -121,7 +122,7 @@ impl GasCosts {
     ///
     /// Formula: `state_write + per_byte_write × byte_count`.
     #[must_use]
-    pub fn total_state_write_cost(&self, byte_count: u64) -> u64 {
+    pub const fn total_state_write_cost(&self, byte_count: u64) -> u64 {
         self.state_write + self.per_byte_write * byte_count
     }
 }
@@ -133,8 +134,8 @@ impl GasCosts {
 /// `GasCounter` tracks:
 /// - Total gas consumed (`used`) against a hard `limit`.
 /// - The number of discrete state-read and state-write operations.
-/// - The current call-stack depth, which is bounded by
-///   [`GasCosts::max_call_depth`] to prevent reentrancy attacks.
+/// - The current call-stack depth, when a caller explicitly uses the optional
+///   [`push_call`][Self::push_call] guard for recursive execution.
 ///
 /// # Example
 ///
@@ -170,7 +171,7 @@ pub struct GasCounter {
 impl GasCounter {
     /// Create a new counter using the default mainnet [`GasCosts`].
     #[must_use]
-    pub fn new(limit: u64) -> Self {
+    pub const fn new(limit: u64) -> Self {
         Self {
             limit,
             used: 0,
@@ -186,7 +187,7 @@ impl GasCounter {
     /// Useful for testing, alternative networks, or fee-schedule upgrades
     /// without touching the mainnet defaults.
     #[must_use]
-    pub fn new_with_costs(limit: u64, costs: GasCosts) -> Self {
+    pub const fn new_with_costs(limit: u64, costs: GasCosts) -> Self {
         Self {
             limit,
             used: 0,
@@ -203,7 +204,7 @@ impl GasCounter {
     /// mutating gas prices mid-execution.  Supply a custom schedule at build
     /// time via [`GasCounter::new_with_costs`].
     #[must_use]
-    pub fn costs(&self) -> &GasCosts {
+    pub const fn costs(&self) -> &GasCosts {
         &self.costs
     }
 
@@ -276,7 +277,7 @@ impl GasCounter {
     /// Always succeeds; it is a logic error to call `pop_call` more times
     /// than [`push_call`][Self::push_call], but the counter simply clamps at
     /// zero rather than panicking.
-    pub fn pop_call(&mut self) {
+    pub const fn pop_call(&mut self) {
         self.call_depth = self.call_depth.saturating_sub(1);
     }
 
@@ -286,7 +287,7 @@ impl GasCounter {
     /// `used` has exceeded `limit` (which can happen when `charge` returns an
     /// error but the caller continues executing).
     #[must_use]
-    pub fn remaining(&self) -> u64 {
+    pub const fn remaining(&self) -> u64 {
         self.limit.saturating_sub(self.used)
     }
 
@@ -296,7 +297,7 @@ impl GasCounter {
     /// exit point, and `false` when execution was halted (e.g., gas exhausted,
     /// reentrancy guard triggered, or a trap).
     #[must_use]
-    pub fn to_report(&self, completed_normally: bool) -> GasReport {
+    pub const fn to_report(&self, completed_normally: bool) -> GasReport {
         GasReport::new(self.used, self.limit, completed_normally)
     }
 }
@@ -426,6 +427,21 @@ mod tests {
             result.unwrap_err(),
             "max call depth exceeded: potential reentrancy"
         );
+    }
+
+    // ── GasCounter — pop_call saturates at zero ───────────────────────────────
+
+    #[test]
+    fn test_counter_pop_call_saturates_at_zero() {
+        let mut counter = GasCounter::new(1_000);
+        // Popping when the depth is already 0 must stay at 0 (no underflow/panic).
+        counter.pop_call();
+        assert_eq!(counter.call_depth, 0);
+        // An unbalanced push/pop sequence must never drive the depth below 0.
+        counter.push_call().unwrap();
+        counter.pop_call();
+        counter.pop_call();
+        assert_eq!(counter.call_depth, 0);
     }
 
     // ── GasCounter — report & remaining ──────────────────────────────────────

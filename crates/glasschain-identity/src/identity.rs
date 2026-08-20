@@ -201,13 +201,30 @@ mod tests {
 
     #[test]
     fn test_wrong_key_fails_verification() {
-        let signer = Identity::generate("node-1");
+        let identity = Identity::generate("node-1");
         let impostor = Identity::generate("node-2");
         let tx = sample_tx();
-        let mut signed = signer.sign_transaction(tx).unwrap();
+        let mut signed_tx = identity.sign_transaction(tx).unwrap();
         // Replace with impostor's public key
-        signed.signer_public_key = impostor.public_key_bytes().to_vec();
-        assert!(signed.verify().is_err());
+        signed_tx.signer_public_key = impostor.public_key_bytes().to_vec();
+        assert!(signed_tx.verify().is_err());
+    }
+
+    #[test]
+    fn test_wrong_length_public_key_returns_invalid_public_key() {
+        let identity = Identity::generate("node-1");
+        let mut signed_tx = identity.sign_transaction(sample_tx()).unwrap();
+        // ed25519 verifying keys are always 32 bytes; a different length must
+        // fail key parsing and surface as InvalidPublicKey (not VerificationFailed).
+        signed_tx.signer_public_key = vec![0u8; 31];
+
+        let err = signed_tx
+            .verify()
+            .expect_err("a non-32-byte public key must be rejected as invalid");
+        assert!(
+            matches!(err, IdentityError::InvalidPublicKey),
+            "expected InvalidPublicKey, got {err}"
+        );
     }
 
     #[test]

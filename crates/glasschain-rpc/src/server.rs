@@ -100,10 +100,13 @@ impl LedgerService for ServerState {
         let index = request.into_inner().index;
         let ledger = self.node.shared_ledger();
         let ledger = ledger.lock().await;
-        match ledger.chain.get(index as usize) {
-            Some(block) => Ok(Response::new(block_to_get_response(block))),
-            None => Err(Status::not_found(format!("block {index} not found"))),
-        }
+        let block = usize::try_from(index)
+            .ok()
+            .and_then(|index| ledger.chain.get(index));
+        block.map_or_else(
+            || Err(Status::not_found(format!("block {index} not found"))),
+            |block| Ok(Response::new(block_to_get_response(block))),
+        )
     }
 
     /// Stream existing blocks from `start_index` and then push each new block
@@ -112,7 +115,7 @@ impl LedgerService for ServerState {
         &self,
         request: Request<StreamBlocksRequest>,
     ) -> Result<Response<Self::StreamBlocksStream>, Status> {
-        let start = request.into_inner().start_index as usize;
+        let start = usize::try_from(request.into_inner().start_index).unwrap_or(usize::MAX);
         let shared_ledger = self.node.shared_ledger();
         let mut event_rx = self.node.subscribe();
 
@@ -140,17 +143,16 @@ impl LedgerService for ServerState {
                         NodeEvent::BlockMined { index, .. }
                         | NodeEvent::BlockReceived { index, .. },
                     ) => {
-                        if (index as usize) >= start {
-                            let block_proto = {
-                                let ledger = shared_ledger.lock().await;
-                                ledger
-                                    .chain
-                                    .get(index as usize)
-                                    .map(block_to_stream_response)
-                            };
-                            if let Some(b) = block_proto {
-                                if tx.send(Ok(b)).await.is_err() {
-                                    break;
+                        if let Ok(index) = usize::try_from(index) {
+                            if index >= start {
+                                let block_proto = {
+                                    let ledger = shared_ledger.lock().await;
+                                    ledger.chain.get(index).map(block_to_stream_response)
+                                };
+                                if let Some(b) = block_proto {
+                                    if tx.send(Ok(b)).await.is_err() {
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -158,7 +160,6 @@ impl LedgerService for ServerState {
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         log::warn!("stream_blocks lagged; skipped {skipped} events");
-                        continue;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
@@ -262,33 +263,35 @@ impl LedgerService for ServerState {
     ) -> Result<Response<QueryAssetHistoryResponse>, Status> {
         let req = request.into_inner();
         let ledger = self.node.shared_ledger();
-        let ledger = ledger.lock().await;
-        let transactions = ledger
-            .chain
-            .iter()
-            .flat_map(|b| b.transactions.iter())
-            .filter_map(|tx| {
-                if let TransactionKind::AssetRegistration(TraceableAssetRegistration {
-                    asset,
-                    ..
-                }) = &tx.kind
-                {
-                    let gtin_match =
-                        req.gtin.is_empty() || asset.gtin.as_deref() == Some(req.gtin.as_str());
-                    let serial_match = req.serial_number.is_empty()
-                        || asset.serial_number.as_deref() == Some(req.serial_number.as_str());
-                    if gtin_match && serial_match {
-                        return Some(TransactionProto {
-                            id: tx.id.clone(),
-                            timestamp: tx.timestamp,
-                            kind: "AssetRegistration".to_owned(),
-                            payload_json: serde_json::to_string(tx).unwrap_or_default(),
-                        });
+        let transactions = {
+            let ledger = ledger.lock().await;
+            ledger
+                .chain
+                .iter()
+                .flat_map(|b| b.transactions.iter())
+                .filter_map(|tx| {
+                    if let TransactionKind::AssetRegistration(TraceableAssetRegistration {
+                        asset,
+                        ..
+                    }) = &tx.kind
+                    {
+                        let gtin_match =
+                            req.gtin.is_empty() || asset.gtin.as_deref() == Some(req.gtin.as_str());
+                        let serial_match = req.serial_number.is_empty()
+                            || asset.serial_number.as_deref() == Some(req.serial_number.as_str());
+                        if gtin_match && serial_match {
+                            return Some(TransactionProto {
+                                id: tx.id.clone(),
+                                timestamp: tx.timestamp,
+                                kind: "AssetRegistration".to_owned(),
+                                payload_json: serde_json::to_string(tx).unwrap_or_default(),
+                            });
+                        }
                     }
-                }
-                None
-            })
-            .collect();
+                    None
+                })
+                .collect()
+        };
         Ok(Response::new(QueryAssetHistoryResponse { transactions }))
     }
 
@@ -419,6 +422,7 @@ impl LedgerService for ServerState {
                 }
             }
         }
+        drop(ledger);
         Ok(Response::new(GetVerifiableLineageResponse {
             asset_id,
             custody_chain,
@@ -469,21 +473,24 @@ impl NodeService for ServerState {
             Ok(()) => {
                 let ledger = self.node.shared_ledger();
                 let ledger = ledger.lock().await;
-                if let Some(block) = ledger.chain.last() {
-                    Ok(Response::new(MineBlockResponse {
-                        success: true,
-                        block_index: block.index,
-                        block_hash: block.hash.clone(),
-                        error: String::new(),
-                    }))
-                } else {
-                    Ok(Response::new(MineBlockResponse {
-                        success: false,
-                        block_index: 0,
-                        block_hash: String::new(),
-                        error: "chain empty after mining".into(),
-                    }))
-                }
+                ledger.chain.last().map_or_else(
+                    || {
+                        Ok(Response::new(MineBlockResponse {
+                            success: false,
+                            block_index: 0,
+                            block_hash: String::new(),
+                            error: "chain empty after mining".into(),
+                        }))
+                    },
+                    |block| {
+                        Ok(Response::new(MineBlockResponse {
+                            success: true,
+                            block_index: block.index,
+                            block_hash: block.hash.clone(),
+                            error: String::new(),
+                        }))
+                    },
+                )
             }
             Err(e) => Ok(Response::new(MineBlockResponse {
                 success: false,
@@ -586,7 +593,11 @@ impl GlasschainServer {
     /// against the supplied `registry`.  When `false`, headers are validated if
     /// present but their absence is allowed (backward-compatible mode).
     #[must_use]
-    pub fn with_auth(node: Arc<Node>, registry: TrustedKeyRegistry, require_auth: bool) -> Self {
+    pub const fn with_auth(
+        node: Arc<Node>,
+        registry: TrustedKeyRegistry,
+        require_auth: bool,
+    ) -> Self {
         let interceptor = if require_auth {
             MspAuthInterceptor::new_strict(registry)
         } else {

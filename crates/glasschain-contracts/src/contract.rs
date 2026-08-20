@@ -43,7 +43,7 @@ pub struct Contract {
 
 impl Contract {
     /// Create a new active contract from a ledger-committed definition.
-    #[must_use] 
+    #[must_use]
     pub const fn new(definition: SmartContractDef) -> Self {
         Self {
             definition,
@@ -54,32 +54,45 @@ impl Contract {
     }
 
     /// Return `true` when the contract is accepting automatic executions.
-    #[must_use] 
+    #[must_use]
     pub fn is_active(&self) -> bool {
         self.status == ContractStatus::Active
     }
 
     /// Return a reference to the contract's purchase conditions.
-    #[must_use] 
+    #[must_use]
     pub const fn conditions(&self) -> &PurchaseConditions {
         &self.definition.conditions
     }
 
     /// Return the contract's unique identifier.
-    #[must_use] 
+    #[must_use]
     pub fn id(&self) -> &str {
         &self.definition.contract_id
     }
 
     /// Return the buyer's identifier.
-    #[must_use] 
+    #[must_use]
     pub fn buyer_id(&self) -> &str {
         &self.definition.buyer_id
     }
 
     /// Return the targeted product identifier.
-    #[must_use] 
+    #[must_use]
     pub fn product_id(&self) -> &str {
         &self.definition.product_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contract_status_display_matches_variant_names() {
+        assert_eq!(ContractStatus::Active.to_string(), "Active");
+        assert_eq!(ContractStatus::Paused.to_string(), "Paused");
+        assert_eq!(ContractStatus::Fulfilled.to_string(), "Fulfilled");
+        assert_eq!(ContractStatus::Cancelled.to_string(), "Cancelled");
     }
 }

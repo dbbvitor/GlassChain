@@ -224,10 +224,7 @@ impl MspAuthInterceptor {
     /// 5. Hex-decode `x-glasschain-auth-sig` to exactly 64 bytes; reject if malformed.
     /// 6. Look up `x-glasschain-node-id` in the registry; reject if unknown.
     /// 7. Verify the ed25519 signature over `"{node_id}:{timestamp}"` bytes.
-    fn verify_request(
-        &self,
-        metadata: &tonic::metadata::MetadataMap,
-    ) -> Result<(), tonic::Status> {
+    fn verify_request(&self, metadata: &tonic::metadata::MetadataMap) -> Result<(), tonic::Status> {
         let node_id_mv = metadata.get("x-glasschain-node-id");
         let ts_mv = metadata.get("x-glasschain-auth-ts");
         let sig_mv = metadata.get("x-glasschain-auth-sig");
@@ -245,23 +242,17 @@ impl MspAuthInterceptor {
         }
 
         // All three headers must be present and valid ASCII.
-        let node_id = node_id_mv
-            .and_then(|mv| mv.to_str().ok())
-            .ok_or_else(|| {
-                tonic::Status::unauthenticated("missing or invalid x-glasschain-node-id")
-            })?;
+        let node_id = node_id_mv.and_then(|mv| mv.to_str().ok()).ok_or_else(|| {
+            tonic::Status::unauthenticated("missing or invalid x-glasschain-node-id")
+        })?;
 
-        let ts_str = ts_mv
-            .and_then(|mv| mv.to_str().ok())
-            .ok_or_else(|| {
-                tonic::Status::unauthenticated("missing or invalid x-glasschain-auth-ts")
-            })?;
+        let ts_str = ts_mv.and_then(|mv| mv.to_str().ok()).ok_or_else(|| {
+            tonic::Status::unauthenticated("missing or invalid x-glasschain-auth-ts")
+        })?;
 
-        let sig_hex = sig_mv
-            .and_then(|mv| mv.to_str().ok())
-            .ok_or_else(|| {
-                tonic::Status::unauthenticated("missing or invalid x-glasschain-auth-sig")
-            })?;
+        let sig_hex = sig_mv.and_then(|mv| mv.to_str().ok()).ok_or_else(|| {
+            tonic::Status::unauthenticated("missing or invalid x-glasschain-auth-sig")
+        })?;
 
         // Parse the timestamp as decimal Unix seconds.
         let ts: u64 = ts_str
@@ -306,10 +297,7 @@ impl MspAuthInterceptor {
 }
 
 impl tonic::service::Interceptor for MspAuthInterceptor {
-    fn call(
-        &mut self,
-        request: tonic::Request<()>,
-    ) -> Result<tonic::Request<()>, tonic::Status> {
+    fn call(&mut self, request: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
         self.verify_request(request.metadata())?;
         Ok(request)
     }
@@ -394,6 +382,7 @@ impl AuthTokenBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glasschain_identity::Organization;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -551,6 +540,137 @@ mod tests {
         let ts = now_secs();
         let sig_hex = sign_challenge(&seed, "node-unknown", ts);
         let metadata = make_metadata("node-unknown", ts, &sig_hex);
+
+        let result = interceptor.verify_request(&metadata);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::Unauthenticated);
+    }
+
+    // ── AuthTokenBuilder ───────────────────────────────────────────────────────
+
+    /// `build_headers` produces the three recognised headers that, once
+    /// re-inserted into metadata, pass a full `verify_request` round-trip.
+    #[test]
+    fn test_build_headers_end_to_end() {
+        let seed = [0x12u8; 32];
+        let signing_key = SigningKey::from_bytes(&seed);
+        let pub_key_bytes = signing_key.verifying_key().to_bytes();
+
+        let headers =
+            AuthTokenBuilder::build_headers(&seed, &pub_key_bytes, "node-builder").unwrap();
+        assert_eq!(headers[0].0, "x-glasschain-node-id");
+        assert_eq!(headers[0].1, "node-builder");
+        assert_eq!(headers[1].0, "x-glasschain-auth-ts");
+        assert_eq!(headers[2].0, "x-glasschain-auth-sig");
+        assert!(!headers[2].1.is_empty());
+
+        let registry = TrustedKeyRegistry::new();
+        registry.register("node-builder", pub_key_bytes);
+        let interceptor = MspAuthInterceptor::new_strict(registry);
+
+        // Re-insert the three headers into a MetadataMap and verify.
+        let mut map = tonic::metadata::MetadataMap::new();
+        for (name, value) in &headers {
+            map.insert(*name, value.parse().expect("valid header value"));
+        }
+        assert!(interceptor.verify_request(&map).is_ok());
+    }
+
+    /// `build_headers` must reject a verifying key that is not a valid
+    /// ed25519 compressed point.
+    #[test]
+    fn test_build_headers_invalid_verifying_key() {
+        let seed = [0x12u8; 32];
+        // 0x42 is not a valid ed25519 compressed point in curve25519-dalek,
+        // so it must be rejected before any headers are built.
+        let bad_pub_key = [0x42u8; 32];
+
+        let result = AuthTokenBuilder::build_headers(&seed, &bad_pub_key, "node-1");
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("invalid verifying key bytes"),
+            "error should mention the verifying-key validation",
+        );
+    }
+
+    // ── verify_request malformed-input branches ───────────────────────────────
+
+    /// A non-numeric `x-glasschain-auth-ts` must be rejected as an invalid
+    /// timestamp format.
+    #[test]
+    fn test_verify_invalid_timestamp_rejected() {
+        let registry = TrustedKeyRegistry::new();
+        let interceptor = MspAuthInterceptor::new_strict(registry);
+
+        let mut map = tonic::metadata::MetadataMap::new();
+        map.insert("x-glasschain-node-id", "node-1".parse().unwrap());
+        map.insert("x-glasschain-auth-ts", "not-a-number".parse().unwrap());
+        map.insert("x-glasschain-auth-sig", "00".parse().unwrap());
+
+        let result = interceptor.verify_request(&map);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::Unauthenticated);
+    }
+
+    /// A partial header set (e.g. only `node-id` present) must be rejected:
+    /// once any auth header is present, all three are required.
+    #[test]
+    fn test_verify_partial_headers_rejected() {
+        let registry = TrustedKeyRegistry::new();
+        let interceptor = MspAuthInterceptor::new_strict(registry);
+
+        let mut map = tonic::metadata::MetadataMap::new();
+        map.insert("x-glasschain-node-id", "node-1".parse().unwrap());
+        // auth-ts and auth-sig are intentionally absent.
+
+        let result = interceptor.verify_request(&map);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::Unauthenticated);
+    }
+
+    /// A signature that hex-decodes to the wrong length (not 64 bytes) must be
+    /// rejected as an invalid signature encoding.
+    #[test]
+    fn test_verify_bad_sig_encoding_rejected() {
+        let registry = TrustedKeyRegistry::new();
+        let interceptor = MspAuthInterceptor::new_strict(registry);
+
+        let ts = now_secs();
+        let mut map = tonic::metadata::MetadataMap::new();
+        map.insert("x-glasschain-node-id", "node-1".parse().unwrap());
+        map.insert("x-glasschain-auth-ts", ts.to_string().parse().unwrap());
+        // Valid hex but only 4 bytes — not a 64-byte ed25519 signature.
+        map.insert("x-glasschain-auth-sig", "deadbeef".parse().unwrap());
+
+        let result = interceptor.verify_request(&map);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::Unauthenticated);
+    }
+
+    // ── register_from_org ──────────────────────────────────────────────────────
+
+    /// `register_from_org` should populate the registry with each member's
+    /// verifying key, and that key must drive a subsequent `verify_request`.
+    #[test]
+    fn test_register_from_org_and_verify_request() {
+        let mut org = Organization::new("acme-corp").unwrap();
+        org.issue_identity("org-node-1").unwrap();
+
+        let registry = TrustedKeyRegistry::new();
+        registry.register_from_org(&org);
+
+        // The org member's key is registered under its node ID.
+        let member = org.get_member("org-node-1").unwrap();
+        assert!(registry.contains("org-node-1"));
+        assert_eq!(registry.get("org-node-1"), Some(member.public_key_bytes()));
+
+        // The org-registered key is the one enforced by verify_request: a
+        // request signed with any other key fails at signature verification.
+        let interceptor = MspAuthInterceptor::new_strict(registry);
+        let ts = now_secs();
+        let wrong_seed = [0xEEu8; 32];
+        let sig_hex = sign_challenge(&wrong_seed, "org-node-1", ts);
+        let metadata = make_metadata("org-node-1", ts, &sig_hex);
 
         let result = interceptor.verify_request(&metadata);
         assert!(result.is_err());

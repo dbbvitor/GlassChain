@@ -15,7 +15,7 @@ GlassChain connects buyers and sellers across a peer-to-peer network, giving par
 | **Contract Automation** | `ContractCreation` rules auto-execute purchase flows on matching offers |
 | **Watcher Automation** | Commit-phase inventory hooks can enqueue autonomous reorder purchase orders |
 | **Regulatory Traceability** | Anvisa/SNCM-aligned metadata model with `MetadataTrustScore` scoring |
-| **Federated Network** | TCP-based P2P protocol with mutual certificate exchange, TLS-encrypted transport, transaction/block broadcast, and sync |
+| **Federated Network** | Active TLS-encrypted TCP P2P protocol with certificate exchange, transaction/block broadcast, and sync; libp2p is experimental and currently unwired |
 | **gRPC API** | Tonic/Prost server for ledger queries, tx submission, asset history, and event streams |
 | **Indexer + Provenance** | In-memory indexing and custody-chain primitives for analytics/audit workflows |
 
@@ -80,7 +80,7 @@ cargo run --release -p glasschain-node -- --id node-1 --listen 0.0.0.0:8000
 cargo run --release -p glasschain-node -- --id node-2 --listen 0.0.0.0:8001 --peer 127.0.0.1:8000
 ```
 
-Peer transport is **TLS-encrypted by default in release builds**. By default, nodes exchange certificates during connection setup and pin the presented peer certificate for that session. For stronger identity binding, the node binary also supports **identity-backed TLS certificates** issued from the `glasschain-identity` crate. The optional `GLASSCHAIN_INSECURE_TLS=1` escape hatch is intended only for local debugging.
+Peer transport is **TLS-encrypted by default in release builds**. By default, nodes exchange certificates during connection setup and pin the presented peer certificate for that session. The current trust model is deliberately TOFU-only; the node binary also supports **identity-backed TLS certificates** issued from the `glasschain-identity` crate, but organization CA verification is not attached to the handshake. The optional `GLASSCHAIN_INSECURE_TLS=1` escape hatch is intended only for local debugging.
 
 ---
 
@@ -138,10 +138,13 @@ Before the framed protocol begins, peers exchange certificates and then upgrade 
 
 Current trust model:
 - **Default mode:** encrypted transport, per-session certificate pinning, and TOFU identity persistence across reconnects.
-- **Identity-backed mode:** same as default, plus the TLS certificate is derived from the node's identity key so that transport and transaction identity share one key pair.
+- **Identity-backed mode:** same deliberate TOFU default, plus the TLS certificate is derived from the node's identity key so that transport and transaction identity share one key pair.
+- **libp2p mode:** experimental and currently unwired; reserved for the selective-disclosure roadmap.
 - **Insecure mode:** only when explicitly enabled with `GLASSCHAIN_INSECURE_TLS=1` or the matching build feature.
 
-> **Note:** TOFU trust is address-bound and in-memory. There is no shared CA, no certificate-chain validation, and no trust persistence across process restarts. A peer that changes its listen address is treated as a new peer. These are known limitations, not bugs.
+> **Note:** TOFU trust is address-bound and in-memory. There is no shared CA between organizations and no trust persistence across process restarts. A peer that changes its listen address is treated as a new peer. These are known limitations, not bugs.
+>
+> Certificate-chain validation itself *is* implemented — `glasschain-identity`'s `CertChainVerifier` verifies a peer certificate against an organization Root CA using `rustls-webpki`, rejecting forged and tampered certificates — but it is intentionally not attached to the current TOFU handshake. A shared or multi-organization trust model must be chosen before enabling it.
 
 Message types:
 

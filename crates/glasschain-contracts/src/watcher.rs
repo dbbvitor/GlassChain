@@ -31,7 +31,7 @@
 //! [`WatcherStateSnapshot`], enabling seamless recovery after a node restart
 //! without requiring a full chain replay.
 
-use base64::Engine as _;
+use crate::approval_gate::{ApprovalGate, ApprovalGatePolicy, GateDecision};
 use glasschain_core::{
     ExecutionProvider, InventoryUpdate, PurchaseOrder, Transaction, TransactionKind,
 };
@@ -256,6 +256,8 @@ impl WatcherService {
     /// When a trigger carries a `wasm_code_b64` module **and** an executor has
     /// been registered, the module is executed and must approve the order (see
     /// the module-level documentation for the exact approval protocol).
+    // Keep the event-condition-action evaluation in one transaction path.
+    #[allow(clippy::too_many_lines)]
     pub fn on_inventory_update(&mut self, update: &InventoryUpdate) -> Vec<Transaction> {
         // Apply the inventory delta.
         let level = self
@@ -331,44 +333,19 @@ impl WatcherService {
                         trigger.product_id.as_bytes().to_vec(),
                     );
 
-                    let wasm_bytes =
-                        match base64::engine::general_purpose::STANDARD.decode(wasm_b64) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                log::warn!(
-                                    "WatcherService: trigger '{}' has invalid base64 wasm: {e}",
-                                    trigger.trigger_id
-                                );
-                                continue; // skip this trigger
-                            }
-                        };
-
-                    // NOTE: execute_with_state signature is
-                    //   (contract_id, payload, initial_state: HashMap, gas_limit)
-                    match exec.execute_with_state(
-                        &trigger.trigger_id,
-                        &wasm_bytes,
-                        world_state,
-                        100_000,
-                    ) {
-                        Ok(mutations) => {
-                            let approved =
-                                mutations.iter().any(|(k, v)| k == "approve" && v == b"1");
-                            if !approved {
-                                log::info!(
-                                    "WatcherService: trigger '{}' WASM denied the PurchaseOrder",
-                                    trigger.trigger_id
-                                );
-                                continue; // WASM said no
-                            }
+                    let initial_state = Ok(world_state);
+                    let gate =
+                        ApprovalGate::new(exec.as_ref(), ApprovalGatePolicy::InventoryTrigger);
+                    match gate.evaluate(&trigger.trigger_id, wasm_b64, initial_state) {
+                        GateDecision::Approved => {
                             log::debug!(
                                 "WatcherService: trigger '{}' WASM approved the PurchaseOrder",
                                 trigger.trigger_id
                             );
                         }
-                        Err(e) => {
+                        GateDecision::Denied { reason } => {
                             log::warn!(
-                                "WatcherService: trigger '{}' WASM execution failed: {e}. Skipping.",
+                                "WatcherService: trigger '{}' WASM gate denied the PurchaseOrder: {reason}",
                                 trigger.trigger_id
                             );
                             continue;
@@ -406,6 +383,7 @@ impl WatcherService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use glasschain_vm::WasmExecutionProvider;
     use std::sync::Arc;
 
@@ -653,6 +631,22 @@ mod tests {
     /// When `wasm_code_b64` is set on a trigger but no executor has been
     /// registered, the trigger must fire unconditionally (dev/test fast-path).
     #[test]
+    fn test_invalid_wasm_gate_skips_trigger() {
+        let mut svc = WatcherService::new();
+        let executor = Arc::new(WasmExecutionProvider::new().expect("wasmtime engine"));
+        svc.set_executor(executor);
+
+        let trigger = InventoryTrigger {
+            wasm_code_b64: Some("not-base64".into()),
+            ..make_trigger("t-invalid", "SKU-INVALID", "owner-1", 100, 300)
+        };
+        svc.add_trigger(trigger);
+
+        let orders = svc.on_inventory_update(&inv_update("SKU-INVALID", "owner-1", 50));
+        assert!(orders.is_empty());
+    }
+
+    #[test]
     fn test_wasm_no_executor_fires_unconditionally() {
         let mut svc = WatcherService::new();
         // Deliberately do NOT call svc.set_executor(…).
@@ -753,5 +747,12 @@ mod tests {
             orders[0].id, orders2[0].id,
             "tx IDs generated across a snapshot boundary must be unique"
         );
+    }
+
+    #[test]
+    fn test_restore_from_invalid_bytes_errors() {
+        let mut svc = WatcherService::new();
+        // Bytes that are not valid JSON matching WatcherStateSnapshot.
+        assert!(svc.restore_from_bytes(b"not json").is_err());
     }
 }
