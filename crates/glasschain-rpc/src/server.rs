@@ -75,6 +75,69 @@ fn now_unix() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Map a [`NodeEvent`] to its subscription response.
+fn event_to_response(event: &NodeEvent) -> SubscribeToEventsResponse {
+    match event {
+        NodeEvent::TransactionAccepted(t) => SubscribeToEventsResponse {
+            timestamp: now_unix(),
+            event_type: "transaction_accepted".into(),
+            payload_json: serde_json::json!({ "transaction_id": t.id }).to_string(),
+        },
+        NodeEvent::BlockMined { index, hash } => SubscribeToEventsResponse {
+            timestamp: now_unix(),
+            event_type: "block_mined".into(),
+            payload_json: serde_json::json!({
+                "block_index": index,
+                "block_hash": hash
+            })
+            .to_string(),
+        },
+        NodeEvent::BlockReceived { index, hash } => SubscribeToEventsResponse {
+            timestamp: now_unix(),
+            event_type: "block_received".into(),
+            payload_json: serde_json::json!({
+                "block_index": index,
+                "block_hash": hash
+            })
+            .to_string(),
+        },
+        NodeEvent::PeerConnected(addr) => SubscribeToEventsResponse {
+            timestamp: now_unix(),
+            event_type: "peer_connected".into(),
+            payload_json: serde_json::json!({ "address": addr }).to_string(),
+        },
+        NodeEvent::PeerDisconnected(addr) => SubscribeToEventsResponse {
+            timestamp: now_unix(),
+            event_type: "peer_disconnected".into(),
+            payload_json: serde_json::json!({ "address": addr }).to_string(),
+        },
+        NodeEvent::ContractExecuted {
+            contract_id,
+            quantity,
+        } => SubscribeToEventsResponse {
+            timestamp: now_unix(),
+            event_type: "contract_executed".into(),
+            payload_json: serde_json::json!({
+                "contract_id": contract_id,
+                "quantity": quantity
+            })
+            .to_string(),
+        },
+        NodeEvent::AutonomousTransactionGenerated {
+            trigger_id,
+            transaction_id,
+        } => SubscribeToEventsResponse {
+            timestamp: now_unix(),
+            event_type: "autonomous_tx_generated".into(),
+            payload_json: serde_json::json!({
+                "trigger_id": trigger_id,
+                "transaction_id": transaction_id
+            })
+            .to_string(),
+        },
+    }
+}
+
 // ── Shared server state ───────────────────────────────────────────────────────
 
 /// Shared state for both gRPC services.
@@ -312,65 +375,7 @@ impl LedgerService for ServerState {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
-                let resp = match &evt {
-                    NodeEvent::TransactionAccepted(t) => SubscribeToEventsResponse {
-                        timestamp: now_unix(),
-                        event_type: "transaction_accepted".into(),
-                        payload_json: serde_json::json!({ "transaction_id": t.id }).to_string(),
-                    },
-                    NodeEvent::BlockMined { index, hash } => SubscribeToEventsResponse {
-                        timestamp: now_unix(),
-                        event_type: "block_mined".into(),
-                        payload_json: serde_json::json!({
-                            "block_index": index,
-                            "block_hash": hash
-                        })
-                        .to_string(),
-                    },
-                    NodeEvent::BlockReceived { index, hash } => SubscribeToEventsResponse {
-                        timestamp: now_unix(),
-                        event_type: "block_received".into(),
-                        payload_json: serde_json::json!({
-                            "block_index": index,
-                            "block_hash": hash
-                        })
-                        .to_string(),
-                    },
-                    NodeEvent::PeerConnected(addr) => SubscribeToEventsResponse {
-                        timestamp: now_unix(),
-                        event_type: "peer_connected".into(),
-                        payload_json: serde_json::json!({ "address": addr }).to_string(),
-                    },
-                    NodeEvent::PeerDisconnected(addr) => SubscribeToEventsResponse {
-                        timestamp: now_unix(),
-                        event_type: "peer_disconnected".into(),
-                        payload_json: serde_json::json!({ "address": addr }).to_string(),
-                    },
-                    NodeEvent::ContractExecuted {
-                        contract_id,
-                        quantity,
-                    } => SubscribeToEventsResponse {
-                        timestamp: now_unix(),
-                        event_type: "contract_executed".into(),
-                        payload_json: serde_json::json!({
-                            "contract_id": contract_id,
-                            "quantity": quantity
-                        })
-                        .to_string(),
-                    },
-                    NodeEvent::AutonomousTransactionGenerated {
-                        trigger_id,
-                        transaction_id,
-                    } => SubscribeToEventsResponse {
-                        timestamp: now_unix(),
-                        event_type: "autonomous_tx_generated".into(),
-                        payload_json: serde_json::json!({
-                            "trigger_id": trigger_id,
-                            "transaction_id": transaction_id
-                        })
-                        .to_string(),
-                    },
-                };
+                let resp = event_to_response(&evt);
                 if tx.send(Ok(resp)).await.is_err() {
                     break;
                 }
@@ -663,5 +668,81 @@ impl GlasschainServer {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::event_to_response;
+    use glasschain_core::{InventoryUpdate, Transaction, TransactionKind};
+    use glasschain_network::NodeEvent;
+
+    /// Assert the `event_type` and payload JSON of a mapped event (timestamp
+    /// is wall-clock and intentionally not asserted).
+    fn assert_maps(event: &NodeEvent, event_type: &str, expected_payload: &serde_json::Value) {
+        let resp = event_to_response(event);
+        assert_eq!(resp.event_type, event_type);
+        let actual: serde_json::Value = serde_json::from_str(&resp.payload_json).unwrap();
+        assert_eq!(&actual, expected_payload);
+    }
+
+    #[test]
+    fn test_event_mapping_all_variants() {
+        let tx = Transaction::with_id(
+            "tx-1".to_owned(),
+            TransactionKind::InventoryUpdate(InventoryUpdate {
+                product_id: "SKU-001".into(),
+                owner_id: "owner-1".into(),
+                quantity_delta: 10,
+                reason: "test".into(),
+            }),
+        );
+        assert_maps(
+            &NodeEvent::TransactionAccepted(tx),
+            "transaction_accepted",
+            &serde_json::json!({ "transaction_id": "tx-1" }),
+        );
+        assert_maps(
+            &NodeEvent::BlockMined {
+                index: 3,
+                hash: "abc".into(),
+            },
+            "block_mined",
+            &serde_json::json!({ "block_index": 3, "block_hash": "abc" }),
+        );
+        assert_maps(
+            &NodeEvent::BlockReceived {
+                index: 4,
+                hash: "def".into(),
+            },
+            "block_received",
+            &serde_json::json!({ "block_index": 4, "block_hash": "def" }),
+        );
+        assert_maps(
+            &NodeEvent::PeerConnected("10.0.0.1:8000".into()),
+            "peer_connected",
+            &serde_json::json!({ "address": "10.0.0.1:8000" }),
+        );
+        assert_maps(
+            &NodeEvent::PeerDisconnected("10.0.0.1:8000".into()),
+            "peer_disconnected",
+            &serde_json::json!({ "address": "10.0.0.1:8000" }),
+        );
+        assert_maps(
+            &NodeEvent::ContractExecuted {
+                contract_id: "c1".into(),
+                quantity: 50,
+            },
+            "contract_executed",
+            &serde_json::json!({ "contract_id": "c1", "quantity": 50 }),
+        );
+        assert_maps(
+            &NodeEvent::AutonomousTransactionGenerated {
+                trigger_id: "trig-1".into(),
+                transaction_id: "tx-2".into(),
+            },
+            "autonomous_tx_generated",
+            &serde_json::json!({ "trigger_id": "trig-1", "transaction_id": "tx-2" }),
+        );
     }
 }
