@@ -57,15 +57,16 @@ pub struct ContractDeployArgs {
 /// Execute the `contract-deploy` command.
 ///
 /// Constructs a [`glasschain_core::SmartContractDef`] from `args`, serialises
-/// it via [`GlasschainClient::build_smart_contract_tx`], and either prints the
-/// JSON (when `--dry-run` is set) or shows the gRPC submission instructions.
+/// it via [`GlasschainClient::build_smart_contract_tx`], and either writes the
+/// JSON to `out` (when `--dry-run` is set) or shows the gRPC submission
+/// instructions.
 ///
 /// # Errors
 ///
 /// Returns an error if JSON serialisation fails (should be unreachable in
-/// practice).
+/// practice) or if writing to `out` fails.
 #[allow(clippy::needless_pass_by_value)] // clap gives us owned Args; consuming them is idiomatic
-pub fn run(args: ContractDeployArgs) -> Result<()> {
+pub fn run(args: ContractDeployArgs, out: &mut dyn std::io::Write) -> Result<()> {
     log::info!(
         "contract-deploy: contract_id={}, buyer={}, product={}, dry_run={}",
         args.contract_id,
@@ -92,42 +93,45 @@ pub fn run(args: ContractDeployArgs) -> Result<()> {
     )?;
 
     if args.dry_run {
-        println!("=== Dry Run — Contract Deployment Transaction ===");
-        println!();
-        println!("{tx_json}");
-        println!();
-        println!("(dry-run: transaction was NOT submitted to any node)");
+        writeln!(out, "=== Dry Run — Contract Deployment Transaction ===")?;
+        writeln!(out)?;
+        writeln!(out, "{tx_json}")?;
+        writeln!(out)?;
+        writeln!(out, "(dry-run: transaction was NOT submitted to any node)")?;
     } else {
-        println!("=== Contract Deployment Transaction ===");
-        println!();
-        println!("{tx_json}");
-        println!();
-        println!("To deploy, submit the JSON above to:");
-        println!("  gRPC service  : LedgerService");
-        println!("  RPC method    : SubmitTransaction");
-        println!();
-        println!("Example (grpcurl):");
-        println!(
+        writeln!(out, "=== Contract Deployment Transaction ===")?;
+        writeln!(out)?;
+        writeln!(out, "{tx_json}")?;
+        writeln!(out)?;
+        writeln!(out, "To deploy, submit the JSON above to:")?;
+        writeln!(out, "  gRPC service  : LedgerService")?;
+        writeln!(out, "  RPC method    : SubmitTransaction")?;
+        writeln!(out)?;
+        writeln!(out, "Example (grpcurl):")?;
+        writeln!(
+            out,
             "  grpcurl -d '{{\"transaction_json\": ...}}' \
              <NODE_HOST>:<NODE_PORT> glasschain.v1.LedgerService/SubmitTransaction"
-        );
+        )?;
     }
 
     // Print a compact summary of the contract parameters.
-    println!("--- Contract Summary ---");
-    println!("  Contract ID  : {}", args.contract_id);
-    println!("  Buyer        : {}", args.buyer_id);
-    println!("  Product      : {}", args.product_id);
-    println!(
+    writeln!(out, "--- Contract Summary ---")?;
+    writeln!(out, "  Contract ID  : {}", args.contract_id)?;
+    writeln!(out, "  Buyer        : {}", args.buyer_id)?;
+    writeln!(out, "  Product      : {}", args.product_id)?;
+    writeln!(
+        out,
         "  Price limit  : {} {} / unit",
         args.max_price, args.currency
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "  Quantity     : {} – {} units (lifetime cap)",
         args.min_qty, args.max_qty
-    );
-    println!("  Lead time    : ≤ {} days", args.max_lead_days);
-    println!("  Auto-execute : true");
+    )?;
+    writeln!(out, "  Lead time    : ≤ {} days", args.max_lead_days)?;
+    writeln!(out, "  Auto-execute : true")?;
 
     // Validate that a well-formed Transaction was produced by round-tripping
     // the JSON (cheap, catches any edge-case serialisation bugs at runtime).
@@ -137,4 +141,100 @@ pub fn run(args: ContractDeployArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(dry_run: bool) -> ContractDeployArgs {
+        ContractDeployArgs {
+            contract_id: "CONTRACT-TEST-001".into(),
+            buyer_id: "buyer-1".into(),
+            product_id: "SKU-001".into(),
+            max_price: 5_000,
+            min_qty: 100,
+            max_qty: 1_000,
+            max_lead_days: 14,
+            currency: "BRL".into(),
+            dry_run,
+        }
+    }
+
+    fn run_captured(args: ContractDeployArgs) -> String {
+        let mut out = Vec::new();
+        run(args, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// Extract the pretty-printed transaction JSON that sits between the
+    /// closing `===` of the header line and the first blank line after it.
+    fn emitted_tx_json(text: &str) -> String {
+        text.split("===")
+            .nth(2)
+            .unwrap()
+            .trim_start()
+            .split("\n\n")
+            .next()
+            .unwrap()
+            .trim_end()
+            .to_owned()
+    }
+
+    #[test]
+    fn dry_run_prints_tx_json_without_submit_instructions() {
+        let text = run_captured(args(true));
+
+        // Dry-run branch: no submission instructions.
+        assert!(text.contains("=== Dry Run — Contract Deployment Transaction ==="));
+        assert!(text.contains("(dry-run: transaction was NOT submitted to any node)"));
+        assert!(!text.contains("SubmitTransaction"));
+        assert!(!text.contains("grpcurl"));
+
+        // PurchaseConditions assembly reflected in the human summary.
+        assert!(text.contains("  Contract ID  : CONTRACT-TEST-001"));
+        assert!(text.contains("  Buyer        : buyer-1"));
+        assert!(text.contains("  Product      : SKU-001"));
+        assert!(text.contains("  Price limit  : 5000 BRL / unit"));
+        assert!(text.contains("  Quantity     : 100 – 1000 units (lifetime cap)"));
+        assert!(text.contains("  Lead time    : ≤ 14 days"));
+        assert!(text.contains("  Auto-execute : true"));
+    }
+
+    #[test]
+    fn submit_mode_prints_grpc_submit_instructions() {
+        let text = run_captured(args(false));
+
+        // Submit branch.
+        assert!(text.contains("=== Contract Deployment Transaction ==="));
+        assert!(text.contains("To deploy, submit the JSON above to:"));
+        assert!(text.contains("  gRPC service  : LedgerService"));
+        assert!(text.contains("  RPC method    : SubmitTransaction"));
+        assert!(text.contains("glasschain.v1.LedgerService/SubmitTransaction"));
+        assert!(!text.contains("(dry-run: transaction was NOT submitted to any node)"));
+    }
+
+    #[test]
+    fn emitted_transaction_round_trips_to_contract_creation() {
+        let text = run_captured(args(true));
+        let tx: Transaction = serde_json::from_str(&emitted_tx_json(&text)).unwrap();
+
+        match tx.kind {
+            TransactionKind::ContractCreation(def) => {
+                assert_eq!(def.contract_id, "CONTRACT-TEST-001");
+                assert_eq!(def.buyer_id, "buyer-1");
+                assert_eq!(def.product_id, "SKU-001");
+                assert!(def.wasm_code_b64.is_none());
+                let conditions = def.conditions;
+                assert_eq!(conditions.max_price_per_unit, 5_000);
+                assert_eq!(conditions.min_quantity, 100);
+                assert_eq!(conditions.max_quantity, 1_000);
+                assert_eq!(conditions.max_lead_time_days, 14);
+                assert_eq!(conditions.currency, "BRL");
+                assert!(conditions.auto_execute);
+                assert!(conditions.preferred_seller_id.is_none());
+            }
+            other => panic!("expected ContractCreation, got {other:?}"),
+        }
+    }
 }

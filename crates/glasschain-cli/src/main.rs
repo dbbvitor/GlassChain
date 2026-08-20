@@ -81,9 +81,9 @@ fn main() -> anyhow::Result<()> {
     log::debug!("glasschain CLI starting — command: {:?}", cli.command);
 
     match cli.command {
-        Commands::IdentityGen(args) => commands::identity::run(args)?,
-        Commands::ContractDeploy(args) => commands::contract::run(args)?,
-        Commands::LedgerInspect(args) => commands::inspect::run(&args),
+        Commands::IdentityGen(args) => commands::identity::run(args, &mut std::io::stdout())?,
+        Commands::ContractDeploy(args) => commands::contract::run(args, &mut std::io::stdout())?,
+        Commands::LedgerInspect(args) => commands::inspect::run(&args, &mut std::io::stdout())?,
     }
 
     Ok(())
