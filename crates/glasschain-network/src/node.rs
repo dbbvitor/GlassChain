@@ -1607,6 +1607,8 @@ async fn process_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glasschain_core::{InventoryUpdate, PurchaseConditions, SmartContractDef, SupplyOffer};
+    use glasschain_identity::SignedTransaction;
 
     #[test]
     fn tofu_first_contact_records_identity() {
@@ -1672,5 +1674,404 @@ mod tests {
         assert!(reg
             .verify_or_register("127.0.0.1:8000", "node-b", "aaa")
             .is_err());
+    }
+
+    // ── helpers for chain-restore tests ───────────────────────────────────────
+
+    /// Mine a `n_blocks`-long valid chain and persist it to `storage`.
+    fn seed_storage(
+        storage: &Arc<dyn StorageProvider>,
+        difficulty: usize,
+        n_blocks: usize,
+    ) -> Vec<Block> {
+        let mut ledger = Ledger::new(difficulty);
+        for _ in 1..n_blocks {
+            ledger.mine_pending_transactions().unwrap();
+        }
+        let chain = ledger.chain.clone();
+        for block in &chain {
+            storage.put_block(block).unwrap();
+        }
+        chain
+    }
+
+    // ── 1. restore_ledger ─────────────────────────────────────────────────────
+
+    #[test]
+    fn restore_ledger_reloads_valid_chain() {
+        let storage: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
+        let seeded = seed_storage(&storage, 2, 3);
+
+        let ledger = Node::restore_ledger(&storage, 2);
+        let chain = ledger.try_lock().unwrap().chain.clone();
+
+        assert_eq!(chain.len(), 3, "all seeded blocks should be restored");
+        assert_eq!(chain, seeded, "restored chain must match the persisted one");
+    }
+
+    #[test]
+    fn restore_ledger_falls_back_on_invalid_chain_link() {
+        let storage: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
+        let mut chain = seed_storage(&storage, 2, 2);
+        // Corrupt block 1 so it no longer satisfies the PoW target.
+        chain[1].nonce = chain[1].nonce.wrapping_add(12345);
+        chain[1].hash = chain[1].calculate_hash();
+        storage.put_block(&chain[1]).unwrap();
+
+        let ledger = Node::restore_ledger(&storage, 2);
+        let restored = ledger.try_lock().unwrap().chain.clone();
+
+        assert_eq!(
+            restored.len(),
+            1,
+            "an invalid chain must fall back to a fresh genesis-only ledger"
+        );
+        assert_eq!(restored[0].previous_hash, "0");
+    }
+
+    #[test]
+    fn restore_ledger_falls_back_on_missing_block() {
+        let storage: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
+        let genesis = Ledger::new(2).chain[0].clone();
+        storage.put_block(&genesis).unwrap();
+        // Latest index is 2 but block 1 is missing → the load loop must abort.
+        let mut b2 = Block::new(2, vec![], genesis.hash);
+        b2.mine(2);
+        storage.put_block(&b2).unwrap();
+        assert_eq!(storage.latest_block_index().unwrap(), Some(2));
+
+        let ledger = Node::restore_ledger(&storage, 2);
+        let restored = ledger.try_lock().unwrap().chain.clone();
+
+        assert_eq!(
+            restored.len(),
+            1,
+            "a gap in the stored chain must trigger the fresh-ledger fallback"
+        );
+    }
+
+    #[test]
+    fn restore_ledger_rejects_invalid_genesis() {
+        let storage: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
+        // Genesis with previous_hash != "0" is invalid regardless of PoW.
+        let mut genesis = Block::new(0, vec![], "not-zero".into());
+        genesis.mine(2);
+        storage.put_block(&genesis).unwrap();
+
+        let ledger = Node::restore_ledger(&storage, 2);
+        assert_eq!(ledger.try_lock().unwrap().chain.len(), 1);
+    }
+
+    // ── 2. build_tls — identity-backed certificate ────────────────────────────
+
+    #[test]
+    fn build_tls_identity_branch_sets_common_name_to_node_id() {
+        // build_tls reads GLASSCHAIN_INSECURE_TLS; serialize with the env test.
+        let _env_guard = TLS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let identity = Identity::generate("node-42");
+        let tls = Node::build_tls(Some(Arc::new(identity)));
+
+        // The served cert fingerprint is derived from the served cert bytes.
+        assert_eq!(tls.cert_fingerprint, sha256(tls.cert_der.as_ref()));
+        // With the insecure-tls feature off (default), no permissive connector
+        // is pre-built; the feature turns it on regardless of env.
+        assert_eq!(tls.insecure, cfg!(feature = "insecure-tls"));
+        assert_eq!(tls.connector.is_some(), cfg!(feature = "insecure-tls"));
+
+        let (_, cert) = x509_parser::parse_x509_certificate(tls.cert_der.as_ref())
+            .expect("identity cert must parse as X.509");
+        let cns: Vec<&str> = cert
+            .subject()
+            .iter_common_name()
+            .map(|attr| attr.as_str().unwrap())
+            .collect();
+        assert_eq!(cns, vec!["node-42"], "cert CN must equal the node id");
+    }
+
+    #[test]
+    fn build_tls_anonymous_branch_uses_default_common_name() {
+        // build_tls reads GLASSCHAIN_INSECURE_TLS; serialize with the env test.
+        let _env_guard = TLS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tls = Node::build_tls(None);
+        let (_, cert) = x509_parser::parse_x509_certificate(tls.cert_der.as_ref()).unwrap();
+        let cns: Vec<&str> = cert
+            .subject()
+            .iter_common_name()
+            .map(|attr| attr.as_str().unwrap())
+            .collect();
+        // Without an identity, rcgen's built-in default CN is used (which is
+        // distinct from the identity branch, which sets CN = node_id).
+        assert_eq!(cns, vec!["rcgen self signed cert"]);
+    }
+
+    // ── 3. build_tls / insecure_tls_allowed ───────────────────────────────────
+
+    /// RAII guard that restores a process env var after the test body runs.
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    // Env-var manipulation is process-global, so serialize the tests that touch it.
+    static TLS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn tls_insecure_env_var_controls_permissive_connector() {
+        let _guard = TLS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // GLASSCHAIN_INSECURE_TLS=1 → permissive AcceptAnyCert connector is built.
+        let env_guard = EnvGuard::set("GLASSCHAIN_INSECURE_TLS", "1");
+        let insecure_tls = Node::build_tls(None);
+        assert!(insecure_tls.insecure);
+        assert!(
+            insecure_tls.connector.is_some(),
+            "permissive connector expected"
+        );
+        drop(env_guard);
+
+        // With the variable unset (and the crate feature off in default builds),
+        // the connector stays None and verification is the default.
+        let secure_tls = Node::build_tls(None);
+        assert_eq!(secure_tls.insecure, cfg!(feature = "insecure-tls"));
+        assert_eq!(
+            secure_tls.connector.is_some(),
+            cfg!(feature = "insecure-tls")
+        );
+    }
+
+    // ── 4. set_cert_verifier ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn set_cert_verifier_stores_org_verifier() {
+        let node = Node::new("n1", "127.0.0.1:0", 2);
+        assert!(node.state.lock().await.cert_verifier.is_none());
+
+        // Build a self-signed root cert to act as the org trust anchor.
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec!["Corp Root CA".into()]).unwrap();
+        let root = params.self_signed(&key).unwrap();
+        let verifier = CertChainVerifier::from_der("Corp", root.der()).unwrap();
+
+        node.set_cert_verifier(verifier).await;
+
+        let stored = node.state.lock().await.cert_verifier.clone();
+        assert!(stored.is_some(), "CA verifier must be stored on the node");
+        assert_eq!(stored.unwrap().org_name, "Corp");
+    }
+
+    // ── 5. set_signing_identity + signing branch of after_block_commit ────────
+
+    #[tokio::test]
+    async fn after_block_commit_signs_autonomous_watcher_transaction() {
+        let storage: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
+        let node = Node::new_with_storage("n1", "127.0.0.1:0", 2, Arc::clone(&storage));
+
+        node.set_signing_identity(Arc::new(Identity::generate("signer-1")))
+            .await;
+        node.register_inventory_trigger(InventoryTrigger {
+            trigger_id: "trig-1".into(),
+            product_id: "SKU".into(),
+            owner_id: "buyer-1".into(),
+            reorder_threshold: 0,
+            reorder_quantity: 25,
+            seller_id: "seller-1".into(),
+            price_per_unit: 100,
+            currency: "USD".into(),
+            active: true,
+            wasm_code_b64: None,
+        })
+        .await;
+
+        // Commit a block containing an inventory update that drops below the
+        // threshold so the watcher emits a PurchaseOrder.
+        let prev_hash = node.ledger.lock().await.chain[0].hash.clone();
+        let tx = Transaction::with_id(
+            "inv-1",
+            TransactionKind::InventoryUpdate(InventoryUpdate {
+                product_id: "SKU".into(),
+                owner_id: "buyer-1".into(),
+                quantity_delta: -100,
+                reason: "consumption".into(),
+            }),
+        );
+        let mut block = Block::new(1, vec![tx], prev_hash);
+        block.mine(2);
+
+        let generated = Node::after_block_commit(
+            &node.ledger,
+            &node.state,
+            &node.event_tx,
+            &node.indexer,
+            &node.event_bus,
+            &block,
+            &node.storage,
+        )
+        .await;
+
+        assert!(!generated.is_empty(), "watcher should emit a PurchaseOrder");
+        let order_tx = &generated[0];
+        assert!(
+            matches!(
+                order_tx.kind,
+                TransactionKind::PurchaseOrder(ref po) if po.product_id == "SKU"
+            ),
+            "generated tx should be a PurchaseOrder for SKU"
+        );
+
+        // The identity must have signed it and persisted the result to storage.
+        let key = format!("signed_tx:{}", order_tx.id);
+        let bytes = storage
+            .get_state(&key)
+            .unwrap()
+            .expect("signed autonomous tx must be persisted");
+        let signed: SignedTransaction = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(signed.signer_node_id, "signer-1");
+        assert_eq!(signed.transaction.id, order_tx.id);
+        signed.verify().unwrap();
+    }
+
+    // ── 6. rebuild_runtime_state_from_chain ───────────────────────────────────
+
+    #[tokio::test]
+    async fn rebuild_runtime_state_restores_watcher_snapshot() {
+        let storage: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
+
+        // Persist a watcher snapshot carrying non-trivial inventory.
+        let mut watcher = WatcherService::new();
+        watcher.on_inventory_update(&InventoryUpdate {
+            product_id: "SKU".into(),
+            owner_id: "buyer-1".into(),
+            quantity_delta: 42,
+            reason: "seed".into(),
+        });
+        let bytes = watcher.serialize_state().unwrap();
+        storage.put_state("watcher:state", &bytes).unwrap();
+
+        let node = Node::new_with_storage("n1", "127.0.0.1:0", 2, Arc::clone(&storage));
+        Node::rebuild_runtime_state_from_chain(&node.ledger, &node.state, &node.storage).await;
+
+        let restored = node
+            .state
+            .lock()
+            .await
+            .watcher
+            .inventory_level("SKU", "buyer-1");
+        assert_eq!(
+            restored, 42,
+            "watcher state should restore from the snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_runtime_state_replays_chain_when_snapshot_invalid() {
+        let storage: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
+        storage
+            .put_state("watcher:state", b"not-valid-json")
+            .unwrap();
+
+        // Build a persisted chain that commits an InventoryUpdate.
+        let genesis = Ledger::new(2).chain[0].clone();
+        storage.put_block(&genesis).unwrap();
+        let tx = Transaction::with_id(
+            "inv-1",
+            TransactionKind::InventoryUpdate(InventoryUpdate {
+                product_id: "SKU".into(),
+                owner_id: "buyer-1".into(),
+                quantity_delta: 7,
+                reason: "x".into(),
+            }),
+        );
+        let mut block = Block::new(1, vec![tx], genesis.hash);
+        block.mine(2);
+        storage.put_block(&block).unwrap();
+
+        let node = Node::new_with_storage("n1", "127.0.0.1:0", 2, Arc::clone(&storage));
+        Node::rebuild_runtime_state_from_chain(&node.ledger, &node.state, &node.storage).await;
+
+        let restored = node
+            .state
+            .lock()
+            .await
+            .watcher
+            .inventory_level("SKU", "buyer-1");
+        assert_eq!(
+            restored, 7,
+            "invalid snapshot must fall back to replaying committed inventory updates"
+        );
+    }
+
+    // ── 7. contract_summaries ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn contract_summaries_project_engine_contracts() {
+        let node = Node::new("n1", "127.0.0.1:0", 2);
+
+        // Register a contract via a ledger-committed ContractCreation tx.
+        let def = SmartContractDef {
+            contract_id: "c1".into(),
+            buyer_id: "buyer-1".into(),
+            product_id: "SKU-1".into(),
+            conditions: PurchaseConditions {
+                max_price_per_unit: 1000,
+                min_quantity: 1,
+                max_quantity: 50,
+                max_lead_time_days: 5,
+                preferred_seller_id: None,
+                currency: "USD".into(),
+                auto_execute: true,
+            },
+            wasm_code_b64: None,
+        };
+        node.submit_transaction(Transaction::new(TransactionKind::ContractCreation(def)))
+            .await
+            .unwrap();
+
+        // Submit a matching offer so the engine auto-executes a purchase and
+        // advances `quantity_purchased` on the live contract.
+        let offer = SupplyOffer {
+            product_id: "SKU-1".into(),
+            product_name: "Widget".into(),
+            seller_id: "seller-1".into(),
+            quantity_available: 10,
+            price_per_unit: 100,
+            lead_time_days: 2,
+            currency: "USD".into(),
+        };
+        node.submit_transaction(Transaction::new(TransactionKind::SupplyOffer(offer)))
+            .await
+            .unwrap();
+
+        let summaries = node.contract_summaries().await;
+        assert_eq!(summaries.len(), 1);
+        let summary = &summaries[0];
+        assert_eq!(summary.id, "c1");
+        assert_eq!(summary.buyer_id, "buyer-1");
+        assert_eq!(summary.product_id, "SKU-1");
+        assert_eq!(summary.status, "Active");
+        assert_eq!(summary.quantity_purchased, 10);
+        assert_eq!(summary.max_quantity, 50);
     }
 }

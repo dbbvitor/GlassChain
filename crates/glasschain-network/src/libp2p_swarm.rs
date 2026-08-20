@@ -658,6 +658,8 @@ impl LibP2pNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glasschain_core::{InventoryUpdate, TransactionKind};
+    use tokio::time::{sleep, timeout};
 
     /// Verify that a [`LibP2pConfig`] can be constructed with a valid multiaddr
     /// and that both fields are stored correctly.
@@ -723,5 +725,176 @@ mod tests {
         let cloned = error.clone();
         assert!(format!("{error:?}").contains("test error message"));
         assert!(format!("{cloned:?}").contains("test error message"));
+    }
+
+    // ── Helpers for the end-to-end node tests ─────────────────────────────────
+
+    /// Reserve a fresh ephemeral TCP port on loopback by binding a listener and
+    /// immediately releasing it. There is a tiny race in which another process
+    /// could grab the port in between, but it is acceptable for tests.
+    fn reserve_loopback_port() -> u16 {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("should bind an ephemeral loopback port");
+        listener
+            .local_addr()
+            .expect("bound listener should have a local address")
+            .port()
+    }
+
+    /// Build a loopback TCP multiaddress for the given port.
+    fn loopback_addr(port: u16) -> Multiaddr {
+        format!("/ip4/127.0.0.1/tcp/{port}")
+            .parse()
+            .expect("valid loopback multiaddress")
+    }
+
+    /// Build an [`InventoryUpdate`] transaction with an identifiable owner and a
+    /// deterministic id (so the round-trip can be matched in the test).
+    fn inventory_tx(owner: &str) -> Transaction {
+        Transaction::with_id(
+            owner.to_string(),
+            TransactionKind::InventoryUpdate(InventoryUpdate {
+                product_id: "SKU-LIBP2P".into(),
+                owner_id: owner.into(),
+                quantity_delta: 10,
+                reason: "libp2p swarm test".into(),
+            }),
+        )
+    }
+
+    /// Poll `node.known_peers()` until `peer` shows up or `within` elapses.
+    async fn wait_for_peer(node: &LibP2pNode, peer: PeerId, within: Duration) {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            if node.known_peers().await.contains(&peer) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for peer {peer} to appear in known_peers"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Drive two `LibP2pNode`s on loopback through the full public API.
+    ///
+    /// Spawns a node per side, dials A → B, waits for the connection to be
+    /// observed on both ends, exercises `known_peers`/`add_known_peer`, publishes
+    /// a transaction and a block from A, and asserts B receives them through
+    /// `try_recv_event`. Finally shuts both nodes down.
+    ///
+    /// Gossipsub runs a 10s heartbeat and requires the mesh to form before any
+    /// message is delivered, so publishing is retried with fresh payloads until
+    /// the recipient observes one, bounded by a generous overall timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+    async fn test_lib_p2p_node_end_to_end() {
+        let addr_a = loopback_addr(reserve_loopback_port());
+        let addr_b = loopback_addr(reserve_loopback_port());
+
+        let node_a = LibP2pNode::new(LibP2pConfig {
+            listen_addr: addr_a.clone(),
+            bootstrap_peers: vec![],
+        })
+        .expect("node A should start");
+        let node_b = LibP2pNode::new(LibP2pConfig {
+            listen_addr: addr_b.clone(),
+            bootstrap_peers: vec![],
+        })
+        .expect("node B should start");
+
+        let peer_a = node_a.local_peer_id;
+        let peer_b = node_b.local_peer_id;
+        assert_ne!(peer_a, peer_b, "each node should have a distinct peer id");
+
+        // ── dial A → B and wait for the connection on both sides ─────────────
+        node_a.dial(addr_b.clone()).await;
+        wait_for_peer(&node_a, peer_b, Duration::from_secs(20)).await;
+        wait_for_peer(&node_b, peer_a, Duration::from_secs(20)).await;
+
+        // ── known_peers reflects the connected counterpart ───────────────────
+        assert!(
+            node_a.known_peers().await.contains(&peer_b),
+            "A should report B among its known peers"
+        );
+        assert!(
+            node_b.known_peers().await.contains(&peer_a),
+            "B should report A among its known peers"
+        );
+
+        // ── add_known_peer: register A's address with B's routing table ─────
+        // There is no observable effect through the public API (Kademlia address
+        // insertion is internal), so this verifies the command enqueues cleanly.
+        node_b.add_known_peer(peer_a, addr_a.clone()).await;
+
+        // ── publish a transaction and a block; retry until B receives them ──
+        let (received_tx, received_block) = timeout(Duration::from_secs(45), async {
+            let mut delivered_tx = None;
+            let mut delivered_block = None;
+            let publish_deadline = std::time::Instant::now() + Duration::from_secs(40);
+            let mut attempt = 0u32;
+
+            while delivered_tx.is_none() || delivered_block.is_none() {
+                attempt += 1;
+                if delivered_tx.is_none() {
+                    node_a
+                        .publish_transaction(inventory_tx(&format!("owner-{attempt}")))
+                        .await;
+                }
+                if delivered_block.is_none() {
+                    let block = Block::new(1000 + u64::from(attempt), vec![], "0".to_string());
+                    node_a.publish_block(block).await;
+                }
+
+                // Drain B's events looking for our payloads; published messages
+                // use ids/indices that cannot collide with unrelated events.
+                let poll_deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while std::time::Instant::now() < poll_deadline {
+                    match node_b.try_recv_event().await {
+                        Some(SwarmNodeEvent::TransactionReceived(tx))
+                            if tx.id.starts_with("owner-") =>
+                        {
+                            delivered_tx = Some(tx);
+                        }
+                        Some(SwarmNodeEvent::BlockReceived(blk)) if blk.index >= 1000 => {
+                            delivered_block = Some(blk);
+                        }
+                        _ => {}
+                    }
+                    sleep(Duration::from_millis(100)).await;
+                }
+
+                assert!(
+                    std::time::Instant::now() < publish_deadline,
+                    "timed out delivering a message over the gossipsub mesh"
+                );
+            }
+
+            (
+                delivered_tx.expect("a transaction should have been delivered"),
+                delivered_block.expect("a block should have been delivered"),
+            )
+        })
+        .await
+        .expect("message delivery should complete within the timeout");
+
+        // The round-tripped payload must match what A published.
+        assert!(
+            matches!(received_tx.kind, TransactionKind::InventoryUpdate(_)),
+            "received transaction should be an InventoryUpdate"
+        );
+        assert!(
+            received_block.index >= 1000,
+            "received block should be one we published"
+        );
+        assert!(
+            received_block.transactions.is_empty(),
+            "received block should round-trip its empty transaction list"
+        );
+
+        // ── shutdown both nodes cleanly ──────────────────────────────────────
+        node_a.shutdown().await;
+        node_b.shutdown().await;
     }
 }

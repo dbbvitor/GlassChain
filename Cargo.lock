@@ -1648,6 +1648,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
+ "x509-parser 0.18.1",
 ]
 
 [[package]]
