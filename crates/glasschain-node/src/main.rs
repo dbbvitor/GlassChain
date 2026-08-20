@@ -1074,3 +1074,66 @@ mod tests {
         }
     }
 }
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::parse_price;
+
+    #[test]
+    fn parse_price_accepts_whole_number() {
+        assert_eq!(parse_price("12"), Some(1200));
+        assert_eq!(parse_price("0"), Some(0));
+        // Leading/trailing whitespace is trimmed.
+        assert_eq!(parse_price(" 7 "), Some(700));
+    }
+
+    #[test]
+    fn parse_price_accepts_one_digit_fraction() {
+        assert_eq!(parse_price("12.5"), Some(1250));
+        assert_eq!(parse_price("0.1"), Some(10));
+    }
+
+    #[test]
+    fn parse_price_accepts_two_digit_fraction() {
+        assert_eq!(parse_price("12.50"), Some(1250));
+        assert_eq!(parse_price("9.99"), Some(999));
+        assert_eq!(parse_price("0.05"), Some(5));
+    }
+
+    #[test]
+    fn parse_price_rejects_three_digit_fraction() {
+        assert_eq!(parse_price("12.500"), None);
+        assert_eq!(parse_price("1.234"), None);
+    }
+
+    #[test]
+    fn parse_price_rejects_negative() {
+        assert_eq!(parse_price("-12.50"), None);
+        assert_eq!(parse_price("-1"), None);
+    }
+
+    #[test]
+    fn parse_price_rejects_empty_or_garbage() {
+        assert_eq!(parse_price(""), None);
+        assert_eq!(parse_price("   "), None);
+        assert_eq!(parse_price("abc"), None);
+        assert_eq!(parse_price("12.x"), None);
+        assert_eq!(parse_price("1.2.3"), None);
+        assert_eq!(parse_price(".5"), None);
+        assert_eq!(parse_price("+1"), None);
+    }
+
+    #[test]
+    fn parse_price_rejects_overflow() {
+        // `u64::MAX` in minor units is the largest accepted value.
+        assert_eq!(parse_price("184467440737095516.15"), Some(u64::MAX));
+        // `whole * 100` exceeds `u64::MAX` (checked_mul).
+        assert_eq!(parse_price("184467440737095517"), None);
+        // `whole * 100 + frac` exceeds `u64::MAX` (checked_add).
+        assert_eq!(parse_price("184467440737095516.16"), None);
+        // The whole part itself exceeds `u64::MAX` (parse fails).
+        assert_eq!(parse_price("18446744073709551616"), None);
+    }
+}

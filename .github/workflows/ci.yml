@@ -143,7 +143,10 @@ jobs:
         run: cargo install --locked cargo-tarpaulin
 
       - name: Generate coverage report
-        run: cargo tarpaulin --verbose --workspace --all-features --all-targets --locked --timeout 120 --out xml
+        # --engine llvm: wasmtime delivers WASM traps (e.g. `unreachable`, fuel
+        # exhaustion) via SIGILL/SIGSEGV caught by its own signal handler; the
+        # default ptrace engine intercepts those signals and aborts the run.
+        run: cargo tarpaulin --verbose --workspace --all-features --all-targets --locked --timeout 120 --engine llvm --out xml
 
       - name: Upload coverage to Codecov
         if: ${{ env.CODECOV_TOKEN != '' }}
