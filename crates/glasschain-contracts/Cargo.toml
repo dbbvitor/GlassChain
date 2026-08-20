@@ -21,7 +21,7 @@ base64     = "0.22"
 env_logger = "0.11"
 wat = "1.247"
 glasschain-vm = { path = "../glasschain-vm" }
-criterion  = "0.5"
+criterion  = "0.8"
 
 [[bench]]
 name = "watcher_throughput"

@@ -9,10 +9,11 @@
 //! inventory triggers per second**.  Each benchmark measures a different
 //! cost centre in the execution pipeline.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use glasschain_core::{ExecutionLimits, ExecutionProvider};
 use glasschain_vm::WasmExecutionProvider;
 use std::collections::HashMap;
+use std::hint::black_box;
 use wat::parse_str;
 
 const fn limits(value: u64) -> ExecutionLimits {
