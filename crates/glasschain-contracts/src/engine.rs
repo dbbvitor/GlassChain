@@ -806,42 +806,11 @@ mod tests {
 mod wasm_tests {
     use super::*;
 
+    use crate::test_wasm::{approving_wasm_b64, denying_wasm_b64};
     use base64::prelude::*;
     use glasschain_core::{PurchaseConditions, SmartContractDef, SupplyOffer};
     use glasschain_vm::WasmExecutionProvider;
     use std::sync::Arc;
-
-    fn approving_wasm_b64() -> String {
-        let wat = r#"
-(module
-  (import "env" "set_state" (func $set_state (param i32 i32 i32 i32)))
-  (memory (export "memory") 1)
-  (data (i32.const 0) "approve")
-  (data (i32.const 7) "1")
-  (func (export "execute")
-    (call $set_state (i32.const 0) (i32.const 7) (i32.const 7) (i32.const 1))
-  )
-)
-"#;
-        let wasm = wat::parse_str(wat).expect("WAT compile");
-        BASE64_STANDARD.encode(&wasm)
-    }
-
-    fn denying_wasm_b64() -> String {
-        let wat = r#"
-(module
-  (import "env" "set_state" (func $set_state (param i32 i32 i32 i32)))
-  (memory (export "memory") 1)
-  (data (i32.const 0) "approve")
-  (data (i32.const 7) "0")
-  (func (export "execute")
-    (call $set_state (i32.const 0) (i32.const 7) (i32.const 7) (i32.const 1))
-  )
-)
-"#;
-        let wasm = wat::parse_str(wat).expect("WAT compile");
-        BASE64_STANDARD.encode(&wasm)
-    }
 
     fn exhausting_wasm_b64() -> String {
         let wat = r#"

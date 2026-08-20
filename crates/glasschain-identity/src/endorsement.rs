@@ -555,6 +555,31 @@ mod tests {
         assert!(!engine.is_approved(&proposal));
     }
 
+    #[test]
+    fn test_engine_skips_valid_signature_from_unlisted_org() {
+        // A cryptographically valid signature whose org is not in the policy
+        // must not count toward the quorum.
+        let policy = EndorsementPolicy::new("1-of-1", vec!["OrgA".into()], 1);
+        let engine = EndorsementEngine::new(policy);
+
+        let tx = sample_tx();
+        let mut proposal = EndorsementProposal::new(tx.clone());
+        proposal.add_signature(make_sig("node-b", "OrgB", tx));
+
+        let result = engine.evaluate(&proposal);
+        assert!(
+            matches!(
+                result,
+                EndorsementResult::Rejected {
+                    collected: 0,
+                    required: 1,
+                    ..
+                }
+            ),
+            "expected Rejected with collected=0 (unlisted org skipped), got {result:?}"
+        );
+    }
+
     // ── 10. Policy: cryptographically invalid signature is not counted ───────
 
     #[test]
