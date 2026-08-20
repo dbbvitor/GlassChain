@@ -450,4 +450,26 @@ mod tests {
             "expected a Critical violation for empty 'gtin'"
         );
     }
+
+    #[test]
+    fn test_invalid_expiry_date_format_critical() {
+        let mut asset = full_asset();
+        asset.expiry_date = Some("not-a-date".into());
+        let report = validate_asset(&asset);
+        assert!(
+            !report.is_compliant,
+            "invalid expiry_date format must cause non-compliance"
+        );
+        assert_eq!(report.critical_count(), 1);
+        let expiry = report
+            .violations
+            .iter()
+            .find(|v| v.field == "expiry_date")
+            .expect("expiry_date violation present");
+        assert!(
+            expiry.message.contains("invalid format"),
+            "expected an 'invalid format' message, got: {}",
+            expiry.message
+        );
+    }
 }

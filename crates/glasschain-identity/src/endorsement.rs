@@ -522,6 +522,59 @@ mod tests {
         );
     }
 
+    // ── 9. Engine: a signature that fails verification is skipped ────────────
+
+    #[test]
+    fn test_engine_skips_signature_that_fails_verification() {
+        // 1-of-1, but the single signature is cryptographically invalid (its
+        // payload was tampered after signing). It must be skipped, not counted.
+        let policy = EndorsementPolicy::new("1-of-1", vec!["OrgA".into()], 1);
+        let engine = EndorsementEngine::new(policy);
+
+        let tx = sample_tx();
+        let mut proposal = EndorsementProposal::new(tx.clone());
+        let mut sig = make_sig("node-a", "OrgA", tx);
+        if let TransactionKind::InventoryUpdate(ref mut u) = sig.signed_transaction.transaction.kind
+        {
+            u.quantity_delta = 999;
+        }
+        proposal.add_signature(sig);
+
+        let result = engine.evaluate(&proposal);
+        assert!(
+            matches!(
+                result,
+                EndorsementResult::Rejected {
+                    collected: 0,
+                    required: 1,
+                    ..
+                }
+            ),
+            "expected Rejected with collected=0 (invalid sig skipped), got {result:?}"
+        );
+        assert!(!engine.is_approved(&proposal));
+    }
+
+    // ── 10. Policy: cryptographically invalid signature is not counted ───────
+
+    #[test]
+    fn test_policy_ignores_signature_that_fails_verification() {
+        let policy = EndorsementPolicy::new("1-of-1", vec!["OrgA".into()], 1);
+
+        let tx = sample_tx();
+        let mut sig = make_sig("node-a", "OrgA", tx);
+        // Org is listed but the embedded signature no longer verifies.
+        if let TransactionKind::InventoryUpdate(ref mut u) = sig.signed_transaction.transaction.kind
+        {
+            u.quantity_delta = 999;
+        }
+
+        assert!(
+            !policy.is_satisfied_by(&[sig]),
+            "a cryptographically invalid signature must not count toward the quorum"
+        );
+    }
+
     // ── 8. EndorsementResult: Debug variants ─────────────────────────────────
 
     #[test]

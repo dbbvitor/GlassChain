@@ -1,3 +1,4 @@
+mod approval_gate;
 pub mod contract;
 pub mod engine;
 pub mod error;

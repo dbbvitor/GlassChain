@@ -298,4 +298,98 @@ mod tests {
         let txns = indexer.transactions_in_block(2).unwrap();
         assert_eq!(txns.len(), 2);
     }
+
+    #[test]
+    fn test_kind_name_all_variants() {
+        use glasschain_core::{
+            ContractExecution, PurchaseConditions, PurchaseOrder, SmartContractDef, SupplyOffer,
+            TraceableAsset, TraceableAssetRegistration,
+        };
+
+        let conditions = PurchaseConditions {
+            max_price_per_unit: 100,
+            min_quantity: 1,
+            max_quantity: 10,
+            max_lead_time_days: 5,
+            preferred_seller_id: None,
+            currency: "USD".into(),
+            auto_execute: true,
+        };
+        let cases = vec![
+            (sample_tx(), "InventoryUpdate"),
+            (
+                Transaction::new(TransactionKind::SupplyOffer(SupplyOffer {
+                    product_id: "SKU-1".into(),
+                    product_name: "Drug A".into(),
+                    seller_id: "node-1".into(),
+                    quantity_available: 100,
+                    price_per_unit: 1500,
+                    lead_time_days: 3,
+                    currency: "USD".into(),
+                })),
+                "SupplyOffer",
+            ),
+            (
+                Transaction::new(TransactionKind::PurchaseOrder(PurchaseOrder {
+                    product_id: "SKU-1".into(),
+                    buyer_id: "node-2".into(),
+                    seller_id: "node-1".into(),
+                    quantity: 5,
+                    agreed_price_per_unit: 1500,
+                    currency: "USD".into(),
+                    contract_id: None,
+                })),
+                "PurchaseOrder",
+            ),
+            (
+                Transaction::new(TransactionKind::ContractCreation(SmartContractDef {
+                    contract_id: "c-1".into(),
+                    buyer_id: "node-2".into(),
+                    product_id: "SKU-1".into(),
+                    conditions,
+                    wasm_code_b64: None,
+                })),
+                "ContractCreation",
+            ),
+            (
+                Transaction::new(TransactionKind::ContractExecution(ContractExecution {
+                    contract_id: "c-1".into(),
+                    purchase_order_tx_id: "po-1".into(),
+                    buyer_id: "node-2".into(),
+                    seller_id: "node-1".into(),
+                    product_id: "SKU-1".into(),
+                    quantity: 5,
+                    total_price: 7500,
+                    currency: "USD".into(),
+                })),
+                "ContractExecution",
+            ),
+            (
+                Transaction::new(TransactionKind::AssetRegistration(
+                    TraceableAssetRegistration {
+                        asset: TraceableAsset {
+                            gtin: Some("07891234100016".into()),
+                            batch_number: Some("BATCH-001".into()),
+                            expiry_date: Some("2027-12-31".into()),
+                            serial_number: Some("SN-001".into()),
+                            anvisa_registration: None,
+                            manufacturer_id: None,
+                            product_name: "Drug A".into(),
+                            custodian_id: "node-1".into(),
+                            country_of_origin: None,
+                            storage_temp_celsius: None,
+                            quantity: 1,
+                        },
+                        event_type: "manufacture".into(),
+                        originator_id: "node-1".into(),
+                        purchase_order_ref: None,
+                    },
+                )),
+                "AssetRegistration",
+            ),
+        ];
+        for (tx, expected) in cases {
+            assert_eq!(kind_name(&tx), expected);
+        }
+    }
 }

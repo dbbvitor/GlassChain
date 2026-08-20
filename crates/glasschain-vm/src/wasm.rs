@@ -483,6 +483,62 @@ mod tests {
         ));
     }
 
+    /// Garbage bytes that are not a valid WASM module must fail compilation and
+    /// surface as a `CoreError::Execution` (never a trap or panic).
+    #[test]
+    fn test_compile_error_returns_execution_error() {
+        let provider = WasmExecutionProvider::new().unwrap();
+        let result = provider.execute("not-wasm-contract", b"not-wasm", limits(10_000));
+        assert!(
+            matches!(result, Err(CoreError::Execution(_))),
+            "expected Execution error, got {result:?}"
+        );
+    }
+
+    /// When the operation-gas limit is below the base execution cost, the early
+    /// guard must reject the call with `GasExhausted` / `GasMeter::Operation`.
+    #[test]
+    fn test_operation_gas_below_base_cost_exhausts() {
+        let provider = WasmExecutionProvider::new().unwrap();
+        let wasm = compile_wat(r#"(module (func (export "execute")))"#);
+        // base_execution costs 1_000; any limit below it must fail upfront.
+        let result = provider.execute(
+            "base-cost-contract",
+            &wasm,
+            ExecutionLimits::new(10_000, 999),
+        );
+        assert!(matches!(
+            result,
+            Err(CoreError::GasExhausted {
+                meter: GasMeter::Operation,
+                used: 1_000,
+                limit: 999
+            })
+        ));
+    }
+
+    /// A `unreachable` instruction traps — neither fuel nor operation
+    /// exhaustion — so it must surface as `CoreError::Execution` rather than
+    /// `GasExhausted`.
+    #[test]
+    fn test_unreachable_trap_returns_execution_error() {
+        let provider = WasmExecutionProvider::new().unwrap();
+        let wasm = compile_wat(
+            r#"
+(module
+  (func (export "execute")
+    unreachable
+  )
+)
+"#,
+        );
+        let result = provider.execute("trap-contract", &wasm, limits(10_000));
+        assert!(
+            matches!(result, Err(CoreError::Execution(_))),
+            "expected Execution error, got {result:?}"
+        );
+    }
+
     #[test]
     fn test_operation_gas_charges_state_read() {
         let provider = WasmExecutionProvider::new().unwrap();
@@ -593,6 +649,48 @@ mod tests {
         assert!(result.is_ok(), "expected Ok(mutations), got {result:?}");
         // No mutations were written, so the mutations list must be empty.
         assert!(result.unwrap().is_empty());
+    }
+
+    /// Verify that calling `get_state` when the key's value is longer than the
+    /// caller-supplied buffer returns -2 (buffer too small) without trapping.
+    ///
+    /// The contract records the low byte of the returned status under the key
+    /// "result" so the test can observe the -2 return value (i32 -2 stores as
+    /// 0xFE via `i32.store8`).
+    #[test]
+    fn test_get_state_buffer_too_small_returns_neg_two() {
+        let provider = WasmExecutionProvider::new().unwrap();
+        let wasm = compile_wat(
+            r#"
+(module
+  (import "env" "get_state" (func $get_state (param i32 i32 i32 i32) (result i32)))
+  (import "env" "set_state" (func $set_state (param i32 i32 i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "ping")
+  (data (i32.const 10) "result")
+  (func (export "execute")
+    (local $result i32)
+    (local.set $result
+      (call $get_state
+        (i32.const 0)   (i32.const 4)   ;; key = "ping"
+        (i32.const 100) (i32.const 2)   ;; 2-byte buffer, value is 4 bytes
+      )
+    )
+    (i32.store8 (i32.const 50) (local.get $result))
+    (call $set_state (i32.const 10) (i32.const 6) (i32.const 50) (i32.const 1))
+  )
+)
+"#,
+        );
+        let mut initial = HashMap::new();
+        initial.insert("ping".to_string(), b"pong".to_vec());
+        let mutations = provider
+            .execute_with_state("buffer-too-small-test", &wasm, initial, limits(10_000))
+            .unwrap();
+        assert_eq!(mutations.len(), 1);
+        assert_eq!(mutations[0].0, "result");
+        // -2 as i32; i32.store8 keeps only the low byte 0xFE.
+        assert_eq!(mutations[0].1, vec![0xFE]);
     }
 
     /// Verify that `execute_with_state` makes the pre-populated world-state

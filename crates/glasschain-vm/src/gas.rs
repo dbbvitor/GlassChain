@@ -429,6 +429,21 @@ mod tests {
         );
     }
 
+    // ── GasCounter — pop_call saturates at zero ───────────────────────────────
+
+    #[test]
+    fn test_counter_pop_call_saturates_at_zero() {
+        let mut counter = GasCounter::new(1_000);
+        // Popping when the depth is already 0 must stay at 0 (no underflow/panic).
+        counter.pop_call();
+        assert_eq!(counter.call_depth, 0);
+        // An unbalanced push/pop sequence must never drive the depth below 0.
+        counter.push_call().unwrap();
+        counter.pop_call();
+        counter.pop_call();
+        assert_eq!(counter.call_depth, 0);
+    }
+
     // ── GasCounter — report & remaining ──────────────────────────────────────
 
     #[test]

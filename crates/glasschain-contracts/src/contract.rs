@@ -83,3 +83,16 @@ impl Contract {
         &self.definition.product_id
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contract_status_display_matches_variant_names() {
+        assert_eq!(ContractStatus::Active.to_string(), "Active");
+        assert_eq!(ContractStatus::Paused.to_string(), "Paused");
+        assert_eq!(ContractStatus::Fulfilled.to_string(), "Fulfilled");
+        assert_eq!(ContractStatus::Cancelled.to_string(), "Cancelled");
+    }
+}

@@ -582,6 +582,87 @@ mod tests {
 
     // ── 10. Bit-flipped signature is rejected ─────────────────────────────────
 
+    // ── 11. Validity window excludes now ────────────────────────────────────
+
+    #[test]
+    fn test_expired_cert_is_rejected_invalid_validity() {
+        let org = Organization::new("PharmaOrg").unwrap();
+        let verifier = CertChainVerifier::from_org(&org).unwrap();
+
+        // Replicate the org Root CA's Subject DN so the Issuer DN byte-matches
+        // (as `impostor_pair` does), but set a validity window that expired in
+        // the past so step 3 of `verify_cert_der` fires before the signature
+        // check does.
+        let mut params = rcgen::CertificateParams::default();
+        let mut dn = rcgen::DistinguishedName::new();
+        dn.push(rcgen::DnType::CommonName, "PharmaOrg Root CA");
+        dn.push(rcgen::DnType::OrganizationName, "PharmaOrg");
+        params.distinguished_name = dn;
+        params.not_after = rcgen::date_time_ymd(2000, 1, 1);
+
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let expired_cert = params.self_signed(&key_pair).unwrap();
+
+        let err = verifier
+            .verify_cert_pem(&expired_cert.pem())
+            .expect_err("a cert whose validity window excludes now must be rejected");
+
+        assert!(
+            matches!(err, CertVerificationError::InvalidValidity),
+            "expected InvalidValidity, got {err}"
+        );
+    }
+
+    // ── 12. verify_cert_pem rejects garbage PEM ──────────────────────────────
+
+    #[test]
+    fn test_verify_cert_pem_rejects_garbage_pem() {
+        let (org, _) = org_with_member("PemOrg", "node-x");
+        let verifier = CertChainVerifier::from_org(&org).unwrap();
+
+        let err = verifier
+            .verify_cert_pem("not a pem")
+            .expect_err("garbage PEM input must be rejected");
+
+        assert!(
+            matches!(err, CertVerificationError::PemError(_)),
+            "expected PemError, got {err}"
+        );
+    }
+
+    // ── 13. from_pem rejects PEM with no CERTIFICATE block ───────────────────
+
+    #[test]
+    fn test_from_pem_rejects_non_certificate_pem() {
+        // A structurally valid PEM block, but labelled PRIVATE KEY rather than
+        // CERTIFICATE: decoding must fail with PemError, not ParseError.
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let private_key_pem = key_pair.serialize_pem();
+
+        let Err(err) = CertChainVerifier::from_pem("TestOrg", &private_key_pem) else {
+            panic!("PEM containing no CERTIFICATE block must be rejected")
+        };
+
+        assert!(
+            matches!(err, CertVerificationError::PemError(_)),
+            "expected PemError, got {err}"
+        );
+    }
+
+    // ── 14. from_der rejects malformed DER ───────────────────────────────────
+
+    #[test]
+    fn test_from_der_rejects_malformed_der() {
+        let Err(err) = CertChainVerifier::from_der("TestOrg", &[0xFFu8; 32]) else {
+            panic!("malformed DER bytes must be rejected")
+        };
+
+        assert!(
+            matches!(err, CertVerificationError::ParseError(_)),
+            "expected ParseError, got {err}"
+        );
+    }
+
     #[test]
     fn test_tampered_certificate_is_rejected() {
         let (org, cert_pem) = org_with_member("PharmaOrg", "node-tamper");
