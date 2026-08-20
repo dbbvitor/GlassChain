@@ -446,4 +446,22 @@ mod consensus_tests {
                                              // Chains_to should fail even with correct hash if pow is recalculated
         assert!(provider.validate_block(&block, &g).is_err());
     }
+
+    #[test]
+    fn test_pow_validate_block_rejects_insufficient_pow() {
+        let g = genesis();
+        // Block chains correctly to genesis but its hash does not satisfy a
+        // stricter PoW target (difficulty 2).
+        let mut block = Block::new(1, vec![], g.hash.clone());
+        while block.hash.starts_with("00") {
+            block.nonce = block.nonce.wrapping_add(1);
+            block.hash = block.calculate_hash();
+        }
+        let strict = PowConsensusProvider::new(2);
+        let err = strict.validate_block(&block, &g).unwrap_err();
+        assert!(matches!(
+            err,
+            CoreError::InvalidBlock(msg) if msg.contains("PoW difficulty 2")
+        ));
+    }
 }

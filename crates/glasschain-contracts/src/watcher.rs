@@ -748,4 +748,11 @@ mod tests {
             "tx IDs generated across a snapshot boundary must be unique"
         );
     }
+
+    #[test]
+    fn test_restore_from_invalid_bytes_errors() {
+        let mut svc = WatcherService::new();
+        // Bytes that are not valid JSON matching WatcherStateSnapshot.
+        assert!(svc.restore_from_bytes(b"not json").is_err());
+    }
 }

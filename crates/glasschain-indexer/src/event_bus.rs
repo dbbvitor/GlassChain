@@ -229,6 +229,105 @@ mod tests {
         assert!(log.iter().any(|e| e.event_type == "block_committed"));
     }
 
+    #[test]
+    fn test_publish_block_routes_all_transaction_kinds() {
+        use glasschain_core::{
+            ContractExecution, PurchaseConditions, PurchaseOrder, SmartContractDef, SupplyOffer,
+            TraceableAsset, TraceableAssetRegistration,
+        };
+
+        let conditions = PurchaseConditions {
+            max_price_per_unit: 100,
+            min_quantity: 1,
+            max_quantity: 10,
+            max_lead_time_days: 5,
+            preferred_seller_id: None,
+            currency: "USD".into(),
+            auto_execute: true,
+        };
+        let asset = TraceableAsset {
+            gtin: Some("07891234100016".into()),
+            batch_number: Some("BATCH-001".into()),
+            expiry_date: Some("2027-12-31".into()),
+            serial_number: Some("SN-001".into()),
+            anvisa_registration: None,
+            manufacturer_id: None,
+            product_name: "Drug A".into(),
+            custodian_id: "node-1".into(),
+            country_of_origin: None,
+            storage_temp_celsius: None,
+            quantity: 1,
+        };
+        let txs = vec![
+            Transaction::new(TransactionKind::SupplyOffer(SupplyOffer {
+                product_id: "SKU-1".into(),
+                product_name: "Drug A".into(),
+                seller_id: "node-1".into(),
+                quantity_available: 100,
+                price_per_unit: 1500,
+                lead_time_days: 3,
+                currency: "USD".into(),
+            })),
+            Transaction::new(TransactionKind::PurchaseOrder(PurchaseOrder {
+                product_id: "SKU-1".into(),
+                buyer_id: "node-2".into(),
+                seller_id: "node-1".into(),
+                quantity: 5,
+                agreed_price_per_unit: 1500,
+                currency: "USD".into(),
+                contract_id: None,
+            })),
+            Transaction::new(TransactionKind::ContractCreation(SmartContractDef {
+                contract_id: "c-1".into(),
+                buyer_id: "node-2".into(),
+                product_id: "SKU-1".into(),
+                conditions,
+                wasm_code_b64: None,
+            })),
+            Transaction::new(TransactionKind::ContractExecution(ContractExecution {
+                contract_id: "c-1".into(),
+                purchase_order_tx_id: "po-1".into(),
+                buyer_id: "node-2".into(),
+                seller_id: "node-1".into(),
+                product_id: "SKU-1".into(),
+                quantity: 5,
+                total_price: 7500,
+                currency: "USD".into(),
+            })),
+            Transaction::new(TransactionKind::AssetRegistration(
+                TraceableAssetRegistration {
+                    asset,
+                    event_type: "manufacture".into(),
+                    originator_id: "node-1".into(),
+                    purchase_order_ref: None,
+                },
+            )),
+        ];
+        let mut block = Block::new(5, txs, "0".into());
+        block.mine(1);
+
+        let bus = InMemoryEventBus::default();
+        bus.publish_block(&block).unwrap();
+
+        let log = bus.event_log();
+        let mut kinds: Vec<&str> = log
+            .iter()
+            .filter(|e| e.event_type == "transaction_committed")
+            .map(|e| e.transaction_kind.as_str())
+            .collect();
+        kinds.sort_unstable();
+        assert_eq!(
+            kinds,
+            vec![
+                "AssetRegistration",
+                "ContractCreation",
+                "ContractExecution",
+                "PurchaseOrder",
+                "SupplyOffer",
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn test_subscribe_receives_event() {
         use tokio::time::{timeout, Duration};

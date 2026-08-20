@@ -546,6 +546,49 @@ mod tests {
         assert!(txs.is_empty());
     }
 
+    #[test]
+    fn test_offer_product_mismatch_rejected() {
+        let mut engine = ContractEngine::new();
+        engine
+            .register_contract(make_contract(
+                "c1", "buyer-1", "SKU-001", 1500, 10, 10, 100, true,
+            ))
+            .unwrap();
+        // Contract targets SKU-001; offer is for a different product.
+        let offer = make_offer("seller-1", "SKU-999", 50, 1000, 5);
+        let txs = engine.evaluate_supply_offer(&offer, "offer-tx-1");
+        assert!(txs.is_empty());
+    }
+
+    #[test]
+    fn test_offer_currency_mismatch_rejected() {
+        let mut engine = ContractEngine::new();
+        engine
+            .register_contract(make_contract(
+                "c1", "buyer-1", "SKU-001", 1500, 10, 10, 100, true,
+            ))
+            .unwrap();
+        // Contract is denominated in USD; offer is in EUR.
+        let mut offer = make_offer("seller-1", "SKU-001", 50, 1000, 5);
+        offer.currency = "EUR".into();
+        let txs = engine.evaluate_supply_offer(&offer, "offer-tx-1");
+        assert!(txs.is_empty());
+    }
+
+    #[test]
+    fn test_offer_quantity_below_min_rejected() {
+        let mut engine = ContractEngine::new();
+        engine
+            .register_contract(make_contract(
+                "c1", "buyer-1", "SKU-001", 1500, 10, 10, 100, true,
+            ))
+            .unwrap();
+        // Contract requires min_quantity 10; offer only has 5 available.
+        let offer = make_offer("seller-1", "SKU-001", 5, 1000, 5);
+        let txs = engine.evaluate_supply_offer(&offer, "offer-tx-1");
+        assert!(txs.is_empty());
+    }
+
     // -------------------------------------------------------------------------
     // Fulfilment & lifecycle
     // -------------------------------------------------------------------------
@@ -567,6 +610,103 @@ mod tests {
         // Second evaluation should produce nothing (contract is fulfilled).
         let txs2 = engine.evaluate_supply_offer(&offer, "offer-tx-2");
         assert!(txs2.is_empty());
+    }
+
+    #[test]
+    fn test_exhausted_budget_fulfills_contract_without_new_purchase() {
+        let mut engine = ContractEngine::new();
+        engine
+            .register_contract(make_contract(
+                "c1", "buyer-1", "SKU-001", 1500, 10, 10, 100, true,
+            ))
+            .unwrap();
+        // Pre-set quantity_purchased to the contract's max_quantity so no
+        // remaining budget is left for a new purchase.
+        engine.get_contract_mut("c1").unwrap().quantity_purchased = 100;
+        let offer = make_offer("seller-1", "SKU-001", 50, 1000, 5);
+        let txs = engine.evaluate_supply_offer(&offer, "offer-tx-1");
+        assert!(txs.is_empty());
+        assert_eq!(
+            engine.get_contract("c1").unwrap().status,
+            ContractStatus::Fulfilled
+        );
+    }
+
+    #[test]
+    fn test_cancel_unknown_contract_returns_not_found() {
+        let mut engine = ContractEngine::new();
+        let err = engine.cancel_contract("missing").unwrap_err();
+        assert!(matches!(err, ContractError::NotFound(id) if id == "missing"));
+    }
+
+    #[test]
+    fn test_pause_active_contract() {
+        let mut engine = ContractEngine::new();
+        engine
+            .register_contract(make_contract(
+                "c1", "buyer-1", "SKU-001", 1500, 10, 10, 100, true,
+            ))
+            .unwrap();
+        engine.pause_contract("c1").unwrap();
+        assert_eq!(
+            engine.get_contract("c1").unwrap().status,
+            ContractStatus::Paused
+        );
+    }
+
+    #[test]
+    fn test_pause_inactive_contract_rejected() {
+        let mut engine = ContractEngine::new();
+        engine
+            .register_contract(make_contract(
+                "c1", "buyer-1", "SKU-001", 1500, 10, 10, 100, true,
+            ))
+            .unwrap();
+        engine.pause_contract("c1").unwrap();
+        // Contract is already paused (not active) — pausing again must fail.
+        let err = engine.pause_contract("c1").unwrap_err();
+        assert!(matches!(err, ContractError::Inactive(_)));
+    }
+
+    #[test]
+    fn test_resume_paused_contract() {
+        let mut engine = ContractEngine::new();
+        engine
+            .register_contract(make_contract(
+                "c1", "buyer-1", "SKU-001", 1500, 10, 10, 100, true,
+            ))
+            .unwrap();
+        engine.pause_contract("c1").unwrap();
+        engine.resume_contract("c1").unwrap();
+        assert_eq!(
+            engine.get_contract("c1").unwrap().status,
+            ContractStatus::Active
+        );
+    }
+
+    #[test]
+    fn test_resume_non_paused_contract_is_noop() {
+        let mut engine = ContractEngine::new();
+        engine
+            .register_contract(make_contract(
+                "c1", "buyer-1", "SKU-001", 1500, 10, 10, 100, true,
+            ))
+            .unwrap();
+        // Resuming an already-active contract is a silent no-op (no error).
+        engine.resume_contract("c1").unwrap();
+        assert_eq!(
+            engine.get_contract("c1").unwrap().status,
+            ContractStatus::Active
+        );
+    }
+
+    #[test]
+    fn test_load_from_ledger_is_idempotent() {
+        let mut engine = ContractEngine::new();
+        let def = make_contract("c1", "buyer-1", "SKU-001", 1500, 10, 10, 100, true);
+        engine.load_from_ledger(def.clone());
+        engine.load_from_ledger(def);
+        assert_eq!(engine.contracts().count(), 1, "no duplicate registered");
     }
 
     #[test]

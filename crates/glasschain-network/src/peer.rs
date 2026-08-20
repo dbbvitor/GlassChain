@@ -189,3 +189,55 @@ impl PeerConnection {
         Ok(message)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn test_framed_roundtrip() {
+        let (client, server) = duplex(1024);
+        let mut writer = PeerWriter::new(client, "peer:8000".into());
+        let mut reader = PeerReader::new(server, "peer:8000".into());
+
+        writer
+            .send(&Message::Goodbye {
+                reason: "bye".into(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            reader.receive().await.unwrap(),
+            Message::Goodbye { reason } if reason == "bye"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_oversized_frame_rejected() {
+        let (mut client, server) = duplex(1024);
+        let mut reader = PeerReader::new(server, "peer:8000".into());
+
+        client
+            .write_all(
+                &(u32::try_from(MAX_MESSAGE_SIZE).expect("16 MiB fits u32") + 1).to_be_bytes(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            reader.receive().await,
+            Err(NetworkError::MessageTooLarge { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_clean_eof_maps_to_disconnect() {
+        let (client, server) = duplex(64);
+        let mut reader = PeerReader::new(server, "peer:8000".into());
+        drop(client);
+        assert!(matches!(
+            reader.receive().await,
+            Err(NetworkError::PeerDisconnected(_))
+        ));
+    }
+}

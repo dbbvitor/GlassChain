@@ -217,4 +217,14 @@ mod tests {
         let b1 = Block::new(1, vec![], "wrong_hash".into());
         assert!(b1.chains_to(&genesis).is_err());
     }
+
+    #[test]
+    fn test_chains_to_rejects_index_gap() {
+        let mut genesis = Block::new(0, vec![], "0".into());
+        genesis.mine(1);
+        // previous_hash matches but the index jumps by 2 instead of 1
+        let mut b2 = Block::new(2, vec![], genesis.hash.clone());
+        b2.mine(1);
+        assert!(b2.chains_to(&genesis).is_err());
+    }
 }

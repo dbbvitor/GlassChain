@@ -109,3 +109,142 @@ impl<'a> ApprovalGate<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use glasschain_core::{CoreError, ExecutionLimits, ExecutionProvider};
+
+    /// Canned executor: returns a fixed result for every call.
+    struct StubExecutor {
+        mutations: Result<Vec<(String, Vec<u8>)>, String>,
+    }
+
+    impl ExecutionProvider for StubExecutor {
+        fn execute(
+            &self,
+            _contract_id: &str,
+            _payload: &[u8],
+            _limits: ExecutionLimits,
+        ) -> Result<Vec<(String, Vec<u8>)>, CoreError> {
+            self.mutations.clone().map_err(CoreError::Execution)
+        }
+
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+    }
+
+    fn gate(executor: &StubExecutor) -> ApprovalGate<'_> {
+        ApprovalGate::new(executor, ApprovalGatePolicy::ContractEvaluation)
+    }
+
+    fn evaluate(
+        executor: &StubExecutor,
+        wasm_code_b64: &str,
+        initial_state: Result<HashMap<String, Vec<u8>>, String>,
+    ) -> GateDecision {
+        gate(executor).evaluate("execution-1", wasm_code_b64, initial_state)
+    }
+
+    #[test]
+    fn approves_when_approve_mutation_is_one() {
+        let executor = StubExecutor {
+            mutations: Ok(vec![("approve".into(), b"1".to_vec())]),
+        };
+        let decision = evaluate(
+            &executor,
+            &BASE64_STANDARD.encode(b"wasm"),
+            Ok(HashMap::new()),
+        );
+        assert!(matches!(decision, GateDecision::Approved));
+    }
+
+    #[test]
+    fn denies_when_approve_mutation_missing() {
+        let executor = StubExecutor {
+            mutations: Ok(vec![("other".into(), b"1".to_vec())]),
+        };
+        let decision = evaluate(
+            &executor,
+            &BASE64_STANDARD.encode(b"wasm"),
+            Ok(HashMap::new()),
+        );
+        assert!(matches!(
+            decision,
+            GateDecision::Denied {
+                reason: GateDenial::MissingApproval
+            }
+        ));
+    }
+
+    #[test]
+    fn denies_invalid_base64_payload() {
+        let executor = StubExecutor {
+            mutations: Ok(Vec::new()),
+        };
+        let decision = evaluate(&executor, "not-base64", Ok(HashMap::new()));
+        assert!(matches!(
+            decision,
+            GateDecision::Denied {
+                reason: GateDenial::InvalidPayload(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn denies_state_preparation_failure() {
+        let executor = StubExecutor {
+            mutations: Ok(Vec::new()),
+        };
+        let decision = evaluate(
+            &executor,
+            &BASE64_STANDARD.encode(b"wasm"),
+            Err("offer serialization failed".into()),
+        );
+        assert!(matches!(
+            decision,
+            GateDecision::Denied {
+                reason: GateDenial::StatePreparation(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn denies_execution_failure() {
+        let executor = StubExecutor {
+            mutations: Err("gas exhausted".into()),
+        };
+        let decision = evaluate(
+            &executor,
+            &BASE64_STANDARD.encode(b"wasm"),
+            Ok(HashMap::new()),
+        );
+        assert!(matches!(
+            decision,
+            GateDecision::Denied {
+                reason: GateDenial::Execution(_)
+            }
+        ));
+    }
+
+    #[test]
+    fn gate_denial_display_formats_all_variants() {
+        assert_eq!(
+            GateDenial::InvalidPayload("bad".into()).to_string(),
+            "invalid payload: bad"
+        );
+        assert_eq!(
+            GateDenial::StatePreparation("sp".into()).to_string(),
+            "state preparation failed: sp"
+        );
+        assert_eq!(
+            GateDenial::Execution("ex".into()).to_string(),
+            "execution failed: ex"
+        );
+        assert_eq!(
+            GateDenial::MissingApproval.to_string(),
+            "approval mutation missing"
+        );
+    }
+}

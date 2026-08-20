@@ -211,6 +211,23 @@ mod tests {
     }
 
     #[test]
+    fn test_wrong_length_public_key_returns_invalid_public_key() {
+        let identity = Identity::generate("node-1");
+        let mut signed_tx = identity.sign_transaction(sample_tx()).unwrap();
+        // ed25519 verifying keys are always 32 bytes; a different length must
+        // fail key parsing and surface as InvalidPublicKey (not VerificationFailed).
+        signed_tx.signer_public_key = vec![0u8; 31];
+
+        let err = signed_tx
+            .verify()
+            .expect_err("a non-32-byte public key must be rejected as invalid");
+        assert!(
+            matches!(err, IdentityError::InvalidPublicKey),
+            "expected InvalidPublicKey, got {err}"
+        );
+    }
+
+    #[test]
     fn test_public_key_hex_is_64_chars() {
         let identity = Identity::generate("test");
         assert_eq!(identity.public_key_hex().len(), 64);

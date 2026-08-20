@@ -814,4 +814,268 @@ mod tests {
         );
         assert!(row.contains("100"), "trust_score must appear in the row");
     }
+
+    // ── Test 9: flatten_transaction returns Deserialization on malformed payload ──
+
+    #[test]
+    fn test_flatten_transaction_deserialization_error() {
+        let tx = IndexedTransaction {
+            id: "tx-bad".to_owned(),
+            block_index: 1,
+            timestamp: 1_700_000_000,
+            kind: "AssetRegistration".to_owned(),
+            payload_json: "{not valid json".to_owned(),
+        };
+        let err = AnalyticalFlattener::flatten_transaction(&tx, 1, "abc123", 1_700_000_000)
+            .expect_err("malformed payload should fail to deserialize");
+        assert!(
+            matches!(err, FlattenerError::Deserialization(_)),
+            "expected Deserialization, got {err:?}"
+        );
+    }
+
+    // ── Test 10: ingest_indexed_block warns and skips a malformed AssetRegistration ──
+
+    #[test]
+    fn test_ingest_indexed_block_skips_malformed_asset() {
+        let mut flattener = AnalyticalFlattener::new();
+        let block = make_block();
+
+        let good = make_asset_tx(full_asset(), "manufacture", "tx-good");
+        let malformed = IndexedTransaction {
+            id: "tx-malformed".to_owned(),
+            block_index: 1,
+            timestamp: 1_700_000_000,
+            kind: "AssetRegistration".to_owned(),
+            payload_json: "{oops".to_owned(),
+        };
+
+        flattener.ingest_indexed_block(&block, &[good, malformed]);
+
+        assert_eq!(
+            flattener.records().len(),
+            1,
+            "malformed AssetRegistration must be skipped"
+        );
+        assert_eq!(flattener.records()[0].transaction_id, "tx-good");
+    }
+
+    // ── Test 11: records_by_custodian filters by custodian_id ──
+
+    #[test]
+    fn test_records_by_custodian() {
+        let mut flattener = AnalyticalFlattener::new();
+        let block = make_block();
+
+        let mut a1 = full_asset();
+        a1.custodian_id = "fab-a".into();
+        let mut a2 = full_asset();
+        a2.custodian_id = "fab-b".into();
+        let mut a3 = full_asset();
+        a3.custodian_id = "fab-a".into();
+
+        flattener.ingest_indexed_block(
+            &block,
+            &[
+                make_asset_tx(a1, "manufacture", "tx-1"),
+                make_asset_tx(a2, "manufacture", "tx-2"),
+                make_asset_tx(a3, "dispatch", "tx-3"),
+            ],
+        );
+
+        let fab_a = flattener.records_by_custodian("fab-a");
+        assert_eq!(fab_a.len(), 2);
+        assert!(fab_a.iter().all(|r| r.custodian_id == "fab-a"));
+
+        let fab_b = flattener.records_by_custodian("fab-b");
+        assert_eq!(fab_b.len(), 1);
+
+        assert!(flattener.records_by_custodian("none").is_empty());
+    }
+
+    // ── Test 12: records_by_batch filters by batch_number ──
+
+    #[test]
+    fn test_records_by_batch() {
+        let mut flattener = AnalyticalFlattener::new();
+        let block = make_block();
+
+        let mut a1 = full_asset();
+        a1.batch_number = Some("BATCH-A".into());
+        let mut a2 = full_asset();
+        a2.batch_number = Some("BATCH-B".into());
+        let mut a3 = full_asset();
+        a3.batch_number = Some("BATCH-A".into());
+
+        flattener.ingest_indexed_block(
+            &block,
+            &[
+                make_asset_tx(a1, "manufacture", "tx-1"),
+                make_asset_tx(a2, "manufacture", "tx-2"),
+                make_asset_tx(a3, "dispatch", "tx-3"),
+            ],
+        );
+
+        let batch_a = flattener.records_by_batch("BATCH-A");
+        assert_eq!(batch_a.len(), 2);
+        assert!(batch_a
+            .iter()
+            .all(|r| r.batch_number.as_deref() == Some("BATCH-A")));
+
+        let batch_b = flattener.records_by_batch("BATCH-B");
+        assert_eq!(batch_b.len(), 1);
+
+        assert!(flattener.records_by_batch("NOPE").is_empty());
+    }
+
+    // ── Test 13: to_csv_row RFC 4180 quotes commas, quotes, and newlines ──
+
+    #[test]
+    fn test_to_csv_row_quotes_special_characters() {
+        let tx = make_asset_tx(full_asset(), "manufacture", "tx-csv");
+        let mut record =
+            AnalyticalFlattener::flatten_transaction(&tx, 1, "abc123def456", 1_700_000_000)
+                .unwrap();
+        record.missing_core_fields = "a,b\"c\nd".into();
+
+        let row = AnalyticalFlattener::to_csv_row(&record);
+
+        // RFC 4180: a value containing comma, quote and newline is wrapped in
+        // double-quotes and internal double-quotes are doubled.
+        assert!(row.contains("\"a,b\"\"c\nd\""));
+    }
+
+    // ── Test 14: VerifiableLineage::build — SN full path with average trust ──
+
+    #[test]
+    fn test_verifiable_lineage_sn_full_path() {
+        let mut flattener = AnalyticalFlattener::new();
+        let block = make_block();
+        let mut low = minimal_asset();
+        low.gtin = Some("07891234100016".into());
+        let full_score = MetadataTrustScore::compute(&full_asset()).score;
+        let low_score = MetadataTrustScore::compute(&low).score;
+        flattener.ingest_indexed_block(
+            &block,
+            &[
+                make_asset_tx(full_asset(), "manufacture", "tx-001"),
+                make_asset_tx(low, "dispatch", "tx-002"),
+            ],
+        );
+
+        let mut provenance = ProvenanceIndex::new();
+        for (i, ev) in ["manufacture", "dispatch"].into_iter().enumerate() {
+            provenance.record_event(CustodyEvent {
+                asset_id: "GTIN:07891234100016:SN:SN-001".into(),
+                event_type: ev.to_string(),
+                custodian_id: "node-1".into(),
+                transaction_id: format!("ct-{i}"),
+                block_index: 1,
+                timestamp: 1_700_000_000 + i as u64,
+            });
+        }
+
+        let lineage =
+            VerifiableLineage::build("GTIN:07891234100016:SN:SN-001", &provenance, &flattener);
+
+        assert_eq!(lineage.flat_records.len(), 2, "records matched by GTIN");
+        assert!(lineage.is_complete, "custody events == flat records");
+        let expected_avg = f64::from(full_score).midpoint(f64::from(low_score));
+        assert!(
+            (lineage.trust_score_avg - expected_avg).abs() < f64::EPSILON,
+            "expected avg {expected_avg}, got {}",
+            lineage.trust_score_avg
+        );
+        assert!(lineage.trust_score_avg > 0.0 && lineage.trust_score_avg < 100.0);
+    }
+
+    // ── Test 15: VerifiableLineage::build — :BATCH: format extracts GTIN ──
+
+    #[test]
+    fn test_verifiable_lineage_batch_format() {
+        let mut flattener = AnalyticalFlattener::new();
+        let block = make_block();
+        flattener.ingest_indexed_block(
+            &block,
+            &[make_asset_tx(full_asset(), "manufacture", "tx-001")],
+        );
+
+        let provenance = ProvenanceIndex::new();
+        let lineage = VerifiableLineage::build(
+            "GTIN:07891234100016:BATCH:BATCH-001",
+            &provenance,
+            &flattener,
+        );
+        assert_eq!(
+            lineage.flat_records.len(),
+            1,
+            ":BATCH: format extracts GTIN"
+        );
+        assert!(!lineage.is_complete, "no custody events recorded");
+    }
+
+    // ── Test 16: VerifiableLineage::build — bare GTIN fallback ──
+
+    #[test]
+    fn test_verifiable_lineage_gtin_only() {
+        let mut flattener = AnalyticalFlattener::new();
+        let block = make_block();
+        flattener.ingest_indexed_block(
+            &block,
+            &[make_asset_tx(full_asset(), "manufacture", "tx-001")],
+        );
+
+        let mut provenance = ProvenanceIndex::new();
+        provenance.record_event(CustodyEvent {
+            asset_id: "GTIN:07891234100016".into(),
+            event_type: "manufacture".into(),
+            custodian_id: "node-1".into(),
+            transaction_id: "ct-1".into(),
+            block_index: 1,
+            timestamp: 1_700_000_000,
+        });
+
+        let lineage = VerifiableLineage::build("GTIN:07891234100016", &provenance, &flattener);
+        assert_eq!(lineage.flat_records.len(), 1, "bare GTIN matches records");
+        assert!(lineage.is_complete);
+        assert!(
+            (lineage.trust_score_avg - 100.0).abs() < f64::EPSILON,
+            "expected avg 100.0, got {}",
+            lineage.trust_score_avg
+        );
+    }
+
+    // ── Test 17: VerifiableLineage::build — non-GTIN id, incomplete, zero avg ──
+
+    #[test]
+    fn test_verifiable_lineage_unknown_format_empty_avg() {
+        let mut flattener = AnalyticalFlattener::new();
+        let block = make_block();
+        flattener.ingest_indexed_block(
+            &block,
+            &[make_asset_tx(full_asset(), "manufacture", "tx-001")],
+        );
+
+        let mut provenance = ProvenanceIndex::new();
+        provenance.record_event(CustodyEvent {
+            asset_id: "PRODUCT:Drug A".into(),
+            event_type: "manufacture".into(),
+            custodian_id: "node-1".into(),
+            transaction_id: "ct-1".into(),
+            block_index: 1,
+            timestamp: 1_700_000_000,
+        });
+
+        let lineage = VerifiableLineage::build("PRODUCT:Drug A", &provenance, &flattener);
+        assert!(
+            lineage.flat_records.is_empty(),
+            "non-GTIN id matches no records"
+        );
+        assert!(!lineage.is_complete, "custody event without a flat record");
+        assert!(
+            lineage.trust_score_avg.abs() < f64::EPSILON,
+            "expected avg 0.0, got {}",
+            lineage.trust_score_avg
+        );
+    }
 }

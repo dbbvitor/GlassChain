@@ -269,4 +269,59 @@ mod tests {
         });
         assert_eq!(idx.tracked_assets().len(), 2);
     }
+
+    #[test]
+    fn test_verify_lineage_missing_event_after_length_guard() {
+        let mut idx = ProvenanceIndex::new();
+        for ev in ["manufacture", "receive"] {
+            idx.record_event(CustodyEvent {
+                asset_id: "A:001".into(),
+                event_type: ev.into(),
+                custodian_id: "node".into(),
+                transaction_id: format!("tx-{ev}"),
+                block_index: 1,
+                timestamp: 1000,
+            });
+        }
+        // Chain length (2) passes the guard, but "dispatch" is absent.
+        assert!(!idx.verify_lineage("A:001", &["manufacture", "dispatch"]));
+    }
+
+    #[test]
+    fn test_verify_lineage_out_of_order_events() {
+        let mut idx = ProvenanceIndex::new();
+        for ev in ["dispatch", "manufacture"] {
+            idx.record_event(CustodyEvent {
+                asset_id: "A:001".into(),
+                event_type: ev.into(),
+                custodian_id: "node".into(),
+                transaction_id: format!("tx-{ev}"),
+                block_index: 1,
+                timestamp: 1000,
+            });
+        }
+        assert!(!idx.verify_lineage("A:001", &["manufacture", "dispatch"]));
+    }
+
+    #[test]
+    fn test_asset_id_for_batch_bare_and_product_fallback() {
+        // GTIN + batch only → batch-level id.
+        let mut batch_asset = asset("07891234100016", "SN", "node-1");
+        batch_asset.serial_number = None;
+        assert_eq!(
+            asset_id_for(&batch_asset),
+            "GTIN:07891234100016:BATCH:BATCH-001"
+        );
+
+        // GTIN with neither serial nor batch → bare GTIN id.
+        let mut bare_asset = asset("07891234100016", "SN", "node-1");
+        bare_asset.serial_number = None;
+        bare_asset.batch_number = None;
+        assert_eq!(asset_id_for(&bare_asset), "GTIN:07891234100016");
+
+        // No GTIN → PRODUCT fallback.
+        let mut product_asset = asset("07891234100016", "SN", "node-1");
+        product_asset.gtin = None;
+        assert_eq!(asset_id_for(&product_asset), "PRODUCT:Drug A");
+    }
 }
