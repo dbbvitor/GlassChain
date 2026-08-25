@@ -91,9 +91,9 @@ allow-print-in-tests = true
 # every improvement opportunity and can choose when to act on it.
 avoid-breaking-exported-api = false
 
-# These duplicate transitive versions come from independent platform,
-# networking, and cryptographic dependency trees; direct dependency versions
-# cannot unify them.
+# Keep only duplicates Clippy reports for the locked workspace graph. The VM's
+# Wasmtime dependency opts out of unused default feature trees, so its cache and
+# component-model duplicates do not need exceptions.
 allowed-duplicate-crates = [
     "base64",
     "bitflags",
@@ -104,27 +104,25 @@ allowed-duplicate-crates = [
     "getrandom",
     "hashbrown",
     "hashlink",
-    "thiserror",
-    "thiserror-impl",
-    "wasm-encoder",
-    "wasmparser",
-    "windows-sys",
-    "wit-bindgen",
-    "wit-parser",
-    "winnow",
     "itertools",
     "parking_lot",
     "parking_lot_core",
-    "redox_syscall",
     "r-efi",
     "rand",
     "rand_chacha",
     "rand_core",
     "rcgen",
+    "redox_syscall",
     "socket2",
     "spki",
     "syn",
+    "thiserror",
+    "thiserror-impl",
     "unsigned-varint",
+    "wasm-encoder",
+    "wasmparser",
+    "windows-sys",
+    "wit-bindgen",
     "x509-parser",
     "yamux",
 ]
