@@ -91,11 +91,14 @@ allow-print-in-tests = true
 # every improvement opportunity and can choose when to act on it.
 avoid-breaking-exported-api = false
 
-# These duplicate transitive versions come from independent platform and
-# networking dependency trees; direct dependency versions cannot unify them.
+# These duplicate transitive versions come from independent platform,
+# networking, and cryptographic dependency trees; direct dependency versions
+# cannot unify them.
 allowed-duplicate-crates = [
     "base64",
     "bitflags",
+    "const-oid",
+    "der",
     "embedded-io",
     "foldhash",
     "getrandom",
@@ -119,6 +122,7 @@ allowed-duplicate-crates = [
     "rand_core",
     "rcgen",
     "socket2",
+    "spki",
     "syn",
     "unsigned-varint",
     "x509-parser",
