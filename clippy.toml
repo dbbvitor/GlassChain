@@ -94,6 +94,20 @@ avoid-breaking-exported-api = false
 # These duplicate transitive versions come from independent platform and
 # networking dependency trees; direct dependency versions cannot unify them.
 allowed-duplicate-crates = [
+    "block-buffer",
+    "const-oid",
+    "cpufeatures",
+    "crypto-common",
+    "curve25519-dalek",
+    "der",
+    "digest",
+    "ed25519",
+    "ed25519-dalek",
+    "fiat-crypto",
+    "pkcs8",
+    "sha2",
+    "signature",
+    "spki",
     "bitflags",
     "embedded-io",
     "foldhash",
