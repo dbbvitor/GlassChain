@@ -11,14 +11,20 @@ categories = ["network-programming", "asynchronous", "cryptography"]
 
 [dependencies]
 glasschain-core = { path = "../glasschain-core" }
-wasmtime = "47.0.3"
+# Only core modules, fuel, and WAT parsing are used; avoid unused Wasmtime
+# component, cache, profiling, and other default feature dependency trees.
+wasmtime = {
+    version = "47.0.3",
+    default-features = false,
+    features = ["cranelift", "runtime", "wat"],
+}
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 log = "0.4"
 
 [dev-dependencies]
-wat = "1.247"
+wat = "1.256"
 criterion = "0.8"
 
 [[bench]]

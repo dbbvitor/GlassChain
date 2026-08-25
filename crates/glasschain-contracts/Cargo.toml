@@ -19,7 +19,7 @@ base64     = "0.23"
 
 [dev-dependencies]
 env_logger = "0.11"
-wat = "1.247"
+wat = "1.256"
 glasschain-vm = { path = "../glasschain-vm" }
 criterion  = "0.8"
 
