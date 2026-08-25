@@ -224,8 +224,8 @@ impl CertChainVerifier {
         // compared directly with the Issuer DN bytes inside peer certificates.
         let mut root_subject_der = Vec::new();
         root_cert
-            .tbs_certificate
-            .subject
+            .tbs_certificate()
+            .subject()
             .encode_to_vec(&mut root_subject_der)
             .map_err(|e| CertVerificationError::ParseError(e.to_string()))?;
 
@@ -276,13 +276,13 @@ impl CertChainVerifier {
         // ── 2. Issuer DN must match Root CA Subject DN ───────────────────────
         let mut peer_issuer_der = Vec::new();
         peer_cert
-            .tbs_certificate
-            .issuer
+            .tbs_certificate()
+            .issuer()
             .encode_to_vec(&mut peer_issuer_der)
             .map_err(|e| CertVerificationError::ParseError(e.to_string()))?;
 
         if peer_issuer_der != self.root_subject_der {
-            let actual_issuer = format!("{:?}", peer_cert.tbs_certificate.issuer);
+            let actual_issuer = format!("{:?}", peer_cert.tbs_certificate().issuer());
             return Err(CertVerificationError::IssuerMismatch {
                 expected_org: self.org_name.clone(),
                 actual_issuer,
@@ -295,9 +295,9 @@ impl CertChainVerifier {
             .unwrap_or_default()
             .as_secs();
 
-        let validity = &peer_cert.tbs_certificate.validity;
+        let validity = peer_cert.tbs_certificate().validity();
 
-        // Time is Copy and exposes to_unix_duration(self) directly in x509-cert 0.2.
+        // Time is Copy and exposes to_unix_duration(self) directly in x509-cert 0.3.
         let not_before = validity.not_before.to_unix_duration().as_secs();
         let not_after = validity.not_after.to_unix_duration().as_secs();
 
