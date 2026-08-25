@@ -3,7 +3,7 @@
 use crate::error::IdentityError;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use glasschain_core::Transaction;
-use rand_core::OsRng;
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
 /// An on-ledger participant identity, consisting of an ed25519 key pair and a
@@ -35,8 +35,9 @@ impl Clone for Identity {
 impl Identity {
     /// Generate a fresh identity with a randomly-generated ed25519 key pair.
     pub fn generate(node_id: impl Into<String>) -> Self {
-        let mut rng = OsRng;
-        let signing_key = SigningKey::generate(&mut rng);
+        let mut seed = [0_u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let signing_key = SigningKey::from_bytes(&seed);
         Self {
             node_id: node_id.into(),
             signing_key,
