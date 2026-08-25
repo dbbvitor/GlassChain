@@ -95,6 +95,7 @@ avoid-breaking-exported-api = false
 # networking, and cryptographic dependency trees; direct dependency versions
 # cannot unify them.
 allowed-duplicate-crates = [
+    "base64",
     "bitflags",
     "const-oid",
     "der",
