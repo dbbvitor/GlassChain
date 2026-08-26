@@ -35,6 +35,7 @@ fn build_transaction_protos(block: &glasschain_core::Block) -> Vec<TransactionPr
                 TransactionKind::InventoryUpdate(_) => "InventoryUpdate",
                 TransactionKind::AssetRegistration(_) => "AssetRegistration",
                 TransactionKind::CanonicalRecord(_) => "CanonicalRecord",
+                TransactionKind::CapabilityActivation(_) => "CapabilityActivation",
             };
             TransactionProto {
                 id: tx.id.clone(),

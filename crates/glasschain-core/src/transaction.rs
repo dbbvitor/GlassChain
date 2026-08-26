@@ -1,5 +1,6 @@
 use crate::asset::TraceableAsset;
 use crate::canonical::CanonicalRecord;
+use crate::capability::CapabilityActivation;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -153,6 +154,9 @@ pub enum TransactionKind {
     /// network-wide registry, including certification, audit, and
     /// state-commitment anchors.
     CanonicalRecord(CanonicalRecord),
+    /// Capability activation control-plane record (ADR-010): activates a
+    /// capability at a future height.
+    CapabilityActivation(CapabilityActivation),
 }
 
 /// A single ledger entry.

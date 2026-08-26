@@ -4,9 +4,9 @@ use crate::protocol::{Message, PROTOCOL_VERSION};
 use glasschain_contracts::{ContractEngine, InventoryTrigger, WatcherService};
 use glasschain_core::crypto::sha256;
 use glasschain_core::providers::in_memory::InMemoryStorageProvider;
-use glasschain_core::validate_block_records;
 use glasschain_core::{
-    Block, ExecutionProvider, Ledger, StorageProvider, Transaction, TransactionKind,
+    Block, CapabilityAdvertisement, CapabilityHistory, ExecutionProvider, Ledger, StorageProvider,
+    Transaction, TransactionKind, CAPABILITY_V1,
 };
 use glasschain_identity::CertChainVerifier;
 use glasschain_identity::Identity;
@@ -155,6 +155,31 @@ struct NodeState {
     identity: Option<Arc<Identity>>,
 }
 
+impl NodeState {
+    /// Write channels of peers that support the `active` capability set;
+    /// read-only observers are excluded from active-write relay (ADR-010
+    /// decision 6).
+    fn relay_targets(&self, active: &glasschain_core::CapabilitySet) -> Vec<Sender<Message>> {
+        self.peer_senders
+            .iter()
+            .filter(|(addr, _)| !self.peer_registry.is_read_only(addr, active))
+            .map(|(_, sender)| sender.clone())
+            .collect()
+    }
+}
+
+/// The capability set effective at the local chain tip (ADR-010 decision 5).
+async fn active_set_at_tip(ledger: &Arc<Mutex<Ledger>>) -> glasschain_core::CapabilitySet {
+    let ledger_guard = ledger.lock().await;
+    match CapabilityHistory::build_from_blocks(&ledger_guard.chain) {
+        Ok(history) => history.effective_set(ledger_guard.chain.len().saturating_sub(1) as u64),
+        Err(e) => {
+            log::warn!("Capability history invalid; using genesis set for admission: {e}");
+            glasschain_core::CapabilitySet::genesis()
+        }
+    }
+}
+
 // ── TOFU Peer Registry ───────────────────────────────────────────────────────
 
 /// A verified peer identity recorded on first contact (Trust On First Use).
@@ -162,6 +187,25 @@ struct NodeState {
 struct VerifiedPeer {
     node_id: String,
     cert_fingerprint: String,
+    /// Capabilities the peer advertised in its most recent `Hello`.
+    advertised: Vec<CapabilityAdvertisement>,
+}
+
+impl VerifiedPeer {
+    /// `true` when the peer supports every capability in `set`, matching
+    /// `(id, version)`. A peer that cannot support an active capability may
+    /// parse and validate history but not propose, vote, or relay active
+    /// writes (ADR-010 decision 6).
+    fn supports(&self, set: &glasschain_core::CapabilitySet) -> bool {
+        CAPABILITY_V1.iter().all(|c| {
+            let Some((active_version, _)) = set.active_version(c.id) else {
+                return true;
+            };
+            self.advertised
+                .iter()
+                .any(|advert| advert.id == c.id && advert.version == active_version)
+        })
+    }
 }
 
 /// Stable peer identity store using a TOFU (Trust On First Use) model.
@@ -214,10 +258,26 @@ impl PeerRegistry {
                 VerifiedPeer {
                     node_id: node_id.to_owned(),
                     cert_fingerprint: cert_fingerprint.to_owned(),
+                    advertised: Vec::new(),
                 },
             );
             Ok(true)
         }
+    }
+
+    /// Record the capabilities a peer advertised in its latest `Hello`.
+    fn set_advertised(&mut self, listen_addr: &str, advertised: Vec<CapabilityAdvertisement>) {
+        if let Some(peer) = self.peers.get_mut(listen_addr) {
+            peer.advertised = advertised;
+        }
+    }
+
+    /// `true` when the peer at `listen_addr` cannot support `set` and is
+    /// therefore a read-only observer.
+    fn is_read_only(&self, listen_addr: &str, set: &glasschain_core::CapabilitySet) -> bool {
+        self.peers
+            .get(listen_addr)
+            .is_none_or(|peer| !peer.supports(set))
     }
 }
 
@@ -893,15 +953,19 @@ impl Node {
     }
 
     /// Broadcast a message to all connected peers via their persistent write channels.
+    ///
+    /// Transaction relays skip read-only observers: they may parse and
+    /// validate history, but not participate in relaying active writes
+    /// (ADR-010 decision 6). Blocks and sync traffic still reach them.
     async fn broadcast(&self, message: Message) {
         let senders: Vec<Sender<Message>> = {
-            self.state
-                .lock()
-                .await
-                .peer_senders
-                .values()
-                .cloned()
-                .collect()
+            let s = self.state.lock().await;
+            if matches!(message, Message::Transaction(_)) {
+                let active = active_set_at_tip(&self.ledger).await;
+                s.relay_targets(&active)
+            } else {
+                s.peer_senders.values().cloned().collect()
+            }
         };
         for sender in senders {
             match sender.try_send(message.clone()) {
@@ -1083,6 +1147,13 @@ async fn handle_peer(
         tls_cert_fingerprint: ctx.local_tls_cert_fingerprint.clone(),
         chain_length,
         version: PROTOCOL_VERSION.to_owned(),
+        capabilities: CAPABILITY_V1
+            .iter()
+            .map(|c| CapabilityAdvertisement {
+                id: c.id.to_owned(),
+                version: c.version,
+            })
+            .collect(),
         listen_addr: ctx.listen_addr.clone(),
     };
     if write_tx.try_send(hello).is_err() {
@@ -1281,11 +1352,26 @@ async fn process_message(
             tls_cert_fingerprint,
             chain_length,
             listen_addr: peer_listen_addr,
-            ..
+            version,
+            capabilities,
         } => {
             log::info!(
                 "Hello from {addr} (id={peer_id}, chain_len={chain_length}, listen={peer_listen_addr})"
             );
+
+            // ── Step 0: wire-encoding compatibility gate (ADR-010 decision 6) ──
+            // PROTOCOL_VERSION is a wire-encoding gate, separate from ledger
+            // capabilities; incompatible peers are rejected.
+            if version != PROTOCOL_VERSION {
+                log::warn!(
+                    "Rejecting peer {peer_id} at {addr}: protocol version '{version}' \
+                     is incompatible with '{PROTOCOL_VERSION}'"
+                );
+                return MessageEffect {
+                    disconnect: true,
+                    ..Default::default()
+                };
+            }
 
             // Detect self-connections by comparing the peer's advertised TLS
             // fingerprint against our own local certificate fingerprint.
@@ -1374,7 +1460,15 @@ async fn process_message(
                     );
                 }
 
-                // ── Step 4: register live connection state ────────────
+                // ── Step 4: record advertised capabilities ──────────────
+                // Read-only status is not cached here: it is evaluated at
+                // each proposal/relay against the capability set effective at
+                // the current tip, so a peer that predates an activation loses
+                // write rights the moment the activation takes effect.
+                s.peer_registry
+                    .set_advertised(&peer_listen_addr, capabilities);
+
+                // ── Step 5: register live connection state ────────────
                 s.known_peers.insert(peer_listen_addr.clone());
                 s.peer_senders
                     .insert(peer_listen_addr.clone(), write_tx.clone());
@@ -1396,9 +1490,18 @@ async fn process_message(
 
         Message::Transaction(tx) => {
             // Reject messages from peers that have not completed a successful Hello.
-            if current_stable_addr.is_none() {
+            let Some(stable_addr) = current_stable_addr else {
                 log::warn!("Ignoring transaction from unauthenticated peer {addr}");
                 return MessageEffect::default();
+            };
+            // Read-only observers may not propose writes (ADR-010 decision 6).
+            {
+                let active = active_set_at_tip(&ctx.ledger).await;
+                let s = ctx.state.lock().await;
+                if s.peer_registry.is_read_only(stable_addr, &active) {
+                    log::warn!("Ignoring transaction from read-only observer {addr}");
+                    return MessageEffect::default();
+                }
             }
             let generated = {
                 let mut s = ctx.state.lock().await;
@@ -1434,14 +1537,11 @@ async fn process_message(
                 }
             }
 
-            let senders: Vec<Sender<Message>> = ctx
-                .state
-                .lock()
-                .await
-                .peer_senders
-                .values()
-                .cloned()
-                .collect();
+            let senders: Vec<Sender<Message>> = {
+                let active = active_set_at_tip(&ctx.ledger).await;
+                let s = ctx.state.lock().await;
+                s.relay_targets(&active)
+            };
             for gen_tx in generated {
                 for s in &senders {
                     let _ = s.try_send(Message::Transaction(gen_tx.clone()));
@@ -1452,9 +1552,18 @@ async fn process_message(
 
         Message::Block(block) => {
             // Reject messages from peers that have not completed a successful Hello.
-            if current_stable_addr.is_none() {
+            let Some(stable_addr) = current_stable_addr else {
                 log::warn!("Ignoring block from unauthenticated peer {addr}");
                 return MessageEffect::default();
+            };
+            // Read-only observers may not propose blocks (ADR-010 decision 6).
+            {
+                let active = active_set_at_tip(&ctx.ledger).await;
+                let s = ctx.state.lock().await;
+                if s.peer_registry.is_read_only(stable_addr, &active) {
+                    log::warn!("Ignoring block from read-only observer {addr}");
+                    return MessageEffect::default();
+                }
             }
             // Reject blocks with implausible timestamps (> 2 hours in the future).
             // Block 0 (genesis) uses timestamp 0 by design and is exempt.
@@ -1480,7 +1589,9 @@ async fn process_message(
                     l.chain.last().map_or((false, false), |prev| {
                         let valid = block.chains_to(prev).is_ok()
                             && block.has_valid_pow(diff)
-                            && validate_block_records(&block).is_ok();
+                            && CapabilityHistory::build_from_blocks(&l.chain)
+                                .and_then(|mut history| history.validate_block(&block))
+                                .is_ok();
                         (valid, false)
                     })
                 } else {
@@ -1521,14 +1632,11 @@ async fn process_message(
                     hash: block.hash.clone(),
                 });
 
-                let senders: Vec<Sender<Message>> = ctx
-                    .state
-                    .lock()
-                    .await
-                    .peer_senders
-                    .values()
-                    .cloned()
-                    .collect();
+                let senders: Vec<Sender<Message>> = {
+                    let active = active_set_at_tip(&ctx.ledger).await;
+                    let s = ctx.state.lock().await;
+                    s.relay_targets(&active)
+                };
                 for tx in generated {
                     for s in &senders {
                         let _ = s.try_send(Message::Transaction(tx.clone()));

@@ -98,6 +98,13 @@ async fn send_hello(writer: &mut PeerWriter, node_id: &str, listen_addr: &str, f
         tls_cert_fingerprint: fingerprint.to_owned(),
         chain_length: 1,
         version: PROTOCOL_VERSION.to_owned(),
+        capabilities: glasschain_core::CAPABILITY_V1
+            .iter()
+            .map(|c| glasschain_core::CapabilityAdvertisement {
+                id: c.id.to_owned(),
+                version: c.version,
+            })
+            .collect(),
         listen_addr: listen_addr.to_owned(),
     };
     writer.send(&msg).await.unwrap();

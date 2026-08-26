@@ -149,7 +149,10 @@ Current trust model:
 
 Message types:
 
-- `Hello`
+- `Hello` — advertises the wire `version` (mismatches are disconnected) and the
+  capabilities the peer supports. A peer lacking an active capability is
+  treated as a read-only observer: it can parse and validate history but may
+  not propose, vote, or relay active writes.
 - `Transaction`
 - `Block`
 - `RequestChain`

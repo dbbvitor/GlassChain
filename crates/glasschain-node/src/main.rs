@@ -772,6 +772,7 @@ async fn main() {
                         TransactionKind::InventoryUpdate(_) => "InventoryUpdate",
                         TransactionKind::AssetRegistration(_) => "AssetRegistration",
                         TransactionKind::CanonicalRecord(_) => "CanonicalRecord",
+                        TransactionKind::CapabilityActivation(_) => "CapabilityActivation",
                     };
                     println!("  {} [{}]", tx.id, kind);
                 }

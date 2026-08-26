@@ -1,4 +1,4 @@
-use glasschain_core::{Block, Transaction};
+use glasschain_core::{Block, CapabilityAdvertisement, Transaction};
 use serde::{Deserialize, Serialize};
 
 /// Maximum wire-frame size accepted (16 MiB).
@@ -28,6 +28,10 @@ pub enum Message {
         chain_length: u64,
         /// Protocol version string (e.g. `"glasschain/1"`).
         version: String,
+        /// Capabilities this peer supports (ADR-010 decision 6). Peers lacking
+        /// an active capability are treated as read-only observers.
+        #[serde(default)]
+        capabilities: Vec<CapabilityAdvertisement>,
         /// The sender's stable TCP listening address (e.g. `"192.168.1.5:8000"`).
         ///
         /// Peers must use this address (rather than the TCP source address, which

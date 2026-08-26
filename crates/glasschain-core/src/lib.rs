@@ -1,6 +1,7 @@
 pub mod asset;
 pub mod block;
 pub mod canonical;
+pub mod capability;
 pub mod crypto;
 pub mod error;
 pub mod ledger;
@@ -16,8 +17,13 @@ pub use canonical::{
     ExtensionFieldType, ExtensionValue, NamespaceDescriptor, RecordSignature, Registry,
     SchemaDescriptor, SchemaEntry, CORE_FIELD_NAMES, NAMESPACE_V1, SCHEMA_V1, SCHEMA_VERSION_V1,
 };
+pub use capability::{
+    capability_hash, lookup_capability, validate_record_under, CapabilityActivation,
+    CapabilityAdvertisement, CapabilityDescriptor, CapabilityHistory, CapabilitySet, CAPABILITY_V1,
+    GENESIS_CAPABILITIES, STATE_COMMITMENT_CAPABILITY_ID,
+};
 pub use error::{CoreError, GasMeter};
-pub use ledger::{validate_block_records, Ledger, DEFAULT_DIFFICULTY};
+pub use ledger::{Ledger, DEFAULT_DIFFICULTY};
 pub use providers::{
     ConsensusProvider, ExecutionLimits, ExecutionProvider, NetworkProvider, PowConsensusProvider,
     StorageProvider,
