@@ -200,15 +200,29 @@ pub trait ExecutionProvider: Send + Sync {
         contract_id: &str,
         payload: &[u8],
         limits: ExecutionLimits,
-    ) -> Result<Vec<(String, Vec<u8>)>, CoreError>;
+    ) -> Result<ExecutionResult, CoreError>;
 
     fn name(&self) -> &str;
 }
 ```
 
+`ExecutionResult` (in `glasschain-core::write_set`) separates the two output
+kinds (ADR-007):
+
+- `ephemeral: Vec<(String, Vec<u8>)>` — invocation-local output (`set_state`
+  semantics); approval gates read `approve` from here and persist nothing;
+- `writes: Vec<PersistentWrite>` — explicit persistent set/delete operations
+  carrying `channel`, `contract`, `key`, `op` (`Set`/`Delete`), and
+  `visibility` (`Public` or `Pdc(name)`).
+
+Providers that only produce legacy ephemeral pairs can convert with
+`Vec::<(String, Vec<u8>)>::into()`. `ExecutionResult::canonicalize()` validates
+scope non-emptiness and rejects duplicate scoped keys, returning a
+deterministically sorted copy for committed-block inclusion (ticket #41).
+
 ### Built-in implementation
 
-`WasmExecutionProvider` (crate `glasschain-vm`) — Wasmtime with independent instruction-fuel and host-operation gas budgets. The existing mutation result is unchanged; budget exhaustion identifies which meter failed.
+`WasmExecutionProvider` (crate `glasschain-vm`) — Wasmtime with independent instruction-fuel and host-operation gas budgets. `set_state` remains ephemeral; the separate `env::persist_state` host operation produces scoped persistent writes. Budget exhaustion identifies which meter failed.
 
 ### Contract module interface
 
@@ -219,6 +233,13 @@ WASM contracts must export an `execute` function and a `memory` export:
   (import "env" "set_state"     (func $set_state     (param i32 i32 i32 i32)))
   (import "env" "get_state_len" (func $get_state_len (param i32 i32) (result i32)))
   (import "env" "get_state"     (func $get_state     (param i32 i32 i32 i32) (result i32)))
+  ;; persist_state(channel_ptr, channel_len, contract_ptr, contract_len,
+  ;;               key_ptr, key_len, val_ptr, val_len, op, visibility,
+  ;;               pdc_ptr, pdc_len) -> i32
+  ;; op: 0 = set, 1 = delete; visibility: 0 = public, 1 = named PDC.
+  ;; Returns 0 on success; -1 unknown op, -2 unknown visibility,
+  ;; -3 empty PDC name, -4 malformed pointers.
+  (import "env" "persist_state" (func $persist_state (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
   (export "execute" (func $main))
   (export "memory" (memory 0))
   ...
@@ -800,8 +821,9 @@ Each execution has two independent budgets:
 - **Operation-gas limit**: host state operations charged by `GasCounter`.
 
 Exhausting either budget returns `CoreError::GasExhausted` with a meter
-  discriminator. The execution result remains the list of state mutations; a
-  `GasReport` is a standalone type and is not returned by `ExecutionProvider`.
+  discriminator. The execution result is the typed `ExecutionResult` (ephemeral
+  output plus the persistent write set); a `GasReport` is a standalone type and
+  is not returned by `ExecutionProvider`.
 
 ```rust
 use glasschain_core::ExecutionLimits;

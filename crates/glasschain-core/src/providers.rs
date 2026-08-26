@@ -23,6 +23,7 @@
 use crate::block::Block;
 use crate::error::CoreError;
 use crate::transaction::Transaction;
+use crate::write_set::ExecutionResult;
 
 /// Abstraction over the consensus mechanism used to agree on the next block.
 ///
@@ -135,11 +136,12 @@ impl ExecutionLimits {
 ///
 /// Implementors may execute contracts as native Rust closures, WASM modules
 /// (via Wasmtime), or any other sandboxed runtime.  The execution provider
-/// receives a serialised contract payload and the current World State accessor
-/// and returns a set of state mutations to be applied atomically.
+/// receives a serialised contract payload and a world-state snapshot, and
+/// returns the typed [`ExecutionResult`]: ephemeral output separated from the
+/// explicit persistent write set (ADR-007 decision 1).
 pub trait ExecutionProvider: Send + Sync {
-    /// Execute a contract payload and return a list of (key, value) state
-    /// mutations to be committed.
+    /// Execute a contract payload and return the typed [`ExecutionResult`]:
+    /// invocation-local ephemeral output plus explicit persistent writes.
     ///
     /// `payload` is an opaque byte slice whose interpretation is provider-
     /// specific (e.g., a WASM module, a Lua script, or JSON instructions).
@@ -155,7 +157,7 @@ pub trait ExecutionProvider: Send + Sync {
         contract_id: &str,
         payload: &[u8],
         limits: ExecutionLimits,
-    ) -> Result<Vec<(String, Vec<u8>)>, CoreError>;
+    ) -> Result<ExecutionResult, CoreError>;
 
     /// Execute a contract with a pre-populated world-state snapshot.
     ///
@@ -175,7 +177,7 @@ pub trait ExecutionProvider: Send + Sync {
         payload: &[u8],
         initial_state: std::collections::HashMap<String, Vec<u8>>,
         limits: ExecutionLimits,
-    ) -> Result<Vec<(String, Vec<u8>)>, CoreError> {
+    ) -> Result<ExecutionResult, CoreError> {
         let _ = initial_state;
         self.execute(contract_id, payload, limits)
     }

@@ -83,13 +83,13 @@ impl<'a> ApprovalGate<'a> {
             }
         };
 
-        let mutations = match self.executor.execute_with_state(
+        let result = match self.executor.execute_with_state(
             execution_id,
             &wasm_bytes,
             initial_state,
             self.policy.limits(),
         ) {
-            Ok(mutations) => mutations,
+            Ok(result) => result,
             Err(error) => {
                 return GateDecision::Denied {
                     reason: GateDenial::Execution(error.to_string()),
@@ -97,7 +97,11 @@ impl<'a> ApprovalGate<'a> {
             }
         };
 
-        if mutations
+        // Approval gates consume **ephemeral** output only (ADR-007 decision 1):
+        // a guest contract cannot approve by requesting a persistent write, and
+        // an approval evaluation never persists anything.
+        if result
+            .ephemeral
             .iter()
             .any(|(key, value)| key == "approve" && value.as_slice() == b"1")
         {
@@ -113,9 +117,9 @@ impl<'a> ApprovalGate<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glasschain_core::{CoreError, ExecutionLimits, ExecutionProvider};
+    use glasschain_core::{CoreError, ExecutionLimits, ExecutionProvider, ExecutionResult};
 
-    /// Canned executor: returns a fixed result for every call.
+    /// Canned executor: returns a fixed ephemeral result for every call.
     struct StubExecutor {
         mutations: Result<Vec<(String, Vec<u8>)>, String>,
     }
@@ -126,8 +130,11 @@ mod tests {
             _contract_id: &str,
             _payload: &[u8],
             _limits: ExecutionLimits,
-        ) -> Result<Vec<(String, Vec<u8>)>, CoreError> {
-            self.mutations.clone().map_err(CoreError::Execution)
+        ) -> Result<ExecutionResult, CoreError> {
+            self.mutations
+                .clone()
+                .map(ExecutionResult::from)
+                .map_err(CoreError::Execution)
         }
 
         fn name(&self) -> &'static str {

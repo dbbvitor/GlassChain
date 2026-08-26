@@ -39,8 +39,8 @@ impl ExecutionProvider for ApprovingExecutionProvider {
         _contract_id: &str,
         _payload: &[u8],
         _limits: glasschain_core::ExecutionLimits,
-    ) -> Result<Vec<(String, Vec<u8>)>, CoreError> {
-        Ok(vec![("approve".into(), b"1".to_vec())])
+    ) -> Result<glasschain_core::ExecutionResult, CoreError> {
+        Ok(vec![("approve".into(), b"1".to_vec())].into())
     }
 
     fn name(&self) -> &'static str {

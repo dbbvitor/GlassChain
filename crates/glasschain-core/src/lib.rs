@@ -7,6 +7,7 @@ pub mod ledger;
 pub mod providers;
 pub mod schema;
 pub mod transaction;
+pub mod write_set;
 
 pub use asset::{MetadataTrustScore, TraceableAsset, TRUST_SCORE_STANDARD_THRESHOLD};
 pub use block::Block;
@@ -29,3 +30,4 @@ pub use transaction::{
     ContractExecution, InventoryUpdate, PurchaseConditions, PurchaseOrder, SmartContractDef,
     SupplyOffer, TraceableAssetRegistration, Transaction, TransactionKind,
 };
+pub use write_set::{ExecutionResult, PersistentWrite, WriteOp, WriteVisibility};
