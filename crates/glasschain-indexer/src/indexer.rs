@@ -145,6 +145,7 @@ const fn kind_name(tx: &Transaction) -> &'static str {
         glasschain_core::TransactionKind::ContractExecution(_) => "ContractExecution",
         glasschain_core::TransactionKind::InventoryUpdate(_) => "InventoryUpdate",
         glasschain_core::TransactionKind::AssetRegistration(_) => "AssetRegistration",
+        glasschain_core::TransactionKind::CanonicalRecord(_) => "CanonicalRecord",
     }
 }
 
@@ -299,6 +300,21 @@ mod tests {
         assert_eq!(txns.len(), 2);
     }
 
+    fn canonical_tx() -> Transaction {
+        Transaction::new(TransactionKind::CanonicalRecord(
+            glasschain_core::CanonicalRecord::new(
+                0,
+                "lot",
+                std::collections::BTreeMap::from([
+                    ("lot_id".into(), serde_json::json!("lot-1")),
+                    ("product_id".into(), serde_json::json!("SKU-1")),
+                    ("batch_number".into(), serde_json::json!("BATCH-001")),
+                ]),
+                "node-1",
+            ),
+        ))
+    }
+
     #[test]
     fn test_kind_name_all_variants() {
         use glasschain_core::{
@@ -387,6 +403,7 @@ mod tests {
                 )),
                 "AssetRegistration",
             ),
+            (canonical_tx(), "CanonicalRecord"),
         ];
         for (tx, expected) in cases {
             assert_eq!(kind_name(&tx), expected);

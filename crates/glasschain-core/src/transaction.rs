@@ -1,4 +1,5 @@
 use crate::asset::TraceableAsset;
+use crate::canonical::CanonicalRecord;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -148,6 +149,10 @@ pub enum TransactionKind {
     InventoryUpdate(InventoryUpdate),
     /// Phase 3: on-chain registration of a traceable asset with trust scoring.
     AssetRegistration(TraceableAssetRegistration),
+    /// Canonical v1 record (ADR-006): strict schema-validated records from the
+    /// network-wide registry, including certification, audit, and
+    /// state-commitment anchors.
+    CanonicalRecord(CanonicalRecord),
 }
 
 /// A single ledger entry.

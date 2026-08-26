@@ -4,6 +4,7 @@ use crate::protocol::{Message, PROTOCOL_VERSION};
 use glasschain_contracts::{ContractEngine, InventoryTrigger, WatcherService};
 use glasschain_core::crypto::sha256;
 use glasschain_core::providers::in_memory::InMemoryStorageProvider;
+use glasschain_core::validate_block_records;
 use glasschain_core::{
     Block, ExecutionProvider, Ledger, StorageProvider, Transaction, TransactionKind,
 };
@@ -1477,7 +1478,9 @@ async fn process_message(
                 let result = if block.index == expected {
                     let diff = l.difficulty;
                     l.chain.last().map_or((false, false), |prev| {
-                        let valid = block.chains_to(prev).is_ok() && block.has_valid_pow(diff);
+                        let valid = block.chains_to(prev).is_ok()
+                            && block.has_valid_pow(diff)
+                            && validate_block_records(&block).is_ok();
                         (valid, false)
                     })
                 } else {

@@ -99,6 +99,7 @@ pub trait EventBusProvider: Send + Sync {
                 glasschain_core::TransactionKind::ContractExecution(_) => "ContractExecution",
                 glasschain_core::TransactionKind::InventoryUpdate(_) => "InventoryUpdate",
                 glasschain_core::TransactionKind::AssetRegistration(_) => "AssetRegistration",
+                glasschain_core::TransactionKind::CanonicalRecord(_) => "CanonicalRecord",
             };
             self.publish(IndexerEvent {
                 event_type: "transaction_committed".into(),

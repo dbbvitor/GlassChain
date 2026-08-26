@@ -11,7 +11,8 @@ GlassChain connects buyers and sellers across a peer-to-peer network, giving par
 | Feature | Description |
 |---|---|
 | **Distributed Ledger** | SHA-256 chained blocks with Proof-of-Work consensus and longest-chain resolution |
-| **Supply-Chain Transactions** | `SupplyOffer`, `PurchaseOrder`, `InventoryUpdate`, and `AssetRegistration` |
+| **Supply-Chain Transactions** | `SupplyOffer`, `PurchaseOrder`, `InventoryUpdate`, `AssetRegistration`, and canonical v1 records (`CanonicalRecord`) |
+| **Canonical Schema v1** | 13 strict record families (lots, shipments, recall, certification, audit, state commitments, …) validated against an immutable network-wide registry before admission and commit |
 | **Contract Automation** | `ContractCreation` rules auto-execute purchase flows on matching offers |
 | **Watcher Automation** | Commit-phase inventory hooks can enqueue autonomous reorder purchase orders |
 | **Regulatory Traceability** | Anvisa/SNCM-aligned metadata model with `MetadataTrustScore` scoring |

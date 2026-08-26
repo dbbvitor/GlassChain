@@ -1,6 +1,7 @@
 use crate::block::Block;
+use crate::canonical::validate_record;
 use crate::error::CoreError;
-use crate::transaction::Transaction;
+use crate::transaction::{Transaction, TransactionKind};
 use serde::{Deserialize, Serialize};
 
 /// Default Proof-of-Work difficulty (number of leading zero characters required).
@@ -56,15 +57,21 @@ impl Ledger {
     /// Add a transaction to the pending pool.
     ///
     /// Transactions must have a non-empty `id`; duplicate IDs are silently
-    /// ignored to provide idempotency across federated nodes.
+    /// ignored to provide idempotency across federated nodes. Canonical v1
+    /// records ([`TransactionKind::CanonicalRecord`]) are strictly validated
+    /// against the network-wide schema registry before admission.
     ///
     /// # Errors
-    /// Returns `Err(CoreError::InvalidTransaction)` if `tx.id` is empty.
+    /// Returns `Err(CoreError::InvalidTransaction)` if `tx.id` is empty or a
+    /// canonical record fails v1 schema validation.
     pub fn add_transaction(&mut self, tx: Transaction) -> Result<(), CoreError> {
         if tx.id.is_empty() {
             return Err(CoreError::InvalidTransaction(
                 "transaction id must not be empty".into(),
             ));
+        }
+        if let TransactionKind::CanonicalRecord(ref record) = tx.kind {
+            validate_record(record)?;
         }
         // Idempotency check: reject if already committed or pending.
         let already_committed = self
@@ -147,6 +154,9 @@ impl Ledger {
             log::warn!("Mined block is stale (chain tip moved); transactions restored to pool");
             return Ok(false);
         }
+        // Commit gate: re-validate every canonical record, so a crafted block
+        // never commits an invalid record.
+        validate_block_records(&block)?;
         self.chain.push(block);
         Ok(true)
     }
@@ -177,6 +187,12 @@ impl Ledger {
                     current.index, self.difficulty
                 )));
             }
+            validate_block_records(current).map_err(|e| {
+                CoreError::InvalidBlock(format!(
+                    "block {} contains an invalid canonical record: {e}",
+                    current.index
+                ))
+            })?;
         }
         // Also validate the genesis block itself.
         if let Some(genesis) = self.chain.first() {
@@ -217,6 +233,11 @@ impl Ledger {
             if !candidate[i].has_valid_pow(self.difficulty) {
                 return false;
             }
+            // Commit gate for peer blocks: no invalid canonical record.
+            if let Err(e) = validate_block_records(&candidate[i]) {
+                log::warn!("Rejecting candidate chain: invalid canonical record: {e}");
+                return false;
+            }
         }
         if let Some(genesis) = candidate.first() {
             if !genesis.is_valid() {
@@ -240,7 +261,6 @@ impl Ledger {
     pub fn committed_supply_offers(
         &self,
     ) -> impl Iterator<Item = &crate::transaction::SupplyOffer> {
-        use crate::transaction::TransactionKind;
         self.chain
             .iter()
             .flat_map(|b| b.transactions.iter())
@@ -254,12 +274,33 @@ impl Ledger {
     }
 }
 
+/// Commit-side gate: re-validate every canonical record inside a block.
+///
+/// Blocks arriving from peers or committed locally cannot carry a record that
+/// would fail v1 schema validation. Call this on any block before it enters
+/// the chain (admission validates transactions individually; this closes the
+/// crafted-block path).
+///
+/// # Errors
+/// Returns `Err(CoreError::InvalidTransaction)` for the first invalid record.
+pub fn validate_block_records(block: &Block) -> Result<(), CoreError> {
+    for tx in &block.transactions {
+        if let TransactionKind::CanonicalRecord(ref record) = tx.kind {
+            validate_record(record)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canonical::{CanonicalRecord, RecordSignature};
     use crate::transaction::{
         InventoryUpdate, PurchaseOrder, SupplyOffer, Transaction, TransactionKind,
     };
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
 
     fn supply_offer_tx(
         seller: &str,
@@ -286,6 +327,80 @@ mod tests {
             quantity_delta: 50,
             reason: "test".into(),
         }))
+    }
+
+    /// A canonical lot record wrapped in a transaction; `valid: false` drops a
+    /// required field so v1 validation rejects it.
+    fn canonical_tx(valid: bool) -> Transaction {
+        let payload: BTreeMap<String, Value> = serde_json::from_value(json!({
+            "lot_id": "lot-1",
+            "product_id": "SKU-1",
+            "batch_number": "BATCH-001",
+        }))
+        .expect("payload map");
+        let mut record = CanonicalRecord::new(0, "lot", payload, "org-issuer");
+        record.signatures.push(RecordSignature {
+            signer: "org-issuer".into(),
+            signature_bytes: vec![0x42],
+        });
+        record.commitment = record.commitment().ok();
+        if !valid {
+            record.payload.remove("batch_number");
+        }
+        Transaction::with_id("canonical:1", TransactionKind::CanonicalRecord(record))
+    }
+
+    #[test]
+    fn test_add_transaction_accepts_valid_canonical_record() {
+        let mut ledger = Ledger::new(1);
+        ledger
+            .add_transaction(canonical_tx(true))
+            .expect("valid record");
+        assert_eq!(ledger.pending_transactions.len(), 1);
+    }
+
+    #[test]
+    fn test_add_transaction_rejects_invalid_canonical_record() {
+        let mut ledger = Ledger::new(1);
+        let error = ledger
+            .add_transaction(canonical_tx(false))
+            .expect_err("invalid record must be rejected at admission");
+        assert!(error.to_string().contains("batch_number"), "{error}");
+        assert!(ledger.pending_transactions.is_empty());
+    }
+
+    #[test]
+    fn test_commit_mined_block_rejects_invalid_canonical_record() {
+        let mut ledger = Ledger::new(1);
+        let previous = ledger.chain[0].clone();
+        let mut block = Block::new(1, vec![canonical_tx(false)], previous.hash.clone());
+        block.mine(1);
+        let error = ledger
+            .commit_mined_block(block, &previous.hash)
+            .expect_err("invalid record must be rejected at commit");
+        assert!(error.to_string().contains("batch_number"), "{error}");
+        assert_eq!(ledger.chain.len(), 1, "block must not be appended");
+    }
+
+    #[test]
+    fn test_try_replace_chain_rejects_invalid_canonical_record() {
+        let mut ledger = Ledger::new(1);
+        ledger
+            .add_transaction(canonical_tx(true))
+            .expect("valid record");
+        ledger.mine_pending_transactions().expect("mine");
+        assert!(ledger.validate_chain().is_ok());
+
+        // A longer candidate whose extra block carries an invalid record.
+        let genesis = ledger.chain[0].clone();
+        let mut bad = Block::new(1, vec![canonical_tx(false)], genesis.hash.clone());
+        bad.mine(1);
+        let candidate = vec![genesis, bad];
+        assert!(
+            !ledger.try_replace_chain(candidate),
+            "candidate with invalid canonical record must be rejected"
+        );
+        assert_eq!(ledger.chain.len(), 2, "local chain stays authoritative");
     }
 
     #[test]
