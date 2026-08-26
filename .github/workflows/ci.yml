@@ -3,8 +3,27 @@ name: CI
 on:
   push:
     branches: [main]
+    # Every job below is a code check (format, lint, test, coverage, audit):
+    # skip the whole workflow when only documentation changes. .github/** is
+    # included so CI config changes always self-validate.
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "clippy.toml"
+      - ".cargo/**"
+      - ".github/**"
   pull_request:
     branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "clippy.toml"
+      - ".cargo/**"
+      - ".github/**"
   workflow_dispatch:
 
 env:
