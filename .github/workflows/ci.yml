@@ -1,23 +1,29 @@
 name: CI
 
-# Code-related jobs only run when files that affect build, lint, test,
-# coverage, or audit results change. Documentation-only changes (README,
-# AGENTS.md, CONTEXT.md, docs/, .agents/, LICENSE, .gitignore, ...) skip all
-# checks; .github/** is included so CI config changes always self-validate.
-x-code-paths: &code-paths
-  - "crates/**"
-  - "Cargo.toml"
-  - "Cargo.lock"
-  - "rust-toolchain.toml"
-  - "clippy.toml"
-  - ".cargo/**"
-  - ".github/**"
-
 on:
   push:
     branches: [main]
+    # Every job below is a code check (format, lint, test, coverage, audit):
+    # skip the whole workflow when only documentation changes. .github/** is
+    # included so CI config changes always self-validate.
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "clippy.toml"
+      - ".cargo/**"
+      - ".github/**"
   pull_request:
     branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "clippy.toml"
+      - ".cargo/**"
+      - ".github/**"
   workflow_dispatch:
 
 env:
@@ -36,7 +42,6 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    paths: *code-paths
 
     steps:
       - uses: actions/checkout@v7
@@ -54,7 +59,6 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    paths: *code-paths
     env:
       RUSTFLAGS: -D warnings
 
@@ -87,7 +91,6 @@ jobs:
     needs: [fmt, clippy]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
-    paths: *code-paths
     strategy:
       fail-fast: false
       matrix:
@@ -132,7 +135,6 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    paths: *code-paths
     env:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
@@ -177,7 +179,6 @@ jobs:
     name: Security audit
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    paths: *code-paths
     permissions:
       contents: read
 
