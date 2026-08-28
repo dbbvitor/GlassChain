@@ -1782,6 +1782,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "glasschain-workflows"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "glasschain-contracts",
+ "glasschain-core",
+ "glasschain-vm",
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "wat",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"

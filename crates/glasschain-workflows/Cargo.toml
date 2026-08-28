@@ -1,0 +1,26 @@
+[package]
+name = "glasschain-workflows"
+version = "0.1.0"
+edition = "2021"
+description = "Corda-style state-machine workflow framework for GlassChain"
+license = "Apache-2.0"
+repository = "https://github.com/dbbvitor/GlassChain"
+readme = "../../README.md"
+keywords = ["blockchain", "supply-chain", "distributed-ledger", "workflow"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+glasschain-core = { path = "../glasschain-core" }
+serde   = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror  = "2.0"
+log        = "0.4"
+
+[dev-dependencies]
+glasschain-contracts = { path = "../glasschain-contracts" }
+glasschain-vm = { path = "../glasschain-vm" }
+base64 = "0.23"
+wat    = "1.256"
+
+[lints]
+workspace = true
