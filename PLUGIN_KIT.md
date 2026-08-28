@@ -54,6 +54,7 @@ forks and no changes to the rest of the stack.
 | 6 | Event Bus | `EventBusProvider` | `glasschain-indexer` | 5 |
 | 7 | Identity / MSP | `Identity`, `Organization` | `glasschain-identity` | 2 |
 | 7b | Endorsement Engine | `EndorsementEngine` | `glasschain-identity` | 2 |
+| 7c | Endorsement Seam | `EndorsementProvider` | `glasschain-core` | 2 |
 | 8 | Watcher (ECA) | `WatcherService` | `glasschain-contracts` | 4 |
 | 9 | Schema Validation | `validate_asset` | `glasschain-core` | 3 |
 | 10 | Gas Metering | `GasCounter`, `GasCosts` | `glasschain-vm` | 4 |
@@ -706,6 +707,61 @@ EndorsementEngine::evaluate(&proposal)
      ▼                 ▼
  Approved          Rejected
 ```
+
+---
+
+## 7c. Endorsement Plugin (`EndorsementProvider`) — ADR-008 seam
+
+**Crate:** `glasschain-core`
+**Trait:** `glasschain_core::EndorsementProvider`
+**Types:** `PolicyExpression`, `Principal`, `ScopedTarget`, `ScopedPolicies`, `EndorsementRequest`, `EndorserIdentity`, `EndorsementEvaluation`
+
+Identity-neutral business-authorization seam (ADR-008). The expression is a
+deterministic Fabric-style signature-policy tree (`SignedBy` / `NOutOf` with
+`and`/`or` builders); the wire form is data, never executable policy code.
+Scope precedence is channel default → contract default → collection policy →
+key policy, and every applicable layer must be satisfied
+(`ScopedPolicies::applicable`), so a more specific policy can only add
+constraints.
+
+### Trait contract
+
+```rust
+pub trait EndorsementProvider: Send + Sync {
+    fn evaluate(
+        &self,
+        expression: &PolicyExpression,
+        request: &EndorsementRequest,
+    ) -> Result<EndorsementEvaluation, CoreError>;
+
+    fn name(&self) -> &str;
+}
+```
+
+Implementations must derive each signer's principal from the authenticated
+key (never the caller-supplied label), reject a claimed principal that
+conflicts with the verified identity, and count at most one signature per
+distinct principal.
+
+### Built-in implementation
+
+`MspEndorsementProvider` (crate `glasschain-identity`) — ed25519 verification
+over a registered key→principal directory:
+
+```rust
+use glasschain_identity::{Identity, MspEndorsementProvider};
+use glasschain_core::{EndorsementProvider, PolicyExpression, Principal};
+
+let identity = Identity::generate("node-1");
+let mut provider = MspEndorsementProvider::new();
+provider.register_identity(&identity, Principal::new("MyOrg"));
+
+let request = /* EndorsementRequest signed by identity.sign_bytes(&payload) */;
+let result = provider.evaluate(&PolicyExpression::signed_by("MyOrg"), &request)?;
+```
+
+Enforcement at the commit path, committed policy metadata, and the
+`VerifyEndorsement` RPC land with ticket #45.
 
 ---
 

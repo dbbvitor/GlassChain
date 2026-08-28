@@ -63,6 +63,14 @@ impl Identity {
         self.signing_key.verifying_key()
     }
 
+    /// Sign arbitrary canonical bytes and return the detached 64-byte ed25519
+    /// signature. Used for endorsement requests, which sign the exact
+    /// transaction plus its committed write set (ADR-008 decision 2).
+    #[must_use]
+    pub fn sign_bytes(&self, payload: &[u8]) -> Vec<u8> {
+        self.signing_key.sign(payload).to_bytes().to_vec()
+    }
+
     /// Produce an `rcgen::KeyPair` that wraps the **same** ed25519 private key
     /// used for transaction signing.
     ///

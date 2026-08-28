@@ -3,6 +3,7 @@ pub mod block;
 pub mod canonical;
 pub mod capability;
 pub mod crypto;
+pub mod endorsement;
 pub mod error;
 pub mod ledger;
 pub mod providers;
@@ -22,11 +23,15 @@ pub use capability::{
     CapabilityAdvertisement, CapabilityDescriptor, CapabilityHistory, CapabilitySet, CAPABILITY_V1,
     GENESIS_CAPABILITIES, STATE_COMMITMENT_CAPABILITY_ID,
 };
+pub use endorsement::{
+    EndorsementEvaluation, EndorsementRequest, EndorserIdentity, PolicyExpression, Principal,
+    ScopedPolicies, ScopedTarget,
+};
 pub use error::{CoreError, GasMeter};
 pub use ledger::{Ledger, DEFAULT_DIFFICULTY};
 pub use providers::{
-    ConsensusProvider, ExecutionLimits, ExecutionProvider, NetworkProvider, PowConsensusProvider,
-    StorageProvider,
+    ConsensusProvider, EndorsementProvider, ExecutionLimits, ExecutionProvider, NetworkProvider,
+    PowConsensusProvider, StorageProvider,
 };
 pub use schema::{
     validate_asset, SchemaValidationReport, SchemaViolation, SncmField, ViolationSeverity,

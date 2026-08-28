@@ -21,6 +21,7 @@
 //! ```
 
 use crate::block::Block;
+use crate::endorsement::{EndorsementEvaluation, EndorsementRequest, PolicyExpression};
 use crate::error::CoreError;
 use crate::transaction::Transaction;
 use crate::write_set::ExecutionResult;
@@ -183,6 +184,39 @@ pub trait ExecutionProvider: Send + Sync {
     }
 
     /// Human-readable identifier for this execution implementation.
+    fn name(&self) -> &str;
+}
+
+/// Abstraction over business-authorization (endorsement) enforcement.
+///
+/// This trait is identity-neutral: the expression, request, and result types
+/// live in `glasschain-core`, while an implementation derives principals from
+/// verified credentials (ADR-008). Application authorization via this seam is
+/// separate from consensus finality.
+pub trait EndorsementProvider: Send + Sync {
+    /// Evaluate one [`PolicyExpression`] against the request's signers.
+    ///
+    /// Implementations must:
+    /// - derive each signer's principal from the authenticated key, never from
+    ///   the caller-supplied label alone;
+    /// - reject a claimed principal that conflicts with the verified identity;
+    /// - count at most one signature per distinct principal — duplicate,
+    ///   multi-node, and replayed signatures never increase the count.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when a signer cannot be authenticated (unknown key), a
+    /// claimed principal conflicts with the verified identity, or the
+    /// expression is not valid v1 policy metadata (allow-all shapes are
+    /// rejected). Signatures that fail cryptographic verification are skipped,
+    /// not fatal.
+    fn evaluate(
+        &self,
+        expression: &PolicyExpression,
+        request: &EndorsementRequest,
+    ) -> Result<EndorsementEvaluation, CoreError>;
+
+    /// Human-readable identifier for this endorsement implementation.
     fn name(&self) -> &str;
 }
 
