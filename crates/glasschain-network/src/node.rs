@@ -5,8 +5,8 @@ use glasschain_contracts::{ContractEngine, InventoryTrigger, WatcherService};
 use glasschain_core::crypto::sha256;
 use glasschain_core::providers::in_memory::InMemoryStorageProvider;
 use glasschain_core::{
-    Block, CapabilityAdvertisement, CapabilityHistory, ExecutionProvider, Ledger, StorageProvider,
-    Transaction, TransactionKind, CAPABILITY_V1,
+    Block, CapabilityAdvertisement, CapabilityHistory, CommitNotification, ExecutionProvider,
+    Ledger, QuorumCertificate, StorageProvider, Transaction, TransactionKind, CAPABILITY_V1,
 };
 use glasschain_identity::CertChainVerifier;
 use glasschain_identity::Identity;
@@ -32,10 +32,21 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 pub enum NodeEvent {
     /// A new transaction was accepted into the pending pool.
     TransactionAccepted(Transaction),
-    /// A block was successfully mined **by this node** and appended to the chain.
-    BlockMined { index: u64, hash: String },
-    /// A block received from a remote peer was validated and appended to the chain.
-    BlockReceived { index: u64, hash: String },
+    /// A block was successfully mined **by this node** and appended to the
+    /// chain. `certificate` is the quorum certificate attesting the block
+    /// (degenerate for the retained `PoW` dev/test consensus).
+    BlockMined {
+        index: u64,
+        hash: String,
+        certificate: QuorumCertificate,
+    },
+    /// A block received from a remote peer was validated and appended to the
+    /// chain, with its quorum certificate.
+    BlockReceived {
+        index: u64,
+        hash: String,
+        certificate: QuorumCertificate,
+    },
     /// A peer connected and completed the handshake.
     PeerConnected(String),
     /// A peer disconnected.
@@ -881,6 +892,11 @@ impl Node {
 
     /// Mine a new block containing all pending transactions and broadcast it.
     ///
+    /// This is the **dev/test consensus driver**: the retained Proof-of-Work
+    /// path supplies a degenerate quorum certificate on the commit
+    /// notification (ADR-002 keeps `PoW` for testing; the BFT engine lands with
+    /// ticket #42).
+    ///
     /// # Errors
     ///
     /// Returns [`NetworkError`] if mining preparation or commit fails.
@@ -892,6 +908,9 @@ impl Node {
 
         let mut block = Block::new(index, transactions, prev_hash.clone());
         block.mine(difficulty);
+        // The commit notification carries the quorum certificate: every commit
+        // consumer receives the attestation set from the seam.
+        let notification = CommitNotification::for_pow_block(block.clone());
 
         let appended = {
             let mut ledger = self.ledger.lock().await;
@@ -914,6 +933,7 @@ impl Node {
             let _ = self.event_tx.send(NodeEvent::BlockMined {
                 index: block.index,
                 hash: block.hash.clone(),
+                certificate: notification.certificate,
             });
             self.broadcast(Message::Block(block)).await;
             for tx in generated {
@@ -1630,6 +1650,11 @@ async fn process_message(
                 let _ = ctx.event_tx.send(NodeEvent::BlockReceived {
                     index: block.index,
                     hash: block.hash.clone(),
+                    // PoW's attestation is the valid nonce in the block itself:
+                    // a verifying member derives and validates the degenerate
+                    // certificate on receipt (real BFT attestations arrive with
+                    // the block in #42).
+                    certificate: QuorumCertificate::pow(&block),
                 });
 
                 let senders: Vec<Sender<Message>> = {
@@ -1666,6 +1691,22 @@ async fn process_message(
                     if let Err(e) = ctx.storage.put_block(block) {
                         log::warn!("Storage: failed to persist block {}: {e}", block.index);
                     }
+                }
+
+                // Every block adopted by sync is a commit: emit the
+                // certificate-bearing notification so commit consumers receive
+                // the attestation set on this path too (degenerate `PoW`
+                // certificate here; real attestations arrive with the BFT
+                // engine in #42).
+                for block in &new_chain {
+                    if block.index == 0 {
+                        continue;
+                    }
+                    let _ = ctx.event_tx.send(NodeEvent::BlockReceived {
+                        index: block.index,
+                        hash: block.hash.clone(),
+                        certificate: QuorumCertificate::pow(block),
+                    });
                 }
 
                 Node::rebuild_runtime_state_from_chain(&ctx.ledger, &ctx.state, &ctx.storage).await;

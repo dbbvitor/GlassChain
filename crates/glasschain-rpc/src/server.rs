@@ -8,10 +8,10 @@ use crate::proto::glasschain_v1::{
     CustodyEventProto, ExchangeCertificateRequest, ExchangeCertificateResponse, GetBlockRequest,
     GetBlockResponse, GetChainStatusRequest, GetChainStatusResponse, GetNodeStatusRequest,
     GetNodeStatusResponse, GetPeersRequest, GetPeersResponse, GetVerifiableLineageRequest,
-    GetVerifiableLineageResponse, MineBlockRequest, MineBlockResponse, QueryAssetHistoryRequest,
-    QueryAssetHistoryResponse, StreamBlocksRequest, StreamBlocksResponse, SubmitTransactionRequest,
-    SubmitTransactionResponse, SubscribeToEventsRequest, SubscribeToEventsResponse,
-    TransactionProto, VerifyEndorsementRequest, VerifyEndorsementResponse,
+    GetVerifiableLineageResponse, QueryAssetHistoryRequest, QueryAssetHistoryResponse,
+    StreamBlocksRequest, StreamBlocksResponse, SubmitTransactionRequest, SubmitTransactionResponse,
+    SubscribeToEventsRequest, SubscribeToEventsResponse, TransactionProto,
+    VerifyEndorsementRequest, VerifyEndorsementResponse,
 };
 use glasschain_core::{TraceableAssetRegistration, Transaction, TransactionKind};
 use glasschain_identity::SignedTransaction;
@@ -85,21 +85,31 @@ fn event_to_response(event: &NodeEvent) -> SubscribeToEventsResponse {
             event_type: "transaction_accepted".into(),
             payload_json: serde_json::json!({ "transaction_id": t.id }).to_string(),
         },
-        NodeEvent::BlockMined { index, hash } => SubscribeToEventsResponse {
+        NodeEvent::BlockMined {
+            index,
+            hash,
+            certificate,
+        } => SubscribeToEventsResponse {
             timestamp: now_unix(),
             event_type: "block_mined".into(),
             payload_json: serde_json::json!({
                 "block_index": index,
-                "block_hash": hash
+                "block_hash": hash,
+                "certificate": certificate
             })
             .to_string(),
         },
-        NodeEvent::BlockReceived { index, hash } => SubscribeToEventsResponse {
+        NodeEvent::BlockReceived {
+            index,
+            hash,
+            certificate,
+        } => SubscribeToEventsResponse {
             timestamp: now_unix(),
             event_type: "block_received".into(),
             payload_json: serde_json::json!({
                 "block_index": index,
-                "block_hash": hash
+                "block_hash": hash,
+                "certificate": certificate
             })
             .to_string(),
         },
@@ -467,46 +477,6 @@ impl NodeService for ServerState {
         let peer_addresses = self.node.known_peers().await;
         Ok(Response::new(GetPeersResponse { peer_addresses }))
     }
-
-    /// Mine a block via the node's `PoW` implementation.
-    ///
-    /// This RPC uses the node's synchronous mining API, which waits for block
-    /// production to complete before returning the result to the caller.
-    async fn mine_block(
-        &self,
-        _request: Request<MineBlockRequest>,
-    ) -> Result<Response<MineBlockResponse>, Status> {
-        match self.node.mine().await {
-            Ok(()) => {
-                let ledger = self.node.shared_ledger();
-                let ledger = ledger.lock().await;
-                ledger.chain.last().map_or_else(
-                    || {
-                        Ok(Response::new(MineBlockResponse {
-                            success: false,
-                            block_index: 0,
-                            block_hash: String::new(),
-                            error: "chain empty after mining".into(),
-                        }))
-                    },
-                    |block| {
-                        Ok(Response::new(MineBlockResponse {
-                            success: true,
-                            block_index: block.index,
-                            block_hash: block.hash.clone(),
-                            error: String::new(),
-                        }))
-                    },
-                )
-            }
-            Err(e) => Ok(Response::new(MineBlockResponse {
-                success: false,
-                block_index: 0,
-                block_hash: String::new(),
-                error: e.to_string(),
-            })),
-        }
-    }
 }
 
 // ── IdentityService implementation ───────────────────────────────────────────
@@ -708,17 +678,35 @@ mod tests {
             &NodeEvent::BlockMined {
                 index: 3,
                 hash: "abc".into(),
+                certificate: glasschain_core::QuorumCertificate {
+                    block_index: 3,
+                    block_hash: "abc".into(),
+                    attestations: Vec::new(),
+                },
             },
             "block_mined",
-            &serde_json::json!({ "block_index": 3, "block_hash": "abc" }),
+            &serde_json::json!({ "block_index": 3, "block_hash": "abc", "certificate": {
+                "block_index": 3,
+                "block_hash": "abc",
+                "attestations": []
+            } }),
         );
         assert_maps(
             &NodeEvent::BlockReceived {
                 index: 4,
                 hash: "def".into(),
+                certificate: glasschain_core::QuorumCertificate {
+                    block_index: 4,
+                    block_hash: "def".into(),
+                    attestations: Vec::new(),
+                },
             },
             "block_received",
-            &serde_json::json!({ "block_index": 4, "block_hash": "def" }),
+            &serde_json::json!({ "block_index": 4, "block_hash": "def", "certificate": {
+                "block_index": 4,
+                "block_hash": "def",
+                "attestations": []
+            } }),
         );
         assert_maps(
             &NodeEvent::PeerConnected("10.0.0.1:8000".into()),

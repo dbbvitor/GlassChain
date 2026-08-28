@@ -14,7 +14,7 @@ use glasschain_rpc::proto::glasschain_v1::{
     identity_service_client::IdentityServiceClient, ledger_service_client::LedgerServiceClient,
     node_service_client::NodeServiceClient, ExchangeCertificateRequest, GetBlockRequest,
     GetChainStatusRequest, GetNodeStatusRequest, GetPeersRequest, GetVerifiableLineageRequest,
-    MineBlockRequest, QueryAssetHistoryRequest, StreamBlocksRequest, SubmitTransactionRequest,
+    QueryAssetHistoryRequest, StreamBlocksRequest, SubmitTransactionRequest,
     SubscribeToEventsRequest,
 };
 use glasschain_rpc::server::GlasschainServer;
@@ -127,15 +127,6 @@ async fn submit_tx(ledger: &mut LedgerClient, tx: &Transaction) {
     assert!(resp.accepted, "tx not accepted: {}", resp.error);
 }
 
-async fn mine_block(node_client: &mut NodeClient) {
-    let resp = node_client
-        .mine_block(MineBlockRequest {})
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(resp.success, "mine failed: {}", resp.error);
-}
-
 // ── Item 1: full gRPC surface over a real connection ─────────────────────────
 
 #[allow(clippy::too_many_lines)]
@@ -178,7 +169,7 @@ async fn test_grpc_unsigned_submit_chain_and_node_surface() {
     assert!(!chain.tip_hash.is_empty());
 
     // Mine → block 1 committed.
-    mine_block(&mut node_client).await;
+    node.mine().await.unwrap();
 
     let chain = ledger
         .get_chain_status(GetChainStatusRequest {})
@@ -219,7 +210,7 @@ async fn test_grpc_unsigned_submit_chain_and_node_surface() {
 #[tokio::test]
 async fn test_grpc_signed_submit_and_signature_verification() {
     let node = start_node().await;
-    let (channel, _handle) = start_server(node).await;
+    let (channel, _handle) = start_server(node.clone()).await;
     let mut ledger = LedgerClient::new(channel);
 
     let identity = Identity::generate("signer-1");
@@ -261,9 +252,8 @@ async fn test_grpc_signed_submit_and_signature_verification() {
 #[tokio::test]
 async fn test_query_asset_history_filters() {
     let node = start_node().await;
-    let (channel, _handle) = start_server(node).await;
+    let (channel, _handle) = start_server(node.clone()).await;
     let mut ledger = LedgerClient::new(channel.clone());
-    let mut node_client = NodeClient::new(channel);
 
     let first_registration = asset_reg_tx(Some(GTIN), Some("SN-AAA"), "manufacture", "factory-1");
     let second_registration = asset_reg_tx(Some(GTIN), Some("SN-BBB"), "dispatch", "dist-1");
@@ -280,7 +270,7 @@ async fn test_query_asset_history_filters() {
     ] {
         submit_tx(&mut ledger, tx).await;
     }
-    mine_block(&mut node_client).await;
+    node.mine().await.unwrap();
 
     // GTIN only → both serials for that GTIN.
     let resp = ledger
@@ -322,9 +312,8 @@ async fn test_query_asset_history_filters() {
 #[tokio::test]
 async fn test_verifiable_lineage_canonical_key_matching() {
     let node = start_node().await;
-    let (channel, _handle) = start_server(node).await;
+    let (channel, _handle) = start_server(node.clone()).await;
     let mut ledger = LedgerClient::new(channel.clone());
-    let mut node_client = NodeClient::new(channel);
 
     // Three assets exercising the three non-empty canonical forms.
     let full_asset = asset_reg_tx(Some(GTIN), Some("SN-F"), "manufacture", "factory-1");
@@ -333,7 +322,7 @@ async fn test_verifiable_lineage_canonical_key_matching() {
     for tx in [&full_asset, &gtin_only, &serial_only] {
         submit_tx(&mut ledger, tx).await;
     }
-    mine_block(&mut node_client).await;
+    node.mine().await.unwrap();
 
     // GTIN+SN canonical key.
     let resp = ledger
@@ -386,9 +375,8 @@ async fn test_verifiable_lineage_canonical_key_matching() {
 #[tokio::test]
 async fn test_build_transaction_protos_all_variants() {
     let node = start_node().await;
-    let (channel, _handle) = start_server(node).await;
+    let (channel, _handle) = start_server(node.clone()).await;
     let mut ledger = LedgerClient::new(channel.clone());
-    let mut node_client = NodeClient::new(channel);
 
     let variants = vec![
         Transaction::new(TransactionKind::SupplyOffer(SupplyOffer {
@@ -464,7 +452,7 @@ async fn test_build_transaction_protos_all_variants() {
     for tx in &variants {
         submit_tx(&mut ledger, tx).await;
     }
-    mine_block(&mut node_client).await;
+    node.mine().await.unwrap();
 
     let block = ledger
         .get_block(GetBlockRequest { index: 1 })
@@ -490,14 +478,13 @@ async fn test_build_transaction_protos_all_variants() {
 #[tokio::test]
 async fn test_stream_blocks_replays_then_live_streams() {
     let node = start_node().await;
-    let (channel, _handle) = start_server(node).await;
+    let (channel, _handle) = start_server(node.clone()).await;
     let mut ledger = LedgerClient::new(channel.clone());
-    let mut node_client = NodeClient::new(channel);
 
     // Commit block 1 before opening the stream.
     let first = inventory_tx("owner-1");
     submit_tx(&mut ledger, &first).await;
-    mine_block(&mut node_client).await;
+    node.mine().await.unwrap();
 
     // Stream from index 1: replays block 1, then live-streams block 2.
     let mut stream = ledger
@@ -516,7 +503,7 @@ async fn test_stream_blocks_replays_then_live_streams() {
     // Mine a second block; it should arrive on the live stream.
     let second = inventory_tx("owner-2");
     submit_tx(&mut ledger, &second).await;
-    mine_block(&mut node_client).await;
+    node.mine().await.unwrap();
 
     let b2 = tokio::time::timeout(Duration::from_secs(3), stream.message())
         .await
@@ -531,9 +518,8 @@ async fn test_stream_blocks_replays_then_live_streams() {
 #[tokio::test]
 async fn test_subscribe_to_events_mapping() {
     let node = start_node().await;
-    let (channel, _handle) = start_server(node).await;
+    let (channel, _handle) = start_server(node.clone()).await;
     let mut ledger = LedgerClient::new(channel.clone());
-    let mut node_client = NodeClient::new(channel);
 
     let mut events = ledger
         .subscribe_to_events(SubscribeToEventsRequest {})
@@ -553,7 +539,7 @@ async fn test_subscribe_to_events_mapping() {
     assert!(evt.payload_json.contains(&tx.id));
 
     // block_mined on mine.
-    mine_block(&mut node_client).await;
+    node.mine().await.unwrap();
     let evt = tokio::time::timeout(Duration::from_secs(3), events.message())
         .await
         .expect("timeout waiting for block_mined")

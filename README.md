@@ -93,17 +93,16 @@ order    <buyer> <seller> <product> <qty> <price> <currency>
 contract <contract_id> <buyer> <product> <max_price> <min_qty> <max_qty> <max_lead> <currency>
 inventory <owner> <product> <delta> <reason>
 asset <originator> <product_name> <gtin> <batch> <expiry> <serial> <qty> <event_type>
-mine
-mine-async
 chain
 pending
 peers
 quit | exit
 ```
 
-`asset` prints Metadata Trust Score at submission time. Use `-` for optional metadata fields.
-
-`mine` waits for block production to finish before returning. `mine-async` starts mining in the background and returns immediately.
+Block production is driven by the consensus layer, not by manual commands: the
+`mine`/`mine-async` REPL commands and the `MineBlock` RPC were retired with the
+quorum-certificate seam (ADR-002); the dev/test Proof-of-Work driver remains
+available programmatically as `Node::mine()`.
 
 ---
 
@@ -124,7 +123,6 @@ The `glasschain-rpc` crate exposes the current gRPC server implementation. The `
 - `NodeService`
   - `GetNodeStatus`
   - `GetPeers`
-  - `MineBlock`
 
 ---
 

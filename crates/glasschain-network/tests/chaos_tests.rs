@@ -7,13 +7,13 @@
 //!   can still mine and sync.
 //! - **Sequential node disconnect / reconnect**: verify chain consistency after
 //!   a node rejoins.
-//! - **Concurrent mining**: two nodes mine simultaneously and resolve via
-//!   longest-chain rule.
+//! - **Concurrent commits**: independently mined blocks are final at commit
+//!   (each carries a validating quorum certificate) and syncing nodes converge.
 
 use glasschain_contracts::{InventoryTrigger, WatcherService};
 use glasschain_core::{
-    InventoryUpdate, MetadataTrustScore, TraceableAsset, Transaction, TransactionKind,
-    TRUST_SCORE_STANDARD_THRESHOLD,
+    CommitNotification, InventoryUpdate, MetadataTrustScore, TraceableAsset, Transaction,
+    TransactionKind, TRUST_SCORE_STANDARD_THRESHOLD,
 };
 use glasschain_network::{Node, NodeEvent};
 use std::sync::Arc;
@@ -155,23 +155,26 @@ async fn test_node_can_sync_after_rejoining() {
     assert!(ledger_c.validate_chain().is_ok());
 }
 
-/// Scenario: concurrent mining — longest chain wins.
+/// Scenario: concurrent commits are final at commit, and a syncing node
+/// converges (liveness).
 ///
-/// Node A and Node B are not connected.  Both mine a block from the same
-/// genesis.  Node B's chain is then longer (it mines a second block first).
-/// When A connects to B, A should replace its chain with B's.
+/// Nodes A and B commit independently. Each committed block carries a quorum
+/// certificate on its commit notification that a verifying member validates
+/// against the committed block — finality does not depend on trusting the
+/// producing node. Node C then connects to B and converges to B's chain.
 #[tokio::test]
-async fn test_concurrent_mining_longest_chain_wins() {
+async fn test_committed_blocks_are_final_and_sync_converges() {
     let addr_a = free_addr();
     let addr_b = free_addr();
     let node_a = Node::new("concurrent-a", &addr_a, 1);
     let node_b = Node::new("concurrent-b", &addr_b, 1);
+    let mut events_b = node_b.subscribe();
 
     // Both nodes start standalone (no peers).
     node_a.start(vec![]).await.unwrap();
     node_b.start(vec![]).await.unwrap();
 
-    // Node B gets ahead: mines 2 blocks.
+    // Node B commits two blocks.
     node_b
         .submit_transaction(inventory_tx("b-1"))
         .await
@@ -183,7 +186,7 @@ async fn test_concurrent_mining_longest_chain_wins() {
         .unwrap();
     node_b.mine().await.unwrap();
 
-    // Node A mines only 1 block.
+    // Node A commits one block.
     node_a
         .submit_transaction(inventory_tx("a-1"))
         .await
@@ -195,11 +198,29 @@ async fn test_concurrent_mining_longest_chain_wins() {
     assert_eq!(remote_chain_blocks, 3, "node B should have 3 blocks");
     assert_eq!(local_chain_blocks, 2, "node A should have 2 blocks");
 
-    // Connect A to B. A should adopt B's longer chain.
-    // We simulate by starting a new node that connects to B and check it gets B's chain.
+    // Every commit notification from B carries a certificate that validates
+    // against the committed block: the block is final at commit, verified
+    // locally, never on "the leader said so".
+    let ledger_b = node_b.ledger_snapshot().await;
+    let mut certified = 0;
+    while let Ok(event) = events_b.try_recv() {
+        if let NodeEvent::BlockMined {
+            index, certificate, ..
+        } = event
+        {
+            let block = ledger_b.chain[usize::try_from(index).expect("index fits usize")].clone();
+            let notification = CommitNotification { block, certificate };
+            notification
+                .validate()
+                .expect("certificate must attest the committed block");
+            certified += 1;
+        }
+    }
+    assert_eq!(certified, 2, "both of B's commits carried certificates");
+
+    // A syncing node converges to B's chain (liveness).
     let addr_c = free_addr();
     let node_c = Node::new("concurrent-c", &addr_c, 1);
-    // Start C connected to B.
     node_c.start(vec![addr_b.clone()]).await.unwrap();
     sleep(Duration::from_millis(500)).await;
 
@@ -210,6 +231,55 @@ async fn test_concurrent_mining_longest_chain_wins() {
         ledger_c.chain.len()
     );
     assert!(ledger_c.validate_chain().is_ok());
+}
+
+/// A syncing (verifying) member validates the quorum certificate on every
+/// block it receives and commits — finality is verifiable locally, not on the
+/// producer's word.
+#[tokio::test]
+async fn test_received_block_certificate_validates_on_verifying_member() {
+    let addr_a = free_addr();
+    let node_a = Node::new("certifier-a", &addr_a, 1);
+    node_a.start(vec![]).await.unwrap();
+    node_a
+        .submit_transaction(inventory_tx("a-1"))
+        .await
+        .unwrap();
+    node_a.mine().await.unwrap();
+    sleep(Duration::from_millis(100)).await;
+
+    // B connects and syncs, then observes A's next live block broadcast.
+    let addr_b = free_addr();
+    let node_b = Node::new("certifier-b", &addr_b, 1);
+    let mut events_b = node_b.subscribe();
+    node_b.start(vec![addr_a.clone()]).await.unwrap();
+    sleep(Duration::from_millis(500)).await;
+
+    node_a
+        .submit_transaction(inventory_tx("a-2"))
+        .await
+        .unwrap();
+    node_a.mine().await.unwrap();
+    sleep(Duration::from_millis(500)).await;
+
+    let ledger_b = node_b.ledger_snapshot().await;
+    let mut received_certificates = 0;
+    while let Ok(event) = events_b.try_recv() {
+        if let NodeEvent::BlockReceived {
+            index, certificate, ..
+        } = event
+        {
+            let block = ledger_b.chain[usize::try_from(index).expect("index fits usize")].clone();
+            CommitNotification { block, certificate }
+                .validate()
+                .expect("verifying member must be able to validate the attestation set");
+            received_certificates += 1;
+        }
+    }
+    assert!(
+        received_certificates >= 1,
+        "the verifying member validated the received block's certificate"
+    );
 }
 
 /// Scenario: block mined event fires and chain is valid after mining.

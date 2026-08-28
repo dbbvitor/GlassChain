@@ -21,6 +21,7 @@
 //! ```
 
 use crate::block::Block;
+use crate::consensus::CommitNotification;
 use crate::endorsement::{EndorsementEvaluation, EndorsementRequest, PolicyExpression};
 use crate::error::CoreError;
 use crate::transaction::Transaction;
@@ -31,13 +32,17 @@ use crate::write_set::ExecutionResult;
 /// Implementors may use Proof-of-Work, Raft, PBFT, or any other algorithm.
 /// The node calls [`ConsensusProvider::propose_block`] when it wants to add
 /// pending transactions to the chain and waits for the provider to return a
-/// fully validated block ready for commitment.
+/// [`CommitNotification`]: the finished block plus the quorum certificate
+/// attesting it (ADR-002). No commit consumer may depend on "the leader said
+/// so" — every notification carries the attestation set.
 pub trait ConsensusProvider: Send + Sync {
     /// Propose a new block containing `transactions` that chains onto `previous`.
     ///
-    /// Returns the finished block (with a valid `hash`) on success.
-    /// The provider is responsible for any work required by the chosen
-    /// consensus algorithm (e.g., mining a `PoW` nonce or gathering signatures).
+    /// Returns the finished block (with a valid `hash`) and its quorum
+    /// certificate on success. The provider is responsible for any work
+    /// required by the chosen consensus algorithm (e.g., mining a `PoW` nonce
+    /// or gathering validator signatures). The retained Proof-of-Work provider
+    /// supplies a degenerate certificate: the valid nonce is the attestation.
     ///
     /// # Errors
     /// Returns `Err` if the consensus algorithm fails to produce a valid block
@@ -47,7 +52,7 @@ pub trait ConsensusProvider: Send + Sync {
         index: u64,
         transactions: Vec<Transaction>,
         previous: &Block,
-    ) -> Result<Block, CoreError>;
+    ) -> Result<CommitNotification, CoreError>;
 
     /// Validate a block proposed by a remote peer.
     ///
@@ -279,10 +284,12 @@ impl ConsensusProvider for PowConsensusProvider {
         index: u64,
         transactions: Vec<Transaction>,
         previous: &Block,
-    ) -> Result<Block, CoreError> {
+    ) -> Result<CommitNotification, CoreError> {
         let mut block = Block::new(index, transactions, previous.hash.clone());
         block.mine(self.difficulty);
-        Ok(block)
+        // PoW's attestation is the valid nonce carried by the block itself:
+        // the certificate is degenerate but still explicit on the seam.
+        Ok(CommitNotification::for_pow_block(block))
     }
 
     fn validate_block(&self, block: &Block, previous: &Block) -> Result<(), CoreError> {
@@ -458,25 +465,33 @@ mod consensus_tests {
     fn test_pow_propose_block() {
         let provider = PowConsensusProvider::new(1);
         let g = genesis();
-        let block = provider.propose_block(1, vec![sample_tx()], &g).unwrap();
-        assert_eq!(block.index, 1);
-        assert!(block.has_valid_pow(1));
-        assert!(block.is_valid());
+        let notification = provider.propose_block(1, vec![sample_tx()], &g).unwrap();
+        assert_eq!(notification.block.index, 1);
+        assert!(notification.block.has_valid_pow(1));
+        assert!(notification.block.is_valid());
+        assert!(
+            notification.certificate.is_degenerate(),
+            "PoW supplies the degenerate certificate"
+        );
+        assert!(
+            notification.validate().is_ok(),
+            "the PoW notification validates structurally"
+        );
     }
 
     #[test]
     fn test_pow_validate_block_valid() {
         let provider = PowConsensusProvider::new(1);
         let g = genesis();
-        let block = provider.propose_block(1, vec![], &g).unwrap();
-        assert!(provider.validate_block(&block, &g).is_ok());
+        let notification = provider.propose_block(1, vec![], &g).unwrap();
+        assert!(provider.validate_block(&notification.block, &g).is_ok());
     }
 
     #[test]
     fn test_pow_validate_block_wrong_prev_hash() {
         let provider = PowConsensusProvider::new(1);
         let g = genesis();
-        let mut block = provider.propose_block(1, vec![], &g).unwrap();
+        let mut block = provider.propose_block(1, vec![], &g).unwrap().block;
         block.previous_hash = "bad".into();
         block.hash = block.calculate_hash(); // re-hash so it's internally valid
                                              // Chains_to should fail even with correct hash if pow is recalculated

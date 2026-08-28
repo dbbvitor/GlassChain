@@ -77,13 +77,20 @@ pub trait ConsensusProvider: Send + Sync {
         index: u64,
         transactions: Vec<Transaction>,
         previous: &Block,
-    ) -> Result<Block, CoreError>;
+    ) -> Result<CommitNotification, CoreError>;
 
     fn validate_block(&self, block: &Block, previous: &Block) -> Result<(), CoreError>;
 
     fn name(&self) -> &str;
 }
 ```
+
+`propose_block` returns a [`CommitNotification`]: the finished block plus its
+quorum certificate (the attestation set). No commit consumer may depend on
+"the leader said so" — the certificate travels with every commit. The retained
+Proof-of-Work provider supplies a **degenerate** certificate (the valid nonce
+is the attestation, carried by the block itself); real BFT attestations land
+with ticket #42.
 
 ### Built-in implementation
 
@@ -92,7 +99,9 @@ pub trait ConsensusProvider: Send + Sync {
 ### Implementing Raft consensus
 
 ```rust
-use glasschain_core::{Block, ConsensusProvider, CoreError, Transaction};
+use glasschain_core::{
+    Block, CommitNotification, ConsensusProvider, CoreError, QuorumCertificate, Transaction,
+};
 
 pub struct RaftConsensusProvider {
     // ... raft state machine ...
@@ -104,10 +113,11 @@ impl ConsensusProvider for RaftConsensusProvider {
         index: u64,
         transactions: Vec<Transaction>,
         previous: &Block,
-    ) -> Result<Block, CoreError> {
+    ) -> Result<CommitNotification, CoreError> {
         // 1. Submit the proposed block to the Raft cluster leader.
         // 2. Wait for quorum acknowledgement.
-        // 3. Return the committed block.
+        // 3. Return the committed block with the quorum certificate
+        //    (`QuorumCertificate` with the validator attestation set).
         todo!()
     }
 

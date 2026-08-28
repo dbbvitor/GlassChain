@@ -37,9 +37,6 @@ service NodeService {
 
   // Return the list of known peer addresses.
   rpc GetPeers(GetPeersRequest) returns (GetPeersResponse);
-
-  // Trigger manual block mining (dev / testing only).
-  rpc MineBlock(MineBlockRequest) returns (MineBlockResponse);
 }
 
 // ─── Identity Service ──────────────────────────────────────────────────────
@@ -149,15 +146,6 @@ message GetPeersRequest {}
 
 message GetPeersResponse {
   repeated string peer_addresses = 1;
-}
-
-message MineBlockRequest {}
-
-message MineBlockResponse {
-  bool success = 1;
-  uint64 block_index = 2;
-  string block_hash = 3;
-  string error = 4;
 }
 
 // ─── IdentityService messages ──────────────────────────────────────────────

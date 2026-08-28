@@ -317,8 +317,11 @@ See [`.agents/README.md`](.agents/README.md) for file templates.
   `glasschain-cli` were added later). `PLUGIN_KIT.md` has the current list.
 - The `glasschain-node` REPL and the gRPC server are separate: no `--rpc-addr`
   means no gRPC.
-- `mine` blocks until a block is produced; `mine-async` returns immediately.
-  PoW difficulty comes from `DEFAULT_DIFFICULTY` in `glasschain-core::ledger`.
+- Block production is consensus-driven, not manual: the `mine`/`mine-async`
+  REPL commands and the `MineBlock` RPC were retired with the quorum-certificate
+  seam (ticket #38). The dev/test Proof-of-Work driver remains available
+  programmatically as `Node::mine()` / `Node::mine_async()`; PoW difficulty
+  comes from `DEFAULT_DIFFICULTY` in `glasschain-core::ledger`.
 - Contract and watcher state are **rebuilt by replaying the committed chain** on
   restart or chain replacement. Any new automation state must be replayable the
   same way, or it will silently diverge after a sync.

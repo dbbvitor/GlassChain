@@ -2,6 +2,7 @@ pub mod asset;
 pub mod block;
 pub mod canonical;
 pub mod capability;
+pub mod consensus;
 pub mod crypto;
 pub mod endorsement;
 pub mod error;
@@ -23,6 +24,7 @@ pub use capability::{
     CapabilityAdvertisement, CapabilityDescriptor, CapabilityHistory, CapabilitySet, CAPABILITY_V1,
     GENESIS_CAPABILITIES, STATE_COMMITMENT_CAPABILITY_ID,
 };
+pub use consensus::{Attestation, CommitNotification, QuorumCertificate};
 pub use endorsement::{
     EndorsementEvaluation, EndorsementRequest, EndorserIdentity, PolicyExpression, Principal,
     ScopedPolicies, ScopedTarget,
