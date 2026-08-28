@@ -49,5 +49,7 @@ pub mod provenance;
 
 pub use event_bus::{EventBusProvider, InMemoryEventBus, IndexerEvent};
 pub use flattener::{AnalyticalFlattener, FlatAssetRecord, FlattenerError, VerifiableLineage};
-pub use indexer::{InMemoryIndexer, IndexedBlock, IndexedTransaction, IndexerProvider};
+pub use indexer::{
+    indexed_transactions_of, InMemoryIndexer, IndexedBlock, IndexedTransaction, IndexerProvider,
+};
 pub use provenance::{CustodyEvent, ProvenanceIndex};

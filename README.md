@@ -119,10 +119,13 @@ The `glasschain-rpc` crate exposes the current gRPC server implementation. The `
   - `SubmitTransaction`
   - `GetChainStatus`
   - `QueryAssetHistory`
+  - `GetVerifiableLineage`
   - `SubscribeToEvents` (server stream)
 - `NodeService`
   - `GetNodeStatus`
   - `GetPeers`
+
+Analytics read path: `QueryAssetHistory` and `GetVerifiableLineage` are answered from the in-memory provenance index and analytical flattener — not by scanning the raw chain. `QueryAssetHistory` matches exact canonical asset ids (`GTIN:<gtin>[:SN:<sn>|:BATCH:<b>]`, `SN:<sn>`), boundary-anchored so a short GTIN never cross-matches a longer one, and each result's `payload_json` carries the custody event rather than the raw transaction JSON.
 
 ---
 

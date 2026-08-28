@@ -42,6 +42,7 @@
 
 use glasschain_core::Block;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::Mutex;
 use tokio::sync::broadcast;
 
@@ -132,14 +133,25 @@ pub trait EventBusProvider: Send + Sync {
     fn name(&self) -> &str;
 }
 
-/// In-memory event bus backed by a `tokio::sync::broadcast` channel.
+/// In-memory event bus backed by a **bounded** `tokio::sync::broadcast` channel.
 ///
-/// All published events are buffered and can be received by multiple async
-/// subscribers via [`InMemoryEventBus::subscribe`].
+/// ## Backpressure policy
+///
+/// Both buffers are capped at `capacity`:
+/// - the broadcast channel: a slow consumer that falls behind receives
+///   [`broadcast::error::RecvError::Lagged`] on its next `recv` (drop-oldest
+///   semantics) — the publisher never blocks and memory stays bounded;
+/// - the local event log (for diagnostics/tests): a drop-oldest ring, so no
+///   consumer can grow it without bound.
+///
+/// All published events can be received by multiple async subscribers via
+/// [`InMemoryEventBus::subscribe`].
 pub struct InMemoryEventBus {
     sender: broadcast::Sender<IndexerEvent>,
-    /// Local log of all published events (for test assertions).
-    log: Mutex<Vec<IndexerEvent>>,
+    /// Bounded drop-oldest ring of published events (for test assertions).
+    log: Mutex<VecDeque<IndexerEvent>>,
+    /// Ring capacity (also the broadcast channel capacity).
+    capacity: usize,
 }
 
 impl Default for InMemoryEventBus {
@@ -155,7 +167,8 @@ impl InMemoryEventBus {
         let (sender, _) = broadcast::channel(capacity);
         Self {
             sender,
-            log: Mutex::new(Vec::new()),
+            log: Mutex::new(VecDeque::with_capacity(capacity)),
+            capacity,
         }
     }
 
@@ -164,19 +177,30 @@ impl InMemoryEventBus {
         self.sender.subscribe()
     }
 
-    /// Return a snapshot of all events published so far.
+    /// Return a snapshot of the most recent events in the bounded log.
     ///
-    /// # Panics
-    ///
-    /// Panics if the internal event-log [`Mutex`] is poisoned.
+    /// The log never holds more than the bus capacity (drop-oldest).
+    #[must_use]
     pub fn event_log(&self) -> Vec<IndexerEvent> {
-        self.log.lock().unwrap().clone()
+        match self.log.lock() {
+            Ok(log) => log.iter().cloned().collect(),
+            Err(poisoned) => poisoned.into_inner().iter().cloned().collect(),
+        }
     }
 }
 
 impl EventBusProvider for InMemoryEventBus {
     fn publish(&self, event: IndexerEvent) -> Result<(), EventBusError> {
-        self.log.lock().unwrap().push(event.clone());
+        {
+            let mut log = match self.log.lock() {
+                Ok(log) => log,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if log.len() >= self.capacity {
+                log.pop_front();
+            }
+            log.push_back(event.clone());
+        }
         // Ignore send errors when there are no active receivers.
         let _ = self.sender.send(event);
         Ok(())
@@ -355,5 +379,44 @@ mod tests {
     fn test_event_bus_name() {
         let bus = InMemoryEventBus::default();
         assert_eq!(bus.name(), "in-memory");
+    }
+
+    /// Buffer-fill test: a slow consumer that never reads cannot grow memory
+    /// unboundedly — the channel drops oldest events for the lagged receiver
+    /// and the local log is a drop-oldest ring capped at capacity.
+    #[tokio::test]
+    async fn test_slow_consumer_cannot_exhaust_memory() {
+        use tokio::time::Duration;
+        const CAPACITY: usize = 8;
+        let bus = InMemoryEventBus::new(CAPACITY);
+        // Subscriber that never reads.
+        let mut slow = bus.subscribe();
+
+        for i in 0..(CAPACITY * 4) {
+            bus.publish(IndexerEvent {
+                event_type: "fill".into(),
+                block_index: i as u64,
+                transaction_id: format!("tx-{i}"),
+                transaction_kind: "InventoryUpdate".into(),
+                timestamp: 1000 + i as u64,
+                payload_json: "{}".into(),
+            })
+            .unwrap();
+        }
+
+        // The in-memory log never exceeds capacity (drop-oldest ring).
+        let log = bus.event_log();
+        assert_eq!(log.len(), CAPACITY, "log is bounded");
+        assert_eq!(log[0].block_index, (CAPACITY * 4 - CAPACITY) as u64);
+
+        // The slow consumer observes Lagged, not unbounded buffering; the
+        // publisher never blocked during the fill.
+        let result = tokio::time::timeout(Duration::from_secs(1), slow.recv())
+            .await
+            .expect("receiver stays responsive");
+        assert!(
+            matches!(result, Err(broadcast::error::RecvError::Lagged(_))),
+            "slow consumer must observe Lagged: {result:?}"
+        );
     }
 }

@@ -41,6 +41,28 @@ pub struct IndexedTransaction {
     pub payload_json: String,
 }
 
+/// Build the indexed transactions for `block` — the exact records
+/// [`InMemoryIndexer::index_block`] stores.
+///
+/// # Errors
+///
+/// Returns [`IndexerError`] if a transaction fails to serialize.
+pub fn indexed_transactions_of(block: &Block) -> Result<Vec<IndexedTransaction>, IndexerError> {
+    block
+        .transactions
+        .iter()
+        .map(|tx| {
+            Ok(IndexedTransaction {
+                id: tx.id.clone(),
+                block_index: block.index,
+                timestamp: tx.timestamp,
+                kind: kind_name(tx).to_owned(),
+                payload_json: serde_json::to_string(tx)?,
+            })
+        })
+        .collect()
+}
+
 /// Abstraction over the analytical storage backend.
 ///
 /// ## Implementing a `PostgreSQL` adapter (`SQLx`)
@@ -164,17 +186,8 @@ impl IndexerProvider for InMemoryIndexer {
 
         {
             let mut txns = self.transactions.write().unwrap();
-            for tx in &block.transactions {
-                txns.insert(
-                    tx.id.clone(),
-                    IndexedTransaction {
-                        id: tx.id.clone(),
-                        block_index,
-                        timestamp: tx.timestamp,
-                        kind: kind_name(tx).to_owned(),
-                        payload_json: serde_json::to_string(tx)?,
-                    },
-                );
+            for tx in indexed_transactions_of(block)? {
+                txns.insert(tx.id.clone(), tx);
             }
         }
         Ok(())

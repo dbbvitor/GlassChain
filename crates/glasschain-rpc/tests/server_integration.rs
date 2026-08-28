@@ -263,10 +263,12 @@ async fn test_query_asset_history_filters() {
         "manufacture",
         "factory-1",
     );
+    let serial_only_registration = asset_reg_tx(None, Some("SN-SOLO"), "receive", "pharm-1");
     for tx in [
         &first_registration,
         &second_registration,
         &nonmatching_registration,
+        &serial_only_registration,
     ] {
         submit_tx(&mut ledger, tx).await;
     }
@@ -305,6 +307,32 @@ async fn test_query_asset_history_filters() {
         .unwrap()
         .into_inner();
     assert!(resp.transactions.is_empty());
+
+    // A GTIN prefix must not cross-match a longer GTIN (boundary-anchored).
+    let resp = ledger
+        .query_asset_history(QueryAssetHistoryRequest {
+            gtin: "0789".into(),
+            serial_number: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        resp.transactions.is_empty(),
+        "short GTIN prefix must not match GTIN:07891234567890 assets"
+    );
+
+    // Serial-only query resolves the standalone `SN:<serial>` canonical key.
+    let resp = ledger
+        .query_asset_history(QueryAssetHistoryRequest {
+            gtin: String::new(),
+            serial_number: "SN-SOLO".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.transactions.len(), 1);
+    assert_eq!(resp.transactions[0].kind, "AssetRegistration");
 }
 
 // ── Item 3: get_verifiable_lineage canonical-key matching ────────────────────
@@ -319,12 +347,20 @@ async fn test_verifiable_lineage_canonical_key_matching() {
     let full_asset = asset_reg_tx(Some(GTIN), Some("SN-F"), "manufacture", "factory-1");
     let gtin_only = asset_reg_tx(Some(GTIN), None, "dispatch", "dist-1");
     let serial_only = asset_reg_tx(None, Some("SN-S"), "receive", "pharm-1");
-    for tx in [&full_asset, &gtin_only, &serial_only] {
+    // A batch-level asset under its own GTIN so its flat-record count stays
+    // independent of the GTIN-keyed assertions above.
+    let mut batch_asset = asset_reg_tx(Some("99999999999999"), None, "manufacture", "plant-b");
+    if let TransactionKind::AssetRegistration(ref mut reg) = batch_asset.kind {
+        reg.asset.batch_number = Some("BATCH-X".into());
+    }
+    for tx in [&full_asset, &gtin_only, &serial_only, &batch_asset] {
         submit_tx(&mut ledger, tx).await;
     }
     node.mine().await.unwrap();
 
-    // GTIN+SN canonical key.
+    // GTIN+SN canonical key: the custody chain comes from the provenance
+    // index; flat records (and therefore total_records and the trust average)
+    // are the flattener's records for the asset's GTIN (both GTIN registrations).
     let resp = ledger
         .get_verifiable_lineage(GetVerifiableLineageRequest {
             asset_id: format!("GTIN:{GTIN}:SN:SN-F"),
@@ -332,10 +368,14 @@ async fn test_verifiable_lineage_canonical_key_matching() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(resp.total_records, 1);
     assert_eq!(resp.custody_chain.len(), 1);
-    assert!(resp.is_complete);
     assert_eq!(resp.custody_chain[0].event_type, "manufacture");
+    assert_eq!(resp.total_records, 2, "flat records are keyed by GTIN");
+    assert!(!resp.is_complete, "1 custody event vs 2 flat records");
+    assert!(
+        resp.trust_score_avg > 0.0,
+        "trust average from flat records"
+    );
 
     // GTIN-only key matches the serial-less asset…
     let resp = ledger
@@ -345,8 +385,9 @@ async fn test_verifiable_lineage_canonical_key_matching() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(resp.total_records, 1);
+    assert_eq!(resp.custody_chain.len(), 1);
     assert_eq!(resp.custody_chain[0].custodian_id, "dist-1");
+    assert_eq!(resp.total_records, 2);
 
     // SN-only key matches the serial-only asset (strict equality, no substring
     // cross-matching between different canonical forms).
@@ -357,8 +398,24 @@ async fn test_verifiable_lineage_canonical_key_matching() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(resp.total_records, 1);
+    assert_eq!(resp.custody_chain.len(), 1);
     assert_eq!(resp.custody_chain[0].custodian_id, "pharm-1");
+    assert_eq!(resp.total_records, 0, "no GTIN → no flat records");
+
+    // BATCH-keyed canonical form: custody from provenance, flat records from
+    // the flattener keyed by the batch asset's GTIN.
+    let resp = ledger
+        .get_verifiable_lineage(GetVerifiableLineageRequest {
+            asset_id: "GTIN:99999999999999:BATCH:BATCH-X".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.custody_chain.len(), 1);
+    assert_eq!(resp.custody_chain[0].event_type, "manufacture");
+    assert_eq!(resp.total_records, 1, "one flat record for the batch GTIN");
+    assert!(resp.is_complete, "1 custody event and 1 flat record");
+    assert!(resp.trust_score_avg > 0.0);
 
     // Empty asset_id → invalid_argument.
     let err = ledger

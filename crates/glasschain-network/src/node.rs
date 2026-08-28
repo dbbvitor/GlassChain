@@ -10,7 +10,10 @@ use glasschain_core::{
 };
 use glasschain_identity::CertChainVerifier;
 use glasschain_identity::Identity;
-use glasschain_indexer::{EventBusProvider, InMemoryEventBus, InMemoryIndexer, IndexerProvider};
+use glasschain_indexer::{
+    indexed_transactions_of, AnalyticalFlattener, EventBusProvider, InMemoryEventBus,
+    InMemoryIndexer, IndexedBlock, IndexerProvider, ProvenanceIndex,
+};
 use rcgen;
 use rustls;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -313,6 +316,11 @@ pub struct Node {
     event_tx: broadcast::Sender<NodeEvent>,
     indexer: Arc<InMemoryIndexer>,
     event_bus: Arc<InMemoryEventBus>,
+    /// Provenance index: custody chains by canonical asset id, ingested on
+    /// every commit and rebuilt from the chain on start/sync.
+    provenance: Arc<Mutex<ProvenanceIndex>>,
+    /// Analytical flattener: flat asset records for lineage queries.
+    flattener: Arc<Mutex<AnalyticalFlattener>>,
     /// Block storage backend — persists committed blocks across restarts.
     storage: Arc<dyn StorageProvider>,
     /// TLS context used to encrypt all peer connections.
@@ -344,6 +352,8 @@ impl Node {
             event_tx,
             indexer: Arc::new(InMemoryIndexer::new()),
             event_bus: Arc::new(InMemoryEventBus::new(4096)),
+            provenance: Arc::new(Mutex::new(ProvenanceIndex::new())),
+            flattener: Arc::new(Mutex::new(AnalyticalFlattener::new())),
             storage,
             tls: Arc::new(Self::build_tls(identity)),
         }
@@ -463,6 +473,20 @@ impl Node {
         Arc::clone(&self.ledger)
     }
 
+    /// Return a clone of the provenance index handle (custody chains keyed by
+    /// canonical asset id).
+    #[must_use]
+    pub fn provenance_index(&self) -> Arc<Mutex<ProvenanceIndex>> {
+        Arc::clone(&self.provenance)
+    }
+
+    /// Return a clone of the analytical flattener handle (flat asset records
+    /// for lineage queries).
+    #[must_use]
+    pub fn analytical_flattener(&self) -> Arc<Mutex<AnalyticalFlattener>> {
+        Arc::clone(&self.flattener)
+    }
+
     /// Return the TCP address this node listens on.
     #[must_use]
     pub fn listen_addr(&self) -> &str {
@@ -580,13 +604,44 @@ impl Node {
     }
 
     /// Rebuild watcher runtime state by replaying committed inventory updates,
-    /// or restoring from a persisted snapshot if one is available.
+    /// or restoring from a persisted snapshot if one is available, and rebuild
+    /// the provenance index and analytical flattener from committed blocks.
     async fn rebuild_runtime_state_from_chain(
         ledger: &Arc<Mutex<Ledger>>,
         state: &Arc<Mutex<NodeState>>,
         storage: &Arc<dyn StorageProvider>,
+        provenance: &Arc<Mutex<ProvenanceIndex>>,
+        flattener: &Arc<Mutex<AnalyticalFlattener>>,
     ) {
         let chain = { ledger.lock().await.chain.clone() };
+
+        // Provenance and flattener are materialized projections of the chain:
+        // rebuild them from committed blocks (the chain is the authority).
+        {
+            let mut provenance_guard = provenance.lock().await;
+            *provenance_guard = ProvenanceIndex::new();
+            for block in &chain {
+                provenance_guard.ingest_block(block);
+            }
+        }
+        {
+            let mut flattener_guard = flattener.lock().await;
+            *flattener_guard = AnalyticalFlattener::new();
+            for block in &chain {
+                let txs = match indexed_transactions_of(block) {
+                    Ok(txs) => txs,
+                    Err(e) => {
+                        log::warn!(
+                            "flattener: failed to index block {} during rebuild: {e}",
+                            block.index
+                        );
+                        continue;
+                    }
+                };
+                flattener_guard.ingest_indexed_block(&IndexedBlock::from(block), &txs);
+            }
+        }
+
         let mut s = state.lock().await;
         // Always replay contracts from chain (authoritative source).
         s.engine = ContractEngine::rebuild_from_chain(&chain);
@@ -659,7 +714,14 @@ impl Node {
     // Keep listener setup and connection fan-out in one lifecycle method.
     #[allow(clippy::too_many_lines)]
     pub async fn start(&self, seed_peers: Vec<String>) -> Result<(), NetworkError> {
-        Self::rebuild_runtime_state_from_chain(&self.ledger, &self.state, &self.storage).await;
+        Self::rebuild_runtime_state_from_chain(
+            &self.ledger,
+            &self.state,
+            &self.storage,
+            &self.provenance,
+            &self.flattener,
+        )
+        .await;
 
         let listener = TcpListener::bind(&self.listen_addr).await?;
         log::info!("Node {} listening on {}", self.node_id, self.listen_addr);
@@ -676,6 +738,8 @@ impl Node {
             self.event_tx.clone(),
             Arc::clone(&self.indexer),
             Arc::clone(&self.event_bus),
+            Arc::clone(&self.provenance),
+            Arc::clone(&self.flattener),
             Arc::clone(&self.storage),
             Arc::clone(&self.tls),
         );
@@ -687,6 +751,8 @@ impl Node {
         let event_tx = self.event_tx.clone();
         let indexer = Arc::clone(&self.indexer);
         let event_bus = Arc::clone(&self.event_bus);
+        let provenance = Arc::clone(&self.provenance);
+        let flattener = Arc::clone(&self.flattener);
 
         let dtx = dial_tx.clone();
         let tls_l = Arc::clone(&self.tls);
@@ -704,6 +770,8 @@ impl Node {
                         let et = event_tx.clone();
                         let ix = Arc::clone(&indexer);
                         let eb = Arc::clone(&event_bus);
+                        let pv = Arc::clone(&provenance);
+                        let fl = Arc::clone(&flattener);
                         let dx = dtx.clone();
                         let tls2 = Arc::clone(&tls_l);
                         let st2 = Arc::clone(&storage_l);
@@ -783,6 +851,8 @@ impl Node {
                                     event_tx: et,
                                     indexer: ix,
                                     event_bus: eb,
+                                    provenance: pv,
+                                    flattener: fl,
                                     dial_tx: dx,
                                     storage: st2,
                                 },
@@ -817,6 +887,8 @@ impl Node {
         event_tx: broadcast::Sender<NodeEvent>,
         indexer: Arc<InMemoryIndexer>,
         event_bus: Arc<InMemoryEventBus>,
+        provenance: Arc<Mutex<ProvenanceIndex>>,
+        flattener: Arc<Mutex<AnalyticalFlattener>>,
         storage: Arc<dyn StorageProvider>,
         tls: Arc<NodeTls>,
     ) {
@@ -829,11 +901,13 @@ impl Node {
                 let et = event_tx.clone();
                 let ix = Arc::clone(&indexer);
                 let eb = Arc::clone(&event_bus);
+                let pv = Arc::clone(&provenance);
+                let fl = Arc::clone(&flattener);
                 let dx = dial_tx.clone();
                 let st = Arc::clone(&storage);
                 let tls_c = Arc::clone(&tls);
                 tokio::spawn(async move {
-                    connect_to_peer(addr, la, l2, s2, ni, et, ix, eb, dx, st, tls_c).await;
+                    connect_to_peer(addr, la, l2, s2, ni, et, ix, eb, pv, fl, dx, st, tls_c).await;
                 });
             }
         });
@@ -924,6 +998,8 @@ impl Node {
                 &self.event_tx,
                 &self.indexer,
                 &self.event_bus,
+                &self.provenance,
+                &self.flattener,
                 &block,
                 &self.storage,
             )
@@ -997,14 +1073,20 @@ impl Node {
         }
     }
 
-    /// Post-commit hook: persist the block, index it, fire the event bus, run
-    /// watcher triggers, and add any autonomous transactions to the ledger.
+    /// Post-commit hook: persist the block, index it, fire the event bus,
+    /// ingest the analytics projections, run watcher triggers, and add any
+    /// autonomous transactions to the ledger.
+    // Each parameter is an injected seam (`Ledger`, `NodeState`, `StorageProvider`, …);
+    // bundling them would hide the injection graph behind an opaque context type.
+    #[allow(clippy::too_many_arguments)]
     async fn after_block_commit(
         ledger: &Arc<Mutex<Ledger>>,
         state: &Arc<Mutex<NodeState>>,
         event_tx: &broadcast::Sender<NodeEvent>,
         indexer: &Arc<InMemoryIndexer>,
         event_bus: &Arc<InMemoryEventBus>,
+        provenance: &Arc<Mutex<ProvenanceIndex>>,
+        flattener: &Arc<Mutex<AnalyticalFlattener>>,
         block: &Block,
         storage: &Arc<dyn StorageProvider>,
     ) -> Vec<Transaction> {
@@ -1018,6 +1100,23 @@ impl Node {
         }
         if let Err(e) = event_bus.publish_block(block) {
             log::warn!("EventBus error: {e}");
+        }
+
+        // Analytics projections: custody provenance and flat records.
+        {
+            let mut provenance_guard = provenance.lock().await;
+            provenance_guard.ingest_block(block);
+        }
+        match indexed_transactions_of(block) {
+            Ok(txs) => {
+                flattener
+                    .lock()
+                    .await
+                    .ingest_indexed_block(&IndexedBlock::from(block), &txs);
+            }
+            Err(e) => {
+                log::warn!("flattener: failed to index block {}: {e}", block.index);
+            }
         }
 
         let watcher_orders: Vec<Transaction> = {
@@ -1125,6 +1224,8 @@ struct PeerContext {
     event_tx: broadcast::Sender<NodeEvent>,
     indexer: Arc<InMemoryIndexer>,
     event_bus: Arc<InMemoryEventBus>,
+    provenance: Arc<Mutex<ProvenanceIndex>>,
+    flattener: Arc<Mutex<AnalyticalFlattener>>,
     dial_tx: UnboundedSender<String>,
     storage: Arc<dyn StorageProvider>,
 }
@@ -1250,6 +1351,8 @@ async fn connect_to_peer(
     event_tx: broadcast::Sender<NodeEvent>,
     indexer: Arc<InMemoryIndexer>,
     event_bus: Arc<InMemoryEventBus>,
+    provenance: Arc<Mutex<ProvenanceIndex>>,
+    flattener: Arc<Mutex<AnalyticalFlattener>>,
     dial_tx: UnboundedSender<String>,
     storage: Arc<dyn StorageProvider>,
     tls: Arc<NodeTls>,
@@ -1332,6 +1435,8 @@ async fn connect_to_peer(
                     event_tx,
                     indexer,
                     event_bus,
+                    provenance,
+                    flattener,
                     dial_tx,
                     storage,
                 },
@@ -1642,6 +1747,8 @@ async fn process_message(
                     &ctx.event_tx,
                     &ctx.indexer,
                     &ctx.event_bus,
+                    &ctx.provenance,
+                    &ctx.flattener,
                     &block,
                     &ctx.storage,
                 )
@@ -1709,7 +1816,14 @@ async fn process_message(
                     });
                 }
 
-                Node::rebuild_runtime_state_from_chain(&ctx.ledger, &ctx.state, &ctx.storage).await;
+                Node::rebuild_runtime_state_from_chain(
+                    &ctx.ledger,
+                    &ctx.state,
+                    &ctx.storage,
+                    &ctx.provenance,
+                    &ctx.flattener,
+                )
+                .await;
                 log::info!(
                     "Contract engine and watcher state rebuilt from synced chain ({} blocks)",
                     new_chain.len()
@@ -1759,7 +1873,10 @@ async fn process_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glasschain_core::{InventoryUpdate, PurchaseConditions, SmartContractDef, SupplyOffer};
+    use glasschain_core::{
+        InventoryUpdate, PurchaseConditions, SmartContractDef, SupplyOffer, TraceableAsset,
+        TraceableAssetRegistration,
+    };
     use glasschain_identity::SignedTransaction;
 
     #[test]
@@ -2078,6 +2195,8 @@ mod tests {
             &node.event_tx,
             &node.indexer,
             &node.event_bus,
+            &node.provenance,
+            &node.flattener,
             &block,
             &node.storage,
         )
@@ -2123,7 +2242,14 @@ mod tests {
         storage.put_state("watcher:state", &bytes).unwrap();
 
         let node = Node::new_with_storage("n1", "127.0.0.1:0", 2, Arc::clone(&storage));
-        Node::rebuild_runtime_state_from_chain(&node.ledger, &node.state, &node.storage).await;
+        Node::rebuild_runtime_state_from_chain(
+            &node.ledger,
+            &node.state,
+            &node.storage,
+            &node.provenance,
+            &node.flattener,
+        )
+        .await;
 
         let restored = node
             .state
@@ -2144,7 +2270,8 @@ mod tests {
             .put_state("watcher:state", b"not-valid-json")
             .unwrap();
 
-        // Build a persisted chain that commits an InventoryUpdate.
+        // Build a persisted chain that commits an InventoryUpdate and an
+        // AssetRegistration (so the analytics projections have data to rebuild).
         let genesis = Ledger::new(2).chain[0].clone();
         storage.put_block(&genesis).unwrap();
         let tx = Transaction::with_id(
@@ -2156,12 +2283,40 @@ mod tests {
                 reason: "x".into(),
             }),
         );
-        let mut block = Block::new(1, vec![tx], genesis.hash);
+        let asset_tx = Transaction::with_id(
+            "asset-1",
+            TransactionKind::AssetRegistration(TraceableAssetRegistration {
+                asset: TraceableAsset {
+                    gtin: Some("07891234100016".into()),
+                    batch_number: None,
+                    expiry_date: None,
+                    serial_number: Some("SN-REBUILD".into()),
+                    anvisa_registration: None,
+                    manufacturer_id: None,
+                    product_name: "Dipirona 500mg".into(),
+                    custodian_id: "plant-1".into(),
+                    country_of_origin: None,
+                    storage_temp_celsius: None,
+                    quantity: 1,
+                },
+                event_type: "manufacture".into(),
+                originator_id: "plant-1".into(),
+                purchase_order_ref: None,
+            }),
+        );
+        let mut block = Block::new(1, vec![tx, asset_tx], genesis.hash);
         block.mine(2);
         storage.put_block(&block).unwrap();
 
         let node = Node::new_with_storage("n1", "127.0.0.1:0", 2, Arc::clone(&storage));
-        Node::rebuild_runtime_state_from_chain(&node.ledger, &node.state, &node.storage).await;
+        Node::rebuild_runtime_state_from_chain(
+            &node.ledger,
+            &node.state,
+            &node.storage,
+            &node.provenance,
+            &node.flattener,
+        )
+        .await;
 
         let restored = node
             .state
@@ -2172,6 +2327,23 @@ mod tests {
         assert_eq!(
             restored, 7,
             "invalid snapshot must fall back to replaying committed inventory updates"
+        );
+
+        // The analytics projections must rebuild from the committed chain.
+        let canonical_id = "GTIN:07891234100016:SN:SN-REBUILD";
+        assert_eq!(
+            node.provenance
+                .lock()
+                .await
+                .get_custody_chain(canonical_id)
+                .len(),
+            1,
+            "provenance must rebuild custody chains from persisted blocks"
+        );
+        assert_eq!(
+            node.flattener.lock().await.records().len(),
+            1,
+            "flattener must rebuild flat records from persisted blocks"
         );
     }
 

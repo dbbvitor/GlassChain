@@ -27,7 +27,7 @@
 
 use crate::indexer::{IndexedBlock, IndexedTransaction};
 use crate::provenance::{CustodyEvent, ProvenanceIndex};
-use glasschain_core::{MetadataTrustScore, TraceableAssetRegistration};
+use glasschain_core::{MetadataTrustScore, Transaction, TransactionKind};
 use serde::{Deserialize, Serialize};
 
 // ── FlatAssetRecord ───────────────────────────────────────────────────────────
@@ -127,7 +127,7 @@ pub struct FlatAssetRecord {
 #[derive(Debug, thiserror::Error)]
 pub enum FlattenerError {
     /// The transaction's `payload_json` could not be parsed as a
-    /// [`TraceableAssetRegistration`].
+    /// [`Transaction`] (the format the indexer stores).
     #[error("deserialization error: {0}")]
     Deserialization(#[from] serde_json::Error),
 
@@ -204,9 +204,10 @@ impl AnalyticalFlattener {
     /// # Errors
     ///
     /// - [`FlattenerError::NotAssetRegistration`] — `tx.kind` is not
-    ///   `"AssetRegistration"`.
+    ///   `"AssetRegistration"`, or the parsed transaction's kind is not an
+    ///   [`AssetRegistration`](glasschain_core::TransactionKind::AssetRegistration).
     /// - [`FlattenerError::Deserialization`] — `tx.payload_json` cannot be
-    ///   parsed as a [`TraceableAssetRegistration`].
+    ///   parsed as a [`Transaction`] (the format the indexer stores).
     pub fn flatten_transaction(
         tx: &IndexedTransaction,
         block_index: u64,
@@ -217,7 +218,12 @@ impl AnalyticalFlattener {
             return Err(FlattenerError::NotAssetRegistration);
         }
 
-        let reg: TraceableAssetRegistration = serde_json::from_str(&tx.payload_json)?;
+        // The indexer stores the full Transaction JSON in `payload_json`
+        // (`index_block` / `indexed_transactions_of`), so unwrap the kind.
+        let full_tx: Transaction = serde_json::from_str(&tx.payload_json)?;
+        let TransactionKind::AssetRegistration(reg) = full_tx.kind else {
+            return Err(FlattenerError::NotAssetRegistration);
+        };
         let score = MetadataTrustScore::compute(&reg.asset);
 
         Ok(FlatAssetRecord {
@@ -474,7 +480,10 @@ fn extract_gtin(asset_id: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glasschain_core::{MetadataTrustScore, TraceableAsset, TraceableAssetRegistration};
+    use glasschain_core::{
+        MetadataTrustScore, TraceableAsset, TraceableAssetRegistration, Transaction,
+        TransactionKind,
+    };
 
     // ── Fixtures ──────────────────────────────────────────────────────────────
 
@@ -512,8 +521,9 @@ mod tests {
         }
     }
 
-    /// Build an [`IndexedTransaction`] carrying a [`TraceableAssetRegistration`]
-    /// payload serialised as JSON — the format expected by `flatten_transaction`.
+    /// Build an [`IndexedTransaction`] carrying an `AssetRegistration`
+    /// transaction serialised the way [`InMemoryIndexer::index_block`] stores
+    /// it: the full [`Transaction`] JSON in `payload_json`.
     fn make_asset_tx(asset: TraceableAsset, event_type: &str, tx_id: &str) -> IndexedTransaction {
         let reg = TraceableAssetRegistration {
             asset,
@@ -521,12 +531,13 @@ mod tests {
             originator_id: "originator-1".into(),
             purchase_order_ref: None,
         };
+        let tx = Transaction::with_id(tx_id, TransactionKind::AssetRegistration(reg));
         IndexedTransaction {
-            id: tx_id.to_owned(),
+            id: tx.id.clone(),
             block_index: 1,
             timestamp: 1_700_000_000,
             kind: "AssetRegistration".to_owned(),
-            payload_json: serde_json::to_string(&reg).unwrap(),
+            payload_json: serde_json::to_string(&tx).unwrap(),
         }
     }
 
