@@ -1,12 +1,14 @@
 use crate::error::NetworkError;
 use crate::peer::{PeerReader, PeerWriter};
 use crate::protocol::{Message, PROTOCOL_VERSION};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use glasschain_contracts::{ContractEngine, InventoryTrigger, WatcherService};
 use glasschain_core::crypto::sha256;
 use glasschain_core::providers::in_memory::InMemoryStorageProvider;
 use glasschain_core::{
-    Block, CapabilityAdvertisement, CapabilityHistory, CommitNotification, ExecutionProvider,
-    Ledger, QuorumCertificate, StorageProvider, Transaction, TransactionKind, CAPABILITY_V1,
+    Block, CapabilityAdvertisement, CapabilityHistory, CommitNotification, ExecutionLimits,
+    ExecutionProvider, ExecutionResult, Ledger, PersistentWrite, QuorumCertificate,
+    StorageProvider, Transaction, TransactionKind, CAPABILITY_V1,
 };
 use glasschain_identity::CertChainVerifier;
 use glasschain_identity::Identity;
@@ -167,6 +169,15 @@ struct NodeState {
     cert_verifier: Option<Arc<CertChainVerifier>>,
     /// Optional node identity for signing autonomous watcher transactions.
     identity: Option<Arc<Identity>>,
+    /// Derived world-state cache: the materialized committed write sets,
+    /// keyed by `ws:<channel>:<contract>:<key>`.  Rebuilt from committed
+    /// blocks on restart — never re-executed (ADR-007 decision 2).  PDC-scoped
+    /// keys hold their commitment until the private payload arrives through
+    /// ADR-003 dissemination (#46/#47).
+    world_state: HashMap<String, Vec<u8>>,
+    /// Optional VM execution provider, used to produce a candidate block's
+    /// write set at mining time.
+    executor: Option<Arc<dyn ExecutionProvider>>,
 }
 
 impl NodeState {
@@ -348,6 +359,8 @@ impl Node {
                 peer_registry: PeerRegistry::new(),
                 cert_verifier: None,
                 identity: identity.clone(),
+                world_state: HashMap::new(),
+                executor: None,
             })),
             event_tx,
             indexer: Arc::new(InMemoryIndexer::new()),
@@ -487,6 +500,12 @@ impl Node {
         Arc::clone(&self.flattener)
     }
 
+    /// Snapshot of the derived world state (committed write sets, keyed by
+    /// `ws:<channel>:<contract>:<key>`).
+    pub async fn world_state(&self) -> HashMap<String, Vec<u8>> {
+        self.state.lock().await.world_state.clone()
+    }
+
     /// Return the TCP address this node listens on.
     #[must_use]
     pub fn listen_addr(&self) -> &str {
@@ -605,7 +624,8 @@ impl Node {
 
     /// Rebuild watcher runtime state by replaying committed inventory updates,
     /// or restoring from a persisted snapshot if one is available, and rebuild
-    /// the provenance index and analytical flattener from committed blocks.
+    /// the derived world state and the analytics projections from committed
+    /// blocks.
     async fn rebuild_runtime_state_from_chain(
         ledger: &Arc<Mutex<Ledger>>,
         state: &Arc<Mutex<NodeState>>,
@@ -614,6 +634,18 @@ impl Node {
         flattener: &Arc<Mutex<AnalyticalFlattener>>,
     ) {
         let chain = { ledger.lock().await.chain.clone() };
+
+        // World state is a materialized projection of the chain: rebuild it
+        // from committed write sets in block order (never re-executing guest
+        // code), healing any partial apply and refreshing the storage state.
+        match Self::rebuild_world_state(storage) {
+            Ok(world_state) => {
+                state.lock().await.world_state = world_state;
+            }
+            Err(e) => {
+                log::warn!("Failed to rebuild world state from chain: {e}");
+            }
+        }
 
         // Provenance and flattener are materialized projections of the chain:
         // rebuild them from committed blocks (the chain is the authority).
@@ -678,6 +710,42 @@ impl Node {
         }
     }
 
+    /// Rebuild the derived world state from committed blocks in block order.
+    ///
+    /// Reads the persisted chain and applies each block's committed write set
+    /// to a fresh cache, re-applying it to the storage state (healing a
+    /// backend failure that persisted the block but not the state).  No guest
+    /// code is executed anywhere on this path (ADR-007 decision 2).
+    fn rebuild_world_state(
+        storage: &Arc<dyn StorageProvider>,
+    ) -> Result<HashMap<String, Vec<u8>>, NetworkError> {
+        let mut world_state = HashMap::new();
+        let Some(latest) = storage.latest_block_index()? else {
+            return Ok(world_state);
+        };
+        for index in 0..=latest {
+            let Some(block) = storage.get_block(index)? else {
+                // A gap in the persisted chain is storage corruption; surface
+                // it loudly and continue so the remaining blocks still heal.
+                log::warn!("world-state rebuild: block {index} missing from storage");
+                continue;
+            };
+            for write in &block.write_set {
+                match &write.op {
+                    glasschain_core::WriteOp::Set(value) => {
+                        world_state.insert(write.state_key(), value.clone());
+                        storage.put_state(&write.state_key(), value)?;
+                    }
+                    glasschain_core::WriteOp::Delete => {
+                        world_state.remove(&write.state_key());
+                        storage.delete_state(&write.state_key())?;
+                    }
+                }
+            }
+        }
+        Ok(world_state)
+    }
+
     /// Attach a WASM execution provider to the contract engine.
     ///
     /// After this call, contracts that carry a `wasm_code_b64` payload will be
@@ -685,7 +753,8 @@ impl Node {
     pub async fn set_execution_provider(&self, executor: Arc<dyn ExecutionProvider>) {
         let mut s = self.state.lock().await;
         s.engine.set_executor(Arc::clone(&executor));
-        s.watcher.set_executor(executor);
+        s.watcher.set_executor(Arc::clone(&executor));
+        s.executor = Some(executor);
     }
 
     /// Enable CA-backed certificate verification for peer authentication.
@@ -722,6 +791,25 @@ impl Node {
             &self.flattener,
         )
         .await;
+
+        // Ensure the persisted chain matches the in-memory chain: a fresh
+        // node's genesis (and any restored-but-unpersisted blocks) must land
+        // through the atomic boundary so later blocks can chain to it.
+        {
+            let chain = self.ledger.lock().await.chain.clone();
+            for block in &chain {
+                let already_persisted = self.storage.get_block(block.index)?.is_some();
+                if already_persisted {
+                    continue;
+                }
+                if let Err(e) = self.storage.apply_block(block) {
+                    log::warn!(
+                        "Storage: failed to persist block {} on start: {e}",
+                        block.index
+                    );
+                }
+            }
+        }
 
         let listener = TcpListener::bind(&self.listen_addr).await?;
         log::info!("Node {} listening on {}", self.node_id, self.listen_addr);
@@ -980,7 +1068,12 @@ impl Node {
             ledger.prepare_mining()?
         };
 
-        let mut block = Block::new(index, transactions, prev_hash.clone());
+        // The committed block carries the canonical write set of the accepted
+        // persistent VM writes (ADR-007 decision 2): execute the candidate's
+        // ContractExecution transactions against the committed snapshot,
+        // canonicalize, and redact PDC values to commitments before inclusion.
+        let write_set = Self::compute_write_set(&self.state, &transactions).await?;
+        let mut block = Block::with_write_set(index, transactions, prev_hash.clone(), write_set);
         block.mine(difficulty);
         // The commit notification carries the quorum certificate: every commit
         // consumer receives the attestation set from the seam.
@@ -1032,6 +1125,78 @@ impl Node {
         self.mine_async().await
     }
 
+    /// Compute the candidate block's canonical write set: execute every
+    /// `ContractExecution` transaction against the committed world-state
+    /// snapshot, canonicalize the collected writes, and redact PDC values to
+    /// their commitments (ADR-007 decision 2 — the block never holds a
+    /// private value).
+    ///
+    /// Deterministic: the snapshot, transaction order, and canonicalized
+    /// output are all functions of committed chain state.  A transaction
+    /// whose execution fails (invalid WASM, gas exhaustion, …) accepts **no**
+    /// writes; the failure is a deterministic function of the same inputs, so
+    /// every node computes the identical write set and the block stays
+    /// consistent — an empty contribution is the complete write set for that
+    /// transaction, not a partial one.
+    async fn compute_write_set(
+        state: &Arc<Mutex<NodeState>>,
+        transactions: &[Transaction],
+    ) -> Result<Vec<PersistentWrite>, NetworkError> {
+        let s = state.lock().await;
+        let Some(executor) = &s.executor else {
+            return Ok(Vec::new());
+        };
+        // The snapshot exposes exactly the committed state this node holds:
+        // public values directly, PDC-scoped keys as their commitment until
+        // the private payload arrives through ADR-003 dissemination (#46/#47).
+        let mut result = ExecutionResult::default();
+        for tx in transactions {
+            let TransactionKind::ContractExecution(ref execution) = tx.kind else {
+                continue;
+            };
+            let Some(contract) = s.engine.get_contract(&execution.contract_id) else {
+                continue;
+            };
+            let Some(wasm_b64) = contract.definition.wasm_code_b64.as_ref() else {
+                continue;
+            };
+            let wasm = match BASE64_STANDARD.decode(wasm_b64) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    log::warn!(
+                        "write-set: contract {} carried invalid WASM: {error}",
+                        execution.contract_id
+                    );
+                    continue;
+                }
+            };
+            let execution_id = format!("commit:{}:{}", execution.contract_id, tx.id);
+            match executor.execute_with_state(
+                &execution_id,
+                &wasm,
+                s.world_state.clone(),
+                ExecutionLimits::new(100_000, 100_000),
+            ) {
+                Ok(execution_result) => result.writes.extend(execution_result.writes),
+                Err(error) => {
+                    log::warn!(
+                        "write-set: execution of contract {} failed: {error}",
+                        execution.contract_id
+                    );
+                }
+            }
+        }
+        // Canonicalize (validates scopes, rejects intra-execution duplicates,
+        // sorts deterministically) and redact PDC values for the block.
+        let canonical = result.canonicalize()?;
+        Ok(canonical
+            .writes
+            .iter()
+            .map(PersistentWrite::block_form)
+            .collect())
+    }
+
+    /// Rebuild the derived world state from committed blocks in block order.
     /// Return a snapshot of the current ledger state.
     pub async fn ledger_snapshot(&self) -> Ledger {
         self.ledger.lock().await.clone()
@@ -1078,7 +1243,8 @@ impl Node {
     /// autonomous transactions to the ledger.
     // Each parameter is an injected seam (`Ledger`, `NodeState`, `StorageProvider`, …);
     // bundling them would hide the injection graph behind an opaque context type.
-    #[allow(clippy::too_many_arguments)]
+    // The body is one linear post-commit pipeline; split it when a caller needs a piece.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn after_block_commit(
         ledger: &Arc<Mutex<Ledger>>,
         state: &Arc<Mutex<NodeState>>,
@@ -1090,9 +1256,21 @@ impl Node {
         block: &Block,
         storage: &Arc<dyn StorageProvider>,
     ) -> Vec<Transaction> {
-        // Persist this block so it survives a restart.
-        if let Err(e) = storage.put_block(block) {
-            log::warn!("Storage: failed to persist block {}: {e}", block.index);
+        // Persist the block and apply its canonical write set through one
+        // atomic commit boundary; on success, mirror the writes into the
+        // derived world-state cache.  On failure the chain stays authoritative
+        // (ADR-007 decision 2): the block is already committed to the ledger,
+        // and the next rebuild heals the storage divergence from the chain.
+        match storage.apply_block(block) {
+            Ok(()) => {
+                let mut s = state.lock().await;
+                for write in &block.write_set {
+                    write.apply_to_cache(&mut s.world_state);
+                }
+            }
+            Err(e) => {
+                log::warn!("Storage: failed to apply block {}: {e}", block.index);
+            }
         }
 
         if let Err(e) = indexer.index_block(block) {
@@ -1874,10 +2052,11 @@ async fn process_message(
 mod tests {
     use super::*;
     use glasschain_core::{
-        InventoryUpdate, PurchaseConditions, SmartContractDef, SupplyOffer, TraceableAsset,
-        TraceableAssetRegistration,
+        ContractExecution, CoreError, InventoryUpdate, PurchaseConditions, SmartContractDef,
+        SupplyOffer, TraceableAsset, TraceableAssetRegistration, WriteOp, WriteVisibility,
     };
     use glasschain_identity::SignedTransaction;
+    use glasschain_vm::WasmExecutionProvider;
 
     #[test]
     fn tofu_first_contact_records_identity() {
@@ -2397,5 +2576,286 @@ mod tests {
         assert_eq!(summary.status, "Active");
         assert_eq!(summary.quantity_purchased, 10);
         assert_eq!(summary.max_quantity, 50);
+    }
+
+    // ── 8. Committed write sets (ticket #41) ────────────────────────────────
+
+    /// A contract that persists one public write and one PDC write.
+    fn write_set_wasm_b64() -> String {
+        let wat = r#"
+(module
+  (import "env" "persist_state" (func $persist (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "env" "set_state" (func $set_state (param i32 i32 i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "ch")
+  (data (i32.const 16) "contract-1")
+  (data (i32.const 32) "public-key")
+  (data (i32.const 48) "public-value")
+  (data (i32.const 64) "pdc-key")
+  (data (i32.const 80) "secret")
+  (data (i32.const 96) "collection-1")
+  (data (i32.const 112) "approve")
+  (data (i32.const 120) "1")
+  (func (export "execute")
+    ;; public set: ch / contract-1 / public-key = public-value
+    (call $persist (i32.const 0) (i32.const 2) (i32.const 16) (i32.const 10)
+                   (i32.const 32) (i32.const 10) (i32.const 48) (i32.const 12)
+                   (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))
+    (drop)
+    ;; PDC set: ch / contract-1 / pdc-key = secret → collection-1
+    (call $persist (i32.const 0) (i32.const 2) (i32.const 16) (i32.const 10)
+                   (i32.const 64) (i32.const 7) (i32.const 80) (i32.const 6)
+                   (i32.const 0) (i32.const 1) (i32.const 96) (i32.const 12))
+    (drop)
+    (call $set_state (i32.const 112) (i32.const 7) (i32.const 120) (i32.const 1))
+  )
+)
+"#;
+        let wasm = wat::parse_str(wat).expect("fixture WAT must compile");
+        BASE64_STANDARD.encode(wasm)
+    }
+
+    fn write_set_contract() -> SmartContractDef {
+        SmartContractDef {
+            contract_id: "c-ws".into(),
+            buyer_id: "buyer-1".into(),
+            product_id: "SKU-1".into(),
+            conditions: PurchaseConditions {
+                max_price_per_unit: 1_000,
+                min_quantity: 1,
+                max_quantity: 10,
+                max_lead_time_days: 5,
+                preferred_seller_id: None,
+                currency: "USD".into(),
+                auto_execute: false,
+            },
+            wasm_code_b64: Some(write_set_wasm_b64()),
+        }
+    }
+
+    fn write_set_execution() -> Transaction {
+        Transaction::new(TransactionKind::ContractExecution(ContractExecution {
+            contract_id: "c-ws".into(),
+            purchase_order_tx_id: "po-1".into(),
+            buyer_id: "buyer-1".into(),
+            seller_id: "seller-1".into(),
+            product_id: "SKU-1".into(),
+            quantity: 5,
+            total_price: 5_000,
+            currency: "USD".into(),
+        }))
+    }
+
+    async fn commit_write_set_scenario(
+        storage: Arc<dyn StorageProvider>,
+    ) -> (Arc<Node>, HashMap<String, Vec<u8>>) {
+        let node = Node::new_with_storage("n-ws", "127.0.0.1:0", 1, Arc::clone(&storage));
+        node.start(vec![]).await.unwrap();
+        node.set_execution_provider(Arc::new(
+            WasmExecutionProvider::new().expect("wasmtime must init"),
+        ))
+        .await;
+        node.submit_transaction(Transaction::new(TransactionKind::ContractCreation(
+            write_set_contract(),
+        )))
+        .await
+        .unwrap();
+        node.mine().await.unwrap();
+        node.submit_transaction(write_set_execution())
+            .await
+            .unwrap();
+        node.mine().await.unwrap();
+
+        let expected = HashMap::from([
+            (
+                "ws:ch:contract-1:public-key".to_owned(),
+                b"public-value".to_vec(),
+            ),
+            (
+                "ws:ch:contract-1:pdc-key".to_owned(),
+                sha256(b"secret").into_bytes(),
+            ),
+        ]);
+        (Arc::new(node), expected)
+    }
+
+    #[tokio::test]
+    async fn committed_block_carries_canonical_write_set_with_pdc_commitment() {
+        let storage: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
+        let (node, expected) = commit_write_set_scenario(Arc::clone(&storage)).await;
+
+        let block = storage
+            .get_block(2)
+            .unwrap()
+            .expect("execution block committed");
+        assert_eq!(block.write_set.len(), 2, "one public + one PDC write");
+        // Canonicalized: scope-sorted, deterministic order.
+        assert_eq!(block.write_set[0].key, "pdc-key");
+        assert_eq!(block.write_set[1].key, "public-key");
+
+        let public_write = &block.write_set[1];
+        assert_eq!(
+            public_write.op,
+            WriteOp::Set(b"public-value".to_vec()),
+            "public writes carry their value"
+        );
+
+        let pdc_write = &block.write_set[0];
+        assert_eq!(
+            pdc_write.visibility,
+            WriteVisibility::Pdc("collection-1".into())
+        );
+        let WriteOp::Set(commitment) = &pdc_write.op else {
+            panic!("expected a commitment Set");
+        };
+        assert_eq!(commitment, &sha256(b"secret").into_bytes());
+        assert_ne!(
+            commitment, b"secret",
+            "the private value must never enter the block"
+        );
+
+        // The derived cache holds the public value and the PDC commitment.
+        assert_eq!(node.world_state().await, expected);
+    }
+
+    #[tokio::test]
+    async fn restart_rebuilds_world_state_from_committed_write_sets_without_reexecution() {
+        let storage: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
+        let (_, expected) = commit_write_set_scenario(Arc::clone(&storage)).await;
+
+        // A fresh node over the same storage, with **no** execution provider:
+        // the world state must rebuild from the committed write sets alone —
+        // no guest code is re-executed anywhere on the rebuild path.
+        let restarted = Node::new_with_storage("n-restart", "127.0.0.1:0", 1, storage);
+        restarted.start(vec![]).await.unwrap();
+        assert_eq!(
+            restarted.world_state().await,
+            expected,
+            "restart rebuild must materialize the same committed state"
+        );
+    }
+
+    /// A backend that persists the block durably and then fails before the
+    /// derived state is applied — the AC3 failure shape.
+    struct FailStateApply {
+        inner: Arc<dyn StorageProvider>,
+    }
+
+    impl StorageProvider for FailStateApply {
+        fn put_block(&self, block: &Block) -> Result<(), CoreError> {
+            self.inner.put_block(block)
+        }
+        fn get_block(&self, index: u64) -> Result<Option<Block>, CoreError> {
+            self.inner.get_block(index)
+        }
+        fn latest_block_index(&self) -> Result<Option<u64>, CoreError> {
+            self.inner.latest_block_index()
+        }
+        fn apply_block(&self, block: &Block) -> Result<(), CoreError> {
+            // Simulated crash: the block lands durably, then the backend dies
+            // before any state application.
+            self.inner.put_block(block)?;
+            Err(CoreError::Storage(
+                "simulated crash after block durability".to_owned(),
+            ))
+        }
+        fn put_state(&self, key: &str, value: &[u8]) -> Result<(), CoreError> {
+            self.inner.put_state(key, value)
+        }
+        fn get_state(&self, key: &str) -> Result<Option<Vec<u8>>, CoreError> {
+            self.inner.get_state(key)
+        }
+        fn delete_state(&self, key: &str) -> Result<(), CoreError> {
+            self.inner.delete_state(key)
+        }
+        fn name(&self) -> &'static str {
+            "fail-state-apply"
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_after_block_durable_is_healed_by_rebuild() {
+        let inner: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
+        let failing: Arc<dyn StorageProvider> = Arc::new(FailStateApply {
+            inner: Arc::clone(&inner),
+        });
+        let (node, expected) = commit_write_set_scenario(Arc::clone(&failing)).await;
+
+        // Every apply_block failed after the block write: history is durable,
+        // the derived cache and storage state are not.
+        assert!(
+            node.world_state().await.is_empty(),
+            "the derived cache must be empty after the failures"
+        );
+        assert!(inner
+            .get_state("ws:ch:contract-1:public-key")
+            .unwrap()
+            .is_none());
+
+        // Rebuild consumes the committed write sets in block order — no
+        // rollback, no history edit — and heals both projections.
+        let healed = Node::rebuild_world_state(&failing).expect("rebuild must succeed");
+        assert_eq!(healed, expected);
+        assert_eq!(
+            inner.get_state("ws:ch:contract-1:public-key").unwrap(),
+            Some(b"public-value".to_vec()),
+            "rebuild must heal the storage state"
+        );
+        assert_eq!(
+            inner.get_block(2).unwrap().unwrap().write_set.len(),
+            2,
+            "history must stay untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn sled_backed_restart_rebuilds_world_state_across_persistence() {
+        use glasschain_storage::SledStorageProvider;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(SledStorageProvider::open(dir.path()).expect("sled must open"));
+        let (_, expected) = commit_write_set_scenario(Arc::clone(&storage)).await;
+
+        // A genuinely fresh node over the same on-disk directory, without an
+        // execution provider: the committed write sets alone must rebuild the
+        // world state (persistence + restart rebuild, AC5).
+        let restarted = Node::new_with_storage("n-sled-restart", "127.0.0.1:0", 1, storage);
+        restarted.start(vec![]).await.unwrap();
+        assert_eq!(restarted.world_state().await, expected);
+    }
+
+    #[tokio::test]
+    async fn failing_execution_accepts_no_writes_and_block_stays_consistent() {
+        let storage: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
+        let node = Node::new_with_storage("n-bad-wasm", "127.0.0.1:0", 1, Arc::clone(&storage));
+        node.start(vec![]).await.unwrap();
+        node.set_execution_provider(Arc::new(
+            WasmExecutionProvider::new().expect("wasmtime must init"),
+        ))
+        .await;
+
+        // A contract whose WASM is not valid base64: execution fails, the
+        // transaction accepts no writes, and the block still commits with an
+        // empty write set — the same result on every node (deterministic).
+        let mut def = write_set_contract();
+        def.wasm_code_b64 = Some("not-base64".to_owned());
+        node.submit_transaction(Transaction::new(TransactionKind::ContractCreation(def)))
+            .await
+            .unwrap();
+        node.mine().await.unwrap();
+        node.submit_transaction(write_set_execution())
+            .await
+            .unwrap();
+        node.mine().await.unwrap();
+
+        let block = storage
+            .get_block(2)
+            .unwrap()
+            .expect("execution block committed");
+        assert!(
+            block.write_set.is_empty(),
+            "a failed execution accepts no writes"
+        );
+        assert!(node.world_state().await.is_empty());
     }
 }

@@ -83,6 +83,56 @@ pub trait StorageProvider: Send + Sync {
     /// Returns `Err` if the underlying storage backend fails to persist the block.
     fn put_block(&self, block: &Block) -> Result<(), CoreError>;
 
+    /// Atomically persist `block` **and** apply its canonical write set to the
+    /// world state, rejecting a stale candidate whole.
+    ///
+    /// This is the one atomic block-plus-state commit boundary (ADR-007
+    /// decision 2): under the backend's atomic section the implementation
+    /// verifies that `block` chains to the current tip (`previous_hash` and
+    /// `index`; the store may be empty only for the genesis block), persists
+    /// the block, and applies every [`PersistentWrite`](crate::PersistentWrite)
+    /// in the block (sets write the value, deletes remove the key, keyed by
+    /// [`PersistentWrite::state_key`](crate::PersistentWrite::state_key)).  On
+    /// any tip mismatch the **whole** candidate — block and write set — is
+    /// rejected with [`CoreError::InvalidBlock`]; a partial write set is never
+    /// acknowledged.
+    ///
+    /// The default implementation is a sequential fallback (block first, then
+    /// one `put_state`/`delete_state` per write): it is correct for
+    /// single-writer processes but **not atomic**.  Implementors should
+    /// override it with a real atomic section (e.g. a sled multi-tree
+    /// transaction).
+    ///
+    /// # Errors
+    /// Returns [`CoreError::InvalidBlock`] if `block` does not chain to the
+    /// stored tip, and `Err` if the backend fails.
+    fn apply_block(&self, block: &Block) -> Result<(), CoreError> {
+        let tip = match self.latest_block_index()? {
+            Some(tip_index) => {
+                let Some(tip) = self.get_block(tip_index)? else {
+                    return Err(CoreError::Storage(format!(
+                        "block {tip_index} missing from store"
+                    )));
+                };
+                Some(tip)
+            }
+            None => None,
+        };
+        validate_tip_chain(block, tip.as_ref())?;
+        self.put_block(block)?;
+        for write in &block.write_set {
+            match &write.op {
+                crate::write_set::WriteOp::Set(value) => {
+                    self.put_state(&write.state_key(), value)?;
+                }
+                crate::write_set::WriteOp::Delete => {
+                    self.delete_state(&write.state_key())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Retrieve a block by its sequential index.
     ///
     /// # Errors
@@ -116,6 +166,39 @@ pub trait StorageProvider: Send + Sync {
 
     /// Human-readable identifier for this storage implementation.
     fn name(&self) -> &str;
+}
+
+/// The block-plus-state boundary's chain check (ADR-007 decision 2): a
+/// candidate must chain to the stored tip.
+///
+/// `None` means an empty store, which accepts only the genesis block.  Every
+/// [`StorageProvider::apply_block`] implementation routes through this so
+/// stale candidates are rejected whole, with one error shape across backends.
+///
+/// # Errors
+///
+/// Returns [`CoreError::InvalidBlock`] when the candidate does not chain to
+/// the tip.
+pub fn validate_tip_chain(block: &Block, tip: Option<&Block>) -> Result<(), CoreError> {
+    match tip {
+        None => {
+            if block.index != 0 {
+                return Err(CoreError::InvalidBlock(format!(
+                    "block {} does not chain to the empty store",
+                    block.index
+                )));
+            }
+        }
+        Some(tip) => {
+            if block.index != tip.index + 1 || block.previous_hash != tip.hash {
+                return Err(CoreError::InvalidBlock(format!(
+                    "stale tip: block {} does not chain to stored tip {}",
+                    block.index, tip.index
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Independent instruction and host-operation budgets for one contract execution.
@@ -313,7 +396,7 @@ impl ConsensusProvider for PowConsensusProvider {
 ///
 /// **Not** suitable for production (data is lost on process restart).
 pub mod in_memory {
-    use super::{Block, CoreError, StorageProvider};
+    use super::{validate_tip_chain, Block, CoreError, StorageProvider};
     use std::collections::HashMap;
     use std::sync::RwLock;
 
@@ -338,6 +421,33 @@ pub mod in_memory {
                 .write()
                 .expect("lock poisoned")
                 .insert(block.index, block.clone());
+            Ok(())
+        }
+
+        // The atomic section must hold both write locks until every write is
+        // applied and the block insert is complete — the guards deliberately
+        // live to the end of the function (the lint mis-reads the loop's last
+        // use as a tighter drop point).
+        #[allow(clippy::significant_drop_tightening)]
+        fn apply_block(&self, block: &Block) -> Result<(), CoreError> {
+            // One atomic block-plus-state boundary (ADR-007 decision 2): the
+            // tip check, block insert, and write-set application all happen
+            // under the same pair of write locks. Lock order (blocks, then
+            // state) is fixed so concurrent applies serialize and a stale
+            // candidate is rejected whole.
+            let mut blocks = self.blocks.write().expect("lock poisoned");
+            let tip = match blocks.keys().copied().max() {
+                Some(tip_index) => Some(blocks.get(&tip_index).cloned().ok_or_else(|| {
+                    CoreError::Storage(format!("block {tip_index} missing from store"))
+                })?),
+                None => None,
+            };
+            validate_tip_chain(block, tip.as_ref())?;
+            let mut state = self.state.write().expect("lock poisoned");
+            blocks.insert(block.index, block.clone());
+            for write in &block.write_set {
+                write.apply_to_cache(&mut state);
+            }
             Ok(())
         }
 
@@ -386,11 +496,22 @@ pub mod in_memory {
     mod tests {
         use super::*;
         use crate::block::Block;
+        use crate::write_set::{PersistentWrite, WriteOp, WriteVisibility};
 
         fn genesis() -> Block {
             let mut b = Block::new(0, vec![], "0".into());
             b.mine(1);
             b
+        }
+
+        fn write(channel: &str, contract: &str, key: &str, value: &[u8]) -> PersistentWrite {
+            PersistentWrite {
+                channel: channel.into(),
+                contract: contract.into(),
+                key: key.into(),
+                op: WriteOp::Set(value.to_vec()),
+                visibility: WriteVisibility::Public,
+            }
         }
 
         #[test]
@@ -429,6 +550,81 @@ pub mod in_memory {
             store.put_state("k", b"v").unwrap();
             store.delete_state("k").unwrap();
             assert!(store.get_state("k").unwrap().is_none());
+        }
+
+        #[test]
+        fn test_apply_block_applies_write_set_atomically() {
+            let store = InMemoryStorageProvider::new();
+            let g = genesis();
+            store.apply_block(&g).unwrap();
+
+            let writes = vec![
+                write("ch", "contract", "a", b"1"),
+                PersistentWrite {
+                    op: WriteOp::Delete,
+                    ..write("ch", "contract", "b", b"gone")
+                },
+            ];
+            let mut b = Block::with_write_set(1, vec![], g.hash, writes);
+            b.mine(1);
+            store.apply_block(&b).unwrap();
+
+            assert_eq!(store.get_block(1).unwrap().unwrap().hash, b.hash);
+            assert_eq!(
+                store.get_state("ws:ch:contract:a").unwrap(),
+                Some(b"1".to_vec()),
+                "set writes must land in the world state"
+            );
+            assert!(
+                store.get_state("ws:ch:contract:b").unwrap().is_none(),
+                "delete writes must remove the key"
+            );
+        }
+
+        #[test]
+        fn test_apply_block_rejects_stale_tip_whole() {
+            let store = InMemoryStorageProvider::new();
+            let g = genesis();
+            store.apply_block(&g).unwrap();
+
+            // The candidate chains to a hash that is not the stored tip.
+            let mut stale = Block::with_write_set(
+                1,
+                vec![],
+                "not-the-tip".into(),
+                vec![write("ch", "contract", "k", b"v")],
+            );
+            stale.mine(1);
+            let err = store
+                .apply_block(&stale)
+                .expect_err("stale tip must be rejected");
+            assert!(matches!(err, CoreError::InvalidBlock(_)));
+
+            assert!(
+                store.get_block(1).unwrap().is_none(),
+                "the stale block must not be persisted"
+            );
+            assert!(
+                store.get_state("ws:ch:contract:k").unwrap().is_none(),
+                "the stale write set must not be applied"
+            );
+        }
+
+        #[test]
+        fn test_apply_block_rejects_index_gap_whole() {
+            let store = InMemoryStorageProvider::new();
+            let g = genesis();
+            store.apply_block(&g).unwrap();
+
+            // Correct previous_hash but a gap in the index sequence.
+            let mut gap =
+                Block::with_write_set(2, vec![], g.hash, vec![write("ch", "contract", "k", b"v")]);
+            gap.mine(1);
+            let err = store
+                .apply_block(&gap)
+                .expect_err("index gap must be rejected");
+            assert!(matches!(err, CoreError::InvalidBlock(_)));
+            assert!(store.get_state("ws:ch:contract:k").unwrap().is_none());
         }
     }
 }

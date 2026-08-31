@@ -13,6 +13,7 @@
 //! canonical result per execution. Duplicate operations are rejected rather
 //! than left to provider-specific ordering (ADR-007 decision 2).
 
+use crate::crypto::sha256;
 use crate::error::CoreError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -72,6 +73,45 @@ impl From<Vec<(String, Vec<u8>)>> for ExecutionResult {
         Self {
             ephemeral,
             writes: Vec::new(),
+        }
+    }
+}
+
+impl PersistentWrite {
+    /// The write's form for the globally replicated block.
+    ///
+    /// Public writes pass through unchanged.  A PDC-scoped `Set` is redacted
+    /// to its SHA-256 value commitment — the block carries the collection
+    /// name and commitment, never the private value (ADR-007 decision 3); the
+    /// private payload travels the ADR-003 dissemination path (#46/#47).  PDC
+    /// deletes stay tombstones.
+    #[must_use]
+    pub fn block_form(&self) -> Self {
+        let op = match (&self.op, &self.visibility) {
+            (WriteOp::Set(value), WriteVisibility::Pdc(_)) => {
+                WriteOp::Set(sha256(value).into_bytes())
+            }
+            _ => self.op.clone(),
+        };
+        Self { op, ..self.clone() }
+    }
+
+    /// The world-state key this write addresses in the derived state cache.
+    #[must_use]
+    pub fn state_key(&self) -> String {
+        format!("ws:{}:{}:{}", self.channel, self.contract, self.key)
+    }
+
+    /// Apply this write to a `HashMap`-shaped world state (the derived cache
+    /// shape): `Set` inserts the value, `Delete` removes the key.
+    pub fn apply_to_cache(&self, cache: &mut std::collections::HashMap<String, Vec<u8>>) {
+        match &self.op {
+            WriteOp::Set(value) => {
+                cache.insert(self.state_key(), value.clone());
+            }
+            WriteOp::Delete => {
+                cache.remove(&self.state_key());
+            }
         }
     }
 }
@@ -233,5 +273,46 @@ mod tests {
         let json = serde_json::to_string(&result).expect("serialize");
         let decoded: ExecutionResult = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn test_block_form_redacts_pdc_value_to_commitment() {
+        let public = write("ch", "contract", "public-key");
+        assert_eq!(public.block_form(), public, "public writes pass through");
+
+        let pdc = PersistentWrite {
+            visibility: WriteVisibility::Pdc("collection-1".into()),
+            ..write("ch", "contract", "pdc-key")
+        };
+        let block_form = pdc.block_form();
+        assert_eq!(block_form.visibility, pdc.visibility);
+        let WriteOp::Set(commitment) = block_form.op else {
+            panic!("expected a commitment Set");
+        };
+        assert_eq!(
+            commitment,
+            crate::crypto::sha256(b"v").into_bytes(),
+            "the block carries the value commitment, not the value"
+        );
+        assert_ne!(
+            commitment, b"v",
+            "the private value must never enter the block"
+        );
+
+        // PDC deletes stay tombstones.
+        let tombstone = PersistentWrite {
+            op: WriteOp::Delete,
+            visibility: WriteVisibility::Pdc("collection-1".into()),
+            ..write("ch", "contract", "pdc-key")
+        };
+        assert_eq!(tombstone.block_form(), tombstone);
+    }
+
+    #[test]
+    fn test_state_key_scopes_the_write() {
+        assert_eq!(
+            write("ch", "contract", "key").state_key(),
+            "ws:ch:contract:key"
+        );
     }
 }

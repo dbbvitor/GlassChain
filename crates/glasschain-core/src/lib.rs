@@ -32,8 +32,8 @@ pub use endorsement::{
 pub use error::{CoreError, GasMeter};
 pub use ledger::{Ledger, DEFAULT_DIFFICULTY};
 pub use providers::{
-    ConsensusProvider, EndorsementProvider, ExecutionLimits, ExecutionProvider, NetworkProvider,
-    PowConsensusProvider, StorageProvider,
+    validate_tip_chain, ConsensusProvider, EndorsementProvider, ExecutionLimits, ExecutionProvider,
+    NetworkProvider, PowConsensusProvider, StorageProvider,
 };
 pub use schema::{
     validate_asset, SchemaValidationReport, SchemaViolation, SncmField, ViolationSeverity,

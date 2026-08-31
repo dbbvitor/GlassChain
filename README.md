@@ -104,6 +104,14 @@ Block production is driven by the consensus layer, not by manual commands: the
 quorum-certificate seam (ADR-002); the dev/test Proof-of-Work driver remains
 available programmatically as `Node::mine()`.
 
+Every committed block carries the canonical write set of the accepted
+persistent VM writes, covered by the block hash (ADR-007): public writes carry
+their value, PDC-scoped writes carry only the collection name and the value's
+SHA-256 commitment — the private value never enters the replicated block. The
+block and its write set persist and apply through one atomic commit boundary
+(`StorageProvider::apply_block`), and state rebuilds replay committed write
+sets in block order without re-executing guest code.
+
 ---
 
 ## gRPC API (Current)

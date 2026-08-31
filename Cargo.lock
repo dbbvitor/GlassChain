@@ -1690,12 +1690,15 @@ dependencies = [
 name = "glasschain-network"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "env_logger",
  "futures",
  "glasschain-contracts",
  "glasschain-core",
  "glasschain-identity",
  "glasschain-indexer",
+ "glasschain-storage",
+ "glasschain-vm",
  "libp2p",
  "log",
  "madsim",
@@ -1703,9 +1706,11 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
+ "wat",
  "x509-parser 0.18.1",
 ]
 

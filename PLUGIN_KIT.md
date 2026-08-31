@@ -145,6 +145,19 @@ pub trait StorageProvider: Send + Sync {
     fn get_block(&self, index: u64) -> Result<Option<Block>, CoreError>;
     fn latest_block_index(&self) -> Result<Option<u64>, CoreError>;
 
+    /// Atomically persist `block` and apply its canonical write set to the
+    /// world state (ADR-007 decision 2).  The implementation must, inside
+    /// one atomic section: verify the block chains to the stored tip (empty
+    /// store accepts only the genesis), persist the block, and apply every
+    /// write (`Set` → put_state, `Delete` → delete_state, keyed by
+    /// `ws:<channel>:<contract>:<key>`).  A stale candidate is rejected
+    /// whole — block and write set together — with `InvalidBlock`.
+    ///
+    /// The trait ships a sequential default (correct for single-writer
+    /// processes, not atomic); override it with a real atomic section
+    /// (e.g. a sled multi-tree transaction).
+    fn apply_block(&self, block: &Block) -> Result<(), CoreError> { … }
+
     fn put_state(&self, key: &str, value: &[u8]) -> Result<(), CoreError>;
     fn get_state(&self, key: &str) -> Result<Option<Vec<u8>>, CoreError>;
     fn delete_state(&self, key: &str) -> Result<(), CoreError>;
@@ -185,6 +198,9 @@ impl StorageProvider for RocksDbStorageProvider {
         self.db.put(key, val)
             .map_err(|e| CoreError::Storage(e.to_string()))
     }
+    // Prefer rocksdb's `WriteBatch` in `apply_block` so the tip check, block
+    // insert, and write-set application commit atomically (the trait default
+    // is sequential and therefore not a real atomic boundary).
     // ... implement remaining methods ...
     fn name(&self) -> &str { "rocksdb" }
 }

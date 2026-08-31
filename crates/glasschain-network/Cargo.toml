@@ -26,6 +26,7 @@ tokio        = { version = "1.52", features = [
 ] }
 thiserror    = "2.0"
 log          = "0.4"
+base64       = "0.23"
 tokio-rustls = "0.26"
 rustls       = { version = "0.23", features = ["ring"] }
 rcgen        = "0.14"
@@ -45,6 +46,10 @@ futures      = "0.3"
 [dev-dependencies]
 env_logger   = "0.11"
 x509-parser  = "0.18"
+wat          = "1.256"
+tempfile     = "3"
+glasschain-vm = { path = "../glasschain-vm" }
+glasschain-storage = { path = "../glasschain-storage" }
 # default-features = false drops madsim's `rpc` feature, whose optional
 # bincode 1.x dependency is unmaintained (RUSTSEC-2025-0141). Only `macros`
 # is used by tests/madsim_chaos.rs.

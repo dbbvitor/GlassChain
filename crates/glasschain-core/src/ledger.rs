@@ -41,6 +41,7 @@ impl Ledger {
             index: 0,
             timestamp: 0,
             transactions: Vec::new(),
+            write_set: Vec::new(),
             previous_hash: "0".to_owned(),
             nonce: 0,
             hash: String::new(),
