@@ -26,7 +26,7 @@ pub enum Message {
         tls_cert_fingerprint: String,
         /// The sender's chain length (used for chain-sync decisions).
         chain_length: u64,
-        /// Protocol version string (e.g. `"glasschain/1"`).
+        /// Protocol version string (e.g. `"glasschain/2"`).
         version: String,
         /// Capabilities this peer supports (ADR-010 decision 6). Peers lacking
         /// an active capability are treated as read-only observers.
@@ -63,4 +63,12 @@ pub enum Message {
 }
 
 /// Current protocol version string.
-pub const PROTOCOL_VERSION: &str = "glasschain/1";
+///
+/// `/2` marks the BFT consensus seam (ticket #42): a `bft_consensus`-active
+/// chain commits blocks whose real quorum certificates are **not** derivable
+/// from the block (unlike the degenerate Proof-of-Work certificate), so a `/1`
+/// peer would reject them at its `PoW` admission check. BFT block admission on
+/// the peer path is itself staged work (ADR-010 adoption gates); the bump is
+/// the compatibility marker separating peers that know BFT blocks can exist
+/// from those that do not.
+pub const PROTOCOL_VERSION: &str = "glasschain/2";

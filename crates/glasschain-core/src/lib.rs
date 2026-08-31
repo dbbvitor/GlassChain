@@ -1,4 +1,6 @@
 pub mod asset;
+#[cfg(feature = "bft")]
+pub mod bft;
 pub mod block;
 pub mod canonical;
 pub mod capability;
@@ -13,6 +15,8 @@ pub mod transaction;
 pub mod write_set;
 
 pub use asset::{MetadataTrustScore, TraceableAsset, TRUST_SCORE_STANDARD_THRESHOLD};
+#[cfg(feature = "bft")]
+pub use bft::{BftConsensusProvider, ValidatorInfo};
 pub use block::Block;
 pub use canonical::{
     migrate_legacy_asset, validate_record, validate_record_with, CanonicalRecord,
@@ -21,8 +25,9 @@ pub use canonical::{
 };
 pub use capability::{
     capability_hash, lookup_capability, validate_record_under, CapabilityActivation,
-    CapabilityAdvertisement, CapabilityDescriptor, CapabilityHistory, CapabilitySet, CAPABILITY_V1,
-    ENDORSEMENT_CAPABILITY_ID, GENESIS_CAPABILITIES, STATE_COMMITMENT_CAPABILITY_ID,
+    CapabilityAdvertisement, CapabilityDescriptor, CapabilityHistory, CapabilitySet,
+    BFT_CONSENSUS_CAPABILITY_ID, CAPABILITY_V1, ENDORSEMENT_CAPABILITY_ID, GENESIS_CAPABILITIES,
+    STATE_COMMITMENT_CAPABILITY_ID,
 };
 pub use consensus::{Attestation, CommitNotification, QuorumCertificate};
 pub use endorsement::{

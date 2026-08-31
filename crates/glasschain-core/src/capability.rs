@@ -34,6 +34,11 @@ pub const STATE_COMMITMENT_CAPABILITY_ID: &str = "state_commitment";
 /// entry cannot drift.
 pub const ENDORSEMENT_CAPABILITY_ID: &str = "endorsement";
 
+/// Capability id gating Tendermint-class BFT consensus (ticket #42, ADR-002).
+/// Kept in one place so the node-level engine selection and the registry entry
+/// cannot drift.
+pub const BFT_CONSENSUS_CAPABILITY_ID: &str = "bft_consensus";
+
 /// The v1 capability registry (ADR-010 decision 2).
 pub const CAPABILITY_V1: &[CapabilityDescriptor] = &[
     CapabilityDescriptor {
@@ -53,7 +58,7 @@ pub const CAPABILITY_V1: &[CapabilityDescriptor] = &[
         version: 1,
     },
     CapabilityDescriptor {
-        id: "bft_consensus",
+        id: BFT_CONSENSUS_CAPABILITY_ID,
         version: 1,
     },
 ];

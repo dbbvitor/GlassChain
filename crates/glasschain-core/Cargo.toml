@@ -17,6 +17,14 @@ hex = "0.4"
 uuid = { version = "1.23", features = ["v4"] }
 thiserror = "2.0"
 log = "0.4"
+ed25519-dalek = { version = "3.0", features = ["alloc"], optional = true }
+
+[features]
+default = []
+# Tendermint-class BFT consensus behind the seam (ticket #42). Default-off:
+# Proof-of-Work remains the dev/test driver. Pulls ed25519-dalek for real
+# validator attestations.
+bft = ["dep:ed25519-dalek"]
 
 [dev-dependencies]
 env_logger = "0.11"

@@ -89,12 +89,20 @@ pub trait ConsensusProvider: Send + Sync {
 quorum certificate (the attestation set). No commit consumer may depend on
 "the leader said so" — the certificate travels with every commit. The retained
 Proof-of-Work provider supplies a **degenerate** certificate (the valid nonce
-is the attestation, carried by the block itself); real BFT attestations land
-with ticket #42.
+is the attestation, carried by the block itself).
 
-### Built-in implementation
+### Built-in implementations
 
-`PowConsensusProvider` — SHA-256 Proof-of-Work with configurable difficulty.
+- `PowConsensusProvider` — SHA-256 Proof-of-Work with configurable difficulty
+  (default, dev/test). Degenerate certificate.
+- `BftConsensusProvider` (ticket #42, behind the `bft` cargo feature,
+  default-off) — Tendermint-class BFT: `attest(block)` produces a block plus a
+  real quorum certificate (ed25519 signatures over the block hash, ≥⅔+
+  distinct validators), `verify_certificate(cert, block)` cryptographically
+  verifies a certificate against the validator set. Node-side selection is
+  capability-gated: the engine engages only when `bft_consensus` is active at
+  the candidate height (ADR-010). Multi-validator network vote gathering is the
+  ADR-010 testnet adoption gate.
 
 ### Implementing Raft consensus
 

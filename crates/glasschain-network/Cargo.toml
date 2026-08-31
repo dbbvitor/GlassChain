@@ -48,6 +48,10 @@ env_logger   = "0.11"
 x509-parser  = "0.18"
 wat          = "1.256"
 tempfile     = "3"
+# ed25519 key material for the bft_finality scenario (tests/bft_finality.rs,
+# cfg-gated to the `bft` feature). Dev-deps compile unconditionally; the crate
+# is already in the workspace graph via glasschain-identity.
+ed25519-dalek = "3.0"
 glasschain-vm = { path = "../glasschain-vm" }
 glasschain-storage = { path = "../glasschain-storage" }
 # default-features = false drops madsim's `rpc` feature, whose optional
@@ -60,6 +64,10 @@ madsim     = { version = "0.2", default-features = false, features = [
 [features]
 default       = []
 insecure-tls  = []
+# Tendermint-class BFT behind the consensus seam (ticket #42), default-off.
+# Enables `glasschain-core/bft` so the node can attest blocks with a real
+# quorum certificate instead of dev/test Proof-of-Work.
+bft = ["glasschain-core/bft"]
 
 [lints]
 workspace = true

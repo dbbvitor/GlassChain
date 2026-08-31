@@ -104,6 +104,32 @@ Block production is driven by the consensus layer, not by manual commands: the
 quorum-certificate seam (ADR-002); the dev/test Proof-of-Work driver remains
 available programmatically as `Node::mine()`.
 
+### Consensus engines (ADR-002)
+
+- **Proof-of-Work (default, dev/test):** every commit notification carries the
+  degenerate quorum certificate — the valid nonce *is* the attestation.
+- **Tendermint-class BFT (staged, default-off):** behind the `bft` cargo
+  feature (`glasschain-core/bft`, `glasschain-network/bft`). When a
+  `BftConsensusProvider` is attached and the `bft_consensus` capability is
+  active at the candidate height, blocks are attested with real ed25519
+  validator signatures over the block hash and committed with a
+  cryptographically verified ≥⅔+ distinct-validator quorum; finality is
+  single-slot and deterministic at commit. The commit consumer is identical for
+  both engines. Activation is a capability activation per ADR-010: a signed
+  control-plane record at a future height.
+
+> **BFT adoption gates (ADR-010 §7 — all must pass before production use):** a
+> GlassChain testnet at the target validator count, API/stability evidence,
+> licensing/stewardship review, and a security audit. Malachite remains the
+> staged engine candidate behind the seam; `tendermint-rs` is type/light-client
+> tooling only, never the engine. The shipped engine's `attest` signs with the
+> local key only — a 1-validator set is its own quorum — while
+> `verify_certificate` verifies full ≥⅔+ quorums from its configured validator
+> set. Gathering remote attestations, wire transport of certificates, BFT-block
+> peer admission, BFT-chain sync (`try_replace_chain`) and restart persistence
+> (both currently `PoW`-coupled), and validator-set changes are part of that
+> staged work.
+
 Every committed block carries the canonical write set of the accepted
 persistent VM writes, covered by the block hash (ADR-007): public writes carry
 their value, PDC-scoped writes carry only the collection name and the value's
@@ -158,10 +184,11 @@ Current trust model:
 
 Message types:
 
-- `Hello` — advertises the wire `version` (mismatches are disconnected) and the
-  capabilities the peer supports. A peer lacking an active capability is
-  treated as a read-only observer: it can parse and validate history but may
-  not propose, vote, or relay active writes.
+- `Hello` — advertises the wire `version` (mismatches are disconnected; current
+  version is `glasschain/2`, bumped with the BFT seam since BFT-attested blocks
+  are not verifiable by `/1` peers) and the capabilities the peer supports. A
+  peer lacking an active capability is treated as a read-only observer: it can
+  parse and validate history but may not propose, vote, or relay active writes.
 - `Transaction`
 - `Block`
 - `RequestChain`

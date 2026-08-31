@@ -5,6 +5,8 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use glasschain_contracts::{ContractEngine, InventoryTrigger, WatcherService};
 use glasschain_core::crypto::sha256;
 use glasschain_core::providers::in_memory::InMemoryStorageProvider;
+#[cfg(feature = "bft")]
+use glasschain_core::BFT_CONSENSUS_CAPABILITY_ID;
 use glasschain_core::{
     evaluate_transaction_endorsements, Block, CapabilityAdvertisement, CapabilityHistory,
     CommitNotification, CoreError, EndorsementEvaluation, EndorsementProvider, EndorsementRequest,
@@ -183,6 +185,12 @@ struct NodeState {
     /// Optional endorsement provider, invoked at the commit path when the
     /// `endorsement` capability is active (ADR-008 handoff 4).
     endorsement: Option<Arc<dyn EndorsementProvider>>,
+    /// Optional Tendermint-class BFT provider (ticket #42, default-off). When
+    /// set **and** the `bft_consensus` capability is active at the candidate
+    /// height, the node attests blocks with a real quorum certificate instead
+    /// of dev/test `PoW`; the commit consumer is unchanged either way.
+    #[cfg(feature = "bft")]
+    consensus: Option<Arc<glasschain_core::BftConsensusProvider>>,
     /// Endorsement-policy history replayed from committed blocks (ADR-008
     /// decision 4): the pre-block policy set used for evaluation.
     policies: PolicyHistory,
@@ -371,6 +379,8 @@ impl Node {
                 executor: None,
                 endorsement: None,
                 policies: PolicyHistory::default(),
+                #[cfg(feature = "bft")]
+                consensus: None,
             })),
             event_tx,
             indexer: Arc::new(InMemoryIndexer::new()),
@@ -783,6 +793,17 @@ impl Node {
         self.state.lock().await.endorsement = Some(provider);
     }
 
+    /// Attach a Tendermint-class BFT provider (ticket #42, default-off).
+    ///
+    /// After this call the node attests blocks with `provider`'s real quorum
+    /// certificate instead of dev/test `PoW` — but only once the `bft_consensus`
+    /// capability is active at the candidate height (ADR-010). The commit
+    /// consumer is unchanged either way.
+    #[cfg(feature = "bft")]
+    pub async fn set_bft_consensus(&self, provider: Arc<glasschain_core::BftConsensusProvider>) {
+        self.state.lock().await.consensus = Some(provider);
+    }
+
     /// Enable CA-backed certificate verification for peer authentication.
     ///
     /// When set, the Hello handshake rejects any peer whose TLS certificate
@@ -1104,9 +1125,11 @@ impl Node {
     /// Mine a new block containing all pending transactions and broadcast it.
     ///
     /// This is the **dev/test consensus driver**: the retained Proof-of-Work
-    /// path supplies a degenerate quorum certificate on the commit
-    /// notification (ADR-002 keeps `PoW` for testing; the BFT engine lands with
-    /// ticket #42).
+    /// path supplies a degenerate quorum certificate on the commit notification
+    /// (ADR-002 keeps `PoW` for testing). When a BFT provider is attached
+    /// (ticket #42, default-off) **and** the `bft_consensus` capability is
+    /// active at the candidate height, the block is attested with a real
+    /// quorum certificate instead; the commit consumer is unchanged.
     ///
     /// # Errors
     ///
@@ -1139,10 +1162,42 @@ impl Node {
             return Err(error);
         }
 
-        block.mine(difficulty);
-        // The commit notification carries the quorum certificate: every commit
-        // consumer receives the attestation set from the seam.
-        let notification = CommitNotification::for_pow_block(block.clone());
+        // Attest the candidate: a BFT provider supplies a real quorum
+        // certificate when the `bft_consensus` capability is active at this
+        // height (ADR-010, ticket #42); otherwise dev/test `PoW` mines a
+        // degenerate one. The commit consumer below is identical either way.
+        #[cfg(feature = "bft")]
+        let notification = {
+            let history = CapabilityHistory::build_from_blocks(&self.ledger.lock().await.chain);
+            let bft_active = match history {
+                Ok(history) => history
+                    .effective_set(index)
+                    .is_active(BFT_CONSENSUS_CAPABILITY_ID),
+                Err(e) => {
+                    log::warn!(
+                        "Capability history invalid at height {index}; BFT stays dormant: {e}"
+                    );
+                    false
+                }
+            };
+            let provider = if bft_active {
+                self.state.lock().await.consensus.clone()
+            } else {
+                None
+            };
+            if let Some(provider) = provider {
+                provider.attest(block)
+            } else {
+                block.mine(difficulty);
+                CommitNotification::for_pow_block(block)
+            }
+        };
+        #[cfg(not(feature = "bft"))]
+        let notification = {
+            block.mine(difficulty);
+            CommitNotification::for_pow_block(block)
+        };
+        let block = notification.block;
 
         let appended = {
             let mut ledger = self.ledger.lock().await;
@@ -1163,7 +1218,7 @@ impl Node {
             )
             .await;
 
-            log::info!("Mined block {} ({}...)", block.index, &block.hash[..8]);
+            log::info!("Committed block {} ({}...)", block.index, &block.hash[..8]);
             let _ = self.event_tx.send(NodeEvent::BlockMined {
                 index: block.index,
                 hash: block.hash.clone(),
@@ -2207,8 +2262,10 @@ async fn process_message(
                     hash: block.hash.clone(),
                     // PoW's attestation is the valid nonce in the block itself:
                     // a verifying member derives and validates the degenerate
-                    // certificate on receipt (real BFT attestations arrive with
-                    // the block in #42).
+                    // certificate on receipt. BFT-attested blocks are not
+                    // admissible here yet: certificate wire transport and
+                    // peer-path quorum verification are ADR-010 adoption-gate
+                    // work (staged, ticket #42).
                     certificate: QuorumCertificate::pow(&block),
                 });
 
@@ -2258,8 +2315,9 @@ async fn process_message(
                 // Every block adopted by sync is a commit: emit the
                 // certificate-bearing notification so commit consumers receive
                 // the attestation set on this path too (degenerate `PoW`
-                // certificate here; real attestations arrive with the BFT
-                // engine in #42).
+                // certificate here; BFT certificate replay on sync is ADR-010
+                // adoption-gate work — certificates are not persisted with
+                // blocks yet, ticket #42).
                 for block in &new_chain {
                     if block.index == 0 {
                         continue;
