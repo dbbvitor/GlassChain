@@ -1,6 +1,6 @@
-# Handoff — GlassChain debt-gap implementation (through ticket #41)
+# Handoff — GlassChain debt-gap implementation (through ticket #45)
 
-**Written:** after closing #39, #40, #41. `main` HEAD: `77d574c`.
+**Written:** after closing #45. `main` HEAD: `e1e4b75`.
 
 ## The loop (established and working — do not redesign it)
 
@@ -23,51 +23,38 @@ before new code). No re-asking the user — continue to the next frontier ticket
 | #39 Analytics read path | `2830938` | provenance/flattener wired into RPC; bounded drop-oldest event bus; lineage queries; boundary-anchored canonical-key filters |
 | #40 Workflow framework | `86339a2` | new crate `glasschain-workflows`: Action/Event/TransitionResult, one type per transition, checkpoint store over `StorageProvider`, handle/ack split (no-loss + at-least-once + deterministic ids), triage view |
 | #41 Committed write sets | `77d574c` | `Block.write_set` hash-covered, `StorageProvider::apply_block` atomic boundary with shared `validate_tip_chain`, PDC commitment redaction (`PersistentWrite::block_form`), node executes `ContractExecution` at mining, `rebuild_world_state` (no WASM re-execution) |
+| #45 Endorsement enforcement | `e1e4b75` | `Transaction.endorsements` carriers (scoped target + signers over canonical tx bytes), `PolicyUpdate` kind + `PolicyHistory` replay (same-block rule, fail-closed `network-governance` fallback), capability-gated enforcement at mine/peer/sync/ledger-commit paths, operation defaults (custody 2-of-2, recall 2-of-2 issuer+`issued_by`, cert/audit issuer), `VerifyEndorsement` real evaluation |
 
 ## Working tree
 
-Clean. All four gates green at `77d574c`:
+Clean. All four gates green at `e1e4b75`:
 `cargo check --workspace --all-targets --all-features --locked` ✅
-`cargo test --workspace --all-targets --all-features --locked` ✅ (22 suites)
+`cargo test --workspace --all-targets --all-features --locked` ✅ (23 suites)
 `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` ✅
 `cargo fmt --all --check` ✅
 
-## Next ticket: #45 (endorsement enforcement at the commit path)
+## Next ticket: #42 (BFT finality)
 
-**Fetched and ready.** All blockers (#36, #41, #37) are closed. Considerably
-smaller than #42 (BFT, explicitly "later, gate-heavy") — the frontier order
-after #45: #42, #43/#44 (both unblocked by #40), #46→#47 (PDCs), #48, #49.
+The frontier order after #45: **#42** (BFT, explicitly "later, gate-heavy" —
+Malachite staged default-off; PoW stays dev/test), #43/#44 (both unblocked by
+#40), #46→#47 (PDCs), #48, #49.
 
-#45 acceptance criteria, condensed:
-1. Endorsement evaluated at admission against the exact transaction **and its
-   committed write set**, before write-set materialization; unsatisfied policy
-   rejects with no partial state.
-2. Operation defaults: custody handoffs 2-of-2 (sender + receiving custodian);
-   recall/quarantine/dispute multi-party; certification/audit issuer signature;
-   PDC writes = collection membership + collection policy.
-3. Policy metadata committed in-band, versioned, append-only; policy update is
-   a signed tx satisfying the current effective policy, activates only after
-   its block commits; historical blocks keep their height-effective policy;
-   key-level policies cleared only through the same authorization.
-4. A block changing a key's policy AND writing the same key later in the same
-   block is rejected; new policy applies from the next block.
-5. `VerifyEndorsement` RPC returns a real evaluation.
-6. Node-level scenarios: failed authorization w/ no partial state, multi-key
-   txs, distinct-signer counting, PDC membership vs endorsement separation.
-
-Existing pieces to build on (from #37): `glasschain_core::endorsement` has
-`PolicyExpression` (SignedBy / NOutOf / AND / OR), `EndorsementRequest`,
-`EndorsementEvaluation`, `EndorsementProvider`; `glasschain-identity` has
-`MspEndorsementProvider`. From #41: `Block.write_set`, `apply_block`,
-`compute_write_set`, `rebuild_world_state`. From #36: capability/height
-selection (spec says "historical blocks under the policy version effective at
-their height"). From #34: `CanonicalRecord` families (`quality_certification`,
-`audit_attestation` require `issuer`; `delivery_receipt` is the custody
-handoff record).
-
-Spec decision 3 in `.agents/plans/spec-close-debt-gap.md` + ADR-008
-(`.agents/plans/adr-008-endorsement-policy-model.md`) are the settled answers;
-do not re-litigate them.
+#45 review findings worth remembering (both fixed in the amended commit):
+- The sync path (`Message::Chain` → `try_replace_chain`) was a full admission
+  bypass — `Node::enforce_chain_endorsements` now walks the candidate chain
+  (capability history + policy history + carrier evaluation) before adoption.
+  Any future admission path must call an endorsement gate too.
+- Record families have no channel/contract scope, so committed policies cannot
+  reach them; `operation_default` (fail-closed on known families) is the only
+  record-level enforcement. Recall's 2-of-2 degenerates to self-approval when
+  envelope issuer == payload `issued_by` (ponytail-noted; configured
+  multi-party policies for records need channel wiring).
+- Known accepted gaps (surfaced to owner in the #45 evidence comment):
+  `PolicyUpdate` is a full replacement (a more-specific scope can weaken a
+  base layer — ADR-008 §1 non-weakening not enforced); no production node
+  wiring attaches an endorsement provider yet (inert outside tests until a
+  node/CLI flag or network default lands); peer-path write binding is
+  aggregate, not per-transaction.
 
 ## Context / conventions (non-negotiable)
 
@@ -88,6 +75,7 @@ do not re-litigate them.
 - `StorageProvider::apply_block(&Block)` — atomic block+state boundary; default sequential fallback; InMemory (block+state locks) and Sled (multi-tree transaction) override. All route the chain check through `validate_tip_chain(block, tip: Option<&Block>)` → `CoreError::InvalidBlock` on stale candidates (sled maps transaction aborts to `InvalidBlock`, real sled errors to `Storage`).
 - `PersistentWrite::{block_form, state_key, apply_to_cache}`; `state_key()` = `ws:<channel>:<contract>:<key>`. PDC values are SHA-256 commitments in blocks AND in the world-state cache until #46/#47 deliver the private payload.
 - Node: `NodeState.world_state` cache + `executor`; `compute_write_set` runs at `mine_async` (failed executions accept no writes — deterministic); `after_block_commit` does `storage.apply_block` + cache mirror (chain stays authoritative on failure); `rebuild_world_state` heals; `start()` persists missing chain blocks (a fresh node's genesis) through `apply_block`.
+- Endorsement (#45): `Transaction.endorsements: Vec<TransactionEndorsement>` is `#[serde(default, skip_serializing_if = "Vec::is_empty")]` — pre-#45 tx JSON (and therefore block hashes) unchanged when empty. Signers sign `TransactionEndorsement::payload(tx)` = tx bytes with carriers cleared (never self-referential). `compute_write_set` returns `(aggregate, per_tx)`; per-tx attribution feeds the coverage check at mining. Enforcement gates: `submit_transaction` (admission), `enforce_block_endorsements` (mining + peer `Message::Block`), `enforce_chain_endorsements` (sync `Message::Chain`), `commit_mined_block` (structural replay). All are dormant unless `NodeState.endorsement` is set AND the `endorsement` capability is active at the candidate height.
 - Workflows crate API: `FlowRunner::handle(storage, triage, flow_id, initial_state, event) -> Option<FlowOutcome { state, actions, completed }>` and `ack(storage, triage, flow_id, executed)` — the caller executes actions durably between handle and ack; ack is the only place the checkpoint advances.
 - `TransactionKind` has `CanonicalRecord` and `CapabilityActivation` variants — exhaustive matches live in `glasschain-indexer/src/indexer.rs` (`kind_name`), `event_bus.rs`, `glasschain-rpc/src/server.rs`, `glasschain-node/src/main.rs`. Adding a variant breaks all of them.
 
