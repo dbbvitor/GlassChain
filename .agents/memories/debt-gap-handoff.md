@@ -1,6 +1,6 @@
-# Handoff — GlassChain debt-gap implementation (through ticket #45)
+# Handoff — GlassChain debt-gap implementation (through ticket #42)
 
-**Written:** after closing #45. `main` HEAD: `e1e4b75`.
+**Written:** after closing #42. `main` HEAD: `044da66`.
 
 ## The loop (established and working — do not redesign it)
 
@@ -24,20 +24,33 @@ before new code). No re-asking the user — continue to the next frontier ticket
 | #40 Workflow framework | `86339a2` | new crate `glasschain-workflows`: Action/Event/TransitionResult, one type per transition, checkpoint store over `StorageProvider`, handle/ack split (no-loss + at-least-once + deterministic ids), triage view |
 | #41 Committed write sets | `77d574c` | `Block.write_set` hash-covered, `StorageProvider::apply_block` atomic boundary with shared `validate_tip_chain`, PDC commitment redaction (`PersistentWrite::block_form`), node executes `ContractExecution` at mining, `rebuild_world_state` (no WASM re-execution) |
 | #45 Endorsement enforcement | `e1e4b75` | `Transaction.endorsements` carriers (scoped target + signers over canonical tx bytes), `PolicyUpdate` kind + `PolicyHistory` replay (same-block rule, fail-closed `network-governance` fallback), capability-gated enforcement at mine/peer/sync/ledger-commit paths, operation defaults (custody 2-of-2, recall 2-of-2 issuer+`issued_by`, cert/audit issuer), `VerifyEndorsement` real evaluation |
+| #42 BFT behind the seam | `044da66` | `BftConsensusProvider` (core, `bft` feature, default-off): real ed25519 attestations over block hash, `verify_certificate` (⅔+ distinct, fail-closed), capability-gated engine selection in `mine_async` (`bft_consensus` active at candidate height), node-level no-fork finality test, wire `glasschain/2`, adoption gates in README |
 
 ## Working tree
 
-Clean. All four gates green at `e1e4b75`:
+Clean. All four gates green at `044da66` (run in **both** feature configs —
+default and `--all-features` — since `bft` gates new code):
 `cargo check --workspace --all-targets --all-features --locked` ✅
-`cargo test --workspace --all-targets --all-features --locked` ✅ (23 suites)
+`cargo test --workspace --all-targets --all-features --locked` ✅ (24 suites)
 `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` ✅
 `cargo fmt --all --check` ✅
 
-## Next ticket: #42 (BFT finality)
+## Next ticket: #43 (or #44 — both unblocked by #40)
 
-The frontier order after #45: **#42** (BFT, explicitly "later, gate-heavy" —
-Malachite staged default-off; PoW stays dev/test), #43/#44 (both unblocked by
-#40), #46→#47 (PDCs), #48, #49.
+The frontier order after #42: **#43/#44** (both unblocked by #40, pick either),
+#46→#47 (PDCs), #48, #49.
+
+#42 review findings worth remembering (both fixed in the amended commit):
+- The Spec reviewer caught two **false doc claims** — README said the engine
+  "gathers attestations from its configured validator set locally" (it doesn't:
+  `attest` is local-signer-only, 1-validator set is its own quorum), and
+  `validate_block`'s doc claimed quorum verification happens on a wire path and
+  at commit time (neither exists). Docs claiming future work as present is the
+  recurring failure mode on staged tickets — write docs against the shipped
+  code, not the plan.
+- Stale "arrives with #42" comments on the received/sync paths had to be
+  rewritten when #42 actually shipped. Grep for a ticket number before closing
+  it.
 
 #45 review findings worth remembering (both fixed in the amended commit):
 - The sync path (`Message::Chain` → `try_replace_chain`) was a full admission
@@ -78,6 +91,8 @@ Malachite staged default-off; PoW stays dev/test), #43/#44 (both unblocked by
 - Endorsement (#45): `Transaction.endorsements: Vec<TransactionEndorsement>` is `#[serde(default, skip_serializing_if = "Vec::is_empty")]` — pre-#45 tx JSON (and therefore block hashes) unchanged when empty. Signers sign `TransactionEndorsement::payload(tx)` = tx bytes with carriers cleared (never self-referential). `compute_write_set` returns `(aggregate, per_tx)`; per-tx attribution feeds the coverage check at mining. Enforcement gates: `submit_transaction` (admission), `enforce_block_endorsements` (mining + peer `Message::Block`), `enforce_chain_endorsements` (sync `Message::Chain`), `commit_mined_block` (structural replay). All are dormant unless `NodeState.endorsement` is set AND the `endorsement` capability is active at the candidate height.
 - Workflows crate API: `FlowRunner::handle(storage, triage, flow_id, initial_state, event) -> Option<FlowOutcome { state, actions, completed }>` and `ack(storage, triage, flow_id, executed)` — the caller executes actions durably between handle and ack; ack is the only place the checkpoint advances.
 - `TransactionKind` has `CanonicalRecord` and `CapabilityActivation` variants — exhaustive matches live in `glasschain-indexer/src/indexer.rs` (`kind_name`), `event_bus.rs`, `glasschain-rpc/src/server.rs`, `glasschain-node/src/main.rs`. Adding a variant breaks all of them.
+- BFT (#42): `BftConsensusProvider` lives in `glasschain-core/src/bft.rs` behind the `bft` feature (`bft = ["dep:ed25519-dalek"]`, default off; `glasschain-network/bft` forwards it). `attest(block)` = one local ed25519 attestation (1-validator set is its own quorum); `verify_certificate` = the real ⅔+-distinct verification (HashSet-deduped keys, unknown validators fail-closed, signatures over `block.hash`). Node selection: `NodeState.consensus: Option<Arc<BftConsensusProvider>>` (concrete type — the sync `propose_block` can't express the node's pre-computed write set), engaged by `set_bft_consensus` + `bft_consensus` active at the candidate height. **PoW-coupled paths that reject BFT blocks:** peer `Message::Block` admission (`has_valid_pow`), `try_replace_chain` (sync), `restore_ledger`/`validate_chain` (restart); certificates are not persisted with blocks. All are adoption-gate work, documented in README.
+- Both feature configs must stay green: CI's `--all-features` compiles the `bft` code, default builds compile the `#[cfg(not(feature = "bft"))]` fallbacks. Gated imports (`#[cfg(feature = "bft")] use ...`) are required or default builds warn on unused imports.
 
 ## Tracker workflow
 
