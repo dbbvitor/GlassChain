@@ -6,9 +6,11 @@ use glasschain_contracts::{ContractEngine, InventoryTrigger, WatcherService};
 use glasschain_core::crypto::sha256;
 use glasschain_core::providers::in_memory::InMemoryStorageProvider;
 use glasschain_core::{
-    Block, CapabilityAdvertisement, CapabilityHistory, CommitNotification, ExecutionLimits,
-    ExecutionProvider, ExecutionResult, Ledger, PersistentWrite, QuorumCertificate,
-    StorageProvider, Transaction, TransactionKind, CAPABILITY_V1,
+    evaluate_transaction_endorsements, Block, CapabilityAdvertisement, CapabilityHistory,
+    CommitNotification, CoreError, EndorsementEvaluation, EndorsementProvider, EndorsementRequest,
+    ExecutionLimits, ExecutionProvider, ExecutionResult, Ledger, PersistentWrite, PolicyHistory,
+    QuorumCertificate, StorageProvider, Transaction, TransactionKind, CAPABILITY_V1,
+    ENDORSEMENT_CAPABILITY_ID,
 };
 use glasschain_identity::CertChainVerifier;
 use glasschain_identity::Identity;
@@ -178,6 +180,12 @@ struct NodeState {
     /// Optional VM execution provider, used to produce a candidate block's
     /// write set at mining time.
     executor: Option<Arc<dyn ExecutionProvider>>,
+    /// Optional endorsement provider, invoked at the commit path when the
+    /// `endorsement` capability is active (ADR-008 handoff 4).
+    endorsement: Option<Arc<dyn EndorsementProvider>>,
+    /// Endorsement-policy history replayed from committed blocks (ADR-008
+    /// decision 4): the pre-block policy set used for evaluation.
+    policies: PolicyHistory,
 }
 
 impl NodeState {
@@ -361,6 +369,8 @@ impl Node {
                 identity: identity.clone(),
                 world_state: HashMap::new(),
                 executor: None,
+                endorsement: None,
+                policies: PolicyHistory::default(),
             })),
             event_tx,
             indexer: Arc::new(InMemoryIndexer::new()),
@@ -678,6 +688,13 @@ impl Node {
         // Always replay contracts from chain (authoritative source).
         s.engine = ContractEngine::rebuild_from_chain(&chain);
 
+        // Endorsement-policy metadata is replayed from committed blocks the
+        // same way (ADR-008 decision 4): versioned, append-only, deterministic.
+        match PolicyHistory::build_from_blocks(&chain) {
+            Ok(policies) => s.policies = policies,
+            Err(e) => log::warn!("Failed to rebuild policy history from chain: {e}"),
+        }
+
         // For watcher state (inventory levels + fire counts), try the persisted
         // snapshot first — it is more up-to-date than chain replay because it
         // captures post-commit updates that haven't been mined into a block yet.
@@ -755,6 +772,15 @@ impl Node {
         s.engine.set_executor(Arc::clone(&executor));
         s.watcher.set_executor(Arc::clone(&executor));
         s.executor = Some(executor);
+    }
+
+    /// Attach an endorsement provider (ADR-008 handoff 4).
+    ///
+    /// After this call, transaction and block admission evaluate the committed
+    /// endorsement policies through the provider — but only once the
+    /// `endorsement` capability is active at the candidate height (ADR-010).
+    pub async fn set_endorsement_provider(&self, provider: Arc<dyn EndorsementProvider>) {
+        self.state.lock().await.endorsement = Some(provider);
     }
 
     /// Enable CA-backed certificate verification for peer authentication.
@@ -1007,6 +1033,29 @@ impl Node {
     ///
     /// Returns [`NetworkError`] if the transaction cannot be added locally.
     pub async fn submit_transaction(&self, tx: Transaction) -> Result<(), NetworkError> {
+        // Transaction admission (ADR-008 §4): when enforcement is active, the
+        // transaction's declared carriers are evaluated immediately — an
+        // unauthorized policy update or record is rejected before it can sit
+        // in any pending pool. Write-scope binding happens at block admission.
+        {
+            let provider = self.state.lock().await.endorsement.clone();
+            if let Some(provider) = provider {
+                // Sequential lock acquisitions: the ledger guard is dropped
+                // before the state guard is taken (state→ledger is the only
+                // nested order used elsewhere).
+                let active = {
+                    let ledger = self.ledger.lock().await;
+                    let next_height = ledger.chain.len() as u64;
+                    CapabilityHistory::build_from_blocks(&ledger.chain)?
+                        .effective_set(next_height)
+                        .is_active(ENDORSEMENT_CAPABILITY_ID)
+                };
+                if active {
+                    let policies = self.state.lock().await.policies.clone();
+                    evaluate_transaction_endorsements(provider.as_ref(), &policies, &tx, &[])?;
+                }
+            }
+        }
         {
             let mut ledger = self.ledger.lock().await;
             ledger.add_transaction(tx.clone())?;
@@ -1072,8 +1121,24 @@ impl Node {
         // persistent VM writes (ADR-007 decision 2): execute the candidate's
         // ContractExecution transactions against the committed snapshot,
         // canonicalize, and redact PDC values to commitments before inclusion.
-        let write_set = Self::compute_write_set(&self.state, &transactions).await?;
-        let mut block = Block::with_write_set(index, transactions, prev_hash.clone(), write_set);
+        let (write_set, per_tx_writes) =
+            Self::compute_write_set(&self.state, &transactions).await?;
+        let mut block =
+            Block::with_write_set(index, transactions.clone(), prev_hash.clone(), write_set);
+
+        // Endorsement enforcement (ADR-008 §4): every declared carrier must
+        // satisfy every applicable policy layer, and the committed write set
+        // must stay inside the signed scopes — before any materialization.
+        if let Err(error) =
+            Self::enforce_block_endorsements(&self.state, &self.ledger, &block, &per_tx_writes)
+                .await
+        {
+            // No partial state: the candidate is dropped and its transactions
+            // return to the pending pool (the stale-tip path's semantics).
+            Self::restore_pending(&self.ledger, transactions).await;
+            return Err(error);
+        }
+
         block.mine(difficulty);
         // The commit notification carries the quorum certificate: every commit
         // consumer receives the attestation set from the seam.
@@ -1131,6 +1196,10 @@ impl Node {
     /// their commitments (ADR-007 decision 2 — the block never holds a
     /// private value).
     ///
+    /// Returns the block-form aggregate plus the per-transaction canonical
+    /// contributions (same order as `transactions`), which the endorsement
+    /// gate binds to each transaction's declared scopes (ADR-008 §4).
+    ///
     /// Deterministic: the snapshot, transaction order, and canonicalized
     /// output are all functions of committed chain state.  A transaction
     /// whose execution fails (invalid WASM, gas exhaustion, …) accepts **no**
@@ -1141,23 +1210,27 @@ impl Node {
     async fn compute_write_set(
         state: &Arc<Mutex<NodeState>>,
         transactions: &[Transaction],
-    ) -> Result<Vec<PersistentWrite>, NetworkError> {
+    ) -> Result<(Vec<PersistentWrite>, Vec<Vec<PersistentWrite>>), NetworkError> {
         let s = state.lock().await;
         let Some(executor) = &s.executor else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), vec![Vec::new(); transactions.len()]));
         };
         // The snapshot exposes exactly the committed state this node holds:
         // public values directly, PDC-scoped keys as their commitment until
         // the private payload arrives through ADR-003 dissemination (#46/#47).
         let mut result = ExecutionResult::default();
+        let mut per_transaction: Vec<Vec<PersistentWrite>> = Vec::with_capacity(transactions.len());
         for tx in transactions {
             let TransactionKind::ContractExecution(ref execution) = tx.kind else {
+                per_transaction.push(Vec::new());
                 continue;
             };
             let Some(contract) = s.engine.get_contract(&execution.contract_id) else {
+                per_transaction.push(Vec::new());
                 continue;
             };
             let Some(wasm_b64) = contract.definition.wasm_code_b64.as_ref() else {
+                per_transaction.push(Vec::new());
                 continue;
             };
             let wasm = match BASE64_STANDARD.decode(wasm_b64) {
@@ -1167,6 +1240,7 @@ impl Node {
                         "write-set: contract {} carried invalid WASM: {error}",
                         execution.contract_id
                     );
+                    per_transaction.push(Vec::new());
                     continue;
                 }
             };
@@ -1177,23 +1251,188 @@ impl Node {
                 s.world_state.clone(),
                 ExecutionLimits::new(100_000, 100_000),
             ) {
-                Ok(execution_result) => result.writes.extend(execution_result.writes),
+                Ok(execution_result) => {
+                    // Canonicalize per transaction so the endorsement gate can
+                    // bind this contribution to the transaction's declared
+                    // scopes (validates scope components, rejects
+                    // intra-transaction duplicates, sorts deterministically).
+                    let contribution = ExecutionResult {
+                        ephemeral: Vec::new(),
+                        writes: execution_result.writes,
+                    }
+                    .canonicalize()?;
+                    result.writes.extend(contribution.writes.iter().cloned());
+                    per_transaction.push(contribution.writes);
+                }
                 Err(error) => {
                     log::warn!(
                         "write-set: execution of contract {} failed: {error}",
                         execution.contract_id
                     );
+                    per_transaction.push(Vec::new());
                 }
             }
         }
         // Canonicalize (validates scopes, rejects intra-execution duplicates,
         // sorts deterministically) and redact PDC values for the block.
         let canonical = result.canonicalize()?;
-        Ok(canonical
-            .writes
-            .iter()
-            .map(PersistentWrite::block_form)
-            .collect())
+        Ok((
+            canonical
+                .writes
+                .iter()
+                .map(PersistentWrite::block_form)
+                .collect(),
+            per_transaction,
+        ))
+    }
+
+    /// Endorsement enforcement for a candidate replacement chain (ADR-008
+    /// §4): the sync path adopts blocks wholesale, so every candidate block is
+    /// evaluated under the capability set and policy history derived from the
+    /// candidate chain itself — a chain that would break enforcement cannot be
+    /// adopted. Carriers are evaluated against each block's pre-block policy
+    /// history; committed writes are checked for aggregate carrier coverage
+    /// (no per-transaction attribution on replay paths).
+    async fn enforce_chain_endorsements(
+        state: &Arc<Mutex<NodeState>>,
+        candidate: &[Block],
+    ) -> Result<(), NetworkError> {
+        let provider = state.lock().await.endorsement.clone();
+        let Some(provider) = provider else {
+            return Ok(());
+        };
+        let mut capabilities = CapabilityHistory::default();
+        let mut policies = PolicyHistory::default();
+        for block in candidate {
+            capabilities.validate_block(block)?;
+            if capabilities
+                .effective_set(block.index)
+                .is_active(ENDORSEMENT_CAPABILITY_ID)
+            {
+                for tx in &block.transactions {
+                    evaluate_transaction_endorsements(provider.as_ref(), &policies, tx, &[])?;
+                }
+                for write in &block.write_set {
+                    if !block
+                        .transactions
+                        .iter()
+                        .any(|tx| tx.endorsements.iter().any(|e| e.covers(write)))
+                    {
+                        return Err(NetworkError::Core(CoreError::InvalidTransaction(format!(
+                            "endorsement: committed write '{}' on ({}, {}) falls outside every \
+                             declared endorsement scope",
+                            write.key, write.channel, write.contract
+                        ))));
+                    }
+                }
+            }
+            policies.validate_block(block)?;
+        }
+        Ok(())
+    }
+
+    /// Return drained transactions to the pending pool after a rejected
+    /// candidate (stale tip or failed endorsement).
+    // The ledger guard must span the whole restore loop: the transactions go
+    // back atomically with the rejection.
+    #[allow(clippy::significant_drop_tightening)]
+    async fn restore_pending(ledger: &Arc<Mutex<Ledger>>, transactions: Vec<Transaction>) {
+        let mut l = ledger.lock().await;
+        for tx in transactions {
+            if let Err(e) = l.add_transaction(tx) {
+                log::warn!("Failed to restore transaction to the pending pool: {e}");
+            }
+        }
+    }
+
+    /// Endorsement enforcement for a candidate block (ADR-008 handoff 4):
+    /// invoked at the network commit path before any materialization.
+    ///
+    /// Gated on the `endorsement` capability being active at the candidate
+    /// height (ADR-010) **and** a provider being configured. Validates the
+    /// block's policy metadata and the same-block policy/write conflict rule,
+    /// then evaluates every transaction's declared carriers against the
+    /// *pre-block* policy history (a same-block policy update applies only
+    /// from the next block). `per_tx_writes` carries the per-transaction
+    /// contributions when the caller can attribute writes (mining); replay
+    /// paths pass an empty slice and get an aggregate coverage check instead.
+    async fn enforce_block_endorsements(
+        state: &Arc<Mutex<NodeState>>,
+        ledger: &Arc<Mutex<Ledger>>,
+        block: &Block,
+        per_tx_writes: &[Vec<PersistentWrite>],
+    ) -> Result<(), NetworkError> {
+        let provider = state.lock().await.endorsement.clone();
+        let Some(provider) = provider else {
+            return Ok(());
+        };
+        let active = {
+            let l = ledger.lock().await;
+            CapabilityHistory::build_from_blocks(&l.chain)?
+                .effective_set(block.index)
+                .is_active(ENDORSEMENT_CAPABILITY_ID)
+        };
+        if !active {
+            return Ok(());
+        }
+        let policies = state.lock().await.policies.clone();
+        // Structural metadata + same-block conflicts, on a scratch history —
+        // signature evaluation below uses the pre-block policy set.
+        let mut scratch = policies.clone();
+        scratch.validate_block(block)?;
+        for (tx_index, tx) in block.transactions.iter().enumerate() {
+            let writes = per_tx_writes.get(tx_index).map_or(&[][..], Vec::as_slice);
+            evaluate_transaction_endorsements(provider.as_ref(), &policies, tx, writes)?;
+        }
+        if per_tx_writes.is_empty() {
+            // No write attribution on replay paths: every committed write
+            // must still sit inside some declared carrier.
+            for write in &block.write_set {
+                if !block
+                    .transactions
+                    .iter()
+                    .any(|tx| tx.endorsements.iter().any(|e| e.covers(write)))
+                {
+                    return Err(NetworkError::Core(CoreError::InvalidTransaction(format!(
+                        "endorsement: committed write '{}' on ({}, {}) falls outside every \
+                         declared endorsement scope",
+                        write.key, write.channel, write.contract
+                    ))));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Evaluate an endorsement request against the committed policies
+    /// (ADR-008): every applicable policy layer for the request's target is
+    /// evaluated through the configured provider. Backs the
+    /// `VerifyEndorsement` RPC.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError`] when no provider is configured, a signer
+    /// cannot be authenticated, or a policy is not valid v1 metadata.
+    pub async fn verify_endorsement(
+        &self,
+        request: EndorsementRequest,
+    ) -> Result<Vec<EndorsementEvaluation>, NetworkError> {
+        let s = self.state.lock().await;
+        let Some(provider) = &s.endorsement else {
+            return Err(NetworkError::Core(CoreError::InvalidTransaction(
+                "no endorsement provider configured on this node".into(),
+            )));
+        };
+        let policies = s
+            .policies
+            .policies_for(&request.target.channel, &request.target.contract);
+        let provider = provider.clone();
+        drop(s);
+        let mut evaluations = Vec::new();
+        for policy in policies.applicable(&request.target) {
+            evaluations.push(provider.evaluate(&policy, &request)?);
+        }
+        Ok(evaluations)
     }
 
     /// Rebuild the derived world state from committed blocks in block order.
@@ -1270,6 +1509,26 @@ impl Node {
             }
             Err(e) => {
                 log::warn!("Storage: failed to apply block {}: {e}", block.index);
+            }
+        }
+
+        // A committed policy update activates now: replay the policy history
+        // from the chain so evaluation uses the post-commit policy set
+        // (ADR-008 decision 4 — the new policy applies from the next block).
+        if block
+            .transactions
+            .iter()
+            .any(|tx| matches!(tx.kind, TransactionKind::PolicyUpdate(_)))
+        {
+            let chain = ledger.lock().await.chain.clone();
+            match PolicyHistory::build_from_blocks(&chain) {
+                Ok(policies) => state.lock().await.policies = policies,
+                Err(e) => {
+                    log::warn!(
+                        "Policy history rebuild failed after block {}: {e}",
+                        block.index
+                    );
+                }
             }
         }
 
@@ -1910,6 +2169,17 @@ async fn process_message(
             }
 
             if should_append {
+                // Endorsement enforcement on the peer-admission path
+                // (ADR-008 §4): policy metadata, the same-block rule, and
+                // declared-carrier evaluation run before the block is
+                // appended; write attribution is not recomputable here (no
+                // re-execution), so coverage is checked in aggregate.
+                if let Err(e) =
+                    Node::enforce_block_endorsements(&ctx.state, &ctx.ledger, &block, &[]).await
+                {
+                    log::warn!("Rejected block {} from {addr}: {e}", block.index);
+                    return MessageEffect::default();
+                }
                 {
                     let mut l = ctx.ledger.lock().await;
                     let committed: std::collections::HashSet<&str> =
@@ -1965,6 +2235,13 @@ async fn process_message(
         }
 
         Message::Chain(candidate) => {
+            // A synced chain is adopted wholesale: endorsement enforcement
+            // must hold on the candidate itself before any block is adopted
+            // (ADR-008 §4 — no commit path bypasses evaluation).
+            if let Err(e) = Node::enforce_chain_endorsements(&ctx.state, &candidate).await {
+                log::warn!("Rejected chain replacement from {addr}: {e}");
+                return MessageEffect::default();
+            }
             let replaced = {
                 let mut l = ctx.ledger.lock().await;
                 l.try_replace_chain(candidate)
@@ -2857,5 +3134,98 @@ mod tests {
             "a failed execution accepts no writes"
         );
         assert!(node.world_state().await.is_empty());
+    }
+
+    // ── 7. enforce_chain_endorsements (sync-path gate, ADR-008 §4) ────────────
+
+    use glasschain_core::{
+        capability_hash, CapabilityActivation, EndorserIdentity, PolicyExpression, PolicyUpdate,
+        RecordSignature, ScopedPolicies, ScopedTarget,
+    };
+    use glasschain_identity::MspEndorsementProvider;
+
+    fn chain_activation_tx(height: u64) -> Transaction {
+        Transaction::with_id(
+            format!("cap:endorsement:{height}"),
+            TransactionKind::CapabilityActivation(CapabilityActivation {
+                capability_id: "endorsement".into(),
+                version: 1,
+                hash: capability_hash("endorsement", 1),
+                activation_height: height,
+                signatures: vec![RecordSignature {
+                    signer: "governance".into(),
+                    signature_bytes: vec![0x42],
+                }],
+            }),
+        )
+    }
+
+    fn chain_policy_update_tx(signer: Option<&Identity>) -> Transaction {
+        let mut tx = Transaction::new(TransactionKind::PolicyUpdate(PolicyUpdate {
+            channel: "supply".into(),
+            contract: String::new(),
+            policies: ScopedPolicies {
+                channel_default: PolicyExpression::signed_by("org-a"),
+                contract_default: None,
+                collection_policy: None,
+                key_policies: Vec::new(),
+            },
+        }));
+        if let Some(identity) = signer {
+            let payload = glasschain_core::TransactionEndorsement::payload(&tx).unwrap();
+            tx.endorsements
+                .push(glasschain_core::TransactionEndorsement {
+                    target: ScopedTarget {
+                        channel: "supply".into(),
+                        contract: String::new(),
+                        keys: Vec::new(),
+                        collection: None,
+                    },
+                    signers: vec![EndorserIdentity {
+                        claimed_principal: glasschain_core::Principal::new("network-governance"),
+                        public_key: identity.public_key_bytes().to_vec(),
+                        signature: identity.sign_bytes(&payload),
+                    }],
+                });
+        }
+        tx
+    }
+
+    fn candidate_chain(second_tx: Transaction) -> Vec<Block> {
+        let genesis = Ledger::new(1).chain.remove(0);
+        let mut b1 = Block::new(1, vec![chain_activation_tx(2)], genesis.hash.clone());
+        b1.mine(1);
+        let mut b2 = Block::new(2, vec![second_tx], b1.hash.clone());
+        b2.mine(1);
+        vec![genesis, b1, b2]
+    }
+
+    #[tokio::test]
+    async fn sync_gate_rejects_an_unsigned_policy_update_in_a_candidate_chain() {
+        let node = Node::new("n-sync", "127.0.0.1:0", 1);
+        let mut msp = MspEndorsementProvider::new();
+        let gov = Identity::generate("gov");
+        msp.register_identity(&gov, glasschain_core::Principal::new("network-governance"));
+        node.set_endorsement_provider(Arc::new(msp)).await;
+
+        let candidate = candidate_chain(chain_policy_update_tx(None));
+        let error = Node::enforce_chain_endorsements(&node.state, &candidate)
+            .await
+            .expect_err("an unsigned policy update must reject the candidate chain");
+        assert!(error.to_string().contains("no endorsement"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn sync_gate_accepts_a_fully_endorsed_candidate_chain() {
+        let node = Node::new("n-sync", "127.0.0.1:0", 1);
+        let mut msp = MspEndorsementProvider::new();
+        let gov = Identity::generate("gov");
+        msp.register_identity(&gov, glasschain_core::Principal::new("network-governance"));
+        node.set_endorsement_provider(Arc::new(msp)).await;
+
+        let candidate = candidate_chain(chain_policy_update_tx(Some(&gov)));
+        Node::enforce_chain_endorsements(&node.state, &candidate)
+            .await
+            .expect("a signed policy update must pass the sync gate");
     }
 }

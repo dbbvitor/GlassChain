@@ -5,8 +5,9 @@
 //! [`GlasschainServer`] on an ephemeral loopback port, and drive its gRPC
 //! surface over a real Tonic in-process TCP connection.
 use glasschain_core::{
-    ContractExecution, InventoryUpdate, PurchaseConditions, PurchaseOrder, SmartContractDef,
-    SupplyOffer, TraceableAsset, TraceableAssetRegistration, Transaction, TransactionKind,
+    ContractExecution, EndorsementRequest, EndorserIdentity, InventoryUpdate, Principal,
+    PurchaseConditions, PurchaseOrder, ScopedTarget, SmartContractDef, SupplyOffer, TraceableAsset,
+    TraceableAssetRegistration, Transaction, TransactionKind,
 };
 use glasschain_identity::Identity;
 use glasschain_network::Node;
@@ -15,7 +16,7 @@ use glasschain_rpc::proto::glasschain_v1::{
     node_service_client::NodeServiceClient, ExchangeCertificateRequest, GetBlockRequest,
     GetChainStatusRequest, GetNodeStatusRequest, GetPeersRequest, GetVerifiableLineageRequest,
     QueryAssetHistoryRequest, StreamBlocksRequest, SubmitTransactionRequest,
-    SubscribeToEventsRequest,
+    SubscribeToEventsRequest, VerifyEndorsementRequest,
 };
 use glasschain_rpc::server::GlasschainServer;
 use std::sync::Arc;
@@ -604,4 +605,95 @@ async fn test_subscribe_to_events_mapping() {
         .expect("stream ended early");
     assert_eq!(evt.event_type, "block_mined");
     assert!(evt.payload_json.contains("\"block_index\":1"));
+}
+
+// ── Item 7: verify_endorsement real evaluation (ADR-008, ticket #45) ─────────
+
+#[tokio::test]
+async fn test_verify_endorsement_returns_a_real_evaluation() {
+    let node = start_node().await;
+    let identity = Identity::generate("gov-node");
+    let mut msp = glasschain_identity::MspEndorsementProvider::new();
+    msp.register_identity(&identity, Principal::new("network-governance"));
+    node.set_endorsement_provider(std::sync::Arc::new(msp))
+        .await;
+    let (channel, _handle) = start_server(node.clone()).await;
+    let mut identity_client = IdentityServiceClient::new(channel);
+
+    // A request signed by the registered principal satisfies the fail-closed
+    // default policy for the (supply, inventory) scope.
+    let payload = b"canonical-payload".to_vec();
+    let signed_request = EndorsementRequest {
+        target: ScopedTarget {
+            channel: "supply".into(),
+            contract: "inventory".into(),
+            keys: vec![],
+            collection: None,
+        },
+        payload: payload.clone(),
+        signers: vec![EndorserIdentity {
+            claimed_principal: Principal::new("network-governance"),
+            public_key: identity.public_key_bytes().to_vec(),
+            signature: identity.sign_bytes(&payload),
+        }],
+    };
+    let response = identity_client
+        .verify_endorsement(tonic::Request::new(VerifyEndorsementRequest {
+            proposal_json: serde_json::to_string(&signed_request).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.approved, "{:?}", response.rejection_reason);
+    assert_eq!(response.endorser_count, 1);
+    assert_eq!(response.proposal_id.len(), 64, "sha256 hex of the payload");
+
+    // An unregistered signer fails the evaluation with a reason.
+    let unsigned = EndorsementRequest {
+        target: signed_request.target.clone(),
+        payload,
+        signers: vec![],
+    };
+    let response = identity_client
+        .verify_endorsement(tonic::Request::new(VerifyEndorsementRequest {
+            proposal_json: serde_json::to_string(&unsigned).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!response.approved);
+    assert!(response.rejection_reason.contains("unsatisfied"));
+}
+
+#[tokio::test]
+async fn test_verify_endorsement_without_provider_reports_configuration_gap() {
+    let node = start_node().await;
+    let (channel, _handle) = start_server(node.clone()).await;
+    let mut identity_client = IdentityServiceClient::new(channel);
+
+    let request = EndorsementRequest {
+        target: ScopedTarget {
+            channel: "supply".into(),
+            contract: "inventory".into(),
+            keys: vec![],
+            collection: None,
+        },
+        payload: b"payload".to_vec(),
+        signers: vec![],
+    };
+    let response = identity_client
+        .verify_endorsement(tonic::Request::new(VerifyEndorsementRequest {
+            proposal_json: serde_json::to_string(&request).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!response.approved);
+    assert!(
+        response
+            .rejection_reason
+            .contains("no endorsement provider"),
+        "{:?}",
+        response.rejection_reason
+    );
 }

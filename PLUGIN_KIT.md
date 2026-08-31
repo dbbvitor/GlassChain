@@ -786,8 +786,38 @@ let request = /* EndorsementRequest signed by identity.sign_bytes(&payload) */;
 let result = provider.evaluate(&PolicyExpression::signed_by("MyOrg"), &request)?;
 ```
 
-Enforcement at the commit path, committed policy metadata, and the
-`VerifyEndorsement` RPC land with ticket #45.
+### Commit-path enforcement (ADR-008 §4)
+
+The node invokes the provider at transaction and block admission — but only
+once the `endorsement` capability is active at the candidate height (ADR-010)
+and a provider is attached via `Node::set_endorsement_provider`.
+
+- **Carrier:** every endorsed transaction carries
+  `Vec<TransactionEndorsement>` (`Transaction.endorsements`): the scoped
+  `target` the signers authorized plus `EndorserIdentity` signatures over the
+  transaction's canonical bytes (serialized with the carriers cleared, so
+  signatures are never self-referential).
+- **Scope binding:** the transaction's committed partial write set must stay
+  inside a declared carrier's scope (`channel`, `contract`, `keys`,
+  `collection`), and every applicable layer — channel, contract, collection,
+  key, plus the operation default — must be satisfied, or the transaction is
+  rejected with no partial state.
+- **Operation defaults (ADR-008 decision 3):** custody handoffs
+  (`delivery_receipt`) require sender + receiving custodian 2-of-2;
+  `quality_certification`/`audit_attestation` require the payload issuer.
+  Recall/quarantine/dispute have no generic default — their multi-party rule
+  is whatever the committed scoped policies configure.
+- **Policy metadata:** `PolicyUpdate` transactions commit versioned,
+  append-only policy sets per `(channel, contract)` scope, replayed
+  deterministically from the chain (`PolicyHistory`). An update is itself a
+  signed transaction satisfying the *current* effective policy and activates
+  only after its block commits; a block that changes a key's policy and
+  writes the same key is rejected (the new policy applies from the next
+  block). Scopes without a committed policy fall back to the fail-closed
+  `network-governance` principal.
+- **RPC:** `IdentityService.VerifyEndorsement` evaluates an
+  `EndorsementRequest` JSON proposal against the committed policies and
+  returns the real combined evaluation.
 
 ---
 

@@ -1,5 +1,6 @@
 use crate::block::Block;
 use crate::capability::{validate_record_under, CapabilityHistory};
+use crate::endorsement::PolicyHistory;
 use crate::error::CoreError;
 use crate::transaction::{Transaction, TransactionKind};
 use serde::{Deserialize, Serialize};
@@ -84,6 +85,17 @@ impl Ledger {
             TransactionKind::CapabilityActivation(ref activation) => {
                 let mut history = CapabilityHistory::build_from_blocks(&self.chain)?;
                 history.apply(activation.clone(), next_height)?;
+            }
+            TransactionKind::PolicyUpdate(ref update) => {
+                // Structural v1 policy metadata; authorization (signatures
+                // under the current effective policy) is verified at the
+                // network commit path, where the provider lives.
+                if update.channel.is_empty() {
+                    return Err(CoreError::InvalidTransaction(
+                        "endorsement policy update: channel must not be empty".into(),
+                    ));
+                }
+                update.policies.validate()?;
             }
             _ => {}
         }
@@ -170,9 +182,13 @@ impl Ledger {
         }
         // Commit gate: re-validate every canonical record and capability
         // activation in the block under the capability set effective at its
-        // height, so a crafted block never commits invalid content.
+        // height, and every policy update under the replayed policy history
+        // (including the same-block policy/write conflict rule), so a crafted
+        // block never commits invalid content.
         let mut history = CapabilityHistory::build_from_blocks(&self.chain)?;
         history.validate_block(&block)?;
+        let mut policies = PolicyHistory::build_from_blocks(&self.chain)?;
+        policies.validate_block(&block)?;
         self.chain.push(block);
         Ok(true)
     }

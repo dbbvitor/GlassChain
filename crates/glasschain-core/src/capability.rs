@@ -29,6 +29,11 @@ pub struct CapabilityDescriptor {
 /// gate in [`validate_record_under`] and the registry entry cannot drift.
 pub const STATE_COMMITMENT_CAPABILITY_ID: &str = "state_commitment";
 
+/// Capability id gating endorsement enforcement at the commit path (ADR-008
+/// handoff 4). Kept in one place so the node-level gate and the registry
+/// entry cannot drift.
+pub const ENDORSEMENT_CAPABILITY_ID: &str = "endorsement";
+
 /// The v1 capability registry (ADR-010 decision 2).
 pub const CAPABILITY_V1: &[CapabilityDescriptor] = &[
     CapabilityDescriptor {
@@ -288,8 +293,9 @@ impl CapabilityHistory {
 ///
 /// Applies the v1 schema rules plus the height-selected capability gates:
 /// `state_commitment` records require the `state_commitment` capability to be
-/// active at the record's height; other gated behaviors (PDC, endorsement)
-/// attach here when their enforcement lands (#46, #45).
+/// active at the record's height. Endorsement enforcement (ADR-008) lives at
+/// the network commit path, where the provider is configured; the remaining
+/// gated behaviors attach here when they land (#46).
 ///
 /// # Errors
 ///

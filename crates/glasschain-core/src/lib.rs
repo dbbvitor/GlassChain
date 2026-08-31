@@ -22,12 +22,13 @@ pub use canonical::{
 pub use capability::{
     capability_hash, lookup_capability, validate_record_under, CapabilityActivation,
     CapabilityAdvertisement, CapabilityDescriptor, CapabilityHistory, CapabilitySet, CAPABILITY_V1,
-    GENESIS_CAPABILITIES, STATE_COMMITMENT_CAPABILITY_ID,
+    ENDORSEMENT_CAPABILITY_ID, GENESIS_CAPABILITIES, STATE_COMMITMENT_CAPABILITY_ID,
 };
 pub use consensus::{Attestation, CommitNotification, QuorumCertificate};
 pub use endorsement::{
-    EndorsementEvaluation, EndorsementRequest, EndorserIdentity, PolicyExpression, Principal,
-    ScopedPolicies, ScopedTarget,
+    evaluate_transaction_endorsements, operation_default, EndorsementEvaluation,
+    EndorsementRequest, EndorserIdentity, PolicyExpression, PolicyHistory, PolicyUpdate, Principal,
+    ScopedPolicies, ScopedTarget, TransactionEndorsement, NETWORK_GOVERNANCE_PRINCIPAL,
 };
 pub use error::{CoreError, GasMeter};
 pub use ledger::{Ledger, DEFAULT_DIFFICULTY};

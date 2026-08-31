@@ -36,6 +36,7 @@ fn build_transaction_protos(block: &glasschain_core::Block) -> Vec<TransactionPr
                 TransactionKind::AssetRegistration(_) => "AssetRegistration",
                 TransactionKind::CanonicalRecord(_) => "CanonicalRecord",
                 TransactionKind::CapabilityActivation(_) => "CapabilityActivation",
+                TransactionKind::PolicyUpdate(_) => "PolicyUpdate",
             };
             TransactionProto {
                 id: tx.id.clone(),
@@ -513,10 +514,11 @@ impl IdentityService for ServerState {
         }))
     }
 
-    /// Verify an endorsement proposal against the configured policy.
-    ///
-    /// Accepts a JSON-serialised [`EndorsementProposal`] and returns whether
-    /// the required number of valid endorsements have been collected.
+    /// Verify an endorsement proposal against the committed policies
+    /// (ADR-008): the proposal is an `EndorsementRequest` JSON document — the
+    /// scoped target, the canonical payload the signers endorsed, and the
+    /// claimed signers. Every applicable policy layer is evaluated through
+    /// the node's configured provider and the combined result is returned.
     async fn verify_endorsement(
         &self,
         request: Request<VerifyEndorsementRequest>,
@@ -525,19 +527,53 @@ impl IdentityService for ServerState {
         if proposal_json.is_empty() {
             return Err(Status::invalid_argument("proposal_json must not be empty"));
         }
-        // Phase 2: Full integration would deserialize the EndorsementProposal
-        // and run EndorsementEngine::evaluate().
-        // Return a well-documented stub that explains the expected contract.
-        log::debug!(
-            "verify_endorsement called (proposal_json len={})",
-            proposal_json.len()
-        );
-        Ok(Response::new(VerifyEndorsementResponse {
-            approved: false,
-            proposal_id: String::new(),
-            endorser_count: 0,
-            rejection_reason: "endorsement engine not yet wired to RPC layer".into(),
-        }))
+        let proposal: glasschain_core::EndorsementRequest =
+            match serde_json::from_str(&proposal_json) {
+                Ok(proposal) => proposal,
+                Err(e) => {
+                    return Err(Status::invalid_argument(format!(
+                        "invalid endorsement request JSON: {e}"
+                    )));
+                }
+            };
+        let proposal_id = glasschain_core::crypto::sha256(&proposal.payload);
+        match self.node.verify_endorsement(proposal).await {
+            Ok(evaluations) => {
+                let endorser_count = evaluations
+                    .iter()
+                    .map(|evaluation| evaluation.distinct_principals.len())
+                    .max()
+                    .unwrap_or(0);
+                let unsatisfied = evaluations
+                    .iter()
+                    .position(|evaluation| !evaluation.satisfied);
+                let (approved, rejection_reason) = unsatisfied.map_or_else(
+                    || (true, String::new()),
+                    |layer| {
+                        (
+                            false,
+                            format!(
+                                "policy layer {layer} of {} unsatisfied (required {})",
+                                evaluations.len(),
+                                evaluations[layer].required
+                            ),
+                        )
+                    },
+                );
+                Ok(Response::new(VerifyEndorsementResponse {
+                    approved,
+                    proposal_id,
+                    endorser_count: u32::try_from(endorser_count).unwrap_or(u32::MAX),
+                    rejection_reason,
+                }))
+            }
+            Err(e) => Ok(Response::new(VerifyEndorsementResponse {
+                approved: false,
+                proposal_id,
+                endorser_count: 0,
+                rejection_reason: e.to_string(),
+            })),
+        }
     }
 }
 
