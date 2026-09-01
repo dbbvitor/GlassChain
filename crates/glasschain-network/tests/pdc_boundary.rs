@@ -49,6 +49,7 @@ fn pricing_collection() -> Channel {
         member_ids: vec![WRITER.to_owned(), MEMBER_PEER.to_owned()],
         description: "Private pricing collection".to_owned(),
         endorsement_policy: None,
+        retention_secs: 3600,
     })
 }
 

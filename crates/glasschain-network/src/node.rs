@@ -292,6 +292,10 @@ struct VerifiedPeer {
     cert_fingerprint: String,
     /// The peer's organization (the collection-membership principal, ADR-003).
     org: String,
+    /// `true` when the org was verified against the peer's TLS certificate
+    /// subject CN under a configured organization Root CA (ticket #47). Bare
+    /// TOFU leaves this `false`: the org is self-asserted.
+    org_verified: bool,
     /// Capabilities the peer advertised in its most recent `Hello`.
     advertised: Vec<CapabilityAdvertisement>,
 }
@@ -327,6 +331,15 @@ struct PeerRegistry {
 }
 
 impl PeerRegistry {
+    /// Whether the peer at `addr` claimed `org` with a certificate-verified
+    /// identity (ticket #47).
+    fn org_verified(&self, addr: &str, org: &str) -> Option<bool> {
+        self.peers
+            .get(addr)
+            .filter(|peer| peer.org == org)
+            .map(|peer| peer.org_verified)
+    }
+
     fn new() -> Self {
         Self {
             peers: HashMap::new(),
@@ -344,6 +357,7 @@ impl PeerRegistry {
         node_id: &str,
         cert_fingerprint: &str,
         org: &str,
+        org_verified: bool,
     ) -> Result<bool, String> {
         if let Some(existing) = self.peers.get(listen_addr) {
             if existing.node_id != node_id {
@@ -357,6 +371,15 @@ impl PeerRegistry {
                     "TLS certificate fingerprint changed for node '{node_id}'"
                 ));
             }
+            // Org drift: a returning peer claiming a different organization is
+            // either a re-keyed node or an impersonation; both are rejections
+            // (ticket #47 — the org gates private-payload delivery).
+            if existing.org != org {
+                return Err(format!(
+                    "org changed for node '{node_id}': expected '{}', got '{org}'",
+                    existing.org
+                ));
+            }
             Ok(false)
         } else {
             self.peers.insert(
@@ -365,6 +388,7 @@ impl PeerRegistry {
                     node_id: node_id.to_owned(),
                     cert_fingerprint: cert_fingerprint.to_owned(),
                     org: org.to_owned(),
+                    org_verified,
                     advertised: Vec::new(),
                 },
             );
@@ -920,7 +944,7 @@ impl Node {
             )
             .into());
         }
-        let (commitment, targets, transient) = {
+        let (commitment, targets, transient, retention_secs) = {
             let s = self.state.lock().await;
             let Some(configured) = s.collection(collection) else {
                 return Err(CoreError::InvalidTransaction(format!(
@@ -930,12 +954,13 @@ impl Node {
             };
             let targets = s.payload_targets(configured);
             let transient = s.transient.clone();
+            let retention_secs = configured.config.retention_secs;
             let commitment = glasschain_core::crypto::sha256(&payload);
             drop(s);
-            (commitment, targets, transient)
+            (commitment, targets, transient, retention_secs)
         };
         // Store outside the state lock (the store is a cheap Arc handle).
-        transient.put(collection, &commitment, &payload)?;
+        transient.put(collection, &commitment, &payload, retention_secs)?;
         for target in targets {
             if let Err(e) = target.try_send(Message::PrivatePayload {
                 collection: collection.to_owned(),
@@ -946,10 +971,103 @@ impl Node {
             }
         }
         log::info!(
-            "Private payload committed to transient store (collection={collection},              commitment={}...)",
+            "Private payload stored (collection={collection}, commitment={}...)",
             &commitment[..8]
         );
         Ok(())
+    }
+
+    /// Purge expired private payloads from the transient store (ADR-003
+    /// decision 3, ticket #47): payloads vanish, the chain's hash commitments
+    /// persist forever. Call periodically or after operations; retention is
+    /// also enforced on read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError`] when the backend fails.
+    pub async fn purge_expired_private_payloads(&self) -> Result<usize, NetworkError> {
+        let transient = self.state.lock().await.transient.clone();
+        Ok(transient.purge_expired()?)
+    }
+
+    /// Pull-reconcile private payloads for `collection` (ADR-003, ticket
+    /// #47): a peer that was offline at dissemination time scans the committed
+    /// chain for the collection's PDC writes and requests every payload its
+    /// transient store is missing from a member peer. The chain's commitments
+    /// drive the request, so nothing is invented and nothing leaks — the
+    /// request names only a commitment this node can already see.
+    ///
+    /// Returns the number of payloads requested (0 when this node holds
+    /// everything or is not a member).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError`] when a transient-store read fails.
+    pub async fn reconcile_private_payloads(
+        &self,
+        collection: &str,
+    ) -> Result<usize, NetworkError> {
+        // Membership gate + transient handle; the guard is released before the
+        // (possibly long) chain scan.
+        let transient = {
+            let s = self.state.lock().await;
+            if !s.is_collection_member(collection, &s.local_org(&self.node_id)) {
+                return Ok(0);
+            }
+            s.transient.clone()
+        };
+        // Snapshot the chain: the scan reads a consistent view and the guard is
+        // released immediately (reconcile is an infrequent operator action).
+        let chain = self.ledger.lock().await.chain.clone();
+        let mut missing: Vec<String> = Vec::new();
+        for block in &chain {
+            for write in &block.write_set {
+                let (WriteOp::Set(committed), WriteVisibility::Pdc(name)) =
+                    (&write.op, &write.visibility)
+                else {
+                    continue;
+                };
+                if name != collection {
+                    continue;
+                }
+                let commitment = String::from_utf8(committed.clone()).map_err(|_| {
+                    CoreError::InvalidBlock(format!(
+                        "PDC commitment for '{collection}' is not valid UTF-8"
+                    ))
+                })?;
+                if transient.get(collection, &commitment)?.is_none() {
+                    missing.push(commitment);
+                }
+            }
+        }
+        missing.sort_unstable();
+        missing.dedup();
+        let target = {
+            let s = self.state.lock().await;
+            let Some(configured) = s.collection(collection) else {
+                return Ok(0);
+            };
+            let target = s.payload_targets(configured).into_iter().next();
+            drop(s);
+            target
+        };
+        let Some(target) = target else {
+            log::warn!("Reconcile: no member peer is connected for collection '{collection}'");
+            return Ok(0);
+        };
+        for commitment in &missing {
+            if let Err(e) = target.try_send(Message::RequestPrivatePayload {
+                collection: collection.to_owned(),
+                commitment: commitment.clone(),
+            }) {
+                log::warn!("Reconcile request for '{collection}' failed: {e}");
+            }
+        }
+        log::info!(
+            "Reconcile: requested {} missing payloads for collection '{collection}'",
+            missing.len()
+        );
+        Ok(missing.len())
     }
 
     /// Read a private payload from the transient store (member read path,
@@ -975,10 +1093,15 @@ impl Node {
         self.state.lock().await.consensus = Some(provider);
     }
 
-    /// Enable CA-backed certificate verification for peer authentication.
+    /// Enable CA-backed certificate verification (ticket #47).
     ///
-    /// When set, the Hello handshake rejects any peer whose TLS certificate
-    /// was not issued by this organization's Root CA.
+    /// When set, the Hello handshake rejects any peer whose **Hello-carried
+    /// organization certificate** does not verify against this organization's
+    /// Root CA with a subject CN equal to the claimed org (the TLS certificate
+    /// itself is a transport-only self-signed cert and is not used for
+    /// organization trust). The private-payload path additionally requires
+    /// senders to be certificate-verified; a reconnecting peer whose claimed
+    /// org changed is rejected (org drift).
     pub async fn set_cert_verifier(&self, verifier: CertChainVerifier) {
         self.state.lock().await.cert_verifier = Some(Arc::new(verifier));
     }
@@ -1329,7 +1452,8 @@ impl Node {
             if !pdc_active {
                 Self::restore_pending(&self.ledger, transactions).await;
                 return Err(CoreError::InvalidTransaction(
-                    "PDC-scoped writes require the 'pdc' capability to be active at the                      candidate height"
+                    "PDC-scoped writes require the 'pdc' capability to be active at the \
+                     candidate height"
                         .into(),
                 )
                 .into());
@@ -1451,7 +1575,7 @@ impl Node {
                     continue;
                 };
                 let commitment = glasschain_core::crypto::sha256(value);
-                let (transient, targets) = {
+                let (transient, targets, retention_secs) = {
                     let s = self.state.lock().await;
                     // A non-member node must never hold private cleartext, even
                     // when it mines a relayed execution (ADR-003 boundary c).
@@ -1470,11 +1594,15 @@ impl Node {
                     };
                     let targets = s.payload_targets(configured);
                     let transient = s.transient.clone();
+                    let retention_secs = configured.config.retention_secs;
                     drop(s);
-                    (transient, targets)
+                    (transient, targets, retention_secs)
                 };
                 // Outside the state lock (the store is a cheap Arc handle).
-                if transient.put(collection, &commitment, value).is_err() {
+                if transient
+                    .put(collection, &commitment, value, retention_secs)
+                    .is_err()
+                {
                     log::warn!("Failed to hold own payload for collection '{collection}'");
                 }
                 for target in targets {
@@ -2000,13 +2128,14 @@ async fn handle_peer(
     // through the call chain — no shared mutable state needed.
 
     let chain_length = ctx.ledger.lock().await.chain.len() as u64;
-    let org = ctx
-        .state
-        .lock()
-        .await
-        .identity
-        .clone()
-        .map_or_else(|| ctx.node_id.clone(), |identity| identity.node_id.clone());
+    let (org, certificate_pem) = {
+        let s = ctx.state.lock().await;
+        let certificate_pem = s
+            .identity
+            .as_ref()
+            .and_then(|identity| identity.certificate_pem.clone());
+        (s.local_org(&ctx.node_id), certificate_pem)
+    };
     let hello = Message::Hello {
         node_id: ctx.node_id.clone(),
         tls_cert_fingerprint: ctx.local_tls_cert_fingerprint.clone(),
@@ -2020,6 +2149,7 @@ async fn handle_peer(
             })
             .collect(),
         org,
+        certificate_pem,
         listen_addr: ctx.listen_addr.clone(),
     };
     if write_tx.try_send(hello).is_err() {
@@ -2214,7 +2344,7 @@ async fn process_message(
     write_tx: &Sender<Message>,
     current_stable_addr: Option<&str>,
     observed_cert_fingerprint: &str,
-    peer_cert_der: &[u8],
+    _peer_cert_der: &[u8],
 ) -> MessageEffect {
     match msg {
         Message::Hello {
@@ -2225,6 +2355,7 @@ async fn process_message(
             version,
             capabilities,
             org: peer_org,
+            certificate_pem: peer_certificate_pem,
         } => {
             log::info!(
                 "Hello from {addr} (id={peer_id}, chain_len={chain_length}, listen={peer_listen_addr})"
@@ -2276,6 +2407,38 @@ async fn process_message(
                 };
             }
 
+            // ── Step 2.5: certificate-verified org (ticket #47) ──────────
+            // When a verifier is configured, the claimed org counts only if
+            // the peer's organization-issued certificate verifies against this
+            // org's Root CA and its subject CN equals the claimed org. The TLS
+            // certificate is transport-only (self-signed), so this check runs
+            // on the Hello-carried certificate.
+            let org_verified = {
+                let s = ctx.state.lock().await;
+                let has_verifier = s.cert_verifier.is_some();
+                let verified = has_verifier
+                    && s.cert_verifier.as_ref().is_some_and(|verifier| {
+                        peer_certificate_pem.as_ref().is_some_and(|pem| {
+                            verifier
+                                .verified_subject_cn_pem(pem)
+                                .is_ok_and(|cn| cn == peer_org)
+                        })
+                    });
+                let rejected = has_verifier && !verified;
+                drop(s);
+                if rejected {
+                    log::warn!(
+                        "Rejecting peer {peer_id} at {peer_listen_addr}: organization \
+                         '{peer_org}' is not certificate-verified"
+                    );
+                    return MessageEffect {
+                        disconnect: true,
+                        ..Default::default()
+                    };
+                }
+                verified
+            };
+
             // ── Step 2: TOFU peer registry ────────────────────────────
             // First contact  → record identity (node_id + cert fingerprint).
             // Reconnection   → verify identity has not changed.
@@ -2287,6 +2450,7 @@ async fn process_message(
                     &peer_id,
                     observed_cert_fingerprint,
                     &peer_org,
+                    org_verified,
                 ) {
                     Ok(is_new) => {
                         if is_new {
@@ -2310,27 +2474,12 @@ async fn process_message(
                     }
                 }
 
-                // ── Step 3: CA certificate verification (org mode) ───────────────
-                // If this node is configured with an Organization Root CA verifier,
-                // require that the peer's TLS certificate was issued by that CA.
-                // Peers with self-signed certs are still accepted in dev mode
-                // (when no cert_verifier is configured).
-                if let Some(ref verifier) = s.cert_verifier {
-                    if let Err(e) = verifier.verify_cert_der(peer_cert_der) {
-                        log::warn!(
-                            "Rejecting peer {peer_id} at {peer_listen_addr}: CA cert \
-                             verification failed: {e}"
-                        );
-                        return MessageEffect {
-                            disconnect: true,
-                            ..Default::default()
-                        };
-                    }
-                    log::info!(
-                        "CA cert verified for peer {peer_id} (org={})",
-                        verifier.org_name()
-                    );
-                }
+                // ── Step 3: certificate-verified org (moved to Step 2.5, #47) ──
+                // The TLS certificate is a transport-only self-signed cert, so
+                // organization trust does NOT ride on it: Step 2.5 verifies the
+                // Hello-carried organization certificate against the configured
+                // Root CA and gates both the connection and the private-payload
+                // path on that verification.
 
                 // ── Step 4: record advertised capabilities ──────────────
                 // Read-only status is not cached here: it is evaluated at
@@ -2675,9 +2824,17 @@ async fn process_message(
                 .map_or_else(|| ctx.node_id.clone(), |identity| identity.node_id.clone());
             let s = ctx.state.lock().await;
             let sender_org = s.peer_org(stable_addr);
+            let sender_verified = sender_org
+                .as_ref()
+                .and_then(|org| s.peer_registry.org_verified(stable_addr, org));
+            // When this node runs certificate verification, a private payload
+            // may only come from a peer whose org was certificate-verified
+            // (ticket #47): the self-asserted Hello org is not trusted here.
+            let verification_required = s.cert_verifier.is_some();
             let sender_ok = sender_org
                 .as_ref()
-                .is_some_and(|org| s.is_collection_member(&collection, org));
+                .is_some_and(|org| s.is_collection_member(&collection, org))
+                && (!verification_required || sender_verified == Some(true));
             let commitment_ok = glasschain_core::crypto::sha256(&payload) == commitment;
             let rejection = match (s.is_collection_member(&collection, &local_org), sender_ok) {
                 (false, _) => Some(format!("local org '{local_org}' is not a member")),
@@ -2690,7 +2847,19 @@ async fn process_message(
             };
             if let Some(reason) = rejection {
                 log::warn!("Rejecting private payload for '{collection}' from {addr}: {reason}");
-            } else if s.transient.put(&collection, &commitment, &payload).is_ok() {
+            } else if s
+                .transient
+                .put(
+                    &collection,
+                    &commitment,
+                    &payload,
+                    s.collection(&collection).map_or(
+                        glasschain_identity::default_retention_secs(),
+                        |configured| configured.config.retention_secs,
+                    ),
+                )
+                .is_ok()
+            {
                 log::info!(
                     "Private payload stored (collection={collection}, commitment={}...)",
                     &commitment[..8]
@@ -2705,6 +2874,52 @@ async fn process_message(
                     "Rejecting private payload for '{collection}' from {addr}: \
                      transient store failure"
                 );
+            }
+            MessageEffect::default()
+        }
+        Message::RequestPrivatePayload {
+            collection,
+            commitment,
+        } => {
+            // Pull reconciliation (ticket #47): only a member may ask, and
+            // only a member holding the payload may answer — the response is
+            // the ordinary PrivatePayload message, so every transport-boundary
+            // check applies to the answer too.
+            let Some(stable_addr) = current_stable_addr else {
+                log::warn!("Ignoring private-payload request from unauthenticated peer {addr}");
+                return MessageEffect::default();
+            };
+            let (transient, requester_member, holder_member) = {
+                let s = ctx.state.lock().await;
+                let requester_member = s
+                    .peer_org(stable_addr)
+                    .is_some_and(|org| s.is_collection_member(&collection, &org));
+                let holder_member = s.is_collection_member(&collection, &s.local_org(&ctx.node_id));
+                let transient = s.transient.clone();
+                drop(s);
+                (transient, requester_member, holder_member)
+            };
+            if !requester_member || !holder_member {
+                log::warn!(
+                    "Ignoring private-payload request for '{collection}' from {addr}: \
+                     requester or holder is not a member"
+                );
+                return MessageEffect::default();
+            }
+            match transient.get(&collection, &commitment) {
+                Ok(Some(payload)) => {
+                    if let Err(e) = write_tx.try_send(Message::PrivatePayload {
+                        collection,
+                        commitment,
+                        payload,
+                    }) {
+                        log::warn!("Reconcile response delivery failed: {e}");
+                    }
+                }
+                Ok(None) => {
+                    log::debug!("Reconcile: payload {commitment} not held for '{collection}'");
+                }
+                Err(e) => log::warn!("Reconcile lookup failed: {e}"),
             }
             MessageEffect::default()
         }
@@ -2730,7 +2945,7 @@ mod tests {
     #[test]
     fn tofu_first_contact_records_identity() {
         let mut reg = PeerRegistry::new();
-        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a");
+        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a", false);
         assert_eq!(result, Ok(true), "first contact should return Ok(true)");
         assert_eq!(reg.peers.len(), 1);
         let peer = &reg.peers["127.0.0.1:8000"];
@@ -2741,9 +2956,9 @@ mod tests {
     #[test]
     fn tofu_returning_peer_with_same_identity_passes() {
         let mut reg = PeerRegistry::new();
-        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a")
+        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a", false)
             .unwrap();
-        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a");
+        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a", false);
         assert_eq!(
             result,
             Ok(false),
@@ -2754,18 +2969,19 @@ mod tests {
     #[test]
     fn tofu_rejects_node_id_change() {
         let mut reg = PeerRegistry::new();
-        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a")
+        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a", false)
             .unwrap();
-        let result = reg.verify_or_register("127.0.0.1:8000", "node-IMPOSTER", "abc123", "org-b");
+        let result =
+            reg.verify_or_register("127.0.0.1:8000", "node-IMPOSTER", "abc123", "org-b", false);
         assert!(result.is_err(), "changed node_id should be rejected");
     }
 
     #[test]
     fn tofu_rejects_cert_fingerprint_change() {
         let mut reg = PeerRegistry::new();
-        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a")
+        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a", false)
             .unwrap();
-        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "TAMPERED", "org-a");
+        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "TAMPERED", "org-a", false);
         assert!(
             result.is_err(),
             "changed cert fingerprint should be rejected"
@@ -2773,23 +2989,35 @@ mod tests {
     }
 
     #[test]
+    fn tofu_rejects_org_drift() {
+        let mut reg = PeerRegistry::new();
+        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a", true)
+            .unwrap();
+        // A returning peer claiming a different organization is rejected:
+        // the org gates private-payload delivery (ticket #47).
+        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-b", true);
+        let err = result.expect_err("org drift should be rejected");
+        assert!(err.contains("org changed"), "{err}");
+    }
+
+    #[test]
     fn tofu_independent_addresses_are_independent() {
         let mut reg = PeerRegistry::new();
-        reg.verify_or_register("127.0.0.1:8000", "node-a", "aaa", "org-a")
+        reg.verify_or_register("127.0.0.1:8000", "node-a", "aaa", "org-a", false)
             .unwrap();
-        reg.verify_or_register("127.0.0.1:9000", "node-b", "bbb", "org-b")
+        reg.verify_or_register("127.0.0.1:9000", "node-b", "bbb", "org-b", false)
             .unwrap();
         assert_eq!(reg.peers.len(), 2);
         // Each address keeps its own identity.
         assert!(reg
-            .verify_or_register("127.0.0.1:8000", "node-a", "aaa", "org-a")
+            .verify_or_register("127.0.0.1:8000", "node-a", "aaa", "org-a", false)
             .is_ok());
         assert!(reg
-            .verify_or_register("127.0.0.1:9000", "node-b", "bbb", "org-b")
+            .verify_or_register("127.0.0.1:9000", "node-b", "bbb", "org-b", false)
             .is_ok());
         // Cross-contamination is rejected.
         assert!(reg
-            .verify_or_register("127.0.0.1:8000", "node-b", "aaa", "org-b")
+            .verify_or_register("127.0.0.1:8000", "node-b", "aaa", "org-b", false)
             .is_err());
     }
 

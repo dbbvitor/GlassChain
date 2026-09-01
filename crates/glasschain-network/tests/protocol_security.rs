@@ -99,6 +99,7 @@ async fn send_hello(writer: &mut PeerWriter, node_id: &str, listen_addr: &str, f
         chain_length: 1,
         version: PROTOCOL_VERSION.to_owned(),
         org: "org-test".to_owned(),
+        certificate_pem: None,
         capabilities: glasschain_core::CAPABILITY_V1
             .iter()
             .map(|c| glasschain_core::CapabilityAdvertisement {
@@ -591,6 +592,7 @@ fn pricing_collection() -> Channel {
         member_ids: vec!["org-writer".to_owned(), "org-member".to_owned()],
         description: "Private pricing collection".to_owned(),
         endorsement_policy: None,
+        retention_secs: 3600,
     })
 }
 
@@ -615,6 +617,7 @@ async fn send_hello_as_org(
             })
             .collect(),
         org: org.to_owned(),
+        certificate_pem: None,
         listen_addr: listen_addr.to_owned(),
     };
     writer.send(&msg).await.unwrap();
@@ -801,6 +804,7 @@ async fn hello_with_old_wire_version_is_disconnected() {
         version: "glasschain/2".to_owned(),
         capabilities: Vec::new(),
         org: "org-old".to_owned(),
+        certificate_pem: None,
         listen_addr: "127.0.0.1:3".to_owned(),
     };
     writer.send(&stale).await.unwrap();
@@ -809,5 +813,45 @@ async fn hello_with_old_wire_version_is_disconnected() {
         .await
         .expect("timeout waiting for version-gate disconnect")
         .expect_err("a pre-private-payload peer must be disconnected");
+    assert!(matches!(result, NetworkError::PeerDisconnected(_)));
+}
+
+/// Certificate-verified org (ticket #47): a node running a cert verifier
+/// disconnects a peer whose Hello-carried organization certificate does not
+/// verify against the org Root CA with the claimed subject CN.
+#[tokio::test]
+async fn hello_with_unverified_org_certificate_is_disconnected() {
+    // A certificate from a DIFFERENT organization (CN = "imposter"): the
+    // claimed org "org-member" cannot be verified from it.
+    let mut other_org = glasschain_identity::Organization::new("MedCorp").unwrap();
+    let imposter = other_org.issue_identity("imposter").unwrap().clone();
+    let cert_pem = imposter.certificate_pem.expect("issued cert");
+
+    let addr = free_addr();
+    let member = Node::new("org-member", &addr, 1);
+    member.start(vec![]).await.unwrap();
+    let org = glasschain_identity::Organization::new("PharmaCorp").unwrap();
+    member
+        .set_cert_verifier(glasschain_identity::CertChainVerifier::from_org(&org).unwrap())
+        .await;
+
+    let (mut reader, mut writer, _node_cert) = connect_raw(&addr, CLIENT_CERT_A).await;
+    read_node_hello(&mut reader).await;
+    let hello = Message::Hello {
+        node_id: "imposter-node".to_owned(),
+        tls_cert_fingerprint: sha256(CLIENT_CERT_A),
+        chain_length: 1,
+        version: PROTOCOL_VERSION.to_owned(),
+        capabilities: Vec::new(),
+        org: "org-member".to_owned(),
+        certificate_pem: Some(cert_pem),
+        listen_addr: "127.0.0.1:4".to_owned(),
+    };
+    writer.send(&hello).await.unwrap();
+
+    let result = timeout(Duration::from_secs(2), reader.receive())
+        .await
+        .expect("timeout waiting for org-verification disconnect")
+        .expect_err("an unverified org certificate must trigger a disconnect");
     assert!(matches!(result, NetworkError::PeerDisconnected(_)));
 }

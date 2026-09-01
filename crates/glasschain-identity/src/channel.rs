@@ -65,6 +65,18 @@ pub struct ChannelConfig {
     /// declares the collection imposes no extra policy.
     #[serde(default)]
     pub endorsement_policy: Option<PolicyExpression>,
+    /// The collection's private-payload retention window in seconds
+    /// (ADR-003 decision 4): the transient pre-commit store holds payloads
+    /// for this long before they become purge candidates. Default: 72 hours.
+    /// Purge removes payloads; the chain's hash commitments persist forever.
+    #[serde(default = "default_retention_secs")]
+    pub retention_secs: u64,
+}
+
+/// The default retention window: 72 hours (ADR-003 decision 4).
+#[must_use]
+pub const fn default_retention_secs() -> u64 {
+    72 * 60 * 60
 }
 
 /// A named sub-ledger (channel) that restricts data visibility to its members.
@@ -204,6 +216,7 @@ mod tests {
             member_ids: vec!["fabricante-abc".into(), "farmacia-sul".into()],
             description: "Test private channel".into(),
             endorsement_policy: None,
+            retention_secs: default_retention_secs(),
         })
     }
 

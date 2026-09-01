@@ -185,7 +185,8 @@ Current trust model:
 Message types:
 
 - `Hello` — advertises the wire `version` (mismatches are disconnected; current
-  version is `glasschain/3`, bumped when the private-payload message was added),
+  version is `glasschain/4`, bumped when the private-payload protocol gained
+  pull-based reconciliation),
   the sender's `org` (the collection-membership principal), and the
   capabilities the peer supports. A peer lacking an active capability is
   treated as a read-only observer: it can parse and validate history but may
@@ -245,9 +246,27 @@ commitments. A non-member can verify that a private-data write occurred and
 that its commitment is unaltered (`commitment == sha256(payload)`) without
 ever reading the payload.
 
-Staged remainder (ticket #47): gossipsub/Kademlia dissemination, pull-based
-reconciliation for offline peers, per-collection retention/purge windows, and
-certificate-verified payload delivery.
+**Distribution (ticket #47):** a peer that was offline at dissemination time
+reconciles by scanning the committed chain for the collection's PDC
+commitments and requesting every payload its transient store is missing from
+a member peer (`reconcile_private_payloads`); the answer travels the same
+member-gated `PrivatePayload` path. Payloads are held for the collection's
+retention window (`ChannelConfig.retention_secs`, default 72h) and purged on
+sweep (`purge_expired_private_payloads`; retention is also enforced on read) —
+payloads vanish, the chain's commitments persist forever, so a late auditor
+can prove existence and consistency but not read contents. The purge sweep's
+expiry index is in-memory: a restarted member cannot enumerate payloads
+written before the restart.
+When a node runs certificate verification (`set_cert_verifier`), the payload
+path trusts only certificate-verified organizations: the sender's
+Hello-carried organization certificate must verify against the org Root CA
+with a subject CN equal to the claimed org; TOFU-only nodes still accept the
+self-asserted org.
+
+Staged remainder: gossipsub-based payload distribution requires per-member
+encryption (gossipsub has no member admission control, so publishing
+cleartext payloads to a topic would weaken the boundary); the libp2p swarm
+stays the staged substrate for the #48 benchmark work.
 
 ---
 
