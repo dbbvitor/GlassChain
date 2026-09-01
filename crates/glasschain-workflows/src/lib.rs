@@ -54,6 +54,7 @@ mod checkpoint;
 mod error;
 mod event;
 mod purchase_flow;
+mod recall_flow;
 mod receipt_flow;
 mod runner;
 mod state;
@@ -74,8 +75,14 @@ pub use purchase_flow::{
     PurchaseFlowState, RaiseDisputeTransition, RecordDeliveryTransition, SettleTransition,
     ShipOrderTransition,
 };
+pub use recall_flow::{
+    dispute_flow, quarantine_flow, recall_flow, ActivateRecallTransition, CompleteRecallTransition,
+    IssueRecallTransition, ObserveRecallTransition, RecallAnchorLotTransition, RecallConfig,
+    RecallFlowState, RecallResponseConfig, RecallResponseState, RespondTransition,
+};
 pub use receipt_flow::{
-    shipment_receipt_flow, AnchorLotTransition, ReceiptFlowState, ShipmentToReceiptTransition,
+    shipment_receipt_flow, AnchorLotTransition as ReceiptAnchorLotTransition, ReceiptFlowState,
+    ShipmentToReceiptTransition,
 };
 pub use runner::{FlowOutcome, FlowRunner};
 pub use state::FlowState;

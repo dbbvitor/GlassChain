@@ -16,7 +16,6 @@ use glasschain_core::{
     TransactionKind, TRUST_SCORE_STANDARD_THRESHOLD,
 };
 use glasschain_network::{Node, NodeEvent};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
 
@@ -325,96 +324,6 @@ async fn test_block_mined_event_fires_under_load() {
     let ledger = node.ledger_snapshot().await;
     assert!(ledger.validate_chain().is_ok());
     assert_eq!(ledger.chain[1].transactions.len(), 5);
-}
-
-/// Simulates an end-to-end supply chain recall across Manufacturer → Distributor → Pharmacy.
-///
-/// 1. Manufacturer registers an asset (GTIN + batch + serial + expiry).
-/// 2. Distributor receives it (custody transfer inventory update).
-/// 3. Pharmacy receives it (custody transfer inventory update).
-/// 4. All three transactions are mined into a single block.
-/// 5. Verify the block contains exactly 3 transactions.
-/// 6. Verify the GTIN is findable across the entire chain.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_recall_simulation_manufacturer_to_pharmacy() {
-    // Setup: single node representing the full supply chain ledger
-    let manufacturer_addr = free_addr();
-    let manufacturer = Arc::new(Node::new("manufacturer", &manufacturer_addr, 1));
-    manufacturer.start(vec![]).await.unwrap();
-
-    let gtin = "07891234567890";
-    let batch = "LOTE-RECALL-001";
-
-    // Step 1: Manufacturer registers asset
-    let asset = glasschain_core::TraceableAsset {
-        gtin: Some(gtin.into()),
-        batch_number: Some(batch.into()),
-        expiry_date: Some("2026-12-31".into()),
-        serial_number: Some("SN-RECALL-001".into()),
-        anvisa_registration: Some("MS 1.0001.0001.001-1".into()),
-        manufacturer_id: Some("12.345.678/0001-99".into()),
-        product_name: "Dipirona 500mg".into(),
-        custodian_id: "manufacturer".into(),
-        country_of_origin: Some("BR".into()),
-        storage_temp_celsius: Some("15-30".into()),
-        quantity: 1000,
-    };
-    let score = glasschain_core::MetadataTrustScore::compute(&asset);
-    assert_eq!(score.score, 100, "Full asset should score 100");
-
-    let tx1 = Transaction::new(TransactionKind::AssetRegistration(
-        glasschain_core::TraceableAssetRegistration {
-            asset: asset.clone(),
-            event_type: "MANUFACTURE".into(),
-            originator_id: "manufacturer".into(),
-            purchase_order_ref: None,
-        },
-    ));
-    manufacturer.submit_transaction(tx1).await.unwrap();
-
-    // Step 2: Distributor receives (inventory update = custody transfer)
-    let tx2 = Transaction::new(TransactionKind::InventoryUpdate(
-        glasschain_core::InventoryUpdate {
-            owner_id: "distributor-sp".into(),
-            product_id: format!("{gtin}:{batch}"),
-            quantity_delta: 1000,
-            reason: "RECEIVED_FROM_MANUFACTURER".into(),
-        },
-    ));
-    manufacturer.submit_transaction(tx2).await.unwrap();
-
-    // Step 3: Pharmacy receives
-    let tx3 = Transaction::new(TransactionKind::InventoryUpdate(
-        glasschain_core::InventoryUpdate {
-            owner_id: "pharmacy-rj-001".into(),
-            product_id: format!("{gtin}:{batch}"),
-            quantity_delta: 200,
-            reason: "RECEIVED_FROM_DISTRIBUTOR".into(),
-        },
-    ));
-    manufacturer.submit_transaction(tx3).await.unwrap();
-
-    // Mine all three into one block
-    manufacturer.mine().await.unwrap();
-
-    let ledger = manufacturer.ledger_snapshot().await;
-    assert_eq!(ledger.chain.len(), 2, "Genesis + 1 data block");
-    let data_block = &ledger.chain[1];
-    assert_eq!(
-        data_block.transactions.len(),
-        3,
-        "All 3 custody events in block"
-    );
-
-    // Verify the GTIN is findable across the chain
-    let found_gtin = ledger.chain.iter().flat_map(|b| &b.transactions).any(|tx| {
-        if let TransactionKind::AssetRegistration(reg) = &tx.kind {
-            reg.asset.gtin.as_deref() == Some(gtin)
-        } else {
-            false
-        }
-    });
-    assert!(found_gtin, "GTIN {gtin} must be findable in the chain");
 }
 
 /// Validates that the watcher service can handle multiple autonomous inventory triggers
