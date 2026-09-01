@@ -1,6 +1,6 @@
-# Handoff — GlassChain debt-gap implementation (through ticket #43)
+# Handoff — GlassChain debt-gap implementation (through ticket #44)
 
-**Written:** after closing #43. `main` HEAD: `11a36ac`.
+**Written:** after closing #44. `main` HEAD: `a0d1a51`.
 
 ## The loop (established and working — do not redesign it)
 
@@ -26,6 +26,7 @@ before new code). No re-asking the user — continue to the next frontier ticket
 | #45 Endorsement enforcement | `e1e4b75` | `Transaction.endorsements` carriers (scoped target + signers over canonical tx bytes), `PolicyUpdate` kind + `PolicyHistory` replay (same-block rule, fail-closed `network-governance` fallback), capability-gated enforcement at mine/peer/sync/ledger-commit paths, operation defaults (custody 2-of-2, recall 2-of-2 issuer+`issued_by`, cert/audit issuer), `VerifyEndorsement` real evaluation |
 | #42 BFT behind the seam | `044da66` | `BftConsensusProvider` (core, `bft` feature, default-off): real ed25519 attestations over block hash, `verify_certificate` (⅔+ distinct, fail-closed), capability-gated engine selection in `mine_async` (`bft_consensus` active at candidate height), node-level no-fork finality test, wire `glasschain/2`, adoption gates in README |
 | #43 Purchase-to-settlement flows | `11a36ac` | `purchase_flow.rs` (buyer/seller role runners over one state machine; PO/shipment/receipt emissions, acceptance/dispute consumption; RFQ/Quote/Settlement are record-less by design), `attestation_flow.rs` (one parameterized cert/audit flow, anchored records with embedded evidence manifests), `Event::Woken` business wake-up (Resumed stays liveness-only), `FlowRunner` Send+Sync, two-org node-level E2E with interruption resume |
+| #44 Recall/quarantine/dispute flows | `a0d1a51` | `recall_flow.rs`: recall lifecycle (append-only status trail issued→active→completed, anchors the CONFIGURED lot), `quarantine_flow`/`dispute_flow` custodian responses emitting `inventory_transformation` records (dispute reason stays off-chain by whitelist), legacy chaos recall simulation replaced by a three-org flow-driven E2E asserting the public trail on all chains |
 
 ## Working tree
 
@@ -36,10 +37,18 @@ default and `--all-features` — since `bft` gates new code):
 `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` ✅
 `cargo fmt --all --check` ✅
 
-## Next ticket: #44 (recall/quarantine/dispute flows)
+## Next ticket: #46 (PDCs — the last big work stream)
 
-The frontier order after #43: **#44** (replaces the recall simulation test with
-a flow-driven E2E over ≥3 orgs), #46→#47 (PDCs), #48, #49.
+The frontier order after #44: **#46→#47** (private data collections: wire +
+dissemination + transient store, then reconciliation/retention), #48, #49
+(#34–#45, #42–#44 all closed).
+
+#44 review finding worth remembering (fixed in the amend, generalizable):
+- `RecallConfig.lot_ref` was write-only — the anchor transition anchored the
+  FIRST committed lot record regardless of config, while the doc claimed lot
+  scoping. Config-driven transitions must actually MATCH on their config
+  (`record.record_id == config.lot_ref`); a write-only config field whose doc
+  claims scoping is a HARD review finding pattern to grep for in every flow.
 
 #43 facts worth remembering:
 - The v1 registry has NO rfq/quote/acceptance/dispute/settlement families —
