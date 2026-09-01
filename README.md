@@ -29,7 +29,8 @@ GlassChain/
 ├── Cargo.toml                      # Workspace manifest
 └── crates/
     ├── glasschain-core/            # Ledger, blocks, tx model, provider traits, trust scoring
-    ├── glasschain-contracts/       # Contract engine + watcher service
+    ├── glasschain-contracts/       # Deterministic contract layer: registry, matching, approval gate
+    ├── glasschain-workflows/       # I/O-driven automation: flows, checkpoints, watcher service
     ├── glasschain-network/         # P2P node, protocol, peer handling
     ├── glasschain-node/            # Interactive CLI node binary
     ├── glasschain-storage/         # Storage backends/adapters
@@ -38,6 +39,29 @@ GlassChain/
     ├── glasschain-indexer/         # Indexing, event bus, provenance model
     └── glasschain-rpc/             # gRPC service definitions and server
 ```
+
+(The workspace also ships `glasschain-sdk` and `glasschain-cli` client crates.)
+
+### Packaging: contracts vs workflows (ticket #49)
+
+The workspace mirrors Corda's CorDapp split — contract code and workflow code
+are separate deployable modules (crates) with no dependency cycle:
+
+- **Contract layer — verification-only, deterministic:** `glasschain-contracts`
+  (the contract registry, condition matching, and the WASM approval gate — a
+  `BTreeMap` registry, so emission order is deterministic across processes)
+  with `glasschain-vm` executing guest code deterministically. **The
+  deterministic-contract invariant:** the contract layer's evaluation and
+  emission are pure functions of their inputs — no wall clock, no randomness,
+  no network, no persistence — so replaying the same inputs is byte-identical
+  and cross-node agreement is safe. (The chain model in `glasschain-core`
+  stamps block/transaction timestamps at creation, outside this invariant.)
+- **Workflow layer — I/O-driven:** `glasschain-workflows` (flow state
+  machines, checkpoint persistence, and the `WatcherService` event automation
+  that observes committed state and emits transactions).
+
+Workflow code may depend on contract code (`glasschain-workflows` →
+`glasschain-contracts` → `glasschain-core`); never the reverse.
 
 ---
 

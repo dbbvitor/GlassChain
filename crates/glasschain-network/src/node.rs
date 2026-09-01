@@ -2,7 +2,7 @@ use crate::error::NetworkError;
 use crate::peer::{PeerReader, PeerWriter};
 use crate::protocol::{Message, PROTOCOL_VERSION};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use glasschain_contracts::{ContractEngine, InventoryTrigger, WatcherService};
+use glasschain_contracts::ContractEngine;
 use glasschain_core::crypto::sha256;
 use glasschain_core::providers::in_memory::InMemoryStorageProvider;
 #[cfg(feature = "bft")]
@@ -22,6 +22,7 @@ use glasschain_indexer::{
     InMemoryIndexer, IndexedBlock, IndexerProvider, ProvenanceIndex,
 };
 use glasschain_storage::TransientStore;
+use glasschain_workflows::{InventoryTrigger, WatcherService};
 use rcgen;
 use rustls;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};

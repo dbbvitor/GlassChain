@@ -37,12 +37,12 @@
 #[cfg(madsim)]
 use madsim::time as sim_time;
 
-use glasschain_contracts::{InventoryTrigger, WatcherService};
 use glasschain_core::{
     InventoryUpdate, MetadataTrustScore, TraceableAsset, Transaction, TransactionKind,
     TRUST_SCORE_STANDARD_THRESHOLD,
 };
 use glasschain_network::{Node, NodeEvent};
+use glasschain_workflows::{InventoryTrigger, WatcherService};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};

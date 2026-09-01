@@ -10,12 +10,12 @@
 //! - **Concurrent commits**: independently mined blocks are final at commit
 //!   (each carries a validating quorum certificate) and syncing nodes converge.
 
-use glasschain_contracts::{InventoryTrigger, WatcherService};
 use glasschain_core::{
     CommitNotification, InventoryUpdate, MetadataTrustScore, TraceableAsset, Transaction,
     TransactionKind, TRUST_SCORE_STANDARD_THRESHOLD,
 };
 use glasschain_network::{Node, NodeEvent};
+use glasschain_workflows::{InventoryTrigger, WatcherService};
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
 

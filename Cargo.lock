@@ -1631,7 +1631,6 @@ name = "glasschain-contracts"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
- "criterion",
  "env_logger",
  "glasschain-core",
  "glasschain-vm",
@@ -1794,6 +1793,7 @@ name = "glasschain-workflows"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "criterion",
  "glasschain-contracts",
  "glasschain-core",
  "glasschain-vm",

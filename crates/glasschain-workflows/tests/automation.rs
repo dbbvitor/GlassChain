@@ -7,7 +7,7 @@
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
-use glasschain_contracts::{ContractEngine, InventoryTrigger, WatcherService};
+use glasschain_contracts::ContractEngine;
 use glasschain_core::providers::in_memory::InMemoryStorageProvider;
 use glasschain_core::{
     InventoryUpdate, PurchaseConditions, PurchaseOrder, SmartContractDef, StorageProvider,
@@ -16,6 +16,7 @@ use glasschain_core::{
 use glasschain_workflows::{
     Event, FlowOutcome, FlowRunner, FlowState, FlowTriage, Transition, TransitionResult,
 };
+use glasschain_workflows::{InventoryTrigger, WatcherService};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 

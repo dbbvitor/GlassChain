@@ -12,6 +12,7 @@ categories = ["network-programming", "asynchronous", "cryptography"]
 [dependencies]
 glasschain-core       = { path = "../glasschain-core" }
 glasschain-contracts  = { path = "../glasschain-contracts" }
+glasschain-workflows  = { path = "../glasschain-workflows" }
 glasschain-indexer    = { path = "../glasschain-indexer" }
 glasschain-identity   = { path = "../glasschain-identity" }
 glasschain-storage    = { path = "../glasschain-storage" }
@@ -55,7 +56,6 @@ tempfile     = "3"
 ed25519-dalek = "3.0"
 glasschain-vm = { path = "../glasschain-vm" }
 glasschain-storage = { path = "../glasschain-storage" }
-glasschain-workflows = { path = "../glasschain-workflows" }
 # default-features = false drops madsim's `rpc` feature, whose optional
 # bincode 1.x dependency is unmaintained (RUSTSEC-2025-0141). Only `macros`
 # is used by tests/madsim_chaos.rs.

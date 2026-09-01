@@ -1,11 +1,11 @@
-/// Integration tests for the `GlassChain` network node.
-///
-/// These tests spin up real Tokio tasks and real TCP connections on localhost.
-use glasschain_contracts::InventoryTrigger;
 use glasschain_core::{
     CoreError, ExecutionProvider, InventoryUpdate, SupplyOffer, Transaction, TransactionKind,
 };
 use glasschain_network::{Node, NodeEvent};
+/// Integration tests for the `GlassChain` network node.
+///
+/// These tests spin up real Tokio tasks and real TCP connections on localhost.
+use glasschain_workflows::InventoryTrigger;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;

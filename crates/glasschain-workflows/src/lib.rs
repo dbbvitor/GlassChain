@@ -60,6 +60,7 @@ mod runner;
 mod state;
 mod transition;
 mod triage;
+pub mod watcher;
 
 pub use action::Action;
 pub use attestation_flow::{
@@ -88,3 +89,4 @@ pub use runner::{FlowOutcome, FlowRunner};
 pub use state::FlowState;
 pub use transition::{Transition, TransitionResult};
 pub use triage::{FlowTriage, TriageEntry};
+pub use watcher::{InventoryTrigger, WatcherService};

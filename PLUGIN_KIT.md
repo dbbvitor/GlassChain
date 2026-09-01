@@ -55,7 +55,7 @@ forks and no changes to the rest of the stack.
 | 7 | Identity / MSP | `Identity`, `Organization` | `glasschain-identity` | 2 |
 | 7b | Endorsement Engine | `EndorsementEngine` | `glasschain-identity` | 2 |
 | 7c | Endorsement Seam | `EndorsementProvider` | `glasschain-core` | 2 |
-| 8 | Watcher (ECA) | `WatcherService` | `glasschain-contracts` | 4 |
+| 8 | Watcher (ECA) | `WatcherService` | `glasschain-workflows` | 4 |
 | 9 | Schema Validation | `validate_asset` | `glasschain-core` | 3 |
 | 10 | Gas Metering | `GasCounter`, `GasCosts` | `glasschain-vm` | 4 |
 | 11 | Client SDK | `GlasschainClient` | `glasschain-sdk` | 6 |
@@ -829,16 +829,18 @@ and a provider is attached via `Node::set_endorsement_provider`.
 
 ---
 
-## 8. Watcher Service Plugin — ECA Triggers (Phase 4)
+## 8. Watcher Service Plugin — ECA Triggers
 
-**Crate:** `glasschain-contracts`
-**Struct:** `glasschain_contracts::WatcherService`
+**Crate:** `glasschain-workflows` (moved from `glasschain-contracts` in the
+packaging split, ticket #49 — I/O-driven automation lives in the workflow
+layer)
+**Struct:** `glasschain_workflows::WatcherService`
 
 The `WatcherService` implements an **Event-Condition-Action** (ECA) model:
 inventory falls below a threshold → autonomously generate a `PurchaseOrder` transaction.
 
 ```rust
-use glasschain_contracts::{InventoryTrigger, WatcherService};
+use glasschain_workflows::{InventoryTrigger, WatcherService};
 
 let mut watcher = WatcherService::new();
 

@@ -59,6 +59,7 @@ impl<'a> ApprovalGate<'a> {
         Self { executor, policy }
     }
 
+    #[must_use]
     pub fn evaluate(
         &self,
         execution_id: &str,

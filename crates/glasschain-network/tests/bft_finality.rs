@@ -116,7 +116,9 @@ async fn bft_final_at_commit_no_fork() {
         .cloned()
         .expect("block 2 committed");
     assert_eq!(block2.index, 2);
-    assert!(!block2.has_valid_pow(1), "BFT blocks are not PoW-mined");
+    // The BFT invariant is "no mining happened" (nonce stays 0), not "the
+    // hash lacks a PoW prefix" — a hash can start with "0" by chance.
+    assert_eq!(block2.nonce, 0, "BFT blocks are not PoW-mined");
 
     // Final at commit: the certificate attests exactly the committed block,
     // and every attestation is a real ed25519 signature over its hash by a
