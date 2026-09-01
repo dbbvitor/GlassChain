@@ -34,6 +34,11 @@ pub const STATE_COMMITMENT_CAPABILITY_ID: &str = "state_commitment";
 /// entry cannot drift.
 pub const ENDORSEMENT_CAPABILITY_ID: &str = "endorsement";
 
+/// Capability id gating private data collections (ADR-003, ticket #46).
+/// Kept in one place so the node-level payload gates and the registry entry
+/// cannot drift.
+pub const PDC_CAPABILITY_ID: &str = "pdc";
+
 /// Capability id gating Tendermint-class BFT consensus (ticket #42, ADR-002).
 /// Kept in one place so the node-level engine selection and the registry entry
 /// cannot drift.
@@ -50,7 +55,7 @@ pub const CAPABILITY_V1: &[CapabilityDescriptor] = &[
         version: 1,
     },
     CapabilityDescriptor {
-        id: "pdc",
+        id: PDC_CAPABILITY_ID,
         version: 1,
     },
     CapabilityDescriptor {

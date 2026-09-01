@@ -7,19 +7,21 @@ use glasschain_core::crypto::sha256;
 use glasschain_core::providers::in_memory::InMemoryStorageProvider;
 #[cfg(feature = "bft")]
 use glasschain_core::BFT_CONSENSUS_CAPABILITY_ID;
+use glasschain_core::PDC_CAPABILITY_ID;
 use glasschain_core::{
     evaluate_transaction_endorsements, Block, CapabilityAdvertisement, CapabilityHistory,
     CommitNotification, CoreError, EndorsementEvaluation, EndorsementProvider, EndorsementRequest,
     ExecutionLimits, ExecutionProvider, ExecutionResult, Ledger, PersistentWrite, PolicyHistory,
-    QuorumCertificate, StorageProvider, Transaction, TransactionKind, CAPABILITY_V1,
-    ENDORSEMENT_CAPABILITY_ID,
+    QuorumCertificate, StorageProvider, Transaction, TransactionKind, WriteOp, WriteVisibility,
+    CAPABILITY_V1, ENDORSEMENT_CAPABILITY_ID,
 };
 use glasschain_identity::CertChainVerifier;
-use glasschain_identity::Identity;
+use glasschain_identity::{Channel, Identity};
 use glasschain_indexer::{
     indexed_transactions_of, AnalyticalFlattener, EventBusProvider, InMemoryEventBus,
     InMemoryIndexer, IndexedBlock, IndexerProvider, ProvenanceIndex,
 };
+use glasschain_storage::TransientStore;
 use rcgen;
 use rustls;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -55,6 +57,15 @@ pub enum NodeEvent {
         index: u64,
         hash: String,
         certificate: QuorumCertificate,
+    },
+    /// A private data collection payload was received and stored in the
+    /// transient store (ADR-003, ticket #46). The event carries the collection
+    /// and the commitment — never the payload bytes.
+    PrivatePayloadReceived {
+        /// The collection the payload belongs to.
+        collection: String,
+        /// SHA-256 of the payload (the chain's commitment).
+        commitment: String,
     },
     /// A peer connected and completed the handshake.
     PeerConnected(String),
@@ -185,6 +196,13 @@ struct NodeState {
     /// Optional endorsement provider, invoked at the commit path when the
     /// `endorsement` capability is active (ADR-008 handoff 4).
     endorsement: Option<Arc<dyn EndorsementProvider>>,
+    /// The private data collections this node is configured with (ADR-003,
+    /// ticket #46). Membership gates every private-payload path; membership is
+    /// never an endorsement (ADR-008).
+    collections: Vec<Channel>,
+    /// Transient pre-commit store for received private payloads, over the
+    /// node's `StorageProvider` (ADR-003; retention/purge is #47).
+    transient: TransientStore,
     /// Optional Tendermint-class BFT provider (ticket #42, default-off). When
     /// set **and** the `bft_consensus` capability is active at the candidate
     /// height, the node attests blocks with a real quorum certificate instead
@@ -197,6 +215,50 @@ struct NodeState {
 }
 
 impl NodeState {
+    /// This node's organization: the identity's node identifier when
+    /// identity-backed, the plain node identifier otherwise. The
+    /// collection-membership principal (ADR-003).
+    fn local_org(&self, node_id: &str) -> String {
+        self.identity
+            .clone()
+            .map_or_else(|| node_id.to_owned(), |identity| identity.node_id.clone())
+    }
+
+    /// The configured collection with `name`, if any.
+    fn collection(&self, name: &str) -> Option<&Channel> {
+        self.collections.iter().find(|c| c.config.name == name)
+    }
+
+    /// `true` when `org` is a member of the collection `name` (ADR-003).
+    /// Membership is a read/write/receipt control and is never an endorsement
+    /// (ADR-008).
+    fn is_collection_member(&self, name: &str, org: &str) -> bool {
+        self.collection(name)
+            .is_some_and(|collection| collection.is_member(org))
+    }
+
+    /// The org a connected peer advertised in its `Hello`, if known.
+    fn peer_org(&self, addr: &str) -> Option<String> {
+        self.peer_registry
+            .peers
+            .get(addr)
+            .map(|peer| peer.org.clone())
+    }
+
+    /// Write channels of peers whose org is a member of `collection` — the
+    /// point-to-point private-payload targets (ADR-003). Nodes without the
+    /// collection or org never appear here.
+    fn payload_targets(&self, collection: &Channel) -> Vec<Sender<Message>> {
+        self.peer_senders
+            .iter()
+            .filter(|(addr, _)| {
+                self.peer_org(addr)
+                    .is_some_and(|org| collection.is_member(&org))
+            })
+            .map(|(_, sender)| sender.clone())
+            .collect()
+    }
+
     /// Write channels of peers that support the `active` capability set;
     /// read-only observers are excluded from active-write relay (ADR-010
     /// decision 6).
@@ -228,6 +290,8 @@ async fn active_set_at_tip(ledger: &Arc<Mutex<Ledger>>) -> glasschain_core::Capa
 struct VerifiedPeer {
     node_id: String,
     cert_fingerprint: String,
+    /// The peer's organization (the collection-membership principal, ADR-003).
+    org: String,
     /// Capabilities the peer advertised in its most recent `Hello`.
     advertised: Vec<CapabilityAdvertisement>,
 }
@@ -279,6 +343,7 @@ impl PeerRegistry {
         listen_addr: &str,
         node_id: &str,
         cert_fingerprint: &str,
+        org: &str,
     ) -> Result<bool, String> {
         if let Some(existing) = self.peers.get(listen_addr) {
             if existing.node_id != node_id {
@@ -299,6 +364,7 @@ impl PeerRegistry {
                 VerifiedPeer {
                     node_id: node_id.to_owned(),
                     cert_fingerprint: cert_fingerprint.to_owned(),
+                    org: org.to_owned(),
                     advertised: Vec::new(),
                 },
             );
@@ -379,6 +445,8 @@ impl Node {
                 executor: None,
                 endorsement: None,
                 policies: PolicyHistory::default(),
+                collections: Vec::new(),
+                transient: TransientStore::new(Arc::clone(&storage)),
                 #[cfg(feature = "bft")]
                 consensus: None,
             })),
@@ -793,6 +861,109 @@ impl Node {
         self.state.lock().await.endorsement = Some(provider);
     }
 
+    /// Configure this node's private data collections (ADR-003, ticket #46).
+    ///
+    /// Membership gates every private-payload path: `submit_private_payload`
+    /// requires the local org to be a member, payloads are sent only to member
+    /// peers, and received payloads are stored only when this node is a
+    /// member. Membership is never an endorsement (ADR-008).
+    pub async fn set_collections(&self, collections: Vec<Channel>) {
+        self.state.lock().await.collections = collections;
+    }
+
+    /// Submit a private payload to the collection `collection` (ADR-003,
+    /// ticket #46).
+    ///
+    /// The payload is held in this member's transient store and sent
+    /// **point-to-point** to member peers only; the globally replicated chain
+    /// receives only `sha256(payload)` via the redacted write set. Rejected
+    /// when the `pdc` capability is inactive or the local org is not a member
+    /// of the collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError`] when the capability gate, membership gate, or
+    /// transient-store write fails.
+    pub async fn submit_private_payload(
+        &self,
+        collection: &str,
+        payload: Vec<u8>,
+    ) -> Result<(), NetworkError> {
+        // Membership gate (the collection-scoped check first, so a non-member
+        // gets the accurate rejection regardless of chain state).
+        {
+            let s = self.state.lock().await;
+            let org = s.local_org(&self.node_id);
+            if !s.is_collection_member(collection, &org) {
+                return Err(CoreError::InvalidTransaction(format!(
+                    "org '{org}' is not a member of collection '{collection}'"
+                ))
+                .into());
+            }
+        }
+        // Capability gate: the write carrying this payload commits at the
+        // NEXT height, so the gate is the capability set effective there
+        // (ADR-010 §4: a block is validated under the set active at its own
+        // height).
+        let pdc_active = {
+            let ledger = self.ledger.lock().await;
+            let next_height = ledger.chain.len() as u64;
+            CapabilityHistory::build_from_blocks(&ledger.chain).is_ok_and(|history| {
+                history
+                    .effective_set(next_height)
+                    .is_active(PDC_CAPABILITY_ID)
+            })
+        };
+        if !pdc_active {
+            return Err(CoreError::InvalidTransaction(
+                "private payloads require the 'pdc' capability to be active".into(),
+            )
+            .into());
+        }
+        let (commitment, targets, transient) = {
+            let s = self.state.lock().await;
+            let Some(configured) = s.collection(collection) else {
+                return Err(CoreError::InvalidTransaction(format!(
+                    "collection '{collection}' is not configured"
+                ))
+                .into());
+            };
+            let targets = s.payload_targets(configured);
+            let transient = s.transient.clone();
+            let commitment = glasschain_core::crypto::sha256(&payload);
+            drop(s);
+            (commitment, targets, transient)
+        };
+        // Store outside the state lock (the store is a cheap Arc handle).
+        transient.put(collection, &commitment, &payload)?;
+        for target in targets {
+            if let Err(e) = target.try_send(Message::PrivatePayload {
+                collection: collection.to_owned(),
+                commitment: commitment.clone(),
+                payload: payload.clone(),
+            }) {
+                log::warn!("Private payload delivery to a member peer failed: {e}");
+            }
+        }
+        log::info!(
+            "Private payload committed to transient store (collection={collection},              commitment={}...)",
+            &commitment[..8]
+        );
+        Ok(())
+    }
+
+    /// Read a private payload from the transient store (member read path,
+    /// ADR-003): `Some(payload)` only when this node holds it as a member.
+    pub async fn transient_payload(&self, collection: &str, commitment: &str) -> Option<Vec<u8>> {
+        self.state
+            .lock()
+            .await
+            .transient
+            .get(collection, commitment)
+            .ok()
+            .flatten()
+    }
+
     /// Attach a Tendermint-class BFT provider (ticket #42, default-off).
     ///
     /// After this call the node attests blocks with `provider`'s real quorum
@@ -1146,6 +1317,24 @@ impl Node {
         // canonicalize, and redact PDC values to commitments before inclusion.
         let (write_set, per_tx_writes) =
             Self::compute_write_set(&self.state, &transactions).await?;
+        // Consensus boundary (ADR-010 §1, #46): a PDC-scoped write may only be
+        // committed while the `pdc` capability is active at the candidate
+        // height — otherwise the candidate is dropped whole.
+        if write_set
+            .iter()
+            .any(|write| matches!(write.visibility, WriteVisibility::Pdc(_)))
+        {
+            let pdc_active = CapabilityHistory::build_from_blocks(&self.ledger.lock().await.chain)
+                .is_ok_and(|history| history.effective_set(index).is_active(PDC_CAPABILITY_ID));
+            if !pdc_active {
+                Self::restore_pending(&self.ledger, transactions).await;
+                return Err(CoreError::InvalidTransaction(
+                    "PDC-scoped writes require the 'pdc' capability to be active at the                      candidate height"
+                        .into(),
+                )
+                .into());
+            }
+        }
         let mut block =
             Block::with_write_set(index, transactions.clone(), prev_hash.clone(), write_set);
 
@@ -1224,6 +1413,11 @@ impl Node {
                 hash: block.hash.clone(),
                 certificate: notification.certificate,
             });
+            // Disseminate this node's raw PDC writes point-to-point to
+            // collection members (ADR-003, #46): the block carries only the
+            // commitments, so members receive the payload out of band. The
+            // writer holds its own payloads in the transient store too.
+            self.disseminate_private_writes(&per_tx_writes).await;
             self.broadcast(Message::Block(block)).await;
             for tx in generated {
                 self.broadcast(Message::Transaction(tx)).await;
@@ -1243,6 +1437,57 @@ impl Node {
     /// Returns [`NetworkError`] if the mining operation fails.
     pub async fn mine(&self) -> Result<(), NetworkError> {
         self.mine_async().await
+    }
+
+    /// Send raw PDC-scoped writes to member peers' transient stores
+    /// (ADR-003, ticket #46). `per_tx_writes` carries the pre-redaction
+    /// values; the block itself receives only `block_form` commitments.
+    async fn disseminate_private_writes(&self, per_tx_writes: &[Vec<PersistentWrite>]) {
+        for writes in per_tx_writes {
+            for write in writes {
+                let (WriteOp::Set(value), WriteVisibility::Pdc(collection)) =
+                    (&write.op, &write.visibility)
+                else {
+                    continue;
+                };
+                let commitment = glasschain_core::crypto::sha256(value);
+                let (transient, targets) = {
+                    let s = self.state.lock().await;
+                    // A non-member node must never hold private cleartext, even
+                    // when it mines a relayed execution (ADR-003 boundary c).
+                    if !s.is_collection_member(collection, &s.local_org(&self.node_id)) {
+                        log::warn!(
+                            "Not disseminating payload for '{collection}': local org is \
+                             not a member"
+                        );
+                        continue;
+                    }
+                    let Some(configured) = s.collection(collection) else {
+                        log::warn!(
+                            "Write targets collection '{collection}' but it is not configured"
+                        );
+                        continue;
+                    };
+                    let targets = s.payload_targets(configured);
+                    let transient = s.transient.clone();
+                    drop(s);
+                    (transient, targets)
+                };
+                // Outside the state lock (the store is a cheap Arc handle).
+                if transient.put(collection, &commitment, value).is_err() {
+                    log::warn!("Failed to hold own payload for collection '{collection}'");
+                }
+                for target in targets {
+                    if let Err(e) = target.try_send(Message::PrivatePayload {
+                        collection: collection.clone(),
+                        commitment: commitment.clone(),
+                        payload: value.clone(),
+                    }) {
+                        log::warn!("Private payload delivery to a member peer failed: {e}");
+                    }
+                }
+            }
+        }
     }
 
     /// Compute the candidate block's canonical write set: execute every
@@ -1755,6 +2000,13 @@ async fn handle_peer(
     // through the call chain — no shared mutable state needed.
 
     let chain_length = ctx.ledger.lock().await.chain.len() as u64;
+    let org = ctx
+        .state
+        .lock()
+        .await
+        .identity
+        .clone()
+        .map_or_else(|| ctx.node_id.clone(), |identity| identity.node_id.clone());
     let hello = Message::Hello {
         node_id: ctx.node_id.clone(),
         tls_cert_fingerprint: ctx.local_tls_cert_fingerprint.clone(),
@@ -1767,6 +2019,7 @@ async fn handle_peer(
                 version: c.version,
             })
             .collect(),
+        org,
         listen_addr: ctx.listen_addr.clone(),
     };
     if write_tx.try_send(hello).is_err() {
@@ -1971,6 +2224,7 @@ async fn process_message(
             listen_addr: peer_listen_addr,
             version,
             capabilities,
+            org: peer_org,
         } => {
             log::info!(
                 "Hello from {addr} (id={peer_id}, chain_len={chain_length}, listen={peer_listen_addr})"
@@ -2032,6 +2286,7 @@ async fn process_message(
                     &peer_listen_addr,
                     &peer_id,
                     observed_cert_fingerprint,
+                    &peer_org,
                 ) {
                     Ok(is_new) => {
                         if is_new {
@@ -2374,6 +2629,85 @@ async fn process_message(
             MessageEffect::default()
         }
 
+        Message::PrivatePayload {
+            collection,
+            commitment,
+            payload,
+        } => {
+            // ── The private-payload transport boundary (ADR-003, #46) ──────
+            // A payload is accepted only when the `pdc` capability is active,
+            // this node's org is a collection member, the sender's org is a
+            // member, and the commitment matches the payload. A non-member
+            // never holds private cleartext; the chain carries only the
+            // commitment.
+            // The payload is a pre-commit artifact for a write that lands at
+            // the NEXT height — it may arrive before its block does — so the
+            // gate is the capability set effective there (matching the
+            // submission gate). One lock scope for height and history so the
+            // chain cannot advance in between.
+            let pdc_active = {
+                let ledger = ctx.ledger.lock().await;
+                let next_height = ledger.chain.len() as u64;
+                CapabilityHistory::build_from_blocks(&ledger.chain).is_ok_and(|history| {
+                    history
+                        .effective_set(next_height)
+                        .is_active(PDC_CAPABILITY_ID)
+                })
+            };
+            if !pdc_active {
+                log::warn!(
+                    "Rejecting private payload for '{collection}' from {addr}: \
+                     the 'pdc' capability is not active"
+                );
+                return MessageEffect::default();
+            }
+            // Only peers that completed the handshake may send payloads.
+            let Some(stable_addr) = current_stable_addr else {
+                log::warn!("Ignoring private payload from unauthenticated peer {addr}");
+                return MessageEffect::default();
+            };
+            let local_org = ctx
+                .state
+                .lock()
+                .await
+                .identity
+                .clone()
+                .map_or_else(|| ctx.node_id.clone(), |identity| identity.node_id.clone());
+            let s = ctx.state.lock().await;
+            let sender_org = s.peer_org(stable_addr);
+            let sender_ok = sender_org
+                .as_ref()
+                .is_some_and(|org| s.is_collection_member(&collection, org));
+            let commitment_ok = glasschain_core::crypto::sha256(&payload) == commitment;
+            let rejection = match (s.is_collection_member(&collection, &local_org), sender_ok) {
+                (false, _) => Some(format!("local org '{local_org}' is not a member")),
+                (true, false) => Some(sender_org.map_or_else(
+                    || "sender not in the peer registry".to_owned(),
+                    |org| format!("sender org '{org}' is not a member"),
+                )),
+                (true, true) if !commitment_ok => Some("commitment mismatch".to_owned()),
+                (true, true) => None,
+            };
+            if let Some(reason) = rejection {
+                log::warn!("Rejecting private payload for '{collection}' from {addr}: {reason}");
+            } else if s.transient.put(&collection, &commitment, &payload).is_ok() {
+                log::info!(
+                    "Private payload stored (collection={collection}, commitment={}...)",
+                    &commitment[..8]
+                );
+                drop(s);
+                let _ = ctx.event_tx.send(NodeEvent::PrivatePayloadReceived {
+                    collection,
+                    commitment,
+                });
+            } else {
+                log::warn!(
+                    "Rejecting private payload for '{collection}' from {addr}: \
+                     transient store failure"
+                );
+            }
+            MessageEffect::default()
+        }
         Message::Goodbye { reason } => {
             log::info!("Peer {addr} says goodbye: {reason}");
             MessageEffect::default()
@@ -2396,7 +2730,7 @@ mod tests {
     #[test]
     fn tofu_first_contact_records_identity() {
         let mut reg = PeerRegistry::new();
-        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123");
+        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a");
         assert_eq!(result, Ok(true), "first contact should return Ok(true)");
         assert_eq!(reg.peers.len(), 1);
         let peer = &reg.peers["127.0.0.1:8000"];
@@ -2407,9 +2741,9 @@ mod tests {
     #[test]
     fn tofu_returning_peer_with_same_identity_passes() {
         let mut reg = PeerRegistry::new();
-        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123")
+        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a")
             .unwrap();
-        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123");
+        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a");
         assert_eq!(
             result,
             Ok(false),
@@ -2420,18 +2754,18 @@ mod tests {
     #[test]
     fn tofu_rejects_node_id_change() {
         let mut reg = PeerRegistry::new();
-        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123")
+        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a")
             .unwrap();
-        let result = reg.verify_or_register("127.0.0.1:8000", "node-IMPOSTER", "abc123");
+        let result = reg.verify_or_register("127.0.0.1:8000", "node-IMPOSTER", "abc123", "org-b");
         assert!(result.is_err(), "changed node_id should be rejected");
     }
 
     #[test]
     fn tofu_rejects_cert_fingerprint_change() {
         let mut reg = PeerRegistry::new();
-        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123")
+        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a")
             .unwrap();
-        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "TAMPERED");
+        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "TAMPERED", "org-a");
         assert!(
             result.is_err(),
             "changed cert fingerprint should be rejected"
@@ -2441,21 +2775,21 @@ mod tests {
     #[test]
     fn tofu_independent_addresses_are_independent() {
         let mut reg = PeerRegistry::new();
-        reg.verify_or_register("127.0.0.1:8000", "node-a", "aaa")
+        reg.verify_or_register("127.0.0.1:8000", "node-a", "aaa", "org-a")
             .unwrap();
-        reg.verify_or_register("127.0.0.1:9000", "node-b", "bbb")
+        reg.verify_or_register("127.0.0.1:9000", "node-b", "bbb", "org-b")
             .unwrap();
         assert_eq!(reg.peers.len(), 2);
         // Each address keeps its own identity.
         assert!(reg
-            .verify_or_register("127.0.0.1:8000", "node-a", "aaa")
+            .verify_or_register("127.0.0.1:8000", "node-a", "aaa", "org-a")
             .is_ok());
         assert!(reg
-            .verify_or_register("127.0.0.1:9000", "node-b", "bbb")
+            .verify_or_register("127.0.0.1:9000", "node-b", "bbb", "org-b")
             .is_ok());
         // Cross-contamination is rejected.
         assert!(reg
-            .verify_or_register("127.0.0.1:8000", "node-b", "aaa")
+            .verify_or_register("127.0.0.1:8000", "node-b", "aaa", "org-b")
             .is_err());
     }
 
@@ -2990,12 +3324,30 @@ mod tests {
             WasmExecutionProvider::new().expect("wasmtime must init"),
         ))
         .await;
+        // PDC-scoped writes require the `pdc` capability active at the
+        // candidate height (ADR-010, ticket #46): activate it for height 2 so
+        // the execution block below may carry the PDC write.
+        node.submit_transaction(Transaction::with_id(
+            "cap:pdc:2".to_owned(),
+            TransactionKind::CapabilityActivation(CapabilityActivation {
+                capability_id: "pdc".into(),
+                version: 1,
+                hash: capability_hash("pdc", 1),
+                activation_height: 2,
+                signatures: vec![RecordSignature {
+                    signer: "org-gov".into(),
+                    signature_bytes: vec![0x42],
+                }],
+            }),
+        ))
+        .await
+        .unwrap();
+        node.mine().await.unwrap();
         node.submit_transaction(Transaction::new(TransactionKind::ContractCreation(
             write_set_contract(),
         )))
         .await
         .unwrap();
-        node.mine().await.unwrap();
         node.submit_transaction(write_set_execution())
             .await
             .unwrap();

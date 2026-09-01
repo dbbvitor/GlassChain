@@ -59,7 +59,7 @@ pub mod msp;
 pub mod msp_policy;
 
 pub use cert_verifier::{CertChainVerifier, CertVerificationError, VerificationLevel};
-pub use channel::{Channel, ChannelConfig};
+pub use channel::{Channel, ChannelConfig, DEFAULT_REGULATOR_ORGS};
 pub use endorsement::{
     EndorsementEngine, EndorsementPolicy, EndorsementProposal, EndorsementResult,
     EndorsementSignature,

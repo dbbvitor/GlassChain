@@ -27,7 +27,7 @@ pub use capability::{
     capability_hash, lookup_capability, validate_record_under, CapabilityActivation,
     CapabilityAdvertisement, CapabilityDescriptor, CapabilityHistory, CapabilitySet,
     BFT_CONSENSUS_CAPABILITY_ID, CAPABILITY_V1, ENDORSEMENT_CAPABILITY_ID, GENESIS_CAPABILITIES,
-    STATE_COMMITMENT_CAPABILITY_ID,
+    PDC_CAPABILITY_ID, STATE_COMMITMENT_CAPABILITY_ID,
 };
 pub use consensus::{Attestation, CommitNotification, QuorumCertificate};
 pub use endorsement::{

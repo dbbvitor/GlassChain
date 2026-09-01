@@ -185,17 +185,69 @@ Current trust model:
 Message types:
 
 - `Hello` — advertises the wire `version` (mismatches are disconnected; current
-  version is `glasschain/2`, bumped with the BFT seam since BFT-attested blocks
-  are not verifiable by `/1` peers) and the capabilities the peer supports. A
-  peer lacking an active capability is treated as a read-only observer: it can
-  parse and validate history but may not propose, vote, or relay active writes.
+  version is `glasschain/3`, bumped when the private-payload message was added),
+  the sender's `org` (the collection-membership principal), and the
+  capabilities the peer supports. A peer lacking an active capability is
+  treated as a read-only observer: it can parse and validate history but may
+  not propose, vote, or relay active writes.
 - `Transaction`
 - `Block`
+- `PrivatePayload` — a private data collection payload, sent **point-to-point
+  between collection members only** (never broadcast). See "Private Data
+  Collections" below.
 - `RequestChain`
 - `Chain`
 - `RequestPeers`
 - `Peers`
 - `Goodbye`
+
+---
+
+## Private Data Collections (ADR-003)
+
+Private payloads (pricing, quantities, counterparties, raw evidence) never
+enter global replication. One global chain carries the facts; collections
+carry the payloads.
+
+**Collections** (`glasschain-identity`): a collection names its member
+organizations and an optional endorsement-policy declaration. Membership —
+who may read and receive payloads, and who may submit payloads locally — is a
+separate control from endorsement: being a member never satisfies a policy.
+The authoritative collection endorsement policy is a committed `PolicyUpdate`
+carrying a collection-scoped `collection_policy`, evaluated by the endorsement
+engine at the commit path over verified principals (ADR-008, ticket #45);
+a node's local `ChannelConfig.endorsement_policy` is its declaration of that
+policy, not an independent enforcement source. Regulator organizations
+(Anvisa, MAPA) are members of every collection by default.
+
+**The boundary model** — private cleartext exists only (a) inside the
+writer's execution, (b) in `Message::PrivatePayload` between members, and (c)
+in members' transient stores. Two author responsibilities keep it that way: a
+guest must compute private values at runtime (a value embedded in a contract's
+WASM data segment rides the committed contract definition), and private input
+must enter through the payload path, not through public record fields.
+
+- **Admission:** `submit_private_payload` requires the local org to be a
+  collection member and the `pdc` capability to be active at the next height;
+  PDC-scoped VM writes are dropped whole while the capability is inactive.
+- **Transport:** payloads are sent point-to-point to peers whose advertised
+  `org` is a member (a self-asserted string until certificate-verified
+  delivery lands in #47); a payload pushed to a non-member, an
+  unauthenticated peer, or with a commitment mismatch is rejected on receipt.
+- **Storage/commit:** the block's write set carries the collection name and
+  `sha256(value)` — never the value (`PersistentWrite::block_form`, ADR-007);
+  the world-state mirror holds only commitments.
+- **Replay:** state rebuilds from committed (redacted) write sets, so no
+  replay path can resurrect cleartext.
+
+**Non-member verification:** every node — member or not — holds the block
+commitments. A non-member can verify that a private-data write occurred and
+that its commitment is unaltered (`commitment == sha256(payload)`) without
+ever reading the payload.
+
+Staged remainder (ticket #47): gossipsub/Kademlia dissemination, pull-based
+reconciliation for offline peers, per-collection retention/purge windows, and
+certificate-verified payload delivery.
 
 ---
 

@@ -261,7 +261,25 @@ async fn setup(writes: Vec<PersistentWrite>) -> Harness {
     node.set_execution_provider(Arc::new(WritingExecutionProvider { writes }))
         .await;
 
+    // Both the endorsement and the `pdc` capabilities activate at height 2:
+    // PDC-scoped writes are capability-gated (ADR-010, ticket #46), and one
+    // test below commits one.
     node.submit_transaction(activation_tx(2)).await.unwrap();
+    node.submit_transaction(Transaction::with_id(
+        "cap:pdc:2".to_owned(),
+        TransactionKind::CapabilityActivation(CapabilityActivation {
+            capability_id: "pdc".into(),
+            version: 1,
+            hash: capability_hash("pdc", 1),
+            activation_height: 2,
+            signatures: vec![RecordSignature {
+                signer: "governance".into(),
+                signature_bytes: vec![0x42],
+            }],
+        }),
+    ))
+    .await
+    .unwrap();
     node.mine().await.unwrap();
 
     node.submit_transaction(policy_update_tx(

@@ -86,6 +86,20 @@ fn event_to_response(event: &NodeEvent) -> SubscribeToEventsResponse {
             event_type: "transaction_accepted".into(),
             payload_json: serde_json::json!({ "transaction_id": t.id }).to_string(),
         },
+        // The payload itself never enters the event stream — the collection
+        // and commitment only (ADR-003, ticket #46).
+        NodeEvent::PrivatePayloadReceived {
+            collection,
+            commitment,
+        } => SubscribeToEventsResponse {
+            timestamp: now_unix(),
+            event_type: "private_payload_received".into(),
+            payload_json: serde_json::json!({
+                "collection": collection,
+                "commitment": commitment
+            })
+            .to_string(),
+        },
         NodeEvent::BlockMined {
             index,
             hash,

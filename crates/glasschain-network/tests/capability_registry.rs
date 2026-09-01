@@ -85,6 +85,7 @@ async fn send_hello(
         chain_length: 1,
         version: version.to_owned(),
         capabilities,
+        org: "org-test".to_owned(),
         listen_addr: listen_addr.to_owned(),
     };
     writer.send(&msg).await.unwrap();

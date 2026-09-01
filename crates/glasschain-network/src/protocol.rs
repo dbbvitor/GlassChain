@@ -26,12 +26,16 @@ pub enum Message {
         tls_cert_fingerprint: String,
         /// The sender's chain length (used for chain-sync decisions).
         chain_length: u64,
-        /// Protocol version string (e.g. `"glasschain/2"`).
+        /// Protocol version string (e.g. `"glasschain/3"`).
         version: String,
         /// Capabilities this peer supports (ADR-010 decision 6). Peers lacking
         /// an active capability are treated as read-only observers.
         #[serde(default)]
         capabilities: Vec<CapabilityAdvertisement>,
+        /// The sender's organization (the collection-membership principal,
+        /// ADR-003). Defaults keep pre-`/3` peers decodable.
+        #[serde(default)]
+        org: String,
         /// The sender's stable TCP listening address (e.g. `"192.168.1.5:8000"`).
         ///
         /// Peers must use this address (rather than the TCP source address, which
@@ -45,6 +49,21 @@ pub enum Message {
 
     /// Announce a newly mined block.
     Block(Block),
+
+    /// A private data collection payload, sent **point-to-point** between
+    /// collection members only (ADR-003, ticket #46) — never broadcast. The
+    /// receiver's node verifies its own membership, the sender's membership,
+    /// and `commitment == sha256(payload)` before holding the payload in its
+    /// transient store; the globally replicated chain carries only the
+    /// commitment (via [`Block`]'s redacted write set).
+    PrivatePayload {
+        /// The collection this payload belongs to.
+        collection: String,
+        /// SHA-256 of `payload` — the exact commitment the chain records.
+        commitment: String,
+        /// The private payload bytes (never replicated globally).
+        payload: Vec<u8>,
+    },
 
     /// Ask a peer to send its full chain.
     RequestChain,
@@ -64,11 +83,9 @@ pub enum Message {
 
 /// Current protocol version string.
 ///
-/// `/2` marks the BFT consensus seam (ticket #42): a `bft_consensus`-active
-/// chain commits blocks whose real quorum certificates are **not** derivable
-/// from the block (unlike the degenerate Proof-of-Work certificate), so a `/1`
-/// peer would reject them at its `PoW` admission check. BFT block admission on
-/// the peer path is itself staged work (ADR-010 adoption gates); the bump is
-/// the compatibility marker separating peers that know BFT blocks can exist
-/// from those that do not.
-pub const PROTOCOL_VERSION: &str = "glasschain/2";
+/// `/3` adds the private-payload wire message (ADR-003, ticket #46): private
+/// data collections exist on the transport, so a `/2` peer can neither send
+/// nor receive member-gated payloads. The version gate keeps such peers out of
+/// the mesh instead of letting them silently miss private writes. (The `/2`
+/// bump marked the BFT consensus seam.)
+pub const PROTOCOL_VERSION: &str = "glasschain/3";

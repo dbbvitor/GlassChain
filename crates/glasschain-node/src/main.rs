@@ -492,6 +492,17 @@ async fn main() {
                 NodeEvent::TransactionAccepted(tx) => {
                     log::info!("[event] Transaction accepted: {}", tx.id);
                 }
+                // The payload itself is never in the event stream (ADR-003).
+                NodeEvent::PrivatePayloadReceived {
+                    collection,
+                    commitment,
+                } => {
+                    log::info!(
+                        "[event] Private payload received: collection={collection} \
+                         commitment={}",
+                        &commitment[..8]
+                    );
+                }
                 NodeEvent::BlockMined {
                     index,
                     hash,
