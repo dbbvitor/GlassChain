@@ -1,6 +1,6 @@
-# Handoff — GlassChain debt-gap implementation (through ticket #42)
+# Handoff — GlassChain debt-gap implementation (through ticket #43)
 
-**Written:** after closing #42. `main` HEAD: `044da66`.
+**Written:** after closing #43. `main` HEAD: `11a36ac`.
 
 ## The loop (established and working — do not redesign it)
 
@@ -25,6 +25,7 @@ before new code). No re-asking the user — continue to the next frontier ticket
 | #41 Committed write sets | `77d574c` | `Block.write_set` hash-covered, `StorageProvider::apply_block` atomic boundary with shared `validate_tip_chain`, PDC commitment redaction (`PersistentWrite::block_form`), node executes `ContractExecution` at mining, `rebuild_world_state` (no WASM re-execution) |
 | #45 Endorsement enforcement | `e1e4b75` | `Transaction.endorsements` carriers (scoped target + signers over canonical tx bytes), `PolicyUpdate` kind + `PolicyHistory` replay (same-block rule, fail-closed `network-governance` fallback), capability-gated enforcement at mine/peer/sync/ledger-commit paths, operation defaults (custody 2-of-2, recall 2-of-2 issuer+`issued_by`, cert/audit issuer), `VerifyEndorsement` real evaluation |
 | #42 BFT behind the seam | `044da66` | `BftConsensusProvider` (core, `bft` feature, default-off): real ed25519 attestations over block hash, `verify_certificate` (⅔+ distinct, fail-closed), capability-gated engine selection in `mine_async` (`bft_consensus` active at candidate height), node-level no-fork finality test, wire `glasschain/2`, adoption gates in README |
+| #43 Purchase-to-settlement flows | `11a36ac` | `purchase_flow.rs` (buyer/seller role runners over one state machine; PO/shipment/receipt emissions, acceptance/dispute consumption; RFQ/Quote/Settlement are record-less by design), `attestation_flow.rs` (one parameterized cert/audit flow, anchored records with embedded evidence manifests), `Event::Woken` business wake-up (Resumed stays liveness-only), `FlowRunner` Send+Sync, two-org node-level E2E with interruption resume |
 
 ## Working tree
 
@@ -35,10 +36,28 @@ default and `--all-features` — since `bft` gates new code):
 `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` ✅
 `cargo fmt --all --check` ✅
 
-## Next ticket: #43 (or #44 — both unblocked by #40)
+## Next ticket: #44 (recall/quarantine/dispute flows)
 
-The frontier order after #42: **#43/#44** (both unblocked by #40, pick either),
-#46→#47 (PDCs), #48, #49.
+The frontier order after #43: **#44** (replaces the recall simulation test with
+a flow-driven E2E over ≥3 orgs), #46→#47 (PDCs), #48, #49.
+
+#43 facts worth remembering:
+- The v1 registry has NO rfq/quote/acceptance/dispute/settlement families —
+  those chain steps are flow states (record-less by design); every
+  family-bearing step emits/consumes its record. Don't "fix" this by extending
+  SCHEMA_V1.
+- The runner swallows `Event::Resumed` for waiting flows (liveness signal
+  only); business decision points need `Event::Woken(reason)`.
+- Flow emissions are only exactly-once because hosts submit with
+  `Transaction::with_id(record.record_id, …)` and keep `rfq_id`/`lot_ref`
+  globally unique (record ids derive from them; the ledger silently drops
+  duplicate tx ids). Documented on the purchase_flow module.
+- `evidence_manifest` for cert/audit families must be an OBJECT:
+  `{"manifest_commitment": <64-hex>}` (ADR-005 embedded manifest), not a
+  string.
+- Future node-hosted flow runtime needs a durable wake queue (`Woken` events
+  arriving while un-acked pending work exists are dropped — fine for
+  operator-driven hosts, recorded in the #43 plan).
 
 #42 review findings worth remembering (both fixed in the amended commit):
 - The Spec reviewer caught two **false doc claims** — README said the engine
