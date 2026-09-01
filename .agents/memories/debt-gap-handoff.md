@@ -1,6 +1,6 @@
-# Handoff — GlassChain debt-gap implementation (through ticket #44)
+# Handoff — GlassChain debt-gap implementation (through ticket #46)
 
-**Written:** after closing #44. `main` HEAD: `a0d1a51`.
+**Written:** after closing #46. `main` HEAD: `f91f0f2`.
 
 ## The loop (established and working — do not redesign it)
 
@@ -27,6 +27,7 @@ before new code). No re-asking the user — continue to the next frontier ticket
 | #42 BFT behind the seam | `044da66` | `BftConsensusProvider` (core, `bft` feature, default-off): real ed25519 attestations over block hash, `verify_certificate` (⅔+ distinct, fail-closed), capability-gated engine selection in `mine_async` (`bft_consensus` active at candidate height), node-level no-fork finality test, wire `glasschain/2`, adoption gates in README |
 | #43 Purchase-to-settlement flows | `11a36ac` | `purchase_flow.rs` (buyer/seller role runners over one state machine; PO/shipment/receipt emissions, acceptance/dispute consumption; RFQ/Quote/Settlement are record-less by design), `attestation_flow.rs` (one parameterized cert/audit flow, anchored records with embedded evidence manifests), `Event::Woken` business wake-up (Resumed stays liveness-only), `FlowRunner` Send+Sync, two-org node-level E2E with interruption resume |
 | #44 Recall/quarantine/dispute flows | `a0d1a51` | `recall_flow.rs`: recall lifecycle (append-only status trail issued→active→completed, anchors the CONFIGURED lot), `quarantine_flow`/`dispute_flow` custodian responses emitting `inventory_transformation` records (dispute reason stays off-chain by whitelist), legacy chaos recall simulation replaced by a three-org flow-driven E2E asserting the public trail on all chains |
+| #46 PDCs on the wire | `f91f0f2` | `Message::PrivatePayload` (point-to-point, member-only), wire `/3` + Hello `org` field, `TransientStore` (storage), collection config with membership≠endorsement + regulator defaults, four-boundary enforcement (admission/transport/storage/replay) with node-level scenarios in `pdc_boundary.rs` + `protocol_security.rs` |
 
 ## Working tree
 
@@ -37,11 +38,31 @@ default and `--all-features` — since `bft` gates new code):
 `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` ✅
 `cargo fmt --all --check` ✅
 
-## Next ticket: #46 (PDCs — the last big work stream)
+## Next ticket: #47 (PDC dissemination end-to-end)
 
-The frontier order after #44: **#46→#47** (private data collections: wire +
-dissemination + transient store, then reconciliation/retention), #48, #49
-(#34–#45, #42–#44 all closed).
+The frontier order after #46: **#47** (gossipsub/Kademlia dissemination, pull
+reconciliation, retention/purge windows, cert-verified payload delivery
+closing the self-asserted-org gap), #48, #49 (#34–#45, #42–#44, #46 closed).
+
+#46 facts worth remembering:
+- The authoritative collection endorsement policy is a COMMITTED `PolicyUpdate`
+  with a collection-scoped `collection_policy` (enforced by the #45 engine,
+  tested in endorsement.rs). `ChannelConfig.endorsement_policy` is a local
+  DECLARATION only — never present it as an enforcement source (the review
+  caught that false-doc pattern again).
+- Capability gates for payloads use the NEXT height (`effective_set(next)`)
+  because payloads are pre-commit artifacts for writes landing at tip+1; they
+  may arrive before their block does.
+- `peer_senders`/peer registry are keyed by the ADVERTISED listen addr; the
+  receive path must use `current_stable_addr` for registry lookups, not the
+  connection addr.
+- A guest MUST compute private values at runtime — a value in a WASM data
+  segment rides the committed ContractCreation tx. The test contracts do this
+  via `i32.store` of an obfuscated constant.
+- #47 must also: attach `CertChainVerifier` to the payload path (org is
+  self-asserted until then), enforce membership on VM writes mined by relayed
+  executions, add org-drift detection to `verify_or_register`, and add the
+  retention/purge windows to `TransientStore` (`delete` is the hook).
 
 #44 review finding worth remembering (fixed in the amend, generalizable):
 - `RecallConfig.lot_ref` was write-only — the anchor transition anchored the
