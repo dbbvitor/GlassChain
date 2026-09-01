@@ -290,7 +290,18 @@ self-asserted org.
 Staged remainder: gossipsub-based payload distribution requires per-member
 encryption (gossipsub has no member admission control, so publishing
 cleartext payloads to a topic would weaken the boundary); the libp2p swarm
-stays the staged substrate for the #48 benchmark work.
+stays the staged substrate.
+
+### Capacity gate (ticket #48)
+
+`cargo test -p glasschain-network --test consensus_capacity -- --ignored --nocapture`
+runs the compact workload (anchored lots, certification anchors,
+`state_commitment` batch records) at 200 and 300 validators in a star
+topology, reporting block latency/size, certificate size, propagation
+fan-out, pending-pool backpressure, partition recovery, and private-data
+dissemination (measured separately). Recorded evidence with the staged-engine
+caveats: `docs/benchmarks/consensus-capacity.md`. No production capacity
+claim is made — ADR-010 §7's testnet/API/audit gates still apply.
 
 ---
 
