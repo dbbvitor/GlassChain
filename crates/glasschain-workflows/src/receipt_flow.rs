@@ -158,7 +158,7 @@ pub fn shipment_receipt_flow(
 /// `occurred_at` come from the shipment and `received_on` from the transition
 /// config — never the wall clock — so replaying the transition emits the
 /// identical record and the ledger dedupes it.
-fn build_receipt(
+pub fn build_receipt(
     shipment: &CanonicalRecord,
     transition: &ShipmentToReceiptTransition,
 ) -> CanonicalRecord {

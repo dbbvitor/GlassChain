@@ -1701,6 +1701,7 @@ dependencies = [
  "glasschain-indexer",
  "glasschain-storage",
  "glasschain-vm",
+ "glasschain-workflows",
  "libp2p",
  "log",
  "madsim",

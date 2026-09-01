@@ -41,15 +41,19 @@ pub struct FlowOutcome<S> {
 ///
 /// The first transition whose [`Transition::matches`] accepts the pair wins —
 /// dispatch order is part of the flow definition and therefore deterministic.
+/// Transitions are `Send + Sync` so a runner can be shared across tasks.
 pub struct FlowRunner<S> {
     flow_kind: &'static str,
-    transitions: Vec<Box<dyn Transition<S>>>,
+    transitions: Vec<Box<dyn Transition<S> + Send + Sync>>,
 }
 
 impl<S: FlowState> FlowRunner<S> {
     /// Build a flow definition.
     #[must_use]
-    pub fn new(flow_kind: &'static str, transitions: Vec<Box<dyn Transition<S>>>) -> Self {
+    pub fn new(
+        flow_kind: &'static str,
+        transitions: Vec<Box<dyn Transition<S> + Send + Sync>>,
+    ) -> Self {
         Self {
             flow_kind,
             transitions,

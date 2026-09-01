@@ -14,6 +14,12 @@ pub enum Event {
     /// update, autonomous purchase order, …).
     TransactionCommitted(TransactionKind),
 
+    /// A business wake-up: an operator decision or an off-chain negotiation
+    /// closing (e.g. `"quote-accepted:<id>"`, `"ship"`, `"settle"`). Unlike
+    /// [`Event::Resumed`] — a pure liveness signal — a `Woken` event is a
+    /// real input transitions may consume.
+    Woken(String),
+
     /// The flow was woken after an interruption (restart, triage).  The string
     /// carries the reason for operators.
     Resumed(String),

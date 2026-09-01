@@ -9,7 +9,7 @@
 //! ## The algebra
 //!
 //! - [`Event`] — an input (a committed canonical record, a committed legacy
-//!   transaction, or a resume wake-up).
+//!   transaction, a business wake-up, or a resume signal).
 //! - [`Transition`] — one named type per transition: a pure, deterministic
 //!   function `(state, event) -> TransitionResult`. No I/O, no wall clock, no
 //!   randomness.
@@ -49,9 +49,11 @@
 //! [`CanonicalRecord`]: glasschain_core::CanonicalRecord
 
 mod action;
+mod attestation_flow;
 mod checkpoint;
 mod error;
 mod event;
+mod purchase_flow;
 mod receipt_flow;
 mod runner;
 mod state;
@@ -59,9 +61,19 @@ mod transition;
 mod triage;
 
 pub use action::Action;
+pub use attestation_flow::{
+    audit_flow, certification_flow, AnchorLotTransition as AttestationAnchorLotTransition,
+    AttestationConfig, AttestationFlowState, EmitAttestationTransition,
+};
 pub use checkpoint::{Checkpoint, CheckpointStore, CHECKPOINT_PREFIX};
 pub use error::WorkflowError;
 pub use event::Event;
+pub use purchase_flow::{
+    buyer_flow, seller_flow, AcceptPurchaseOrderTransition, AcceptQuoteTransition,
+    AwaitSettlementTransition, CommitPurchaseOrderTransition, PurchaseFlowConfig,
+    PurchaseFlowState, RaiseDisputeTransition, RecordDeliveryTransition, SettleTransition,
+    ShipOrderTransition,
+};
 pub use receipt_flow::{
     shipment_receipt_flow, AnchorLotTransition, ReceiptFlowState, ShipmentToReceiptTransition,
 };
