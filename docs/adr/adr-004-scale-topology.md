@@ -126,5 +126,5 @@ that bounding the validator set is configuration, not redesign.
    Scaling effort belongs on the dissemination path (PDC distribution,
    reconciliation, `LibP2pNode`) and the read path (indexer → RPC), neither of
    which creates any membership distinction. See
-   [`participation-model.md`](../memories/participation-model.md) §7 for the
+   [`participation-model.md`](../../.agents/memories/participation-model.md) §7 for the
    three-axis decomposition.

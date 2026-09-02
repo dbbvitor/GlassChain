@@ -3,7 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-08-18
 **Decision owner:** project owner
-**Relates to:** §2.1, §3.4 · [`requirements-alignment.md`](requirements-alignment.md) D1
+**Relates to:** §2.1, §3.4 · [`requirements-alignment.md`](../../.agents/plans/requirements-alignment.md) D1
 
 ## Context
 
