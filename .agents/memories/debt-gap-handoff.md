@@ -1,6 +1,8 @@
-# Handoff — GlassChain debt-gap implementation (through ticket #46)
+# Handoff — GlassChain debt-gap spec: COMPLETE (through #48)
 
-**Written:** after closing #46. `main` HEAD: `f91f0f2`.
+**Written:** after closing #48. `main` HEAD: `322356d`. All spec tickets
+(#34–#49) are closed; the frontier is empty — future work comes from review
+follow-ups and the ADR-010 adoption gates.
 
 ## The loop (established and working — do not redesign it)
 
@@ -28,6 +30,9 @@ before new code). No re-asking the user — continue to the next frontier ticket
 | #43 Purchase-to-settlement flows | `11a36ac` | `purchase_flow.rs` (buyer/seller role runners over one state machine; PO/shipment/receipt emissions, acceptance/dispute consumption; RFQ/Quote/Settlement are record-less by design), `attestation_flow.rs` (one parameterized cert/audit flow, anchored records with embedded evidence manifests), `Event::Woken` business wake-up (Resumed stays liveness-only), `FlowRunner` Send+Sync, two-org node-level E2E with interruption resume |
 | #44 Recall/quarantine/dispute flows | `a0d1a51` | `recall_flow.rs`: recall lifecycle (append-only status trail issued→active→completed, anchors the CONFIGURED lot), `quarantine_flow`/`dispute_flow` custodian responses emitting `inventory_transformation` records (dispute reason stays off-chain by whitelist), legacy chaos recall simulation replaced by a three-org flow-driven E2E asserting the public trail on all chains |
 | #46 PDCs on the wire | `f91f0f2` | `Message::PrivatePayload` (point-to-point, member-only), wire `/3` + Hello `org` field, `TransientStore` (storage), collection config with membership≠endorsement + regulator defaults, four-boundary enforcement (admission/transport/storage/replay) with node-level scenarios in `pdc_boundary.rs` + `protocol_security.rs` |
+| #47 PDC distribution E2E | `fa69e2d` | pull reconciliation (`RequestPrivatePayload` + `reconcile_private_payloads`, wire `/4`), retention/purge (`retention_secs` default 72h, expiry envelopes + `purge_expired`), cert-verified delivery (Hello carries the org cert; Step 2.5 verifies CN == claimed org under the Root CA; payload path requires verified senders when a verifier runs; org-drift rejection); TLS stays transport-only self-signed |
+| #49 Packaging split | `52234f7` | `WatcherService` moved to `glasschain-workflows` (I/O-driven layer) with its bench; contracts = deterministic layer (BTreeMap registry — the determinism invariant is literally true), approval gate public, test_wasm cross-crate (wat main dep); docs in README + AGENTS + PLUGIN_KIT |
+| #48 Capacity gate | `322356d` | `consensus_capacity.rs` (#[ignore]-gated 200/300 + smoke): star topology, compact ADR-010 §7 workload, latency/size/cert/pool/fan-out metrics, app-layer partition recovery, PDC dissemination separate; evidence in `docs/benchmarks/consensus-capacity.md` (PoW cert 115B measured; staged BFT one-attestation cert 508B leader-side; no vote-gossip claims) |
 
 ## Working tree
 
