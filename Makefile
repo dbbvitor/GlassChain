@@ -100,7 +100,7 @@ clippy: ## Run clippy with warnings as errors (CI gate)
 
 bench: ## Run the criterion benchmarks
 	cargo bench -p glasschain-vm
-	cargo bench -p glasschain-contracts
+	cargo bench -p glasschain-workflows
 
 audit: ## Audit dependencies for known vulnerabilities (run `make tools` first)
 	cargo audit --deny warnings --file Cargo.lock
