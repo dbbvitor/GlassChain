@@ -18,7 +18,7 @@ Proof-of-Work consensus, supply-chain transaction types (`SupplyOffer`,
 `PurchaseOrder`, `InventoryUpdate`, `TraceableAssetRegistration`), a contract +
 watcher automation engine, a TLS-encrypted TCP/libp2p P2P layer, and a gRPC API.
 
-- **Type:** Cargo workspace, 11 crates, ~16k lines of Rust across 57 files
+- **Type:** Cargo workspace, 12 crates, ~37k lines of Rust across 93 files
   (tests and benches included).
 - **Toolchain:** Rust **1.95** (pinned in `rust-toolchain.toml`), edition 2021.
 - **Runtime:** Tokio async, `tonic`/`prost` for gRPC, `wasmtime` for contract execution.
@@ -259,7 +259,12 @@ Use the default canonical triage labels: `needs-triage`, `needs-info`, `ready-fo
 
 ### Domain docs
 
-This is a single-context repository using root-level `CONTEXT.md` and `docs/adr/`. See `docs/agents/domain.md`.
+This is a single-context repository using root-level `CONTEXT.md` and
+`docs/adr/`. See `docs/agents/domain.md`.
+
+Accepted architecture decisions are **shipped documentation**, not agent scratch:
+they live in [`docs/adr/`](docs/adr/) alongside the in-depth human docs, never in
+`.agents/plans/`.
 
 ---
 
@@ -284,7 +289,9 @@ Rules:
 - Use subagents for broad exploration when that reduces context churn; keep their
   write scopes disjoint.
 - Keep `.agents/` files short and current. Delete or archive a plan once it ships —
-  stale plans are worse than no plans.
+  stale plans are worse than no plans. An accepted decision is not a plan —
+  promote it to an ADR in [`docs/adr/`](docs/adr/) before deleting the plan that
+  produced it.
 - **Never put source code, secrets, or generated build output in `.agents/`.**
 - If a memory turns out to be a durable project rule, promote it into this file
   instead of leaving it buried in `.agents/memories/`.

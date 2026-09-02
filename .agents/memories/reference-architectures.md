@@ -6,8 +6,8 @@
 **Updated:** full-content packs added — see [Pack recipes](#pack-recipes) below.
 **Why it matters:** these three are the paradigm sources named in the GlassChain
 requirements. Their structure encodes decisions we are still making in
-[ADR-002](../plans/adr-002-consensus-finality.md) and
-[ADR-003](../plans/adr-003-privacy-model.md).
+[ADR-002](../../docs/adr/adr-002-consensus-finality.md) and
+[ADR-003](../../docs/adr/adr-003-privacy-model.md).
 
 ## Scale and shape
 

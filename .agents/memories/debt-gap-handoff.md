@@ -1,8 +1,13 @@
-# Handoff — GlassChain debt-gap spec: COMPLETE (through #48)
+# Debt-gap programme — what #34–#49 shipped
 
-**Written:** after closing #48. `main` HEAD: `322356d`. All spec tickets
-(#34–#49) are closed; the frontier is empty — future work comes from review
-follow-ups and the ADR-010 adoption gates.
+**Written:** after closing #48; header verified 2026-09-02 at `main` HEAD
+`fed76c7` (squash-merged as PR #56). All spec tickets #34–#49 are closed and
+the wayfinder map #15 destination is reached; the frontier is empty. Future
+work comes from review follow-ups and the ADR-010 adoption gates.
+
+This file is now a **reference record**, not a live handoff — read
+`.agents/handoff.md` for current state. Its value is the per-ticket detail,
+the architecture facts, and the review pitfalls below; those remain accurate.
 
 ## The loop (established and working — do not redesign it)
 
@@ -36,18 +41,12 @@ before new code). No re-asking the user — continue to the next frontier ticket
 
 ## Working tree
 
-Clean. All four gates green at `044da66` (run in **both** feature configs —
-default and `--all-features` — since `bft` gates new code):
-`cargo check --workspace --all-targets --all-features --locked` ✅
-`cargo test --workspace --all-targets --all-features --locked` ✅ (24 suites)
-`cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` ✅
-`cargo fmt --all --check` ✅
+Clean. All four gates green — re-verified 2026-09-02 at `fed76c7`: 546 tests
+across 29 harnesses, clippy clean at `-D warnings`, fmt clean. Run consensus
+work in **both** feature configs (default and `--all-features`) since `bft`
+gates real code paths.
 
-## Next ticket: #47 (PDC dissemination end-to-end)
-
-The frontier order after #46: **#47** (gossipsub/Kademlia dissemination, pull
-reconciliation, retention/purge windows, cert-verified payload delivery
-closing the self-asserted-org gap), #48, #49 (#34–#45, #42–#44, #46 closed).
+## Per-ticket facts worth remembering
 
 #46 facts worth remembering:
 - The authoritative collection endorsement policy is a COMMITTED `PolicyUpdate`
@@ -64,10 +63,14 @@ closing the self-asserted-org gap), #48, #49 (#34–#45, #42–#44, #46 closed).
 - A guest MUST compute private values at runtime — a value in a WASM data
   segment rides the committed ContractCreation tx. The test contracts do this
   via `i32.store` of an obfuscated constant.
-- #47 must also: attach `CertChainVerifier` to the payload path (org is
-  self-asserted until then), enforce membership on VM writes mined by relayed
-  executions, add org-drift detection to `verify_or_register`, and add the
-  retention/purge windows to `TransientStore` (`delete` is the hook).
+- #47 delivered: `CertChainVerifier` on the payload path, membership enforced
+  on VM writes mined by relayed executions, org-drift detection in
+  `verify_or_register`, and retention/purge in `TransientStore`. **Caveat
+  found 2026-09-02:** the payload-path cert gate is
+  `verification_required = cert_verifier.is_some()`, and no production binary
+  ever calls `set_cert_verifier` — so it fails open to the self-asserted org
+  outside tests. See `external-review-verdicts.md`; do not "fix" it by
+  installing a single-org verifier in `glasschain-node`.
 
 #44 review finding worth remembering (fixed in the amend, generalizable):
 - `RecallConfig.lot_ref` was write-only — the anchor transition anchored the
@@ -165,4 +168,4 @@ or PRs (established pattern under `/implement`).
 - `calculate_hash` covers `write_set` — any test tampering a block's write set without recomputing fails `is_valid()`.
 - Sled's `TransactionalTree` has no `.last()`; use `.get()` + conflict detection (see `sled_backend.rs::apply_block`).
 - Lock guards in atomic sections trip `significant_drop_tightening`; the justified `#[allow]` on `InMemoryStorageProvider::apply_block` explains why the guards must live to fn end.
-- Repo has 12 crates now; README's crate count is stale (no one has fixed it — don't touch unless updating README anyway).
+- Repo has 12 crates. The stale 11-crate counts in `AGENTS.md`, `PLUGIN_KIT.md`, and `.github/copilot-instructions.md` were corrected 2026-09-02.
