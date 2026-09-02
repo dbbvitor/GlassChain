@@ -245,6 +245,34 @@ Peer connections are TLS-encrypted by default:
   local-debugging escape hatches only — never the default, and never to be
   widened (`AGENTS.md` treats the secure path as an invariant).
 
+### Post-quantum: the key exchange is classical, and this is the exposure that matters
+
+`rustls` is pinned with `features = ["ring"]`
+(`crates/glasschain-network/Cargo.toml:33`), and the **`ring` provider offers no
+post-quantum key exchange at all** — only SECP256R1, SECP384R1 and X25519. Under
+the `aws-lc-rs` provider, hybrid `X25519MLKEM768` is in the *default* key-exchange
+groups (rustls 0.23.22+) and preferred by default (0.23.27+). Our pinned rustls
+version has the capability; the provider selection excludes it.
+
+This matters more than the signature algorithms because it is the only
+**harvest-now-decrypt-later** exposure in the system: traffic recorded today is
+decryptable retroactively once Shor is runnable, and PDC payloads travel
+point-to-point over this transport (Part 3). Signature forgery, by contrast, is
+not retroactive — a future forger cannot rewrite a hash-linked, replicated chain.
+
+The fix is a provider swap, not a redesign, but it is coupled:
+`glasschain-identity` selects `ring` for `rustls-webpki` *deliberately*, to share
+one backend, and there are four `rustls::crypto::ring::default_provider()` call
+sites in `node.rs` (lines 145, 159, 164, 654) plus two in tests. They move
+together or not at all. The real cost is build-time — `aws-lc-rs` vendors a
+C/assembly library — which has to be proven on all three CI platforms.
+
+Assessment, ordered actions and primary sources:
+[`.agents/plans/post-quantum.md`](../.agents/plans/post-quantum.md).
+**Note that ICP-Brasil has already added ML-DSA and ML-KEM to its algorithm
+catalogue** (DOC-ICP-01.01 v6.0, IN ITI nº 35 of 30.01.2026) — as *supported*,
+not mandatory, so nothing about the current stack is out of compliance.
+
 ---
 
 # Part 2 — Endorsement
