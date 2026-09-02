@@ -576,16 +576,16 @@ sequenceDiagram
     W->>W: store in TransientStore (retention window)
     W->>M: Message::PrivatePayload (collection, commitment, payload)
     W->>O: (no message — not a member target)
-    Activate M
+    activate M
     M-->>M: transport gate: pdc active? both orgs members?<br/>sha256(payload)==commitment?
     Note over M: store in TransientStore
-    Deactivate M
+    deactivate M
     W->>C: block with PDC write redacted to commitment
     C-->>O: outsider chain carries identical commitment,<br/>no payload bytes anywhere
 
     Note over M: offline during dissemination
     M->>C: sync chain (Message::Chain)
-    M->>M: reconcile_private_payloads(collection):<br/>scan Pdc writes; missing = held?
+    M->>M: reconcile_private_payloads(collection):<br/>scan Pdc writes, missing = held?
     M->>W: Message::RequestPrivatePayload (collection, commitment)
     W-->>M: Message::PrivatePayload (member-gated answer)
     Note over M: now holds what it was missing
