@@ -506,23 +506,23 @@ async fn main() {
                 NodeEvent::BlockMined {
                     index,
                     hash,
-                    certificate,
+                    certificate: quorum,
                 } => {
+                    let quorum_attestations = quorum.attestations.len();
                     log::info!(
-                        "[event] Block mined: index={index} hash={} cert_attestations={}",
+                        "[event] Block mined: index={index} hash={} quorum_attestations={quorum_attestations}",
                         &hash[..8],
-                        certificate.attestations.len(),
                     );
                 }
                 NodeEvent::BlockReceived {
                     index,
                     hash,
-                    certificate,
+                    certificate: quorum,
                 } => {
+                    let quorum_attestations = quorum.attestations.len();
                     log::info!(
-                        "[event] Block received from peer: index={index} hash={} cert_attestations={}",
+                        "[event] Block received from peer: index={index} hash={} quorum_attestations={quorum_attestations}",
                         &hash[..8],
-                        certificate.attestations.len(),
                     );
                 }
                 NodeEvent::PeerConnected(addr) => {

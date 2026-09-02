@@ -1619,6 +1619,36 @@ impl Node {
         }
     }
 
+    /// The peer-block append: re-validate the candidate against the CURRENT
+    /// tip under the push lock, prune its transactions from the pending pool,
+    /// and push. The admission check ran outside this lock, so the tip may
+    /// have moved in between — pushing a stale candidate would fork the local
+    /// chain. Returns `true` when the block was appended.
+    ///
+    /// The guard must live across the re-validation, the pending prune, and
+    /// the push: they are one atomic append against the tip that the
+    /// admission check can no longer see.
+    #[allow(clippy::significant_drop_tightening)]
+    async fn append_peer_block(ledger: &Arc<Mutex<Ledger>>, block: &Block) -> bool {
+        let mut l = ledger.lock().await;
+        let still_valid = l
+            .chain
+            .last()
+            .map_or(block.index == 0 && block.previous_hash == "0", |tip| {
+                block.chains_to(tip).is_ok()
+            });
+        if !still_valid {
+            log::warn!("Dropping stale peer block {}: the tip moved", block.index);
+            return false;
+        }
+        let committed: std::collections::HashSet<&str> =
+            block.transactions.iter().map(|t| t.id.as_str()).collect();
+        l.pending_transactions
+            .retain(|t| !committed.contains(t.id.as_str()));
+        l.chain.push(block.clone());
+        true
+    }
+
     /// Compute the candidate block's canonical write set: execute every
     /// `ContractExecution` transaction against the committed world-state
     /// snapshot, canonicalize the collected writes, and redact PDC values to
@@ -2640,14 +2670,7 @@ async fn process_message(
                     log::warn!("Rejected block {} from {addr}: {e}", block.index);
                     return MessageEffect::default();
                 }
-                {
-                    let mut l = ctx.ledger.lock().await;
-                    let committed: std::collections::HashSet<&str> =
-                        block.transactions.iter().map(|t| t.id.as_str()).collect();
-                    l.pending_transactions
-                        .retain(|t| !committed.contains(t.id.as_str()));
-                    l.chain.push(block.clone());
-                }
+                Node::append_peer_block(&ctx.ledger, &block).await;
 
                 let generated = Node::after_block_commit(
                     &ctx.ledger,

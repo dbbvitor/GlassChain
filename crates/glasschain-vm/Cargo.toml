@@ -14,7 +14,7 @@ glasschain-core = { path = "../glasschain-core" }
 # Only core modules, fuel, and WAT parsing are used; avoid unused Wasmtime
 # component, cache, profiling, and other default feature dependency trees.
 wasmtime = {
-    version = "47.0.3",
+    version = "47.0.4",
     default-features = false,
     features = ["cranelift", "runtime", "wat"],
 }

@@ -254,7 +254,7 @@ struct RoundMetrics {
     mine_ms: u128,
     block_bytes: usize,
     tx_count: usize,
-    certificate_bytes: usize,
+    attestation_set_bytes: usize,
     /// Pool depth after the round's submissions, before the mine — the
     /// backpressure the consensus layer absorbs.
     pool_depth_before_mine: usize,
@@ -265,8 +265,8 @@ struct RoundMetrics {
 
 fn print_round(m: &RoundMetrics) {
     println!(
-        "round {:>3}: submit {:>5} ms | mine {:>4} ms | block {:>6} B / {:>2} txs | cert {:>4} B | pool-before-mine {:>3} | fan-out 50% {:>4?} 95% {:>4?} 100% {:>4?} ms",
-        m.seq, m.submit_ms, m.mine_ms, m.block_bytes, m.tx_count, m.certificate_bytes,
+        "round {:>3}: submit {:>5} ms | mine {:>4} ms | block {:>6} B / {:>2} txs | attest. set {:>4} B | pool-before-mine {:>3} | fan-out 50% {:>4?} 95% {:>4?} 100% {:>4?} ms",
+        m.seq, m.submit_ms, m.mine_ms, m.block_bytes, m.tx_count, m.attestation_set_bytes,
         m.pool_depth_before_mine, m.propagation_50, m.propagation_95, m.propagation_100,
     );
 }
@@ -282,11 +282,11 @@ fn percentile<I: IntoIterator<Item = u128>>(values: I, percent: usize) -> u128 {
 fn print_summary(label: &str, rounds: &[RoundMetrics]) {
     let mine: Vec<u128> = rounds.iter().map(|r| r.mine_ms).collect();
     let sizes: Vec<usize> = rounds.iter().map(|r| r.block_bytes).collect();
-    let certs: Vec<usize> = rounds.iter().map(|r| r.certificate_bytes).collect();
+    let certs: Vec<usize> = rounds.iter().map(|r| r.attestation_set_bytes).collect();
     let pools: Vec<usize> = rounds.iter().map(|r| r.pool_depth_before_mine).collect();
     let p100 = rounds.iter().map(|r| r.propagation_100);
     println!(
-        "SUMMARY[{label}]: rounds={} | mine p50={} p95={} ms | block bytes avg={} | certificate bytes avg={} | pool-before max={} | fan-out-100% median={:?} ms",
+        "SUMMARY[{label}]: rounds={} | mine p50={} p95={} ms | block bytes avg={} | attestation-set bytes avg={} | pool-before max={} | fan-out-100% median={:?} ms",
         rounds.len(),
         percentile(mine.clone(), 50),
         percentile(mine, 95),
@@ -331,10 +331,15 @@ async fn run_round(
 
     // The staged engine's certificate: one local attestation per block (no
     // cross-validator vote rounds exist to measure — see the evidence doc).
-    let certificate_bytes = loop {
+    let attestation_set_bytes = loop {
         match tokio::time::timeout(Duration::from_secs(2), events.recv()).await {
-            Ok(Some(NodeEvent::BlockMined { certificate, .. })) => {
-                break serde_json::to_vec(&certificate).map_or(0, |v| v.len());
+            // The metric is the attestation SET (the vote-traffic proxy) —
+            // serialized on its own, never the full certificate envelope.
+            Ok(Some(NodeEvent::BlockMined {
+                certificate: quorum,
+                ..
+            })) => {
+                break serde_json::to_vec(&quorum.attestations).map_or(0, |v| v.len());
             }
             Ok(Some(_)) => {}
             _ => break 0,
@@ -360,7 +365,7 @@ async fn run_round(
         mine_ms,
         block_bytes: serde_json::to_vec(&last).map_or(0, |v| v.len()),
         tx_count: last.transactions.len(),
-        certificate_bytes,
+        attestation_set_bytes,
         pool_depth_before_mine,
         propagation_50,
         propagation_95,
@@ -534,7 +539,7 @@ async fn capacity_harness_smoke() {
     let m = run_round(&set, &mut events, 1, 6).await;
     assert_eq!(m.tx_count, 6, "the round commits the compact workload");
     assert!(
-        m.certificate_bytes > 0,
+        m.attestation_set_bytes > 0,
         "every commit carries a certificate"
     );
     assert!(m.propagation_100.is_some(), "all validators converge");
