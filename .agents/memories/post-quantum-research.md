@@ -259,6 +259,50 @@ Medida Provisória n° 2.200-2, de 24 de agosto de 2001").
 
 ---
 
+## Follow-up 1 (2026-09-02): ICP-Brasil certificate types, key storage, validity, homologação
+
+Source: DOC-ICP-04 v8.3 consolidated ("resolucao179_doc-icp-04_compilada.pdf" on
+documentos-principais; text extracted) and DOC-ICP-01.01 v6.0.
+
+- **Modernized typology (Res. CG ICP-Brasil nº 211/2024, DOC-ICP-04 v8.2/v8.3): the end-user
+  certificate types are exactly 10: A3, A4, SE-S, SE-H, T3, T4, AE-S, AE-H, A CF-e-SAT,
+  OM-BR.** A1/A2 and S1–S4 are **no longer defined types** in the current norm (flagged: the
+  user's A1/S1/S3/S4 premise is pre-2024; DOC-ICP-01.01 v6.0 key-size tables still list
+  A1/A2/S1–S4 rows — an observed, unadjudicated inconsistency between the two current docs).
+- **Tabela 4 – Mídias Armazenadoras de Chaves Criptográficas (redação Res. 211/2024), verbatim:**
+  - SE-S e AE-S → "Repositório protegido por senha e/ou identificação biométrica, cifrado
+    por software na forma definida acima."
+  - A3, A4, SE-H, T3, T4, AE-H e OM-BR → "Hardware criptográfico, homologado junto à
+    ICP-Brasil ou com certificação INMETRO."
+  - A CF-e-SAT → "Hardware criptográfico." (Nota: homologação/certificação requirement
+    suspensa para A CF-e-SAT, T3 e T4 até ulterior deliberação do CG.)
+  - Private key must be written encrypted (6.1.1.4: "gravada cifrada, por algoritmo
+    simétrico aprovado…"); third-party storage in hardware only via PSC or corporate HSM
+    (6.1.1.8).
+- **Tabela 6 – Períodos de Validade (redação Res. 212/2025), verbatim rows:** SE-S e AE-S 1
+  ano; A3, SE-H, AE-H e T3 → 5; A4 e SE-H → 11 (para cadeias hierárquicas completas em
+  Curvas Elípticas); A4 e T4 → 6; A CF-e-SAT → 5; OM-BR → 10.
+- **Homologação / "MCT":** current hardware requirement is "homologado junto à ICP-Brasil ou
+  com certificação INMETRO", operationalized by the **DOC-ICP-10.x** framework (10.01
+  procedimentos administrativos; 10.02 níveis de segurança de homologação — NSH-2/NSH-3 per
+  DOC-ICP-01.01 §3 for AC and AC Raiz modules; 10.03 cartões inteligentes/leitoras/tokens;
+  10.05 módulos de segurança criptográfica). **"MCT" in current ITI leg. is "Manual de
+  Condutas Técnicas" (e.g., MCT nº 03, nº 10), NOT "Módulo Criptográfico Testado"** — the
+  user's expansion was not found in current docs; flagged. The homologação program page
+  (gov.br/iti/pt-br/assuntos/homologacao) describes equipment/system homologação in ICP-Brasil.
+- **Could not verify:** the pre-2024 (v8.1 and earlier) Tabela 4 text listing A1/A2/S1–S4
+  storage media — iti.gov.br serves only consolidated post-211 versions; change-control
+  history (Res. 91/2012; 87/2010) references A3/S3/T3 validity and A4/S4/T4 rules.
+
+## Follow-up 2 (2026-09-02): NIST parameter sizes (verified verbatim from the FIPS PDFs)
+
+- FIPS 204 Table 2 (sizes in bytes; pk / sig): ML-DSA-44 → **1,312 / 2,420**; ML-DSA-65 →
+  **1,952 / 3,309**; ML-DSA-87 → **2,592 / 4,627**. Private keys 2,560 / 4,032 / 4,896.
+- FIPS 205 Table 2 (page 43): SLH-DSA-128s pk **32**, sig **7,856**; SLH-DSA-128f pk **32**,
+  sig **17,088** (192s 48/16,224; 192f 48/35,664; 256s 64/29,792; 256f 64/49,856).
+- FIPS 203 Table 3: ML-KEM-768 encapsulation key **1,184**, ciphertext **1,088**, decapsulation
+  key 2,400, shared secret 32.
+
 ## Unverifiable items (explicit)
 
 1. FIPS 206 / FN-DSA: no CSRC record, no accessible draft PDF or DOI (all 404 on

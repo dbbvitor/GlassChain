@@ -128,8 +128,8 @@ anyway costs almost nothing; adding it later costs a second break.
 
 Sizing note for whoever does the performance work: ML-DSA-44 signatures are 2420
 bytes against ed25519's 64. At a 201-attestation quorum that is ~487 KB of
-certificate versus ~13 KB. **This interacts badly with performance §6 Step 4
-(BLS)** — see §5.
+certificate versus ~13 KB. **This interacts badly with the performance plan's
+Step 4 (BLS)** — see §5.
 
 ### What to defer
 
@@ -158,9 +158,10 @@ NIST IR 8547 places SHA-256 collision search at Category 2. SHA-256 stays.
 
 ## 5. The uncomfortable interaction with the performance plan
 
-**Performance §6 Step 4 promotes BLS aggregation, and BLS is pairing-based, which
-means Shor breaks it too.** There is no post-quantum aggregate signature scheme
-with comparable size and verification properties available today.
+**The performance plan's Step 4 promotes BLS aggregation, and BLS is
+pairing-based, which means Shor breaks it too.** There is no post-quantum
+aggregate signature scheme with comparable size and verification properties
+available today.
 
 This does not cancel Step 4 — the light-client ladder argument that promoted it
 stands, and the 2035 horizon gives it a full useful life. But it does mean:
@@ -181,6 +182,93 @@ stands, and the 2035 horizon gives it a full useful life. But it does mean:
   planned aggregation are both classical.
 - **Not urgent for signatures.** Anyone proposing an ML-DSA migration this year
   should be asked which requirement it serves.
+
+## 7. Algorithm selection — and why it is nearly forced
+
+### We do not get to pick. ICP-Brasil picked.
+
+DOC-ICP-01.01 v6.0 names **ML-DSA (44/65/87)** and **ML-KEM (512/768/1024)** and
+nothing else post-quantum. **SLH-DSA is absent from the catalogue.** That matters
+because SLH-DSA is otherwise the conservative choice — hash-based, 32-byte public
+keys, security resting on assumptions we already trust for SHA-256 — and on a
+purely technical comparison it would deserve a serious look for long-lived
+non-repudiation. It is off the table for anything touching legal identity in our
+jurisdiction, so the comparison is moot.
+
+The selection therefore is:
+
+| Purpose | Algorithm | Sizes (bytes) | Status |
+|---|---|---|---|
+| Transport key exchange | **X25519MLKEM768** (hybrid) | ek 1 184 / ct 1 088 | Ship it (§2) |
+| Signatures, when triggered | **ML-DSA-44** | pk 1 312 / sig 2 420 | Deferred (§3) |
+| Hashing | **SHA-256**, unchanged | — | No action (§4) |
+
+Sizes are FIPS 203 Table 3 and FIPS 204 Table 2. Against ed25519's 32/64, ML-DSA-44
+is **41× the public key and 38× the signature** — the number behind the deferral
+in §3, and the reason `ValidatorInfo.public_key: [u8; 32]` is a hard blocker
+rather than an inconvenience.
+
+**Hybrid, not pure.** X25519MLKEM768 keeps the classical exchange alongside the
+KEM, so a flaw in ML-KEM — a young lattice assumption — does not cost us
+confidentiality. It is also what rustls offers by default, which means the lazy
+option and the correct option coincide. Pure ML-KEM groups exist in the provider
+and are deliberately left out of the defaults "out of conservatism"; take that
+advice.
+
+### A caution when reading DOC-ICP-01.01
+
+Resolução CG ICP-Brasil nº 211/2024 replaced the end-user certificate types: the
+current set is **A3, A4, SE-S, SE-H, T3, T4, AE-S, AE-H, A CF-e-SAT, OM-BR**, and
+**A1/A2 and S1–S4 no longer exist**. DOC-ICP-01.01 v6.0's key-size tables
+nevertheless still carry A1/A2/S1–S4 rows. Do not treat the older type names as
+live, and do not cite pre-2024 A1-vs-A3 framing — it is a common and now-wrong
+mental model.
+
+## 8. Argon2 and friends: the wrong layer, and pre-empted by law
+
+**Argon2 is a memory-hard password-hashing function / KDF.** It does not sign, it
+does not perform key exchange, and it is not a NIST post-quantum algorithm. Its
+job is making brute force against a **low-entropy secret** expensive. It is not a
+candidate for anything in §7.
+
+**And there is no low-entropy secret in this workspace.** Verified 2026-09-02:
+zero occurrences of `password`, `passphrase`, `argon`, `scrypt`, `pbkdf2`,
+`bcrypt` or `keystore` anywhere in `crates/`. `Identity::generate`
+(`glasschain-identity/src/identity.rs:42`) pulls 32 bytes from `getrandom::fill`
+and the key never touches disk — `glasschain-identity` has no save/load path at
+all, consistent with `AGENTS.md` ("identity material is generated at runtime").
+There is nothing for a KDF to stretch.
+
+### Where it *would* have belonged, and why it still will not
+
+The legitimate home for Argon2 is an encrypted keystore for a **persisted** node
+signing key — which we will need, because runtime-generated identity means a
+validator's key changes on every restart, untenable for a real federation.
+
+But when that arrives, ICP-Brasil has already answered it, and the answer is not
+a software keystore. DOC-ICP-04 v8.3 Tabela 4 mandates for **A3, A4, SE-H, T3,
+T4, AE-H and OM-BR**: *"Hardware criptográfico, homologado junto à ICP-Brasil ou
+com certificação INMETRO."* Only **SE-S and AE-S** permit *"Repositório protegido
+por senha e/ou identificação biométrica, cifrado por software"* — and those are
+the 1-year certificates, against 5–11 years for the hardware levels.
+
+So the path for a persisted validator identity bound to ICP-Brasil credentials is
+**HSM or homologated token via PKCS#11**, at DOC-ICP-10.02 levels NSH-2/NSH-3 —
+not a passphrase-derived key at all. Argon2's use case is pre-empted before it
+arises.
+
+**Scope this honestly:** none of that binds us *today*. Our node certificates are
+self-issued org roots, not ICP-Brasil certificates, so DOC-ICP-04 does not
+currently apply. The constraint bites when node identity is bound to ICP-Brasil
+credentials — which is the entire premise of the ICP interoperability
+requirement, so it is a *when*, not an *if*. Note also the general duty in
+DOC-ICP-01.01 §6.1.1.4 that private keys be stored *"gravada cifrada, por
+algoritmo simétrico aprovado"*.
+
+**The one narrow case where Argon2 would still be right:** an operator-facing
+software keystore for a development or SE-S-tier identity, where a human
+passphrase genuinely guards the key. If that is ever built, Argon2id is the
+correct choice and there is no argument to have. It is not on any current path.
 
 ---
 
@@ -214,16 +302,27 @@ stands, and the 2035 horizon gives it a full useful life. But it does mean:
 - Post-quantum signatures in consensus (§3, deferred with a named trigger).
 - Changing the hash function (§4).
 - Post-quantum for libp2p noise (§2 — nothing to adopt upstream).
+- **SLH-DSA** — technically attractive for long-lived non-repudiation, but absent
+  from the ICP-Brasil catalogue (§7).
+- **Argon2 / scrypt / PBKDF2 and any password-derived key material** — wrong
+  layer for this question, and no low-entropy secret exists to protect (§8).
+- **Persistent node identity and its key custody** — a real gap, but it is an
+  HSM/PKCS#11 decision (§8), not a post-quantum one. Track separately.
 
 ## Sources
 
 See [`../memories/post-quantum-research.md`](../memories/post-quantum-research.md)
 for primary sources with URLs and read dates: rustls release notes and docs.rs,
-NIST FIPS 203/204/205, NIST IR 8105 / IR 8547 (ipd), NIST PQC FAQ, Bernstein
-(SHARCS 2009), ITI DOC-ICP-01.01 v6.0 and Instrução Normativa ITI nº 35, and the
-rust-libp2p repository.
+NIST FIPS 203/204/205 (including the size tables in §7), NIST IR 8105 / IR 8547
+(ipd), NIST PQC FAQ, Bernstein (SHARCS 2009), ITI DOC-ICP-01.01 v6.0,
+DOC-ICP-04 v8.3, DOC-ICP-10.02, Resoluções CG 211/2024 and 212/2025, Instrução
+Normativa ITI nº 35, and the rust-libp2p repository.
 
-**Flagged as unverified in that research:** FIPS 206 / FN-DSA status (no CSRC
-record), a *final* NIST IR 8547 (only the November 2024 initial public draft was
-found), and an exhaustive search of ITI public consultations. Do not cite those
-three as settled.
+**Flagged as unverified in that research — do not cite these as settled:**
+
+- FIPS 206 / FN-DSA status (no CSRC record found).
+- A *final* NIST IR 8547 (only the November 2024 initial public draft was found).
+- An exhaustive search of ITI public consultations (listings are JS-rendered).
+- The pre-2024 A1/S1–S4 key-storage wording (iti.gov.br serves only post-211
+  consolidations). This does not affect §8, which rests on the *current*
+  DOC-ICP-04 v8.3 Tabela 4.
