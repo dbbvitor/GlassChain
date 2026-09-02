@@ -522,10 +522,19 @@ blocking for every performance claim in this document.
 
 The evidence doc's own scoping caveats: recovery models an application-layer
 partition (validators that never dialed join late), not severed TCP sessions;
-no WAN delay is injected; the fan-out columns are sequential threshold polls,
-not cumulative; and **no production capacity claim is made or implied** — this
-gate evidences that the compact workload executes and converges at 200/300
-in-process validators with the stated engine.
+no WAN delay is injected; and **no production capacity claim is made or
+implied** — this gate evidences that the compact workload executes and converges
+at 200/300 in-process validators with the stated engine.
+
+**The fan-out thresholds measure the harness, not the network.** The three polls
+are sequential with independent start times, and each sweeps every connected
+validator taking a lock on its ledger before sleeping 20 ms — so the 50% poll
+absorbs the lock contention from ongoing commit work while the later polls find
+the block already delivered. The raw output shows it: the 50% column grows
+496 → 16 354 ms across nine rounds while the 100% column stays at 0–98 ms in the
+same rounds, which cannot describe propagation. Cite the recovery-convergence
+figure instead, and see §10.5 — fixing this instrument is a prerequisite for the
+finality measurement that §10.4 step 0 calls for.
 
 ### 7.2 External production data point
 
@@ -739,7 +748,51 @@ saves almost no round CPU (~1–3 ms for an aggregate versus tens of ms to
 batch-verify 200 ed25519 signatures); its win is bytes, storage, and third-party
 proof size.
 
-### 10.5 What actually gets us to 300 reliably
+### 10.5 Tail at scale
+
+Assessed against the shipped code. **The built paths are structurally sound, the
+dangerous one is unbuilt, and we are blind.**
+
+- **Broadcast is tail-tolerant.** `Node::broadcast` `try_send`s into per-peer
+  bounded channels, each drained by its own writer task — the broadcaster never
+  awaits a peer, so one slow validator cannot stall fan-out to the rest. The cost
+  is that the tail becomes *silent message loss*: a full channel logs a warning
+  and drops. There is no counter and no per-peer metric, so **the straggler is
+  invisible**.
+- **The quorum wait does not exist yet.** Gathering attestations from remote
+  validators is an ADR-010 adoption gate (§5), so the classic "wait for the 201st
+  of 300" exposure is unbuilt rather than absent. Worth carrying forward: a ⅔
+  quorum is *inherently a partial hedge* (you discard the slowest 99), and
+  Tendermint's round timeout already **is** the hedge — the risk is re-deriving
+  it badly, not omitting it.
+- **One path is exposed.** `reconcile_private_payloads` picks exactly one target
+  peer and fires every request at it with no timeout, retry, or failover. Small
+  blast radius (an operator action), cheap fix (fan across all member peers).
+  Note more generally that **there are no timeouts anywhere on the peer path**.
+- **Persistence sits in front of broadcast.** `after_block_commit` runs
+  `storage.apply_block` — synchronous, blocking disk work with no
+  `spawn_blocking` — *between* ledger append and broadcast on the mine path, so
+  the leader's storage latency is inserted in front of fan-out to every peer.
+  On the peer path the same call blocks that peer's read task. It does **not**
+  compound per hop: `Message::Block` is broadcast only from `mine_async`, and
+  gossipsub forwarding happens inside libp2p. The fix is scheduling, not
+  durability: broadcast first, persist after. The ledger is already appended by
+  then, and ADR-007 decision 2 already makes the chain authoritative with rebuild
+  healing divergence, so no invariant moves.
+- **A write-ahead log is not the mitigation.** Sled is already log-structured
+  with its own WAL, and the block-log-then-derived-state ordering plus
+  rebuild-on-recovery is already WAL-and-replay. `fsync` is a *cause* of tail
+  latency, not a cure. Group commit stays on the shelf for whenever explicit
+  durability is decided — today nothing flushes outside tests, so there is
+  nothing to batch (and that is a separate, recorded durability gap).
+- **The propagation instrument measures itself** — see §7.1 and the benchmark
+  document's caveat 2. Fixing it is a prerequisite for step 0 above meaning
+  anything.
+
+Full assessment and ranked actions:
+[`.agents/plans/performance.md`](../.agents/plans/performance.md) §5.
+
+### 10.6 What actually gets us to 300 reliably
 
 Not protocol work. The bounds that bite among institutional validators are
 correlated failure, heavy-tailed latency, and governance (§6.2). The work is

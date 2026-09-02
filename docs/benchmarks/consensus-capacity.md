@@ -69,13 +69,20 @@
    gossip bandwidth. Real Tendermint-class vote gossip (O(n²)) and BFT peer
    admission are the ADR-010 testnet/adoption gates and are not substitutable
    by this in-process gate.
-2. **Fan-out** is three sequential threshold polls (50%/95%/100%), each with
-   its own start time — the printed columns are NOT cumulative and a
-   "100% = 0 ms" means every connected validator had already reached the
-   height when the third poll began. The 50%-column grows with background
-   load (sequential sweep cost); treat the whole fan-out family as
-   supplementary and the recovery-convergence figure as the reliable
-   end-to-end number.
+2. **Fan-out thresholds are not a usable measurement — do not cite the 50%
+   column.** The three thresholds (50%/95%/100%) are sequential polls, each with
+   its own start time, and each poll sweeps every connected validator taking a
+   lock on its ledger before sleeping 20 ms. The 50% poll therefore absorbs the
+   lock contention from ongoing commit work while the later polls find the block
+   already delivered. The recorded output shows the result directly: the 50%
+   column grows 496 → 16 354 ms across nine rounds while the 100% column stays at
+   0–98 ms in the same rounds, which is incoherent as a propagation measurement
+   — 100% cannot follow 50% by a negative interval. The sweep is also
+   O(connected) locks per tick, so the instrument degrades as the system it
+   measures grows. **Treat the recovery-convergence figure as the only reliable
+   end-to-end propagation number here**; the threshold family measures the
+   harness. Fixing or deleting it is tracked in
+   [`.agents/plans/performance.md`](../../.agents/plans/performance.md) §5.4.
 3. **Recovery** models an application-layer partition (validators that never
    dialed join late); it does not sever established TCP sessions. WAN delay is
    not injected; madsim's deterministic scheduling covers ordering, not

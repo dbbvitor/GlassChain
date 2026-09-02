@@ -127,7 +127,187 @@ designed operating point rather than a ceiling to apologise for.
 
 ---
 
-## 5. Ordered path
+## 5. Tail at scale
+
+Assessed 2026-09-02 against the shipped code, in the sense of Dean & Barroso's
+"The Tail at Scale": in a system where one operation touches many components,
+the p99 of each component becomes the p50 of the whole.
+
+**Verdict: the built paths are structurally sound — the dangerous one is
+unbuilt, one path is genuinely exposed, and we are blind.**
+
+### 5.1 Broadcast is tail-tolerant, and that is the important one
+
+`Node::broadcast` (`crates/glasschain-network/src/node.rs:1919`) snapshots the
+sender list, then `try_send`s into per-peer bounded channels (256 slots,
+`handle_peer`, same file), each drained by its own writer task. **The broadcaster
+never awaits a peer.** One slow validator cannot stall fan-out to the other 299;
+it fills its own channel and nothing more. That is precisely the
+decouple-the-caller-from-the-straggler pattern, and it is the single most
+important thing to have got right.
+
+The cost is that the tail is converted from latency into **silent message loss**:
+a full channel logs `"Dropping outbound message: peer channel full"` and moves
+on. A chronically slow peer silently misses blocks and resyncs later. That is a
+defensible trade — but it is a `log::warn!` and nothing else. No counter, no
+per-peer metric. **The straggler is invisible.**
+
+### 5.2 The dangerous path does not exist yet
+
+The classic BFT tail exposure is waiting for the 201st of 300 attestations.
+**That code is not written.** `BftConsensusProvider::attest` produces one local
+attestation, and `bft.rs`'s own module doc records that gathering attestations
+from remote validators is an ADR-010 adoption gate.
+
+So we are not vulnerable *because the vulnerable component is unbuilt* — the
+decision is ahead of us, not behind us. Two things to carry into it:
+
+- A ⅔ quorum is **inherently a partial hedge**: you take the 201st fastest and
+  discard the slowest 99. That is far better than any fan-out that waits for all
+  `n`. But 201/300 is the 67th percentile of the response distribution, which
+  under Pareto tails is still deep — this is the `n^(1/α)` order statistic from
+  Step 7, made concrete.
+- **Do not invent hedging.** Tendermint's round timeout already *is* the hedge.
+  The risk when Step 5 or the Malachite path lands is re-deriving it badly, not
+  omitting it.
+
+### 5.3 One path is genuinely exposed
+
+`Node::reconcile_private_payloads` (`node.rs:1055`) picks **exactly one** target
+peer, then fires every missing-payload request at it with **no timeout, no retry,
+no failover, and no hedge** — and returns the count of requests *sent*, not
+received. One slow member and reconciliation silently does nothing.
+
+Blast radius is small (an infrequent operator action, not a hot path) and the fix
+is cheap: fan the requests across all member peers instead of choosing one.
+
+Relatedly, **there are no timeouts anywhere on the peer path**. `peer.rs`
+`send`/`receive` have none; the only `Duration` in `node.rs` is a 5-second
+reconnect sleep. Today that is masked by the `try_send` decoupling. It will not
+be once any request/response path matters.
+
+### 5.4 The measurement instrument is broken — act on this first
+
+From the recorded gate (`docs/benchmarks/consensus-capacity.md`, 200 validators):
+
+| Round | fan-out 50% | fan-out 100% |
+|---|---|---|
+| 1 | 496 ms | 0 ms |
+| 5 | 7 941 ms | 98 ms |
+| 9 | **16 354 ms** | 34 ms |
+
+That is **incoherent as a network measurement** — 100% cannot be reached in 34 ms
+immediately after 50% took 16 seconds. The cause is in `propagation_ms`
+(`crates/glasschain-network/tests/consensus_capacity.rs:193`): each poll sweeps
+*every* connected validator taking `.lock().await` on its ledger, then sleeps
+20 ms, and the three thresholds run as sequential polls with independent start
+times. The 50% poll absorbs all the lock contention with ongoing commit work; by
+the time the later polls begin, everything has already arrived.
+
+**It measures the harness, not the network** — and the sweep is itself
+O(connected) lock acquisitions per 20 ms tick, so the instrument degrades as the
+thing it measures grows. `consensus-capacity.md` calls this family
+"supplementary"; that is too generous.
+
+### 5.5 A write-ahead log is not the answer — but the question found one
+
+Assessed 2026-09-02. **No: we should not build a WAL. We already have two, and a
+third would make the tail worse.** The investigation did surface a real exposure
+at the same location, so the question earned its keep.
+
+Why not:
+
+1. **Sled is already a log-structured store with its own write-ahead log.**
+   Hand-rolling one on top of `sled 0.34.7` reimplements the dependency we
+   already pay for.
+2. **The block log is semantically already a WAL.** `apply_block`
+   (`crates/glasschain-storage/src/sled_backend.rs:85`) writes the block and its
+   derived write set in one multi-tree transaction; on failure the chain stays
+   authoritative and rebuild-from-chain heals the derived state (ADR-007
+   decision 2). Write-ahead, then replay on recovery — that *is* the pattern, and
+   `failure_after_block_durable_is_healed_by_rebuild`
+   (`node.rs:3718`) is the test that proves it.
+3. **A WAL is a durability mechanism, and `fsync` is a *cause* of tail latency,
+   not a cure.** Dean & Barroso name background daemons and queueing among the
+   sources of tail; a synchronous log flush on the commit path adds one.
+
+#### What the question actually found: persistence sits in front of relay
+
+`after_block_commit` calls `storage.apply_block(block)` — synchronous, blocking
+disk and CPU work — directly on a Tokio worker thread with **no
+`spawn_blocking`**. On the mine path it sits **between ledger append and
+broadcast**:
+
+| | Ledger append | Blocking persist | Broadcast |
+|---|---|---|---|
+| `mine_async` | `node.rs:1518` | `node.rs:1962` | `node.rs:1546` |
+| `process_message` | `node.rs:2675` | `node.rs:1962` | — (see below) |
+
+**Scope this honestly — it does not compound per hop.** `Message::Block` is
+broadcast from `mine_async` and *nowhere else*; a peer receiving a block never
+re-relays it on the TCP path, and gossipsub mesh forwarding happens inside libp2p
+before our handler runs. So there is no multi-hop amplification. Two narrower
+effects remain, and both are real:
+
+- **Mine path:** the leader's storage latency is inserted in front of fan-out to
+  *every* peer. One node's p99 disk becomes everyone's propagation p50 — the
+  tail-at-scale shape, at one hop rather than many.
+- **Peer path:** the blocking call runs on the per-peer read task, so subsequent
+  messages from that peer queue behind it (head-of-line blocking on that
+  connection), and it occupies a runtime worker thread while it runs.
+
+Magnitude is unmeasured (§2 applies). The fix is scheduling, not durability, and
+it is a smaller diff than a WAL: broadcast first, persist after. The in-memory
+ledger is *already* appended before `after_block_commit`, and ADR-007 decision 2
+already makes the chain authoritative with rebuild healing any storage
+divergence — so moving persistence behind the broadcast changes no invariant.
+`spawn_blocking` is the fallback if ordering turns out to matter somewhere not
+yet identified; it fixes the reactor-blocking but keeps the latency in the path.
+
+#### A real durability gap, recorded but not fixed here
+
+`SledStorageProvider::flush` is **never called outside tests**, and sled 0.34's
+`flush_every_ms` defaults to `Some(500)`. Up to half a second of committed blocks
+can therefore be lost to power loss. Replication masks this — a recovered node
+resyncs from peers — *except under correlated failure*, which §6 Step 7 already
+names as the bound that actually bites.
+
+Do not reflexively "fix" this by adding a flush: it trades exactly the tail
+latency this section is about, on a path that is already in front of relay. It
+needs Step 0's measurement first, and then it is a policy decision with a knob,
+not a default.
+
+#### The one WAL technique worth keeping on the shelf
+
+**Group commit.** If durability is ever made explicit, batch the flush across
+concurrent commits rather than paying it per block — that is the WAL family's own
+answer to the tail it would otherwise create. Trigger is the durability decision
+above, not this one. Nothing to batch today, because nothing flushes today.
+
+### 5.6 Actions, ranked
+
+1. **Delete or fix the 50% fan-out column.** It is actively misleading, and it is
+   the only instrument currently pointed at propagation. Fix = poll concurrently
+   from a single start, or drop the threshold family and keep
+   recovery-convergence. Belongs with Step 0.
+2. **Count the `try_send` drops, per peer.** A counter turns an invisible
+   straggler into a visible one. This is the thing that tells you a tail exists
+   at all, and it is the cheapest item in this document.
+3. **Move persistence behind broadcast** on the mine path, and off the reactor on
+   the peer path (§5.5). Takes the leader's disk latency out of fan-out and stops
+   blocking a runtime worker, for a diff of a few lines.
+4. **Fan reconcile across all member peers**, and put a timeout on it (§5.3).
+5. **Carry §5.2 into the quorum-gathering work** when Step 5 or Malachite lands.
+6. **Record the flush gap** (§5.5) as a durability *decision* with a knob, gated
+   on Step 0 — not as a default change.
+
+Items 1 and 2 are prerequisites for Step 0 meaning anything: the plan's first
+step is "measure," and this section says the measuring tools need fixing before
+they can.
+
+---
+
+## 6. Ordered path
 
 Each step is independently shippable. The ordering is deliberate: the free
 structural wins come before the sophisticated ones, because a speculative fast
@@ -141,8 +321,13 @@ across real validators** and reports p50/p95/p99 finality at 100/200/300. Extend
 `crates/glasschain-network/tests/consensus_capacity.rs` rather than starting
 over; keep it `#[ignore]`-gated.
 
-In the same pass, establish the competitive bar from primary sources (Mysticeti,
-Aptos, Malachite, SmartBFT/Fabric) so the target in §1 is citable.
+**Fix the instrument in the same pass** — the existing fan-out thresholds measure
+the harness's own lock contention rather than propagation (§5.4), and a
+straggler currently leaves no trace but a log line (§5.1). Percentiles are
+worthless if the tool that produces them is the bottleneck.
+
+Also establish the competitive bar from primary sources (Mysticeti, Aptos,
+Malachite, SmartBFT/Fabric) so the target in §1 is citable.
 
 **Until this exists, no performance claim goes in marketing copy or the README.**
 
@@ -275,7 +460,14 @@ more than any protocol item above. Belongs with the federation trust model
 
 - **Step 0** is itself the validation instrument; nothing after it is claimable
   without it. `#[ignore]`-gated, reproducible, with the same honest-scope
-  caveats `consensus-capacity.md` already carries.
+  caveats `consensus-capacity.md` already carries. It is not trustworthy until
+  §5.6 items 1 and 2 land — a broken instrument produces confident wrong numbers,
+  which is worse than no numbers.
+- §5.6 item 3: a propagation measurement taken with persistence behind broadcast,
+  compared against the current ordering — the number that says whether moving it
+  is worth the change.
+- §5.6 item 4: a test proving reconcile still completes when one member peer
+  never answers.
 - Steps 1–2: unit test asserting serialized certificate size at a synthetic
   201-attestation quorum stays under budget; a batch-verify test proving the
   sequential fallback still names the bad signer.
@@ -288,7 +480,7 @@ more than any protocol item above. Belongs with the federation trust model
 
 - **Raising the validator ceiling by protocol optimization.** Settled in §4; send
   new proposals back here. Note this is a *scoping* ruling, not a performance
-  ceiling: §5 is where the performance work lives.
+  ceiling: §6 is where the performance work lives.
 - Reopening ADR-002's consensus family or ADR-004's ladder. Best-in-class latency
   is reachable inside both (§1).
 - Committee sampling, VRF sortition, separate finality gadgets — rejected with
@@ -310,7 +502,20 @@ finding survives unchanged. Three things did not:
 2. It deferred fast paths for want of a sub-second requirement. That requirement
    now exists.
 3. It treated BLS as merely "not an escape route." Under a
-   sell-the-scalability framing it is the enabler of the ladder claim (§4, §5.4).
+   sell-the-scalability framing it is the enabler of the ladder claim (§4, §6.4).
+
+A tail-at-scale assessment was added as §5 on the same day, in response to a
+direct question. It did not change any conclusion above, but it moved two items
+ahead of Step 0: the propagation instrument is measuring itself, and dropped
+messages to a slow peer leave no trace but a log line.
+
+§5.5 was added on the same day, in response to a direct question about whether a
+write-ahead log could mitigate the tail. The answer is no — sled is already
+log-structured, the block log is already write-ahead-then-replay, and `fsync` is
+a tail *source*. But reading the commit path to answer it found that blocking
+persistence sits in front of broadcast on the mine path and on the reactor on the
+peer path, and that nothing flushes outside tests, which is a genuine durability
+gap. Both are now ranked in §5.6; neither changes the ordered path.
 
 ---
 
