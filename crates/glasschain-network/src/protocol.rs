@@ -1,4 +1,4 @@
-use glasschain_core::{Block, Transaction};
+use glasschain_core::{Block, CapabilityAdvertisement, Transaction};
 use serde::{Deserialize, Serialize};
 
 /// Maximum wire-frame size accepted (16 MiB).
@@ -26,8 +26,22 @@ pub enum Message {
         tls_cert_fingerprint: String,
         /// The sender's chain length (used for chain-sync decisions).
         chain_length: u64,
-        /// Protocol version string (e.g. `"glasschain/1"`).
+        /// Protocol version string (e.g. `"glasschain/4"`).
         version: String,
+        /// Capabilities this peer supports (ADR-010 decision 6). Peers lacking
+        /// an active capability are treated as read-only observers.
+        #[serde(default)]
+        capabilities: Vec<CapabilityAdvertisement>,
+        /// The sender's organization (the collection-membership principal,
+        /// ADR-003). Defaults keep pre-`/3` peers decodable.
+        #[serde(default)]
+        org: String,
+        /// The sender's organization-issued certificate (PEM), when
+        /// identity-backed. The payload path verifies the org against this
+        /// certificate's subject CN under a configured Root CA (ticket #47);
+        /// the TLS certificate itself stays a transport-only self-signed cert.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        certificate_pem: Option<String>,
         /// The sender's stable TCP listening address (e.g. `"192.168.1.5:8000"`).
         ///
         /// Peers must use this address (rather than the TCP source address, which
@@ -41,6 +55,32 @@ pub enum Message {
 
     /// Announce a newly mined block.
     Block(Block),
+
+    /// A private data collection payload, sent **point-to-point** between
+    /// collection members only (ADR-003, ticket #46) — never broadcast. The
+    /// receiver's node verifies its own membership, the sender's membership,
+    /// and `commitment == sha256(payload)` before holding the payload in its
+    /// transient store; the globally replicated chain carries only the
+    /// commitment (via [`Block`]'s redacted write set).
+    PrivatePayload {
+        /// The collection this payload belongs to.
+        collection: String,
+        /// SHA-256 of `payload` — the exact commitment the chain records.
+        commitment: String,
+        /// The private payload bytes (never replicated globally).
+        payload: Vec<u8>,
+    },
+
+    /// A collection member asks a member peer for one private payload it is
+    /// missing (pull-based reconciliation, ticket #47). The receiver responds
+    /// with [`Message::PrivatePayload`] only when it is a member that holds
+    /// the payload; silence otherwise.
+    RequestPrivatePayload {
+        /// The collection the payload belongs to.
+        collection: String,
+        /// SHA-256 of the missing payload (the chain's commitment).
+        commitment: String,
+    },
 
     /// Ask a peer to send its full chain.
     RequestChain,
@@ -59,4 +99,10 @@ pub enum Message {
 }
 
 /// Current protocol version string.
-pub const PROTOCOL_VERSION: &str = "glasschain/1";
+///
+/// `/3` added the private-payload wire message (ADR-003, ticket #46);
+/// `/4` added pull-based reconciliation for it (ticket #47): a `/3` peer can
+/// neither request missing payloads nor answer requests, so the gate keeps
+/// such peers from silently missing private writes. (The `/2` bump marked the
+/// BFT consensus seam.)
+pub const PROTOCOL_VERSION: &str = "glasschain/4";

@@ -98,6 +98,15 @@ async fn send_hello(writer: &mut PeerWriter, node_id: &str, listen_addr: &str, f
         tls_cert_fingerprint: fingerprint.to_owned(),
         chain_length: 1,
         version: PROTOCOL_VERSION.to_owned(),
+        org: "org-test".to_owned(),
+        certificate_pem: None,
+        capabilities: glasschain_core::CAPABILITY_V1
+            .iter()
+            .map(|c| glasschain_core::CapabilityAdvertisement {
+                id: c.id.to_owned(),
+                version: c.version,
+            })
+            .collect(),
         listen_addr: listen_addr.to_owned(),
     };
     writer.send(&msg).await.unwrap();
@@ -570,4 +579,279 @@ async fn goodbye_is_handled_gracefully() {
         }
     }
     assert!(got_disconnect, "PeerDisconnected event was not emitted");
+}
+
+// ── Private-payload boundary (ADR-003, ticket #46) ────────────────────────────
+
+use glasschain_identity::{Channel, ChannelConfig};
+
+/// A collection whose member orgs are `org-writer` and `org-member`.
+fn pricing_collection() -> Channel {
+    Channel::new(ChannelConfig {
+        name: "pricing".to_owned(),
+        member_ids: vec!["org-writer".to_owned(), "org-member".to_owned()],
+        description: "Private pricing collection".to_owned(),
+        endorsement_policy: None,
+        retention_secs: 3600,
+    })
+}
+
+/// Send a `Hello` advertising `org` (the collection-membership principal).
+async fn send_hello_as_org(
+    writer: &mut PeerWriter,
+    node_id: &str,
+    listen_addr: &str,
+    fingerprint: &str,
+    org: &str,
+) {
+    let msg = Message::Hello {
+        node_id: node_id.to_owned(),
+        tls_cert_fingerprint: fingerprint.to_owned(),
+        chain_length: 1,
+        version: PROTOCOL_VERSION.to_owned(),
+        capabilities: glasschain_core::CAPABILITY_V1
+            .iter()
+            .map(|c| glasschain_core::CapabilityAdvertisement {
+                id: c.id.to_owned(),
+                version: c.version,
+            })
+            .collect(),
+        org: org.to_owned(),
+        certificate_pem: None,
+        listen_addr: listen_addr.to_owned(),
+    };
+    writer.send(&msg).await.unwrap();
+}
+
+fn private_payload(collection: &str, payload: &[u8]) -> Message {
+    Message::PrivatePayload {
+        collection: collection.to_owned(),
+        commitment: sha256(payload),
+        payload: payload.to_vec(),
+    }
+}
+
+/// A private payload pushed directly to a **non-member** node is rejected at
+/// the transport boundary: no transient entry, no event — even when the
+/// claimed sender org IS a member (a compromised member cannot leak through
+/// the wire to a non-member).
+#[tokio::test]
+async fn private_payload_to_non_member_is_rejected() {
+    init_log_capture();
+    let addr = free_addr();
+    // The node id is the local org; "org-outsider" is not in the collection.
+    let outsider = Node::new("org-outsider", &addr, 1);
+    outsider.start(vec![]).await.unwrap();
+    outsider.set_collections(vec![pricing_collection()]).await;
+    let mut events = outsider.subscribe();
+
+    // Activate `pdc` on the outsider so the membership branch (not the
+    // capability gate) is the one under test.
+    outsider
+        .submit_transaction(glasschain_core::Transaction::with_id(
+            "cap:pdc:2".to_owned(),
+            glasschain_core::TransactionKind::CapabilityActivation(
+                glasschain_core::CapabilityActivation {
+                    capability_id: "pdc".into(),
+                    version: 1,
+                    hash: glasschain_core::capability_hash("pdc", 1),
+                    activation_height: 2,
+                    signatures: vec![glasschain_core::RecordSignature {
+                        signer: "org-gov".into(),
+                        signature_bytes: vec![0x42],
+                    }],
+                },
+            ),
+        ))
+        .await
+        .unwrap();
+    outsider.mine().await.unwrap();
+
+    let (mut reader, mut writer, _node_cert) = connect_raw(&addr, CLIENT_CERT_A).await;
+    read_node_hello(&mut reader).await;
+    send_hello_as_org(
+        &mut writer,
+        "org-writer",
+        "127.0.0.1:1",
+        &sha256(CLIENT_CERT_A),
+        "org-writer",
+    )
+    .await;
+    writer
+        .send(&private_payload("pricing", b"leaked-price"))
+        .await
+        .unwrap();
+
+    // Rejection is silent at the wire (no disconnect); the payload must not be
+    // held and no PrivatePayloadReceived event may fire (other event variants
+    // — e.g. the handshake's — are skipped).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        outsider
+            .transient_payload("pricing", &sha256(b"leaked-price"))
+            .await,
+        None,
+        "a non-member must never hold private cleartext"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    loop {
+        match timeout(Duration::from_millis(100), events.recv()).await {
+            Ok(Ok(NodeEvent::PrivatePayloadReceived { .. })) => {
+                panic!("no PrivatePayloadReceived event may fire for a rejected payload");
+            }
+            Ok(Ok(_)) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "event stream never settled"
+                );
+            }
+            _ => break,
+        }
+    }
+
+    // The rejection reason is logged.
+    wait_for_log("is not a member").await;
+}
+
+/// A private payload whose commitment does not match its bytes is rejected
+/// even when both sides are members.
+#[tokio::test]
+async fn private_payload_with_commitment_mismatch_is_rejected() {
+    init_log_capture();
+    let addr = free_addr();
+    let member = Node::new("org-member", &addr, 1);
+    member.start(vec![]).await.unwrap();
+    member.set_collections(vec![pricing_collection()]).await;
+    let mut events = member.subscribe();
+    // Activate `pdc` so the commitment branch (not the capability gate) runs.
+    member
+        .submit_transaction(glasschain_core::Transaction::with_id(
+            "cap:pdc:2".to_owned(),
+            glasschain_core::TransactionKind::CapabilityActivation(
+                glasschain_core::CapabilityActivation {
+                    capability_id: "pdc".into(),
+                    version: 1,
+                    hash: glasschain_core::capability_hash("pdc", 1),
+                    activation_height: 2,
+                    signatures: vec![glasschain_core::RecordSignature {
+                        signer: "org-gov".into(),
+                        signature_bytes: vec![0x42],
+                    }],
+                },
+            ),
+        ))
+        .await
+        .unwrap();
+    member.mine().await.unwrap();
+
+    let (mut reader, mut writer, _node_cert) = connect_raw(&addr, CLIENT_CERT_B).await;
+    read_node_hello(&mut reader).await;
+    send_hello_as_org(
+        &mut writer,
+        "org-writer",
+        "127.0.0.1:2",
+        &sha256(CLIENT_CERT_B),
+        "org-writer",
+    )
+    .await;
+    let tampered = Message::PrivatePayload {
+        collection: "pricing".to_owned(),
+        commitment: sha256(b"other-value"),
+        payload: b"actual-value".to_vec(),
+    };
+    writer.send(&tampered).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        member
+            .transient_payload("pricing", &sha256(b"other-value"))
+            .await,
+        None,
+        "a commitment mismatch must never be stored"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    loop {
+        match timeout(Duration::from_millis(100), events.recv()).await {
+            Ok(Ok(NodeEvent::PrivatePayloadReceived { .. })) => {
+                panic!("no event may fire for a mismatched payload");
+            }
+            Ok(Ok(_)) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "event stream never settled"
+                );
+            }
+            _ => break,
+        }
+    }
+    wait_for_log("commitment mismatch").await;
+}
+
+/// Wire-version enforcement for the private-payload protocol: a `/2` Hello
+/// predating the private-payload message is disconnected (`/3` gate).
+#[tokio::test]
+async fn hello_with_old_wire_version_is_disconnected() {
+    let addr = free_addr();
+    let node = Node::new("version-node", &addr, 1);
+    node.start(vec![]).await.unwrap();
+
+    let (mut reader, mut writer, _node_cert) = connect_raw(&addr, CLIENT_CERT_A).await;
+    read_node_hello(&mut reader).await;
+    let stale = Message::Hello {
+        node_id: "old-peer".to_owned(),
+        tls_cert_fingerprint: sha256(CLIENT_CERT_A),
+        chain_length: 1,
+        version: "glasschain/2".to_owned(),
+        capabilities: Vec::new(),
+        org: "org-old".to_owned(),
+        certificate_pem: None,
+        listen_addr: "127.0.0.1:3".to_owned(),
+    };
+    writer.send(&stale).await.unwrap();
+
+    let result = timeout(Duration::from_secs(2), reader.receive())
+        .await
+        .expect("timeout waiting for version-gate disconnect")
+        .expect_err("a pre-private-payload peer must be disconnected");
+    assert!(matches!(result, NetworkError::PeerDisconnected(_)));
+}
+
+/// Certificate-verified org (ticket #47): a node running a cert verifier
+/// disconnects a peer whose Hello-carried organization certificate does not
+/// verify against the org Root CA with the claimed subject CN.
+#[tokio::test]
+async fn hello_with_unverified_org_certificate_is_disconnected() {
+    // A certificate from a DIFFERENT organization (CN = "imposter"): the
+    // claimed org "org-member" cannot be verified from it.
+    let mut other_org = glasschain_identity::Organization::new("MedCorp").unwrap();
+    let imposter = other_org.issue_identity("imposter").unwrap().clone();
+    let cert_pem = imposter.certificate_pem.expect("issued cert");
+
+    let addr = free_addr();
+    let member = Node::new("org-member", &addr, 1);
+    member.start(vec![]).await.unwrap();
+    let org = glasschain_identity::Organization::new("PharmaCorp").unwrap();
+    member
+        .set_cert_verifier(glasschain_identity::CertChainVerifier::from_org(&org).unwrap())
+        .await;
+
+    let (mut reader, mut writer, _node_cert) = connect_raw(&addr, CLIENT_CERT_A).await;
+    read_node_hello(&mut reader).await;
+    let hello = Message::Hello {
+        node_id: "imposter-node".to_owned(),
+        tls_cert_fingerprint: sha256(CLIENT_CERT_A),
+        chain_length: 1,
+        version: PROTOCOL_VERSION.to_owned(),
+        capabilities: Vec::new(),
+        org: "org-member".to_owned(),
+        certificate_pem: Some(cert_pem),
+        listen_addr: "127.0.0.1:4".to_owned(),
+    };
+    writer.send(&hello).await.unwrap();
+
+    let result = timeout(Duration::from_secs(2), reader.receive())
+        .await
+        .expect("timeout waiting for org-verification disconnect")
+        .expect_err("an unverified org certificate must trigger a disconnect");
+    assert!(matches!(result, NetworkError::PeerDisconnected(_)));
 }

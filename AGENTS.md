@@ -92,7 +92,7 @@ Criterion benches exist but are not part of the normal loop:
 
 ```bash
 cargo bench -p glasschain-vm          # vm_throughput
-cargo bench -p glasschain-contracts   # watcher_throughput
+cargo bench -p glasschain-workflows    # watcher_throughput
 ```
 
 ---
@@ -127,7 +127,7 @@ GlassChain/
 ### Dependency direction
 
 ```text
-core ← {contracts, storage, vm, identity, indexer} ← network ← rpc ← sdk ← {node, cli}
+core ← {contracts, storage, vm, identity, indexer} ← workflows ← network ← rpc ← sdk ← {node, cli}
 ```
 
 `glasschain-core` depends on nothing internal. **The workspace has no circular
@@ -143,7 +143,8 @@ higher one, define a trait in `glasschain-core` and inject the implementation.
 | Traceability metadata / trust scoring | `glasschain-core/src/asset.rs` |
 | SNCM/Anvisa schema validation | `glasschain-core/src/schema.rs` |
 | A pluggable seam (consensus, storage, execution, network) | `glasschain-core/src/providers.rs` |
-| Contract auto-execution or reorder watchers | `glasschain-contracts/src/{engine,watcher}.rs` |
+| Contract auto-execution | `glasschain-contracts/src/engine.rs` |
+| Reorder watchers (ECA) | `glasschain-workflows/src/watcher.rs` |
 | Peer wire format / message types | `glasschain-network/src/protocol.rs` |
 | Peer lifecycle, TLS handshake, TOFU registry | `glasschain-network/src/{node,peer}.rs` |
 | gRPC surface | `glasschain-rpc/proto/glasschain/v1/glasschain.proto` **and** `src/server.rs` |
@@ -317,8 +318,11 @@ See [`.agents/README.md`](.agents/README.md) for file templates.
   `glasschain-cli` were added later). `PLUGIN_KIT.md` has the current list.
 - The `glasschain-node` REPL and the gRPC server are separate: no `--rpc-addr`
   means no gRPC.
-- `mine` blocks until a block is produced; `mine-async` returns immediately.
-  PoW difficulty comes from `DEFAULT_DIFFICULTY` in `glasschain-core::ledger`.
+- Block production is consensus-driven, not manual: the `mine`/`mine-async`
+  REPL commands and the `MineBlock` RPC were retired with the quorum-certificate
+  seam (ticket #38). The dev/test Proof-of-Work driver remains available
+  programmatically as `Node::mine()` / `Node::mine_async()`; PoW difficulty
+  comes from `DEFAULT_DIFFICULTY` in `glasschain-core::ledger`.
 - Contract and watcher state are **rebuilt by replaying the committed chain** on
   restart or chain replacement. Any new automation state must be replayable the
   same way, or it will silently diverge after a sync.

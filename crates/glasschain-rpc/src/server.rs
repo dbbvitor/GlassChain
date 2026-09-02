@@ -8,12 +8,12 @@ use crate::proto::glasschain_v1::{
     CustodyEventProto, ExchangeCertificateRequest, ExchangeCertificateResponse, GetBlockRequest,
     GetBlockResponse, GetChainStatusRequest, GetChainStatusResponse, GetNodeStatusRequest,
     GetNodeStatusResponse, GetPeersRequest, GetPeersResponse, GetVerifiableLineageRequest,
-    GetVerifiableLineageResponse, MineBlockRequest, MineBlockResponse, QueryAssetHistoryRequest,
-    QueryAssetHistoryResponse, StreamBlocksRequest, StreamBlocksResponse, SubmitTransactionRequest,
-    SubmitTransactionResponse, SubscribeToEventsRequest, SubscribeToEventsResponse,
-    TransactionProto, VerifyEndorsementRequest, VerifyEndorsementResponse,
+    GetVerifiableLineageResponse, QueryAssetHistoryRequest, QueryAssetHistoryResponse,
+    StreamBlocksRequest, StreamBlocksResponse, SubmitTransactionRequest, SubmitTransactionResponse,
+    SubscribeToEventsRequest, SubscribeToEventsResponse, TransactionProto,
+    VerifyEndorsementRequest, VerifyEndorsementResponse,
 };
-use glasschain_core::{TraceableAssetRegistration, Transaction, TransactionKind};
+use glasschain_core::{Transaction, TransactionKind};
 use glasschain_identity::SignedTransaction;
 use glasschain_network::{Node, NodeEvent};
 use std::sync::Arc;
@@ -34,6 +34,9 @@ fn build_transaction_protos(block: &glasschain_core::Block) -> Vec<TransactionPr
                 TransactionKind::ContractExecution(_) => "ContractExecution",
                 TransactionKind::InventoryUpdate(_) => "InventoryUpdate",
                 TransactionKind::AssetRegistration(_) => "AssetRegistration",
+                TransactionKind::CanonicalRecord(_) => "CanonicalRecord",
+                TransactionKind::CapabilityActivation(_) => "CapabilityActivation",
+                TransactionKind::PolicyUpdate(_) => "PolicyUpdate",
             };
             TransactionProto {
                 id: tx.id.clone(),
@@ -83,21 +86,45 @@ fn event_to_response(event: &NodeEvent) -> SubscribeToEventsResponse {
             event_type: "transaction_accepted".into(),
             payload_json: serde_json::json!({ "transaction_id": t.id }).to_string(),
         },
-        NodeEvent::BlockMined { index, hash } => SubscribeToEventsResponse {
+        // The payload itself never enters the event stream — the collection
+        // and commitment only (ADR-003, ticket #46).
+        NodeEvent::PrivatePayloadReceived {
+            collection,
+            commitment,
+        } => SubscribeToEventsResponse {
+            timestamp: now_unix(),
+            event_type: "private_payload_received".into(),
+            payload_json: serde_json::json!({
+                "collection": collection,
+                "commitment": commitment
+            })
+            .to_string(),
+        },
+        NodeEvent::BlockMined {
+            index,
+            hash,
+            certificate,
+        } => SubscribeToEventsResponse {
             timestamp: now_unix(),
             event_type: "block_mined".into(),
             payload_json: serde_json::json!({
                 "block_index": index,
-                "block_hash": hash
+                "block_hash": hash,
+                "certificate": certificate
             })
             .to_string(),
         },
-        NodeEvent::BlockReceived { index, hash } => SubscribeToEventsResponse {
+        NodeEvent::BlockReceived {
+            index,
+            hash,
+            certificate,
+        } => SubscribeToEventsResponse {
             timestamp: now_unix(),
             event_type: "block_received".into(),
             payload_json: serde_json::json!({
                 "block_index": index,
-                "block_hash": hash
+                "block_hash": hash,
+                "certificate": certificate
             })
             .to_string(),
         },
@@ -143,10 +170,13 @@ fn event_to_response(event: &NodeEvent) -> SubscribeToEventsResponse {
 /// Shared state for both gRPC services.
 ///
 /// The node reference provides access to the live ledger, peer list, and
-/// event stream — the RPC layer no longer manages its own isolated ledger.
+/// event stream; the provenance index and analytical flattener back the
+/// analytics read path (ticket #39).
 #[derive(Clone)]
 struct ServerState {
     node: Arc<Node>,
+    provenance: Arc<tokio::sync::Mutex<glasschain_indexer::ProvenanceIndex>>,
+    flattener: Arc<tokio::sync::Mutex<glasschain_indexer::AnalyticalFlattener>>,
 }
 
 // ── LedgerService implementation ──────────────────────────────────────────────
@@ -320,41 +350,55 @@ impl LedgerService for ServerState {
         }))
     }
 
+    /// `QueryAssetHistory` is answered from the provenance index (ticket #39):
+    /// matching happens on exact canonical asset ids
+    /// (`GTIN:<gtin>[:SN:<sn>|:BATCH:<b>]`, `SN:<sn>`) — boundary-anchored, so a
+    /// short GTIN never cross-matches a longer one — and each result's
+    /// `payload_json` carries the custody event: committed lineage, not a raw
+    /// chain scan.
     async fn query_asset_history(
         &self,
         request: Request<QueryAssetHistoryRequest>,
     ) -> Result<Response<QueryAssetHistoryResponse>, Status> {
         let req = request.into_inner();
-        let ledger = self.node.shared_ledger();
-        let transactions = {
-            let ledger = ledger.lock().await;
-            ledger
-                .chain
-                .iter()
-                .flat_map(|b| b.transactions.iter())
-                .filter_map(|tx| {
-                    if let TransactionKind::AssetRegistration(TraceableAssetRegistration {
-                        asset,
-                        ..
-                    }) = &tx.kind
-                    {
-                        let gtin_match =
-                            req.gtin.is_empty() || asset.gtin.as_deref() == Some(req.gtin.as_str());
-                        let serial_match = req.serial_number.is_empty()
-                            || asset.serial_number.as_deref() == Some(req.serial_number.as_str());
-                        if gtin_match && serial_match {
-                            return Some(TransactionProto {
-                                id: tx.id.clone(),
-                                timestamp: tx.timestamp,
-                                kind: "AssetRegistration".to_owned(),
-                                payload_json: serde_json::to_string(tx).unwrap_or_default(),
-                            });
-                        }
-                    }
-                    None
-                })
-                .collect()
-        };
+        let provenance = self.provenance.lock().await;
+        let gtin_prefix = (!req.gtin.is_empty()).then(|| format!("GTIN:{}", req.gtin));
+        let serial_suffix =
+            (!req.serial_number.is_empty()).then(|| format!(":SN:{}", req.serial_number));
+        let serial_only =
+            (!req.serial_number.is_empty()).then(|| format!("SN:{}", req.serial_number));
+
+        let mut assets = provenance.tracked_assets();
+        assets.sort_unstable();
+        let mut transactions = Vec::new();
+        for asset_id in assets {
+            // GTIN matches at the canonical-key boundary: the id is exactly
+            // `GTIN:<gtin>` or continues with `:` (`:SN:` / `:BATCH:`).
+            let gtin_match = gtin_prefix.as_ref().is_none_or(|prefix| {
+                asset_id
+                    .strip_prefix(prefix.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+            });
+            // Serial matches as the `:SN:<sn>` component of a GTIN key or as
+            // the standalone `SN:<sn>` key of a serial-only asset.
+            let serial_match = serial_suffix
+                .as_ref()
+                .is_none_or(|suffix| asset_id.ends_with(suffix.as_str()))
+                || serial_only
+                    .as_ref()
+                    .is_some_and(|only| asset_id == only.as_str());
+            if !gtin_match || !serial_match {
+                continue;
+            }
+            for event in provenance.get_custody_chain(asset_id) {
+                transactions.push(TransactionProto {
+                    id: event.transaction_id.clone(),
+                    timestamp: event.timestamp,
+                    kind: "AssetRegistration".to_owned(),
+                    payload_json: serde_json::to_string(event).unwrap_or_default(),
+                });
+            }
+        }
         Ok(Response::new(QueryAssetHistoryResponse { transactions }))
     }
 
@@ -384,6 +428,9 @@ impl LedgerService for ServerState {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
+    /// `GetVerifiableLineage` is built from the provenance index and analytical
+    /// flattener (ticket #39): the ordered custody chain, the flat records for
+    /// the asset's GTIN, the completeness check, and the trust-score average.
     async fn get_verifiable_lineage(
         &self,
         request: Request<GetVerifiableLineageRequest>,
@@ -392,48 +439,30 @@ impl LedgerService for ServerState {
         if asset_id.is_empty() {
             return Err(Status::invalid_argument("asset_id must not be empty"));
         }
-        // Phase 5: Full implementation requires wiring glasschain-indexer's
-        // ProvenanceIndex and AnalyticalFlattener to the ServerState.
-        // For now, return a partial response from chain state.
-        let ledger = self.node.shared_ledger();
-        let ledger = ledger.lock().await;
-        let mut custody_chain = Vec::new();
-        let mut record_count = 0u32;
-        for block in &ledger.chain {
-            for tx in &block.transactions {
-                if let TransactionKind::AssetRegistration(reg) = &tx.kind {
-                    // Reconstruct the canonical composite key from the stored
-                    // asset fields and compare with strict equality.  Substring
-                    // matching would let a short GTIN like "0789" accidentally
-                    // match a query for "07891234567890".
-                    let canonical_id = match (&reg.asset.gtin, &reg.asset.serial_number) {
-                        (Some(g), Some(s)) => format!("GTIN:{g}:SN:{s}"),
-                        (Some(g), None) => format!("GTIN:{g}"),
-                        (None, Some(s)) => format!("SN:{s}"),
-                        (None, None) => String::new(),
-                    };
-                    let matches = !canonical_id.is_empty() && canonical_id == asset_id;
-                    if matches {
-                        custody_chain.push(CustodyEventProto {
-                            asset_id: asset_id.clone(),
-                            event_type: reg.event_type.clone(),
-                            custodian_id: reg.asset.custodian_id.clone(),
-                            transaction_id: tx.id.clone(),
-                            block_index: block.index,
-                            timestamp: tx.timestamp,
-                        });
-                        record_count += 1;
-                    }
-                }
-            }
-        }
-        drop(ledger);
+        let lineage = {
+            // Scoped: drop both index locks before mapping to the proto response.
+            let provenance = self.provenance.lock().await;
+            let flattener = self.flattener.lock().await;
+            glasschain_indexer::VerifiableLineage::build(&asset_id, &provenance, &flattener)
+        };
+        let custody_chain = lineage
+            .custody_chain
+            .iter()
+            .map(|event| CustodyEventProto {
+                asset_id: event.asset_id.clone(),
+                event_type: event.event_type.clone(),
+                custodian_id: event.custodian_id.clone(),
+                transaction_id: event.transaction_id.clone(),
+                block_index: event.block_index,
+                timestamp: event.timestamp,
+            })
+            .collect();
         Ok(Response::new(GetVerifiableLineageResponse {
             asset_id,
             custody_chain,
-            is_complete: record_count > 0,
-            trust_score_avg: 0.0, // requires indexer wiring
-            total_records: record_count,
+            is_complete: lineage.is_complete,
+            trust_score_avg: lineage.trust_score_avg,
+            total_records: u32::try_from(lineage.flat_records.len()).unwrap_or(u32::MAX),
         }))
     }
 }
@@ -464,46 +493,6 @@ impl NodeService for ServerState {
     ) -> Result<Response<GetPeersResponse>, Status> {
         let peer_addresses = self.node.known_peers().await;
         Ok(Response::new(GetPeersResponse { peer_addresses }))
-    }
-
-    /// Mine a block via the node's `PoW` implementation.
-    ///
-    /// This RPC uses the node's synchronous mining API, which waits for block
-    /// production to complete before returning the result to the caller.
-    async fn mine_block(
-        &self,
-        _request: Request<MineBlockRequest>,
-    ) -> Result<Response<MineBlockResponse>, Status> {
-        match self.node.mine().await {
-            Ok(()) => {
-                let ledger = self.node.shared_ledger();
-                let ledger = ledger.lock().await;
-                ledger.chain.last().map_or_else(
-                    || {
-                        Ok(Response::new(MineBlockResponse {
-                            success: false,
-                            block_index: 0,
-                            block_hash: String::new(),
-                            error: "chain empty after mining".into(),
-                        }))
-                    },
-                    |block| {
-                        Ok(Response::new(MineBlockResponse {
-                            success: true,
-                            block_index: block.index,
-                            block_hash: block.hash.clone(),
-                            error: String::new(),
-                        }))
-                    },
-                )
-            }
-            Err(e) => Ok(Response::new(MineBlockResponse {
-                success: false,
-                block_index: 0,
-                block_hash: String::new(),
-                error: e.to_string(),
-            })),
-        }
     }
 }
 
@@ -539,10 +528,11 @@ impl IdentityService for ServerState {
         }))
     }
 
-    /// Verify an endorsement proposal against the configured policy.
-    ///
-    /// Accepts a JSON-serialised [`EndorsementProposal`] and returns whether
-    /// the required number of valid endorsements have been collected.
+    /// Verify an endorsement proposal against the committed policies
+    /// (ADR-008): the proposal is an `EndorsementRequest` JSON document — the
+    /// scoped target, the canonical payload the signers endorsed, and the
+    /// claimed signers. Every applicable policy layer is evaluated through
+    /// the node's configured provider and the combined result is returned.
     async fn verify_endorsement(
         &self,
         request: Request<VerifyEndorsementRequest>,
@@ -551,19 +541,53 @@ impl IdentityService for ServerState {
         if proposal_json.is_empty() {
             return Err(Status::invalid_argument("proposal_json must not be empty"));
         }
-        // Phase 2: Full integration would deserialize the EndorsementProposal
-        // and run EndorsementEngine::evaluate().
-        // Return a well-documented stub that explains the expected contract.
-        log::debug!(
-            "verify_endorsement called (proposal_json len={})",
-            proposal_json.len()
-        );
-        Ok(Response::new(VerifyEndorsementResponse {
-            approved: false,
-            proposal_id: String::new(),
-            endorser_count: 0,
-            rejection_reason: "endorsement engine not yet wired to RPC layer".into(),
-        }))
+        let proposal: glasschain_core::EndorsementRequest =
+            match serde_json::from_str(&proposal_json) {
+                Ok(proposal) => proposal,
+                Err(e) => {
+                    return Err(Status::invalid_argument(format!(
+                        "invalid endorsement request JSON: {e}"
+                    )));
+                }
+            };
+        let proposal_id = glasschain_core::crypto::sha256(&proposal.payload);
+        match self.node.verify_endorsement(proposal).await {
+            Ok(evaluations) => {
+                let endorser_count = evaluations
+                    .iter()
+                    .map(|evaluation| evaluation.distinct_principals.len())
+                    .max()
+                    .unwrap_or(0);
+                let unsatisfied = evaluations
+                    .iter()
+                    .position(|evaluation| !evaluation.satisfied);
+                let (approved, rejection_reason) = unsatisfied.map_or_else(
+                    || (true, String::new()),
+                    |layer| {
+                        (
+                            false,
+                            format!(
+                                "policy layer {layer} of {} unsatisfied (required {})",
+                                evaluations.len(),
+                                evaluations[layer].required
+                            ),
+                        )
+                    },
+                );
+                Ok(Response::new(VerifyEndorsementResponse {
+                    approved,
+                    proposal_id,
+                    endorser_count: u32::try_from(endorser_count).unwrap_or(u32::MAX),
+                    rejection_reason,
+                }))
+            }
+            Err(e) => Ok(Response::new(VerifyEndorsementResponse {
+                approved: false,
+                proposal_id,
+                endorser_count: 0,
+                rejection_reason: e.to_string(),
+            })),
+        }
     }
 }
 
@@ -641,7 +665,11 @@ impl GlasschainServer {
     /// }
     /// ```
     pub async fn serve(self, addr: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
-        let state = ServerState { node: self.node };
+        let state = ServerState {
+            provenance: self.node.provenance_index(),
+            flattener: self.node.analytical_flattener(),
+            node: self.node,
+        };
 
         log::info!("GlassChain gRPC server listening on {addr}");
 
@@ -706,17 +734,35 @@ mod tests {
             &NodeEvent::BlockMined {
                 index: 3,
                 hash: "abc".into(),
+                certificate: glasschain_core::QuorumCertificate {
+                    block_index: 3,
+                    block_hash: "abc".into(),
+                    attestations: Vec::new(),
+                },
             },
             "block_mined",
-            &serde_json::json!({ "block_index": 3, "block_hash": "abc" }),
+            &serde_json::json!({ "block_index": 3, "block_hash": "abc", "certificate": {
+                "block_index": 3,
+                "block_hash": "abc",
+                "attestations": []
+            } }),
         );
         assert_maps(
             &NodeEvent::BlockReceived {
                 index: 4,
                 hash: "def".into(),
+                certificate: glasschain_core::QuorumCertificate {
+                    block_index: 4,
+                    block_hash: "def".into(),
+                    attestations: Vec::new(),
+                },
             },
             "block_received",
-            &serde_json::json!({ "block_index": 4, "block_hash": "def" }),
+            &serde_json::json!({ "block_index": 4, "block_hash": "def", "certificate": {
+                "block_index": 4,
+                "block_hash": "def",
+                "attestations": []
+            } }),
         );
         assert_maps(
             &NodeEvent::PeerConnected("10.0.0.1:8000".into()),

@@ -1,0 +1,31 @@
+[package]
+name = "glasschain-workflows"
+version = "0.1.0"
+edition = "2021"
+description = "I/O-driven workflow layer for GlassChain: flows, checkpoints, event automation"
+license = "Apache-2.0"
+repository = "https://github.com/dbbvitor/GlassChain"
+readme = "../../README.md"
+keywords = ["blockchain", "supply-chain", "distributed-ledger", "workflow"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+glasschain-core = { path = "../glasschain-core" }
+glasschain-contracts = { path = "../glasschain-contracts" }
+serde   = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror  = "2.0"
+log        = "0.4"
+
+[dev-dependencies]
+glasschain-vm = { path = "../glasschain-vm" }
+criterion  = "0.8"
+base64 = "0.23"
+wat    = "1.258"
+
+[[bench]]
+name = "watcher_throughput"
+harness = false
+
+[lints]
+workspace = true

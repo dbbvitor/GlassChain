@@ -39,6 +39,7 @@ use rustls_pki_types::{pem::PemObject, CertificateDer};
 use serde::{Deserialize, Serialize};
 use x509_cert::{
     der::{Decode, Encode},
+    ext::pkix::name::DirectoryString,
     Certificate,
 };
 
@@ -361,6 +362,58 @@ impl CertChainVerifier {
             .map_err(|e| CertVerificationError::SignatureInvalid(e.to_string()))?;
 
         Ok(())
+    }
+
+    /// Verify `peer_cert_der` against this organisation's Root CA and return
+    /// the certificate subject's Common Name — the member identity stamped at
+    /// issuance. This is the certificate-verified organization for the
+    /// private-payload path (ticket #47): the self-asserted `Hello` org is
+    /// trusted only when it matches this CN.
+    ///
+    /// # Errors
+    ///
+    /// Returns any [`CertVerificationError`] from the chain verification, or
+    /// [`CertVerificationError::ParseError`] when the subject CN is absent or
+    /// not UTF-8.
+    pub fn verified_subject_cn(
+        &self,
+        peer_cert_der: &[u8],
+    ) -> Result<String, CertVerificationError> {
+        self.verify_cert_der(peer_cert_der)?;
+        let peer_cert = Certificate::from_der(peer_cert_der)
+            .map_err(|e| CertVerificationError::ParseError(e.to_string()))?;
+        let cn = peer_cert
+            .tbs_certificate()
+            .subject()
+            .common_name()
+            .ok()
+            .flatten()
+            .and_then(|value| match value {
+                DirectoryString::Utf8String(text) => Some(text),
+                DirectoryString::PrintableString(text) => Some(text.to_string()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                CertVerificationError::ParseError("subject Common Name is absent".to_owned())
+            })?;
+        Ok(cn)
+    }
+
+    /// Verify a PEM-encoded peer certificate and return its subject CN — the
+    /// PEM form of [`Self::verified_subject_cn`], for certificates carried on
+    /// the wire (ticket #47).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CertVerificationError::PemError`] if decoding fails, or any
+    /// error from [`Self::verified_subject_cn`].
+    pub fn verified_subject_cn_pem(
+        &self,
+        peer_cert_pem: &str,
+    ) -> Result<String, CertVerificationError> {
+        let der = rustls_pki_types::CertificateDer::from_pem_slice(peer_cert_pem.as_bytes())
+            .map_err(|e| CertVerificationError::PemError(e.to_string()))?;
+        self.verified_subject_cn(der.as_ref())
     }
 
     /// Verify a PEM-encoded peer certificate against this organisation's Root CA.

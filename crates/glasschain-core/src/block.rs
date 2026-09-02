@@ -1,13 +1,16 @@
 use crate::crypto::sha256;
 use crate::error::CoreError;
 use crate::transaction::Transaction;
+use crate::write_set::PersistentWrite;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A single block in the `GlassChain` blockchain.
 ///
-/// Each block commits a batch of [`Transaction`]s and cryptographically chains
-/// to the previous block via `previous_hash`, forming a tamper-evident ledger.
+/// Each block commits a batch of [`Transaction`]s plus the canonical
+/// [`PersistentWrite`] set of the accepted persistent VM writes (ADR-007
+/// decision 2), and cryptographically chains to the previous block via
+/// `previous_hash`, forming a tamper-evident ledger.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Block {
     /// Sequential block index (genesis block has index 0).
@@ -16,6 +19,10 @@ pub struct Block {
     pub timestamp: u64,
     /// Ordered list of transactions committed in this block.
     pub transactions: Vec<Transaction>,
+    /// The canonical write set of accepted persistent writes, in canonical
+    /// (scope-sorted) order.  PDC-scoped writes carry their value commitment
+    /// here, never the private value (ADR-007 decision 3).
+    pub write_set: Vec<PersistentWrite>,
     /// Hash of the preceding block; `"0"` for the genesis block.
     pub previous_hash: String,
     /// `PoW` nonce found during mining.
@@ -27,9 +34,9 @@ pub struct Block {
 impl Block {
     /// Compute the canonical SHA-256 hash for the current block state.
     ///
-    /// The hash covers: `index`, `timestamp`, serialised `transactions`,
-    /// `previous_hash`, and `nonce`.  Any change to these fields invalidates
-    /// the stored hash.
+    /// The hash covers: `index`, `timestamp`, serialised `transactions`, the
+    /// canonical `write_set`, `previous_hash`, and `nonce`.  Any change to
+    /// these fields invalidates the stored hash.
     ///
     /// Fields are encoded as a JSON tuple to ensure an unambiguous canonical
     /// representation (avoids hash collisions from raw string concatenation).
@@ -38,13 +45,15 @@ impl Block {
     ///
     /// Panics if `serde_json::to_string` fails to serialise the block header
     /// tuple.  In practice this cannot occur because every field in the tuple
-    /// is JSON-safe (integers, a `Vec<Transaction>`, and a `String`).
+    /// is JSON-safe (integers, a `Vec<Transaction>`, a `Vec<PersistentWrite>`,
+    /// and a `String`).
     #[must_use]
     pub fn calculate_hash(&self) -> String {
         let content = serde_json::to_string(&(
             self.index,
             self.timestamp,
             &self.transactions,
+            &self.write_set,
             &self.previous_hash,
             self.nonce,
         ))
@@ -60,7 +69,7 @@ impl Block {
         self.hash.starts_with(&target)
     }
 
-    /// Create a new, **unmined** block.
+    /// Create a new, **unmined** block with no persistent write set.
     ///
     /// The caller should invoke [`Block::mine`] before appending to the ledger.
     ///
@@ -71,6 +80,25 @@ impl Block {
     /// [`std::time::UNIX_EPOCH`]).
     #[must_use]
     pub fn new(index: u64, transactions: Vec<Transaction>, previous_hash: String) -> Self {
+        Self::with_write_set(index, transactions, previous_hash, Vec::new())
+    }
+
+    /// Create a new, **unmined** block carrying the canonical write set of the
+    /// accepted persistent writes (ADR-007 decision 2).
+    ///
+    /// `write_set` must already be validated, deterministically canonicalized,
+    /// and in PDC-redacted block form (`PersistentWrite::block_form`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the system clock is set to a time before the Unix epoch.
+    #[must_use]
+    pub fn with_write_set(
+        index: u64,
+        transactions: Vec<Transaction>,
+        previous_hash: String,
+        write_set: Vec<PersistentWrite>,
+    ) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is before UNIX epoch")
@@ -79,6 +107,7 @@ impl Block {
             index,
             timestamp,
             transactions,
+            write_set,
             previous_hash,
             nonce: 0,
             hash: String::new(),
@@ -191,6 +220,26 @@ mod tests {
     fn test_block_invalid_after_tamper() {
         let mut b = Block::new(1, vec![], "abc".into());
         b.transactions.push(sample_tx()); // tamper without recalculating hash
+        assert!(!b.is_valid());
+    }
+
+    #[test]
+    fn test_block_hash_covers_write_set() {
+        let write = crate::write_set::PersistentWrite {
+            channel: "ch".into(),
+            contract: "contract".into(),
+            key: "k".into(),
+            op: crate::write_set::WriteOp::Set(b"v".to_vec()),
+            visibility: crate::write_set::WriteVisibility::Public,
+        };
+        let a = Block::with_write_set(1, vec![], "abc".into(), vec![write.clone()]);
+        let mut b = Block::with_write_set(1, vec![], "abc".into(), vec![write]);
+        b.write_set[0].op = crate::write_set::WriteOp::Set(b"other".to_vec());
+        assert_ne!(
+            a.hash,
+            b.calculate_hash(),
+            "the write set must be hash-covered"
+        );
         assert!(!b.is_valid());
     }
 

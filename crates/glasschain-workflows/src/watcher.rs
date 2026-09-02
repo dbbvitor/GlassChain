@@ -1,4 +1,10 @@
-//! Watcher service for inventory-threshold-based contract triggering (Phase 4).
+//! Watcher service for inventory-threshold-based contract triggering.
+//!
+//! I/O-driven automation (ticket #49's packaging split): the watcher observes
+//! committed [`InventoryUpdate`] events and autonomously emits `PurchaseOrder`
+//! transactions — the workflow half of the Corda contracts/workflows split.
+//! The deterministic contract layer (registry, matching, approval gate)
+//! remains in `glasschain-contracts`.
 //!
 //! The [`WatcherService`] observes World State changes (specifically
 //! [`InventoryUpdate`][glasschain_core::InventoryUpdate] transactions) and
@@ -31,7 +37,7 @@
 //! [`WatcherStateSnapshot`], enabling seamless recovery after a node restart
 //! without requiring a full chain replay.
 
-use crate::approval_gate::{ApprovalGate, ApprovalGatePolicy, GateDecision};
+use glasschain_contracts::approval_gate::{ApprovalGate, ApprovalGatePolicy, GateDecision};
 use glasschain_core::{
     ExecutionProvider, InventoryUpdate, PurchaseOrder, Transaction, TransactionKind,
 };
@@ -383,7 +389,7 @@ impl WatcherService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_wasm::{approving_wasm_b64, denying_wasm_b64};
+    use glasschain_contracts::test_wasm::{approving_wasm_b64, denying_wasm_b64};
     use glasschain_vm::WasmExecutionProvider;
     use std::sync::Arc;
 

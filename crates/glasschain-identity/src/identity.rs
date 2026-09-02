@@ -3,7 +3,6 @@
 use crate::error::IdentityError;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use glasschain_core::Transaction;
-use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
 /// An on-ledger participant identity, consisting of an ed25519 key pair and a
@@ -34,9 +33,15 @@ impl Clone for Identity {
 
 impl Identity {
     /// Generate a fresh identity with a randomly-generated ed25519 key pair.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the operating system's entropy source is unavailable — the
+    /// same unrecoverable-system-state stance as the clock `.expect`s in
+    /// `Block`/`Transaction` construction.
     pub fn generate(node_id: impl Into<String>) -> Self {
         let mut seed = [0_u8; 32];
-        OsRng.fill_bytes(&mut seed);
+        getrandom::fill(&mut seed).expect("OS entropy source unavailable");
         let signing_key = SigningKey::from_bytes(&seed);
         Self {
             node_id: node_id.into(),
@@ -61,6 +66,14 @@ impl Identity {
     #[must_use]
     pub fn verifying_key(&self) -> VerifyingKey {
         self.signing_key.verifying_key()
+    }
+
+    /// Sign arbitrary canonical bytes and return the detached 64-byte ed25519
+    /// signature. Used for endorsement requests, which sign the exact
+    /// transaction plus its committed write set (ADR-008 decision 2).
+    #[must_use]
+    pub fn sign_bytes(&self, payload: &[u8]) -> Vec<u8> {
+        self.signing_key.sign(payload).to_bytes().to_vec()
     }
 
     /// Produce an `rcgen::KeyPair` that wraps the **same** ed25519 private key

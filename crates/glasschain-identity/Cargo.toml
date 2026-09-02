@@ -13,14 +13,16 @@ categories = ["network-programming", "asynchronous", "cryptography"]
 glasschain-core = { path = "../glasschain-core" }
 ed25519-dalek = { version = "3.0", features = ["alloc", "rand_core", "pkcs8"] }
 rcgen = { version = "0.14", features = ["pem"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
+# OS entropy for identity generation (rand_core 0.10 has no OsRng; this
+# matches ed25519-dalek's own choice).
+getrandom = { version = "0.4", features = ["sys_rng"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 hex = "0.4"
 log = "0.4"
 x509-cert = "0.3"
-rustls-pki-types = "1.0"
+rustls-pki-types = "1.15"
 # lib name is `webpki`; `ring` matches the provider glasschain-network already
 # selects for rustls, so both crates share one crypto backend.
 rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }

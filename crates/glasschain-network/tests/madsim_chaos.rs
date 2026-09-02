@@ -37,12 +37,12 @@
 #[cfg(madsim)]
 use madsim::time as sim_time;
 
-use glasschain_contracts::{InventoryTrigger, WatcherService};
 use glasschain_core::{
     InventoryUpdate, MetadataTrustScore, TraceableAsset, Transaction, TransactionKind,
     TRUST_SCORE_STANDARD_THRESHOLD,
 };
 use glasschain_network::{Node, NodeEvent};
+use glasschain_workflows::{InventoryTrigger, WatcherService};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
@@ -145,28 +145,32 @@ async fn test_madsim_single_node_mines_within_time_budget() {
     assert!(ledger.validate_chain().is_ok(), "chain must be valid");
 }
 
-/// Simulate a **network partition** at the application layer:
+/// Partition and merge under simulated time: isolated partitions commit
+/// blocks that are final at commit, and joining nodes converge to their
+/// partition's chain (liveness).
 ///
-/// 1. Node A mines 2 blocks while isolated.
-/// 2. Node B mines 1 block while isolated (shorter chain).
-/// 3. Node C connects to **A** only — must adopt A's longer chain.
-/// 4. Node D connects to **B** only — must adopt B's shorter chain.
-/// 5. Assert that C has more blocks than D.
+/// 1. Node A commits 2 blocks while isolated; every commit notification
+///    carries a quorum certificate that validates against the committed block.
+/// 2. Node B commits 1 block while isolated.
+/// 3. Node C connects to **A** only — converges to A's chain.
+/// 4. Node D connects to **B** only — converges to B's chain.
+/// 5. Assert convergence and that both chains validate.
 ///
 /// Under madsim, time advances deterministically between partition phases.
 #[cfg_attr(madsim, madsim::test)]
 #[cfg_attr(not(madsim), tokio::test(flavor = "multi_thread", worker_threads = 4))]
-async fn test_madsim_application_layer_partition_and_merge() {
+async fn test_madsim_partition_merge_converges_with_final_commits() {
     let addr_a = free_addr();
     let addr_b = free_addr();
 
-    // ── Phase 1: isolated mining ──────────────────────────────────────────
+    // ── Phase 1: isolated commits ────────────────────────────────────────
     let node_a = Arc::new(Node::new("partition-a", &addr_a, 1));
     let node_b = Arc::new(Node::new("partition-b", &addr_b, 1));
+    let mut events_a = node_a.subscribe();
     node_a.start(vec![]).await.unwrap();
     node_b.start(vec![]).await.unwrap();
 
-    // A builds a longer chain.
+    // A commits two blocks.
     node_a
         .submit_transaction(inv_tx("a-owner", 50))
         .await
@@ -178,7 +182,7 @@ async fn test_madsim_application_layer_partition_and_merge() {
         .unwrap();
     node_a.mine().await.unwrap();
 
-    // B builds a shorter chain.
+    // B commits one block.
     node_b
         .submit_transaction(inv_tx("b-owner", 10))
         .await
@@ -190,16 +194,37 @@ async fn test_madsim_application_layer_partition_and_merge() {
 
     let len_a = node_a.ledger_snapshot().await.chain.len();
     let len_b = node_b.ledger_snapshot().await.chain.len();
-    assert_eq!(len_a, 3, "node A: genesis + 2 mined blocks");
-    assert_eq!(len_b, 2, "node B: genesis + 1 mined block");
+    assert_eq!(len_a, 3, "node A: genesis + 2 committed blocks");
+    assert_eq!(len_b, 2, "node B: genesis + 1 committed block");
 
-    // ── Phase 2: selective sync ───────────────────────────────────────────
-    // Node C joins partition containing A (the longer chain).
+    // Each of A's commits is final at commit: its notification's certificate
+    // attests the committed block, verifiable locally without trusting A.
+    let ledger_a = node_a.ledger_snapshot().await;
+    let mut certified = 0;
+    while let Ok(event) = events_a.try_recv() {
+        if let NodeEvent::BlockMined {
+            index, certificate, ..
+        } = event
+        {
+            let notification = glasschain_core::CommitNotification {
+                block: ledger_a.chain[usize::try_from(index).expect("index fits usize")].clone(),
+                certificate,
+            };
+            notification
+                .validate()
+                .expect("certificate must attest the committed block");
+            certified += 1;
+        }
+    }
+    assert_eq!(certified, 2, "both of A's commits carried certificates");
+
+    // ── Phase 2: convergence after the partition ──────────────────────────
+    // Node C joins partition containing A.
     let addr_c = free_addr();
     let node_c = Arc::new(Node::new("partition-c", &addr_c, 1));
     node_c.start(vec![addr_a.clone()]).await.unwrap();
 
-    // Node D joins partition containing B (the shorter chain).
+    // Node D joins partition containing B.
     let addr_d = free_addr();
     let node_d = Arc::new(Node::new("partition-d", &addr_d, 1));
     node_d.start(vec![addr_b.clone()]).await.unwrap();
@@ -217,10 +242,6 @@ async fn test_madsim_application_layer_partition_and_merge() {
     assert!(
         len_d >= len_b,
         "node D (synced to B) should have ≥ {len_b} blocks, got {len_d}"
-    );
-    assert!(
-        len_c > len_d,
-        "A's partition ({len_c} blocks) must be longer than B's ({len_d} blocks)"
     );
     assert!(node_c.ledger_snapshot().await.validate_chain().is_ok());
     assert!(node_d.ledger_snapshot().await.validate_chain().is_ok());
@@ -582,15 +603,13 @@ async fn test_madsim_partition_reference_implementation() {
         .unwrap();
     node_b.mine().await.unwrap();
 
-    // ── Post-partition: longest chain wins (B has more blocks) ───────────
+    // ── Post-partition: both chains validate, and a joining node converges ──
     let chain_len_a = node_a.ledger_snapshot().await.chain.len();
     let chain_len_b = node_b.ledger_snapshot().await.chain.len();
-    assert!(
-        chain_len_b > chain_len_a,
-        "B must be ahead: B={chain_len_b} A={chain_len_a}"
-    );
+    assert!(node_a.ledger_snapshot().await.validate_chain().is_ok());
+    assert!(node_b.ledger_snapshot().await.validate_chain().is_ok());
 
-    // A new node connects to B and adopts B's longer chain.
+    // A new node connects to B and converges to B's committed chain.
     let addr_e = free_addr();
     let node_e = Arc::new(Node::new("ref-e", &addr_e, 1));
     node_e.start(vec![addr_b.clone()]).await.unwrap();
@@ -601,7 +620,11 @@ async fn test_madsim_partition_reference_implementation() {
     let len_e = await_chain_len(&node_e, chain_len_b).await;
     assert!(
         len_e >= chain_len_b,
-        "E (connected to B) must adopt B's chain: E={len_e} B={chain_len_b}"
+        "E (connected to B) must converge to B's chain: E={len_e} B={chain_len_b}"
+    );
+    assert!(
+        len_e >= chain_len_a,
+        "convergence is liveness, not fork resolution: E={len_e} A={chain_len_a}"
     );
     assert!(node_e.ledger_snapshot().await.validate_chain().is_ok());
 

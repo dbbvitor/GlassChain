@@ -11,7 +11,8 @@ GlassChain connects buyers and sellers across a peer-to-peer network, giving par
 | Feature | Description |
 |---|---|
 | **Distributed Ledger** | SHA-256 chained blocks with Proof-of-Work consensus and longest-chain resolution |
-| **Supply-Chain Transactions** | `SupplyOffer`, `PurchaseOrder`, `InventoryUpdate`, and `AssetRegistration` |
+| **Supply-Chain Transactions** | `SupplyOffer`, `PurchaseOrder`, `InventoryUpdate`, `AssetRegistration`, and canonical v1 records (`CanonicalRecord`) |
+| **Canonical Schema v1** | 13 strict record families (lots, shipments, recall, certification, audit, state commitments, …) validated against an immutable network-wide registry before admission and commit |
 | **Contract Automation** | `ContractCreation` rules auto-execute purchase flows on matching offers |
 | **Watcher Automation** | Commit-phase inventory hooks can enqueue autonomous reorder purchase orders |
 | **Regulatory Traceability** | Anvisa/SNCM-aligned metadata model with `MetadataTrustScore` scoring |
@@ -28,7 +29,8 @@ GlassChain/
 ├── Cargo.toml                      # Workspace manifest
 └── crates/
     ├── glasschain-core/            # Ledger, blocks, tx model, provider traits, trust scoring
-    ├── glasschain-contracts/       # Contract engine + watcher service
+    ├── glasschain-contracts/       # Deterministic contract layer: registry, matching, approval gate
+    ├── glasschain-workflows/       # I/O-driven automation: flows, checkpoints, watcher service
     ├── glasschain-network/         # P2P node, protocol, peer handling
     ├── glasschain-node/            # Interactive CLI node binary
     ├── glasschain-storage/         # Storage backends/adapters
@@ -37,6 +39,29 @@ GlassChain/
     ├── glasschain-indexer/         # Indexing, event bus, provenance model
     └── glasschain-rpc/             # gRPC service definitions and server
 ```
+
+(The workspace also ships `glasschain-sdk` and `glasschain-cli` client crates.)
+
+### Packaging: contracts vs workflows (ticket #49)
+
+The workspace mirrors Corda's CorDapp split — contract code and workflow code
+are separate deployable modules (crates) with no dependency cycle:
+
+- **Contract layer — verification-only, deterministic:** `glasschain-contracts`
+  (the contract registry, condition matching, and the WASM approval gate — a
+  `BTreeMap` registry, so emission order is deterministic across processes)
+  with `glasschain-vm` executing guest code deterministically. **The
+  deterministic-contract invariant:** the contract layer's evaluation and
+  emission are pure functions of their inputs — no wall clock, no randomness,
+  no network, no persistence — so replaying the same inputs is byte-identical
+  and cross-node agreement is safe. (The chain model in `glasschain-core`
+  stamps block/transaction timestamps at creation, outside this invariant.)
+- **Workflow layer — I/O-driven:** `glasschain-workflows` (flow state
+  machines, checkpoint persistence, and the `WatcherService` event automation
+  that observes committed state and emits transactions).
+
+Workflow code may depend on contract code (`glasschain-workflows` →
+`glasschain-contracts` → `glasschain-core`); never the reverse.
 
 ---
 
@@ -92,17 +117,50 @@ order    <buyer> <seller> <product> <qty> <price> <currency>
 contract <contract_id> <buyer> <product> <max_price> <min_qty> <max_qty> <max_lead> <currency>
 inventory <owner> <product> <delta> <reason>
 asset <originator> <product_name> <gtin> <batch> <expiry> <serial> <qty> <event_type>
-mine
-mine-async
 chain
 pending
 peers
 quit | exit
 ```
 
-`asset` prints Metadata Trust Score at submission time. Use `-` for optional metadata fields.
+Block production is driven by the consensus layer, not by manual commands: the
+`mine`/`mine-async` REPL commands and the `MineBlock` RPC were retired with the
+quorum-certificate seam (ADR-002); the dev/test Proof-of-Work driver remains
+available programmatically as `Node::mine()`.
 
-`mine` waits for block production to finish before returning. `mine-async` starts mining in the background and returns immediately.
+### Consensus engines (ADR-002)
+
+- **Proof-of-Work (default, dev/test):** every commit notification carries the
+  degenerate quorum certificate — the valid nonce *is* the attestation.
+- **Tendermint-class BFT (staged, default-off):** behind the `bft` cargo
+  feature (`glasschain-core/bft`, `glasschain-network/bft`). When a
+  `BftConsensusProvider` is attached and the `bft_consensus` capability is
+  active at the candidate height, blocks are attested with real ed25519
+  validator signatures over the block hash and committed with a
+  cryptographically verified ≥⅔+ distinct-validator quorum; finality is
+  single-slot and deterministic at commit. The commit consumer is identical for
+  both engines. Activation is a capability activation per ADR-010: a signed
+  control-plane record at a future height.
+
+> **BFT adoption gates (ADR-010 §7 — all must pass before production use):** a
+> GlassChain testnet at the target validator count, API/stability evidence,
+> licensing/stewardship review, and a security audit. Malachite remains the
+> staged engine candidate behind the seam; `tendermint-rs` is type/light-client
+> tooling only, never the engine. The shipped engine's `attest` signs with the
+> local key only — a 1-validator set is its own quorum — while
+> `verify_certificate` verifies full ≥⅔+ quorums from its configured validator
+> set. Gathering remote attestations, wire transport of certificates, BFT-block
+> peer admission, BFT-chain sync (`try_replace_chain`) and restart persistence
+> (both currently `PoW`-coupled), and validator-set changes are part of that
+> staged work.
+
+Every committed block carries the canonical write set of the accepted
+persistent VM writes, covered by the block hash (ADR-007): public writes carry
+their value, PDC-scoped writes carry only the collection name and the value's
+SHA-256 commitment — the private value never enters the replicated block. The
+block and its write set persist and apply through one atomic commit boundary
+(`StorageProvider::apply_block`), and state rebuilds replay committed write
+sets in block order without re-executing guest code.
 
 ---
 
@@ -119,11 +177,13 @@ The `glasschain-rpc` crate exposes the current gRPC server implementation. The `
   - `SubmitTransaction`
   - `GetChainStatus`
   - `QueryAssetHistory`
+  - `GetVerifiableLineage`
   - `SubscribeToEvents` (server stream)
 - `NodeService`
   - `GetNodeStatus`
   - `GetPeers`
-  - `MineBlock`
+
+Analytics read path: `QueryAssetHistory` and `GetVerifiableLineage` are answered from the in-memory provenance index and analytical flattener — not by scanning the raw chain. `QueryAssetHistory` matches exact canonical asset ids (`GTIN:<gtin>[:SN:<sn>|:BATCH:<b>]`, `SN:<sn>`), boundary-anchored so a short GTIN never cross-matches a longer one, and each result's `payload_json` carries the custody event rather than the raw transaction JSON.
 
 ---
 
@@ -148,14 +208,100 @@ Current trust model:
 
 Message types:
 
-- `Hello`
+- `Hello` — advertises the wire `version` (mismatches are disconnected; current
+  version is `glasschain/4`, bumped when the private-payload protocol gained
+  pull-based reconciliation),
+  the sender's `org` (the collection-membership principal), and the
+  capabilities the peer supports. A peer lacking an active capability is
+  treated as a read-only observer: it can parse and validate history but may
+  not propose, vote, or relay active writes.
 - `Transaction`
 - `Block`
+- `PrivatePayload` — a private data collection payload, sent **point-to-point
+  between collection members only** (never broadcast). See "Private Data
+  Collections" below.
 - `RequestChain`
 - `Chain`
 - `RequestPeers`
 - `Peers`
 - `Goodbye`
+
+---
+
+## Private Data Collections (ADR-003)
+
+Private payloads (pricing, quantities, counterparties, raw evidence) never
+enter global replication. One global chain carries the facts; collections
+carry the payloads.
+
+**Collections** (`glasschain-identity`): a collection names its member
+organizations and an optional endorsement-policy declaration. Membership —
+who may read and receive payloads, and who may submit payloads locally — is a
+separate control from endorsement: being a member never satisfies a policy.
+The authoritative collection endorsement policy is a committed `PolicyUpdate`
+carrying a collection-scoped `collection_policy`, evaluated by the endorsement
+engine at the commit path over verified principals (ADR-008, ticket #45);
+a node's local `ChannelConfig.endorsement_policy` is its declaration of that
+policy, not an independent enforcement source. Regulator organizations
+(Anvisa, MAPA) are members of every collection by default.
+
+**The boundary model** — private cleartext exists only (a) inside the
+writer's execution, (b) in `Message::PrivatePayload` between members, and (c)
+in members' transient stores. Two author responsibilities keep it that way: a
+guest must compute private values at runtime (a value embedded in a contract's
+WASM data segment rides the committed contract definition), and private input
+must enter through the payload path, not through public record fields.
+
+- **Admission:** `submit_private_payload` requires the local org to be a
+  collection member and the `pdc` capability to be active at the next height;
+  PDC-scoped VM writes are dropped whole while the capability is inactive.
+- **Transport:** payloads are sent point-to-point to peers whose advertised
+  `org` is a member (a self-asserted string until certificate-verified
+  delivery lands in #47); a payload pushed to a non-member, an
+  unauthenticated peer, or with a commitment mismatch is rejected on receipt.
+- **Storage/commit:** the block's write set carries the collection name and
+  `sha256(value)` — never the value (`PersistentWrite::block_form`, ADR-007);
+  the world-state mirror holds only commitments.
+- **Replay:** state rebuilds from committed (redacted) write sets, so no
+  replay path can resurrect cleartext.
+
+**Non-member verification:** every node — member or not — holds the block
+commitments. A non-member can verify that a private-data write occurred and
+that its commitment is unaltered (`commitment == sha256(payload)`) without
+ever reading the payload.
+
+**Distribution (ticket #47):** a peer that was offline at dissemination time
+reconciles by scanning the committed chain for the collection's PDC
+commitments and requesting every payload its transient store is missing from
+a member peer (`reconcile_private_payloads`); the answer travels the same
+member-gated `PrivatePayload` path. Payloads are held for the collection's
+retention window (`ChannelConfig.retention_secs`, default 72h) and purged on
+sweep (`purge_expired_private_payloads`; retention is also enforced on read) —
+payloads vanish, the chain's commitments persist forever, so a late auditor
+can prove existence and consistency but not read contents. The purge sweep's
+expiry index is in-memory: a restarted member cannot enumerate payloads
+written before the restart.
+When a node runs certificate verification (`set_cert_verifier`), the payload
+path trusts only certificate-verified organizations: the sender's
+Hello-carried organization certificate must verify against the org Root CA
+with a subject CN equal to the claimed org; TOFU-only nodes still accept the
+self-asserted org.
+
+Staged remainder: gossipsub-based payload distribution requires per-member
+encryption (gossipsub has no member admission control, so publishing
+cleartext payloads to a topic would weaken the boundary); the libp2p swarm
+stays the staged substrate.
+
+### Capacity gate (ticket #48)
+
+`cargo test -p glasschain-network --test consensus_capacity -- --ignored --nocapture`
+runs the compact workload (anchored lots, certification anchors,
+`state_commitment` batch records) at 200 and 300 validators in a star
+topology, reporting block latency/size, certificate size, propagation
+fan-out, pending-pool backpressure, partition recovery, and private-data
+dissemination (measured separately). Recorded evidence with the staged-engine
+caveats: `docs/benchmarks/consensus-capacity.md`. No production capacity
+claim is made — ADR-010 §7's testnet/API/audit gates still apply.
 
 ---
 

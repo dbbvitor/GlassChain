@@ -5,7 +5,7 @@ use glasschain_core::{
     Block, ContractExecution, PurchaseOrder, SmartContractDef, SupplyOffer, Transaction,
     TransactionKind,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// The smart-contract execution engine.
 ///
@@ -15,8 +15,10 @@ use std::collections::HashMap;
 /// [`ContractExecution`] record) for submission to the ledger.
 #[derive(Default)]
 pub struct ContractEngine {
-    /// Keyed by `contract_id`.
-    contracts: HashMap<String, Contract>,
+    /// Keyed by `contract_id`. A `BTreeMap` so iteration — and therefore
+    /// transaction emission order — is deterministic across processes (the
+    /// deterministic-contract invariant, ticket #49).
+    contracts: BTreeMap<String, Contract>,
     /// Optional WASM execution provider for contract-level custom logic.
     executor: Option<std::sync::Arc<dyn glasschain_core::ExecutionProvider>>,
 }

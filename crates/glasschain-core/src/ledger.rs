@@ -1,6 +1,8 @@
 use crate::block::Block;
+use crate::capability::{validate_record_under, CapabilityHistory};
+use crate::endorsement::PolicyHistory;
 use crate::error::CoreError;
-use crate::transaction::Transaction;
+use crate::transaction::{Transaction, TransactionKind};
 use serde::{Deserialize, Serialize};
 
 /// Default Proof-of-Work difficulty (number of leading zero characters required).
@@ -40,6 +42,7 @@ impl Ledger {
             index: 0,
             timestamp: 0,
             transactions: Vec::new(),
+            write_set: Vec::new(),
             previous_hash: "0".to_owned(),
             nonce: 0,
             hash: String::new(),
@@ -56,15 +59,45 @@ impl Ledger {
     /// Add a transaction to the pending pool.
     ///
     /// Transactions must have a non-empty `id`; duplicate IDs are silently
-    /// ignored to provide idempotency across federated nodes.
+    /// ignored to provide idempotency across federated nodes. Canonical v1
+    /// records and capability activations are validated against the
+    /// capability set effective at the next height before admission
+    /// (ADR-010 decision 5).
     ///
     /// # Errors
-    /// Returns `Err(CoreError::InvalidTransaction)` if `tx.id` is empty.
+    /// Returns `Err(CoreError::InvalidTransaction)` if `tx.id` is empty, a
+    /// canonical record fails validation, or a capability activation is not
+    /// admissible at the next height.
     pub fn add_transaction(&mut self, tx: Transaction) -> Result<(), CoreError> {
         if tx.id.is_empty() {
             return Err(CoreError::InvalidTransaction(
                 "transaction id must not be empty".into(),
             ));
+        }
+        // ponytail: O(chain) capability-history rebuild per admission; the
+        // idempotency scan below is O(chain) anyway — cache when blocks grow.
+        let next_height = self.chain.last().map_or(1, |b| b.index + 1);
+        match &tx.kind {
+            TransactionKind::CanonicalRecord(ref record) => {
+                let history = CapabilityHistory::build_from_blocks(&self.chain)?;
+                validate_record_under(&history.effective_set(next_height), record)?;
+            }
+            TransactionKind::CapabilityActivation(ref activation) => {
+                let mut history = CapabilityHistory::build_from_blocks(&self.chain)?;
+                history.apply(activation.clone(), next_height)?;
+            }
+            TransactionKind::PolicyUpdate(ref update) => {
+                // Structural v1 policy metadata; authorization (signatures
+                // under the current effective policy) is verified at the
+                // network commit path, where the provider lives.
+                if update.channel.is_empty() {
+                    return Err(CoreError::InvalidTransaction(
+                        "endorsement policy update: channel must not be empty".into(),
+                    ));
+                }
+                update.policies.validate()?;
+            }
+            _ => {}
         }
         // Idempotency check: reject if already committed or pending.
         let already_committed = self
@@ -147,6 +180,15 @@ impl Ledger {
             log::warn!("Mined block is stale (chain tip moved); transactions restored to pool");
             return Ok(false);
         }
+        // Commit gate: re-validate every canonical record and capability
+        // activation in the block under the capability set effective at its
+        // height, and every policy update under the replayed policy history
+        // (including the same-block policy/write conflict rule), so a crafted
+        // block never commits invalid content.
+        let mut history = CapabilityHistory::build_from_blocks(&self.chain)?;
+        history.validate_block(&block)?;
+        let mut policies = PolicyHistory::build_from_blocks(&self.chain)?;
+        policies.validate_block(&block)?;
         self.chain.push(block);
         Ok(true)
     }
@@ -178,6 +220,11 @@ impl Ledger {
                 )));
             }
         }
+        // Height-selected capability validation and history derivation
+        // (ADR-010 decision 5): each block is validated under the capability
+        // set effective at its height.
+        CapabilityHistory::build_from_blocks(&self.chain)
+            .map_err(|e| CoreError::InvalidBlock(format!("capability history is invalid: {e}")))?;
         // Also validate the genesis block itself.
         if let Some(genesis) = self.chain.first() {
             if !genesis.is_valid() {
@@ -210,11 +257,19 @@ impl Ledger {
         }
 
         // Validate candidate from scratch (hash integrity + PoW).
+        let mut history = CapabilityHistory::default();
         for i in 1..candidate.len() {
             if candidate[i].chains_to(&candidate[i - 1]).is_err() {
                 return false;
             }
             if !candidate[i].has_valid_pow(self.difficulty) {
+                return false;
+            }
+            // Commit gate for peer blocks: canonical records and capability
+            // activations are folded per block under the set effective at that
+            // height.
+            if let Err(e) = history.validate_block(&candidate[i]) {
+                log::warn!("Rejecting candidate chain: invalid block content: {e}");
                 return false;
             }
         }
@@ -240,7 +295,6 @@ impl Ledger {
     pub fn committed_supply_offers(
         &self,
     ) -> impl Iterator<Item = &crate::transaction::SupplyOffer> {
-        use crate::transaction::TransactionKind;
         self.chain
             .iter()
             .flat_map(|b| b.transactions.iter())
@@ -257,9 +311,13 @@ impl Ledger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canonical::{CanonicalRecord, RecordSignature};
+    use crate::capability::{capability_hash, CapabilityActivation};
     use crate::transaction::{
         InventoryUpdate, PurchaseOrder, SupplyOffer, Transaction, TransactionKind,
     };
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
 
     fn supply_offer_tx(
         seller: &str,
@@ -286,6 +344,158 @@ mod tests {
             quantity_delta: 50,
             reason: "test".into(),
         }))
+    }
+
+    /// A canonical lot record wrapped in a transaction; `valid: false` drops a
+    /// required field so v1 validation rejects it.
+    fn canonical_tx(valid: bool) -> Transaction {
+        let payload: BTreeMap<String, Value> = serde_json::from_value(json!({
+            "lot_id": "lot-1",
+            "product_id": "SKU-1",
+            "batch_number": "BATCH-001",
+        }))
+        .expect("payload map");
+        let mut record = CanonicalRecord::new(0, "lot", payload, "org-issuer");
+        record.signatures.push(RecordSignature {
+            signer: "org-issuer".into(),
+            signature_bytes: vec![0x42],
+        });
+        record.commitment = record.commitment().ok();
+        if !valid {
+            record.payload.remove("batch_number");
+        }
+        Transaction::with_id("canonical:1", TransactionKind::CanonicalRecord(record))
+    }
+
+    /// A capability activation declaring `activation_height`.
+    fn activation_tx(id: &str, activation_height: u64) -> Transaction {
+        Transaction::with_id(
+            format!("cap:{id}:{activation_height}"),
+            TransactionKind::CapabilityActivation(CapabilityActivation {
+                capability_id: id.into(),
+                version: 1,
+                hash: capability_hash(id, 1),
+                activation_height,
+                signatures: vec![RecordSignature {
+                    signer: "org-issuer".into(),
+                    signature_bytes: vec![0x42],
+                }],
+            }),
+        )
+    }
+
+    #[test]
+    fn test_add_transaction_accepts_valid_canonical_record() {
+        let mut ledger = Ledger::new(1);
+        ledger
+            .add_transaction(canonical_tx(true))
+            .expect("valid record");
+        assert_eq!(ledger.pending_transactions.len(), 1);
+    }
+
+    #[test]
+    fn test_add_transaction_rejects_invalid_canonical_record() {
+        let mut ledger = Ledger::new(1);
+        let error = ledger
+            .add_transaction(canonical_tx(false))
+            .expect_err("invalid record must be rejected at admission");
+        assert!(error.to_string().contains("batch_number"), "{error}");
+        assert!(ledger.pending_transactions.is_empty());
+    }
+
+    #[test]
+    fn test_commit_mined_block_rejects_invalid_canonical_record() {
+        let mut ledger = Ledger::new(1);
+        let previous = ledger.chain[0].clone();
+        let mut block = Block::new(1, vec![canonical_tx(false)], previous.hash.clone());
+        block.mine(1);
+        let error = ledger
+            .commit_mined_block(block, &previous.hash)
+            .expect_err("invalid record must be rejected at commit");
+        assert!(error.to_string().contains("batch_number"), "{error}");
+        assert_eq!(ledger.chain.len(), 1, "block must not be appended");
+    }
+
+    #[test]
+    fn test_try_replace_chain_rejects_invalid_canonical_record() {
+        let mut ledger = Ledger::new(1);
+        ledger
+            .add_transaction(canonical_tx(true))
+            .expect("valid record");
+        ledger.mine_pending_transactions().expect("mine");
+        assert!(ledger.validate_chain().is_ok());
+
+        // A longer candidate whose extra block carries an invalid record.
+        let genesis = ledger.chain[0].clone();
+        let mut bad = Block::new(1, vec![canonical_tx(false)], genesis.hash.clone());
+        bad.mine(1);
+        let candidate = vec![genesis, bad];
+        assert!(
+            !ledger.try_replace_chain(candidate),
+            "candidate with invalid canonical record must be rejected"
+        );
+        assert_eq!(ledger.chain.len(), 2, "local chain stays authoritative");
+    }
+
+    #[test]
+    fn test_add_transaction_rejects_non_future_activation() {
+        let mut ledger = Ledger::new(1);
+        // Tip is genesis (index 0); the next block is 1, so height 1 is not
+        // strictly future.
+        let error = ledger
+            .add_transaction(activation_tx("pdc", 1))
+            .expect_err("non-future activation must be rejected");
+        assert!(error.to_string().contains("future"), "{error}");
+        assert!(ledger.pending_transactions.is_empty());
+    }
+
+    #[test]
+    fn test_activation_commits_and_flips_the_effective_set() {
+        let mut ledger = Ledger::new(1);
+        ledger
+            .add_transaction(activation_tx("bft_consensus", 3))
+            .expect("future activation admitted");
+        ledger.mine_pending_transactions().expect("mine block 1");
+        ledger.mine_pending_transactions().expect("mine block 2");
+        ledger.mine_pending_transactions().expect("mine block 3");
+
+        assert!(ledger.validate_chain().is_ok());
+        let history = CapabilityHistory::build_from_blocks(&ledger.chain).expect("valid history");
+        assert!(!history.effective_set(2).is_active("bft_consensus"));
+        assert!(history.effective_set(3).is_active("bft_consensus"));
+    }
+
+    #[test]
+    fn test_commit_mined_block_rejects_same_block_activation() {
+        let mut ledger = Ledger::new(1);
+        let previous = ledger.chain[0].clone();
+        // Activation declares height 1 while riding in block 1: not future.
+        let mut block = Block::new(1, vec![activation_tx("pdc", 1)], previous.hash.clone());
+        block.mine(1);
+        let error = ledger
+            .commit_mined_block(block, &previous.hash)
+            .expect_err("same-block activation must be rejected at commit");
+        assert!(error.to_string().contains("future"), "{error}");
+        assert_eq!(ledger.chain.len(), 1, "block must not be appended");
+    }
+
+    #[test]
+    fn test_try_replace_chain_rejects_invalid_activation() {
+        let mut ledger = Ledger::new(1);
+        ledger
+            .add_transaction(canonical_tx(true))
+            .expect("valid record");
+        ledger.mine_pending_transactions().expect("mine");
+
+        let genesis = ledger.chain[0].clone();
+        let mut bad = Block::new(1, vec![activation_tx("pdc", 1)], genesis.hash.clone());
+        bad.mine(1);
+        let candidate = vec![genesis, bad];
+        assert!(
+            !ledger.try_replace_chain(candidate),
+            "candidate with an invalid activation must be rejected"
+        );
+        assert_eq!(ledger.chain.len(), 2, "local chain stays authoritative");
     }
 
     #[test]

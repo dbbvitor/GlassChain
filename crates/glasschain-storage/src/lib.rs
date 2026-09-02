@@ -16,5 +16,7 @@
 //! trait can be dropped in without changing any node code.
 
 pub mod sled_backend;
+pub mod transient;
 
 pub use sled_backend::SledStorageProvider;
+pub use transient::{TransientStore, TRANSIENT_PREFIX};

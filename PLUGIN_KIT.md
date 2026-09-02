@@ -54,7 +54,8 @@ forks and no changes to the rest of the stack.
 | 6 | Event Bus | `EventBusProvider` | `glasschain-indexer` | 5 |
 | 7 | Identity / MSP | `Identity`, `Organization` | `glasschain-identity` | 2 |
 | 7b | Endorsement Engine | `EndorsementEngine` | `glasschain-identity` | 2 |
-| 8 | Watcher (ECA) | `WatcherService` | `glasschain-contracts` | 4 |
+| 7c | Endorsement Seam | `EndorsementProvider` | `glasschain-core` | 2 |
+| 8 | Watcher (ECA) | `WatcherService` | `glasschain-workflows` | 4 |
 | 9 | Schema Validation | `validate_asset` | `glasschain-core` | 3 |
 | 10 | Gas Metering | `GasCounter`, `GasCosts` | `glasschain-vm` | 4 |
 | 11 | Client SDK | `GlasschainClient` | `glasschain-sdk` | 6 |
@@ -76,7 +77,7 @@ pub trait ConsensusProvider: Send + Sync {
         index: u64,
         transactions: Vec<Transaction>,
         previous: &Block,
-    ) -> Result<Block, CoreError>;
+    ) -> Result<CommitNotification, CoreError>;
 
     fn validate_block(&self, block: &Block, previous: &Block) -> Result<(), CoreError>;
 
@@ -84,14 +85,31 @@ pub trait ConsensusProvider: Send + Sync {
 }
 ```
 
-### Built-in implementation
+`propose_block` returns a [`CommitNotification`]: the finished block plus its
+quorum certificate (the attestation set). No commit consumer may depend on
+"the leader said so" — the certificate travels with every commit. The retained
+Proof-of-Work provider supplies a **degenerate** certificate (the valid nonce
+is the attestation, carried by the block itself).
 
-`PowConsensusProvider` — SHA-256 Proof-of-Work with configurable difficulty.
+### Built-in implementations
+
+- `PowConsensusProvider` — SHA-256 Proof-of-Work with configurable difficulty
+  (default, dev/test). Degenerate certificate.
+- `BftConsensusProvider` (ticket #42, behind the `bft` cargo feature,
+  default-off) — Tendermint-class BFT: `attest(block)` produces a block plus a
+  real quorum certificate (ed25519 signatures over the block hash, ≥⅔+
+  distinct validators), `verify_certificate(cert, block)` cryptographically
+  verifies a certificate against the validator set. Node-side selection is
+  capability-gated: the engine engages only when `bft_consensus` is active at
+  the candidate height (ADR-010). Multi-validator network vote gathering is the
+  ADR-010 testnet adoption gate.
 
 ### Implementing Raft consensus
 
 ```rust
-use glasschain_core::{Block, ConsensusProvider, CoreError, Transaction};
+use glasschain_core::{
+    Block, CommitNotification, ConsensusProvider, CoreError, QuorumCertificate, Transaction,
+};
 
 pub struct RaftConsensusProvider {
     // ... raft state machine ...
@@ -103,10 +121,11 @@ impl ConsensusProvider for RaftConsensusProvider {
         index: u64,
         transactions: Vec<Transaction>,
         previous: &Block,
-    ) -> Result<Block, CoreError> {
+    ) -> Result<CommitNotification, CoreError> {
         // 1. Submit the proposed block to the Raft cluster leader.
         // 2. Wait for quorum acknowledgement.
-        // 3. Return the committed block.
+        // 3. Return the committed block with the quorum certificate
+        //    (`QuorumCertificate` with the validator attestation set).
         todo!()
     }
 
@@ -133,6 +152,19 @@ pub trait StorageProvider: Send + Sync {
     fn put_block(&self, block: &Block) -> Result<(), CoreError>;
     fn get_block(&self, index: u64) -> Result<Option<Block>, CoreError>;
     fn latest_block_index(&self) -> Result<Option<u64>, CoreError>;
+
+    /// Atomically persist `block` and apply its canonical write set to the
+    /// world state (ADR-007 decision 2).  The implementation must, inside
+    /// one atomic section: verify the block chains to the stored tip (empty
+    /// store accepts only the genesis), persist the block, and apply every
+    /// write (`Set` → put_state, `Delete` → delete_state, keyed by
+    /// `ws:<channel>:<contract>:<key>`).  A stale candidate is rejected
+    /// whole — block and write set together — with `InvalidBlock`.
+    ///
+    /// The trait ships a sequential default (correct for single-writer
+    /// processes, not atomic); override it with a real atomic section
+    /// (e.g. a sled multi-tree transaction).
+    fn apply_block(&self, block: &Block) -> Result<(), CoreError> { … }
 
     fn put_state(&self, key: &str, value: &[u8]) -> Result<(), CoreError>;
     fn get_state(&self, key: &str) -> Result<Option<Vec<u8>>, CoreError>;
@@ -174,6 +206,9 @@ impl StorageProvider for RocksDbStorageProvider {
         self.db.put(key, val)
             .map_err(|e| CoreError::Storage(e.to_string()))
     }
+    // Prefer rocksdb's `WriteBatch` in `apply_block` so the tip check, block
+    // insert, and write-set application commit atomically (the trait default
+    // is sequential and therefore not a real atomic boundary).
     // ... implement remaining methods ...
     fn name(&self) -> &str { "rocksdb" }
 }
@@ -200,15 +235,29 @@ pub trait ExecutionProvider: Send + Sync {
         contract_id: &str,
         payload: &[u8],
         limits: ExecutionLimits,
-    ) -> Result<Vec<(String, Vec<u8>)>, CoreError>;
+    ) -> Result<ExecutionResult, CoreError>;
 
     fn name(&self) -> &str;
 }
 ```
 
+`ExecutionResult` (in `glasschain-core::write_set`) separates the two output
+kinds (ADR-007):
+
+- `ephemeral: Vec<(String, Vec<u8>)>` — invocation-local output (`set_state`
+  semantics); approval gates read `approve` from here and persist nothing;
+- `writes: Vec<PersistentWrite>` — explicit persistent set/delete operations
+  carrying `channel`, `contract`, `key`, `op` (`Set`/`Delete`), and
+  `visibility` (`Public` or `Pdc(name)`).
+
+Providers that only produce legacy ephemeral pairs can convert with
+`Vec::<(String, Vec<u8>)>::into()`. `ExecutionResult::canonicalize()` validates
+scope non-emptiness and rejects duplicate scoped keys, returning a
+deterministically sorted copy for committed-block inclusion (ticket #41).
+
 ### Built-in implementation
 
-`WasmExecutionProvider` (crate `glasschain-vm`) — Wasmtime with independent instruction-fuel and host-operation gas budgets. The existing mutation result is unchanged; budget exhaustion identifies which meter failed.
+`WasmExecutionProvider` (crate `glasschain-vm`) — Wasmtime with independent instruction-fuel and host-operation gas budgets. `set_state` remains ephemeral; the separate `env::persist_state` host operation produces scoped persistent writes. Budget exhaustion identifies which meter failed.
 
 ### Contract module interface
 
@@ -219,6 +268,13 @@ WASM contracts must export an `execute` function and a `memory` export:
   (import "env" "set_state"     (func $set_state     (param i32 i32 i32 i32)))
   (import "env" "get_state_len" (func $get_state_len (param i32 i32) (result i32)))
   (import "env" "get_state"     (func $get_state     (param i32 i32 i32 i32) (result i32)))
+  ;; persist_state(channel_ptr, channel_len, contract_ptr, contract_len,
+  ;;               key_ptr, key_len, val_ptr, val_len, op, visibility,
+  ;;               pdc_ptr, pdc_len) -> i32
+  ;; op: 0 = set, 1 = delete; visibility: 0 = public, 1 = named PDC.
+  ;; Returns 0 on success; -1 unknown op, -2 unknown visibility,
+  ;; -3 empty PDC name, -4 malformed pointers.
+  (import "env" "persist_state" (func $persist_state (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
   (export "execute" (func $main))
   (export "memory" (memory 0))
   ...
@@ -688,16 +744,103 @@ EndorsementEngine::evaluate(&proposal)
 
 ---
 
-## 8. Watcher Service Plugin — ECA Triggers (Phase 4)
+## 7c. Endorsement Plugin (`EndorsementProvider`) — ADR-008 seam
 
-**Crate:** `glasschain-contracts`
-**Struct:** `glasschain_contracts::WatcherService`
+**Crate:** `glasschain-core`
+**Trait:** `glasschain_core::EndorsementProvider`
+**Types:** `PolicyExpression`, `Principal`, `ScopedTarget`, `ScopedPolicies`, `EndorsementRequest`, `EndorserIdentity`, `EndorsementEvaluation`
+
+Identity-neutral business-authorization seam (ADR-008). The expression is a
+deterministic Fabric-style signature-policy tree (`SignedBy` / `NOutOf` with
+`and`/`or` builders); the wire form is data, never executable policy code.
+Scope precedence is channel default → contract default → collection policy →
+key policy, and every applicable layer must be satisfied
+(`ScopedPolicies::applicable`), so a more specific policy can only add
+constraints.
+
+### Trait contract
+
+```rust
+pub trait EndorsementProvider: Send + Sync {
+    fn evaluate(
+        &self,
+        expression: &PolicyExpression,
+        request: &EndorsementRequest,
+    ) -> Result<EndorsementEvaluation, CoreError>;
+
+    fn name(&self) -> &str;
+}
+```
+
+Implementations must derive each signer's principal from the authenticated
+key (never the caller-supplied label), reject a claimed principal that
+conflicts with the verified identity, and count at most one signature per
+distinct principal.
+
+### Built-in implementation
+
+`MspEndorsementProvider` (crate `glasschain-identity`) — ed25519 verification
+over a registered key→principal directory:
+
+```rust
+use glasschain_identity::{Identity, MspEndorsementProvider};
+use glasschain_core::{EndorsementProvider, PolicyExpression, Principal};
+
+let identity = Identity::generate("node-1");
+let mut provider = MspEndorsementProvider::new();
+provider.register_identity(&identity, Principal::new("MyOrg"));
+
+let request = /* EndorsementRequest signed by identity.sign_bytes(&payload) */;
+let result = provider.evaluate(&PolicyExpression::signed_by("MyOrg"), &request)?;
+```
+
+### Commit-path enforcement (ADR-008 §4)
+
+The node invokes the provider at transaction and block admission — but only
+once the `endorsement` capability is active at the candidate height (ADR-010)
+and a provider is attached via `Node::set_endorsement_provider`.
+
+- **Carrier:** every endorsed transaction carries
+  `Vec<TransactionEndorsement>` (`Transaction.endorsements`): the scoped
+  `target` the signers authorized plus `EndorserIdentity` signatures over the
+  transaction's canonical bytes (serialized with the carriers cleared, so
+  signatures are never self-referential).
+- **Scope binding:** the transaction's committed partial write set must stay
+  inside a declared carrier's scope (`channel`, `contract`, `keys`,
+  `collection`), and every applicable layer — channel, contract, collection,
+  key, plus the operation default — must be satisfied, or the transaction is
+  rejected with no partial state.
+- **Operation defaults (ADR-008 decision 3):** custody handoffs
+  (`delivery_receipt`) require sender + receiving custodian 2-of-2;
+  `quality_certification`/`audit_attestation` require the payload issuer.
+  Recall/quarantine/dispute have no generic default — their multi-party rule
+  is whatever the committed scoped policies configure.
+- **Policy metadata:** `PolicyUpdate` transactions commit versioned,
+  append-only policy sets per `(channel, contract)` scope, replayed
+  deterministically from the chain (`PolicyHistory`). An update is itself a
+  signed transaction satisfying the *current* effective policy and activates
+  only after its block commits; a block that changes a key's policy and
+  writes the same key is rejected (the new policy applies from the next
+  block). Scopes without a committed policy fall back to the fail-closed
+  `network-governance` principal.
+- **RPC:** `IdentityService.VerifyEndorsement` evaluates an
+  `EndorsementRequest` JSON proposal against the committed policies and
+  returns the real combined evaluation.
+
+---
+
+## 8. Watcher Service Plugin — ECA Triggers
+
+**Crate:** `glasschain-workflows` (moved from `glasschain-contracts` in the
+packaging split, ticket #49 — I/O-driven automation lives in the workflow
+layer)
+**Struct:** `glasschain_workflows::WatcherService`
 
 The `WatcherService` implements an **Event-Condition-Action** (ECA) model:
 inventory falls below a threshold → autonomously generate a `PurchaseOrder` transaction.
 
 ```rust
-use glasschain_contracts::{InventoryTrigger, WatcherService};
+use glasschain_workflows::{InventoryTrigger, WatcherService};
 
 let mut watcher = WatcherService::new();
 
@@ -800,8 +943,9 @@ Each execution has two independent budgets:
 - **Operation-gas limit**: host state operations charged by `GasCounter`.
 
 Exhausting either budget returns `CoreError::GasExhausted` with a meter
-  discriminator. The execution result remains the list of state mutations; a
-  `GasReport` is a standalone type and is not returned by `ExecutionProvider`.
+  discriminator. The execution result is the typed `ExecutionResult` (ephemeral
+  output plus the persistent write set); a `GasReport` is a standalone type and
+  is not returned by `ExecutionProvider`.
 
 ```rust
 use glasschain_core::ExecutionLimits;

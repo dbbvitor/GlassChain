@@ -13,6 +13,7 @@ categories = ["network-programming", "asynchronous", "cryptography"]
 glasschain-core = { path = "../glasschain-core" }
 glasschain-network = { path = "../glasschain-network" }
 glasschain-identity = { path = "../glasschain-identity" }
+glasschain-indexer = { path = "../glasschain-indexer" }
 tonic = { version = "0.14.6", features = ["transport"] }
 tonic-prost = "0.14.6"
 prost = "0.14"

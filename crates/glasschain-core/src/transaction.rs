@@ -1,4 +1,7 @@
 use crate::asset::TraceableAsset;
+use crate::canonical::CanonicalRecord;
+use crate::capability::CapabilityActivation;
+use crate::endorsement::{PolicyUpdate, TransactionEndorsement};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -148,6 +151,17 @@ pub enum TransactionKind {
     InventoryUpdate(InventoryUpdate),
     /// Phase 3: on-chain registration of a traceable asset with trust scoring.
     AssetRegistration(TraceableAssetRegistration),
+    /// Canonical v1 record (ADR-006): strict schema-validated records from the
+    /// network-wide registry, including certification, audit, and
+    /// state-commitment anchors.
+    CanonicalRecord(CanonicalRecord),
+    /// Capability activation control-plane record (ADR-010): activates a
+    /// capability at a future height.
+    CapabilityActivation(CapabilityActivation),
+    /// Endorsement-policy update (ADR-008 decision 4): replaces the policy set
+    /// for one channel/contract scope, authorized under the current effective
+    /// policy via the transaction's endorsement carriers.
+    PolicyUpdate(PolicyUpdate),
 }
 
 /// A single ledger entry.
@@ -159,6 +173,12 @@ pub struct Transaction {
     pub timestamp: u64,
     /// The semantic payload of the transaction.
     pub kind: TransactionKind,
+    /// Endorsement carriers: the scoped targets the signers authorized and the
+    /// signers themselves (ADR-008 §4). Absent and empty are equivalent — the
+    /// field is skipped in the canonical serialization so pre-endorsement
+    /// transaction hashes stay stable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endorsements: Vec<TransactionEndorsement>,
 }
 
 impl Transaction {
@@ -177,6 +197,7 @@ impl Transaction {
             id: Uuid::new_v4().to_string(),
             timestamp,
             kind,
+            endorsements: Vec::new(),
         }
     }
 
@@ -196,6 +217,7 @@ impl Transaction {
             id: id.into(),
             timestamp,
             kind,
+            endorsements: Vec::new(),
         }
     }
 }

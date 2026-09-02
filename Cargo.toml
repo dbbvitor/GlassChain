@@ -2,6 +2,7 @@
 members = [
     "crates/glasschain-core",
     "crates/glasschain-contracts",
+    "crates/glasschain-workflows",
     "crates/glasschain-network",
     "crates/glasschain-node",
     "crates/glasschain-storage",

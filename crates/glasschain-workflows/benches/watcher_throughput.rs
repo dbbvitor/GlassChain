@@ -8,8 +8,8 @@
 //! Target: handle 1,000+ autonomous inventory triggers per second.
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use glasschain_contracts::watcher::{InventoryTrigger, WatcherService};
 use glasschain_core::InventoryUpdate;
+use glasschain_workflows::watcher::{InventoryTrigger, WatcherService};
 use std::hint::black_box;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

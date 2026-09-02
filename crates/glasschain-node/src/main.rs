@@ -78,12 +78,6 @@ INTERACTIVE COMMANDS (after startup):
         Register a traceable asset (Phase 3). Displays the Metadata Trust Score.
         Use "-" for any optional field to leave it empty.
 
-    mine
-        Mine a block with all pending transactions and wait for completion.
-
-    mine-async
-        Start mining in the background and return immediately.
-
     chain
         Print the current chain summary.
 
@@ -149,8 +143,6 @@ enum ReplCommand {
         qty: u64,
         event_type: String,
     },
-    Mine,
-    MineAsync,
     Chain,
     Pending,
     Peers,
@@ -318,8 +310,6 @@ fn parse_command(line: &str) -> Result<Option<ReplCommand>, String> {
             }))
         }
 
-        "mine" => Ok(Some(ReplCommand::Mine)),
-        "mine-async" => Ok(Some(ReplCommand::MineAsync)),
         "chain" => Ok(Some(ReplCommand::Chain)),
         "pending" => Ok(Some(ReplCommand::Pending)),
         "peers" => Ok(Some(ReplCommand::Peers)),
@@ -502,13 +492,37 @@ async fn main() {
                 NodeEvent::TransactionAccepted(tx) => {
                     log::info!("[event] Transaction accepted: {}", tx.id);
                 }
-                NodeEvent::BlockMined { index, hash } => {
-                    log::info!("[event] Block mined: index={index} hash={}", &hash[..8]);
-                }
-                NodeEvent::BlockReceived { index, hash } => {
+                // The payload itself is never in the event stream (ADR-003).
+                NodeEvent::PrivatePayloadReceived {
+                    collection,
+                    commitment,
+                } => {
                     log::info!(
-                        "[event] Block received from peer: index={index} hash={}",
-                        &hash[..8]
+                        "[event] Private payload received: collection={collection} \
+                         commitment={}",
+                        &commitment[..8]
+                    );
+                }
+                NodeEvent::BlockMined {
+                    index,
+                    hash,
+                    certificate: quorum,
+                } => {
+                    let quorum_attestations = quorum.attestations.len();
+                    log::info!(
+                        "[event] Block mined: index={index} hash={} quorum_attestations={quorum_attestations}",
+                        &hash[..8],
+                    );
+                }
+                NodeEvent::BlockReceived {
+                    index,
+                    hash,
+                    certificate: quorum,
+                } => {
+                    let quorum_attestations = quorum.attestations.len();
+                    log::info!(
+                        "[event] Block received from peer: index={index} hash={} quorum_attestations={quorum_attestations}",
+                        &hash[..8],
                     );
                 }
                 NodeEvent::PeerConnected(addr) => {
@@ -727,22 +741,6 @@ async fn main() {
                 }
             }
 
-            ReplCommand::Mine => match node.mine().await {
-                Ok(()) => println!("Block mined."),
-                Err(e) => eprintln!("Error mining: {e}"),
-            },
-
-            ReplCommand::MineAsync => {
-                let node_ref = Arc::clone(&node);
-                tokio::spawn(async move {
-                    match node_ref.mine_async().await {
-                        Ok(()) => println!("Block mined."),
-                        Err(e) => eprintln!("Error mining: {e}"),
-                    }
-                });
-                println!("Mining started in the background…");
-            }
-
             ReplCommand::Chain => {
                 let ledger = node.ledger_snapshot().await;
                 println!("Chain length: {} blocks", ledger.chain.len());
@@ -771,6 +769,9 @@ async fn main() {
                         TransactionKind::ContractExecution(_) => "ContractExecution",
                         TransactionKind::InventoryUpdate(_) => "InventoryUpdate",
                         TransactionKind::AssetRegistration(_) => "AssetRegistration",
+                        TransactionKind::CanonicalRecord(_) => "CanonicalRecord",
+                        TransactionKind::CapabilityActivation(_) => "CapabilityActivation",
+                        TransactionKind::PolicyUpdate(_) => "PolicyUpdate",
                     };
                     println!("  {} [{}]", tx.id, kind);
                 }
@@ -1000,8 +1001,6 @@ mod tests {
     #[test]
     fn parse_command_simple_commands() {
         for (line, cmd) in [
-            ("mine", ReplCommand::Mine),
-            ("mine-async", ReplCommand::MineAsync),
             ("chain", ReplCommand::Chain),
             ("pending", ReplCommand::Pending),
             ("peers", ReplCommand::Peers),

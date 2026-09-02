@@ -143,6 +143,7 @@ fn asset_id_for(asset: &glasschain_core::TraceableAsset) -> String {
         (Some(gtin), Some(sn), _) => format!("GTIN:{gtin}:SN:{sn}"),
         (Some(gtin), _, Some(batch)) => format!("GTIN:{gtin}:BATCH:{batch}"),
         (Some(gtin), _, _) => format!("GTIN:{gtin}"),
+        (None, Some(sn), _) => format!("SN:{sn}"),
         _ => format!("PRODUCT:{}", asset.product_name),
     }
 }
@@ -319,9 +320,15 @@ mod tests {
         bare_asset.batch_number = None;
         assert_eq!(asset_id_for(&bare_asset), "GTIN:07891234100016");
 
-        // No GTIN → PRODUCT fallback.
+        // No GTIN → SN-only fallback.
+        let mut serial_asset = asset("07891234100016", "SN", "node-1");
+        serial_asset.gtin = None;
+        assert_eq!(asset_id_for(&serial_asset), "SN:SN");
+
+        // No GTIN, no serial → PRODUCT fallback.
         let mut product_asset = asset("07891234100016", "SN", "node-1");
         product_asset.gtin = None;
+        product_asset.serial_number = None;
         assert_eq!(asset_id_for(&product_asset), "PRODUCT:Drug A");
     }
 }

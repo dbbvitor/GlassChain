@@ -25,6 +25,8 @@
 //!     name: "pharma-channel".into(),
 //!     member_ids: vec!["fabricante-abc".into(), "farmacia-sul".into()],
 //!     description: "Private channel for Anvisa-regulated products".into(),
+//!     endorsement_policy: None,
+//!     retention_secs: 72 * 60 * 60,
 //! };
 //! let mut channel = Channel::new(config);
 //! assert!(channel.is_member("fabricante-abc"));
@@ -32,18 +34,51 @@
 
 use crate::error::IdentityError;
 use glasschain_core::crypto::sha256;
+use glasschain_core::endorsement::PolicyExpression;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+
+/// Organizations that are policy-level members of **every** collection by
+/// default (ADR-003 decision 2).
+///
+/// Regulators already receive full pricing through NF-e, so per-collection
+/// audit grants would only create recall blind spots.
+pub const DEFAULT_REGULATOR_ORGS: &[&str] = &["anvisa", "mapa"];
 
 /// Configuration for creating a new [`Channel`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelConfig {
     /// Unique channel name (e.g. `"pharma-anvisa-channel"`).
     pub name: String,
-    /// Node/participant IDs that are members of this channel.
+    /// Node/participant IDs that are members of this channel. Regulator
+    /// organizations are added to every collection automatically — they are
+    /// not listed here.
     pub member_ids: Vec<String>,
     /// Human-readable channel description.
     pub description: String,
+    /// The collection's optional endorsement policy declaration (ADR-008).
+    ///
+    /// Membership is a **reading/writing/receipt** control; it is never an
+    /// endorsement. This field is this node's LOCAL DECLARATION of the
+    /// collection's policy — the authoritative, enforced source is the
+    /// committed `PolicyUpdate` carrying a collection-scoped
+    /// `collection_policy` (ADR-008), which the endorsement engine evaluates
+    /// at the commit path over verified principals (ticket #45). `None`
+    /// declares the collection imposes no extra policy.
+    #[serde(default)]
+    pub endorsement_policy: Option<PolicyExpression>,
+    /// The collection's private-payload retention window in seconds
+    /// (ADR-003 decision 4): the transient pre-commit store holds payloads
+    /// for this long before they become purge candidates. Default: 72 hours.
+    /// Purge removes payloads; the chain's hash commitments persist forever.
+    #[serde(default = "default_retention_secs")]
+    pub retention_secs: u64,
+}
+
+/// The default retention window: 72 hours (ADR-003 decision 4).
+#[must_use]
+pub const fn default_retention_secs() -> u64 {
+    72 * 60 * 60
 }
 
 /// A named sub-ledger (channel) that restricts data visibility to its members.
@@ -77,16 +112,37 @@ pub struct PrivateDataEntry {
 }
 
 impl Channel {
-    /// Create a new channel from the given configuration.
+    /// Create a new channel from the given configuration. Regulator
+    /// organizations are members of every collection by default (ADR-003
+    /// decision 2), so [`Self::is_member`] accepts them without being listed.
     #[must_use]
     pub fn new(config: ChannelConfig) -> Self {
-        let member_set = config.member_ids.iter().cloned().collect();
+        let mut member_set: HashSet<String> = config.member_ids.iter().cloned().collect();
+        for regulator in DEFAULT_REGULATOR_ORGS {
+            member_set.insert((*regulator).to_owned());
+        }
         Self {
             config,
             committed_hashes: Vec::new(),
             private_data: Vec::new(),
             member_set,
         }
+    }
+
+    /// The collection's optional endorsement policy. Membership never
+    /// satisfies a policy by itself — see [`ChannelConfig::endorsement_policy`].
+    #[must_use]
+    pub const fn endorsement_policy(&self) -> Option<&PolicyExpression> {
+        self.config.endorsement_policy.as_ref()
+    }
+
+    /// The effective member organizations: the configured members plus the
+    /// default regulators.
+    #[must_use]
+    pub fn member_orgs(&self) -> Vec<&str> {
+        let mut orgs: Vec<&str> = self.member_set.iter().map(String::as_str).collect();
+        orgs.sort_unstable();
+        orgs
     }
 
     /// Return `true` if `node_id` is a member of this channel.
@@ -161,7 +217,44 @@ mod tests {
             name: "pharma-channel".into(),
             member_ids: vec!["fabricante-abc".into(), "farmacia-sul".into()],
             description: "Test private channel".into(),
+            endorsement_policy: None,
+            retention_secs: default_retention_secs(),
         })
+    }
+
+    #[test]
+    fn test_regulators_are_default_members() {
+        let ch = test_channel();
+        for regulator in DEFAULT_REGULATOR_ORGS {
+            assert!(
+                ch.is_member(regulator),
+                "regulator {regulator} must be a default member"
+            );
+        }
+        assert!(!ch.is_member("outsider"));
+        let orgs = ch.member_orgs();
+        assert!(orgs.contains(&"anvisa") && orgs.contains(&"mapa"));
+    }
+
+    #[test]
+    fn test_endorsement_policy_is_separate_from_membership() {
+        let mut ch = test_channel();
+        // A member is not an endorsement: no policy is configured, so the
+        // collection imposes none, and membership alone grants no approval.
+        assert!(ch.endorsement_policy().is_none());
+        assert!(ch.is_member("fabricante-abc"));
+        // With a policy configured, membership still does not satisfy it —
+        // the policy is evaluated by the endorsement engine over verified
+        // principals, not by the member set.
+        ch.config.endorsement_policy =
+            Some(glasschain_core::endorsement::PolicyExpression::SignedBy(
+                glasschain_core::endorsement::Principal::new("org-a"),
+            ));
+        assert!(ch.endorsement_policy().is_some());
+        assert!(
+            !ch.member_orgs().is_empty(),
+            "membership and policy are separate controls"
+        );
     }
 
     #[test]

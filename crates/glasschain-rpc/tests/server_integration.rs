@@ -5,8 +5,9 @@
 //! [`GlasschainServer`] on an ephemeral loopback port, and drive its gRPC
 //! surface over a real Tonic in-process TCP connection.
 use glasschain_core::{
-    ContractExecution, InventoryUpdate, PurchaseConditions, PurchaseOrder, SmartContractDef,
-    SupplyOffer, TraceableAsset, TraceableAssetRegistration, Transaction, TransactionKind,
+    ContractExecution, EndorsementRequest, EndorserIdentity, InventoryUpdate, Principal,
+    PurchaseConditions, PurchaseOrder, ScopedTarget, SmartContractDef, SupplyOffer, TraceableAsset,
+    TraceableAssetRegistration, Transaction, TransactionKind,
 };
 use glasschain_identity::Identity;
 use glasschain_network::Node;
@@ -14,8 +15,8 @@ use glasschain_rpc::proto::glasschain_v1::{
     identity_service_client::IdentityServiceClient, ledger_service_client::LedgerServiceClient,
     node_service_client::NodeServiceClient, ExchangeCertificateRequest, GetBlockRequest,
     GetChainStatusRequest, GetNodeStatusRequest, GetPeersRequest, GetVerifiableLineageRequest,
-    MineBlockRequest, QueryAssetHistoryRequest, StreamBlocksRequest, SubmitTransactionRequest,
-    SubscribeToEventsRequest,
+    QueryAssetHistoryRequest, StreamBlocksRequest, SubmitTransactionRequest,
+    SubscribeToEventsRequest, VerifyEndorsementRequest,
 };
 use glasschain_rpc::server::GlasschainServer;
 use std::sync::Arc;
@@ -127,15 +128,6 @@ async fn submit_tx(ledger: &mut LedgerClient, tx: &Transaction) {
     assert!(resp.accepted, "tx not accepted: {}", resp.error);
 }
 
-async fn mine_block(node_client: &mut NodeClient) {
-    let resp = node_client
-        .mine_block(MineBlockRequest {})
-        .await
-        .unwrap()
-        .into_inner();
-    assert!(resp.success, "mine failed: {}", resp.error);
-}
-
 // ── Item 1: full gRPC surface over a real connection ─────────────────────────
 
 #[allow(clippy::too_many_lines)]
@@ -178,7 +170,7 @@ async fn test_grpc_unsigned_submit_chain_and_node_surface() {
     assert!(!chain.tip_hash.is_empty());
 
     // Mine → block 1 committed.
-    mine_block(&mut node_client).await;
+    node.mine().await.unwrap();
 
     let chain = ledger
         .get_chain_status(GetChainStatusRequest {})
@@ -219,7 +211,7 @@ async fn test_grpc_unsigned_submit_chain_and_node_surface() {
 #[tokio::test]
 async fn test_grpc_signed_submit_and_signature_verification() {
     let node = start_node().await;
-    let (channel, _handle) = start_server(node).await;
+    let (channel, _handle) = start_server(node.clone()).await;
     let mut ledger = LedgerClient::new(channel);
 
     let identity = Identity::generate("signer-1");
@@ -261,9 +253,8 @@ async fn test_grpc_signed_submit_and_signature_verification() {
 #[tokio::test]
 async fn test_query_asset_history_filters() {
     let node = start_node().await;
-    let (channel, _handle) = start_server(node).await;
+    let (channel, _handle) = start_server(node.clone()).await;
     let mut ledger = LedgerClient::new(channel.clone());
-    let mut node_client = NodeClient::new(channel);
 
     let first_registration = asset_reg_tx(Some(GTIN), Some("SN-AAA"), "manufacture", "factory-1");
     let second_registration = asset_reg_tx(Some(GTIN), Some("SN-BBB"), "dispatch", "dist-1");
@@ -273,14 +264,16 @@ async fn test_query_asset_history_filters() {
         "manufacture",
         "factory-1",
     );
+    let serial_only_registration = asset_reg_tx(None, Some("SN-SOLO"), "receive", "pharm-1");
     for tx in [
         &first_registration,
         &second_registration,
         &nonmatching_registration,
+        &serial_only_registration,
     ] {
         submit_tx(&mut ledger, tx).await;
     }
-    mine_block(&mut node_client).await;
+    node.mine().await.unwrap();
 
     // GTIN only → both serials for that GTIN.
     let resp = ledger
@@ -315,6 +308,32 @@ async fn test_query_asset_history_filters() {
         .unwrap()
         .into_inner();
     assert!(resp.transactions.is_empty());
+
+    // A GTIN prefix must not cross-match a longer GTIN (boundary-anchored).
+    let resp = ledger
+        .query_asset_history(QueryAssetHistoryRequest {
+            gtin: "0789".into(),
+            serial_number: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        resp.transactions.is_empty(),
+        "short GTIN prefix must not match GTIN:07891234567890 assets"
+    );
+
+    // Serial-only query resolves the standalone `SN:<serial>` canonical key.
+    let resp = ledger
+        .query_asset_history(QueryAssetHistoryRequest {
+            gtin: String::new(),
+            serial_number: "SN-SOLO".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.transactions.len(), 1);
+    assert_eq!(resp.transactions[0].kind, "AssetRegistration");
 }
 
 // ── Item 3: get_verifiable_lineage canonical-key matching ────────────────────
@@ -322,20 +341,27 @@ async fn test_query_asset_history_filters() {
 #[tokio::test]
 async fn test_verifiable_lineage_canonical_key_matching() {
     let node = start_node().await;
-    let (channel, _handle) = start_server(node).await;
+    let (channel, _handle) = start_server(node.clone()).await;
     let mut ledger = LedgerClient::new(channel.clone());
-    let mut node_client = NodeClient::new(channel);
 
     // Three assets exercising the three non-empty canonical forms.
     let full_asset = asset_reg_tx(Some(GTIN), Some("SN-F"), "manufacture", "factory-1");
     let gtin_only = asset_reg_tx(Some(GTIN), None, "dispatch", "dist-1");
     let serial_only = asset_reg_tx(None, Some("SN-S"), "receive", "pharm-1");
-    for tx in [&full_asset, &gtin_only, &serial_only] {
+    // A batch-level asset under its own GTIN so its flat-record count stays
+    // independent of the GTIN-keyed assertions above.
+    let mut batch_asset = asset_reg_tx(Some("99999999999999"), None, "manufacture", "plant-b");
+    if let TransactionKind::AssetRegistration(ref mut reg) = batch_asset.kind {
+        reg.asset.batch_number = Some("BATCH-X".into());
+    }
+    for tx in [&full_asset, &gtin_only, &serial_only, &batch_asset] {
         submit_tx(&mut ledger, tx).await;
     }
-    mine_block(&mut node_client).await;
+    node.mine().await.unwrap();
 
-    // GTIN+SN canonical key.
+    // GTIN+SN canonical key: the custody chain comes from the provenance
+    // index; flat records (and therefore total_records and the trust average)
+    // are the flattener's records for the asset's GTIN (both GTIN registrations).
     let resp = ledger
         .get_verifiable_lineage(GetVerifiableLineageRequest {
             asset_id: format!("GTIN:{GTIN}:SN:SN-F"),
@@ -343,10 +369,14 @@ async fn test_verifiable_lineage_canonical_key_matching() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(resp.total_records, 1);
     assert_eq!(resp.custody_chain.len(), 1);
-    assert!(resp.is_complete);
     assert_eq!(resp.custody_chain[0].event_type, "manufacture");
+    assert_eq!(resp.total_records, 2, "flat records are keyed by GTIN");
+    assert!(!resp.is_complete, "1 custody event vs 2 flat records");
+    assert!(
+        resp.trust_score_avg > 0.0,
+        "trust average from flat records"
+    );
 
     // GTIN-only key matches the serial-less asset…
     let resp = ledger
@@ -356,8 +386,9 @@ async fn test_verifiable_lineage_canonical_key_matching() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(resp.total_records, 1);
+    assert_eq!(resp.custody_chain.len(), 1);
     assert_eq!(resp.custody_chain[0].custodian_id, "dist-1");
+    assert_eq!(resp.total_records, 2);
 
     // SN-only key matches the serial-only asset (strict equality, no substring
     // cross-matching between different canonical forms).
@@ -368,8 +399,24 @@ async fn test_verifiable_lineage_canonical_key_matching() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(resp.total_records, 1);
+    assert_eq!(resp.custody_chain.len(), 1);
     assert_eq!(resp.custody_chain[0].custodian_id, "pharm-1");
+    assert_eq!(resp.total_records, 0, "no GTIN → no flat records");
+
+    // BATCH-keyed canonical form: custody from provenance, flat records from
+    // the flattener keyed by the batch asset's GTIN.
+    let resp = ledger
+        .get_verifiable_lineage(GetVerifiableLineageRequest {
+            asset_id: "GTIN:99999999999999:BATCH:BATCH-X".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.custody_chain.len(), 1);
+    assert_eq!(resp.custody_chain[0].event_type, "manufacture");
+    assert_eq!(resp.total_records, 1, "one flat record for the batch GTIN");
+    assert!(resp.is_complete, "1 custody event and 1 flat record");
+    assert!(resp.trust_score_avg > 0.0);
 
     // Empty asset_id → invalid_argument.
     let err = ledger
@@ -386,9 +433,8 @@ async fn test_verifiable_lineage_canonical_key_matching() {
 #[tokio::test]
 async fn test_build_transaction_protos_all_variants() {
     let node = start_node().await;
-    let (channel, _handle) = start_server(node).await;
+    let (channel, _handle) = start_server(node.clone()).await;
     let mut ledger = LedgerClient::new(channel.clone());
-    let mut node_client = NodeClient::new(channel);
 
     let variants = vec![
         Transaction::new(TransactionKind::SupplyOffer(SupplyOffer {
@@ -464,7 +510,7 @@ async fn test_build_transaction_protos_all_variants() {
     for tx in &variants {
         submit_tx(&mut ledger, tx).await;
     }
-    mine_block(&mut node_client).await;
+    node.mine().await.unwrap();
 
     let block = ledger
         .get_block(GetBlockRequest { index: 1 })
@@ -490,14 +536,13 @@ async fn test_build_transaction_protos_all_variants() {
 #[tokio::test]
 async fn test_stream_blocks_replays_then_live_streams() {
     let node = start_node().await;
-    let (channel, _handle) = start_server(node).await;
+    let (channel, _handle) = start_server(node.clone()).await;
     let mut ledger = LedgerClient::new(channel.clone());
-    let mut node_client = NodeClient::new(channel);
 
     // Commit block 1 before opening the stream.
     let first = inventory_tx("owner-1");
     submit_tx(&mut ledger, &first).await;
-    mine_block(&mut node_client).await;
+    node.mine().await.unwrap();
 
     // Stream from index 1: replays block 1, then live-streams block 2.
     let mut stream = ledger
@@ -516,7 +561,7 @@ async fn test_stream_blocks_replays_then_live_streams() {
     // Mine a second block; it should arrive on the live stream.
     let second = inventory_tx("owner-2");
     submit_tx(&mut ledger, &second).await;
-    mine_block(&mut node_client).await;
+    node.mine().await.unwrap();
 
     let b2 = tokio::time::timeout(Duration::from_secs(3), stream.message())
         .await
@@ -531,9 +576,8 @@ async fn test_stream_blocks_replays_then_live_streams() {
 #[tokio::test]
 async fn test_subscribe_to_events_mapping() {
     let node = start_node().await;
-    let (channel, _handle) = start_server(node).await;
+    let (channel, _handle) = start_server(node.clone()).await;
     let mut ledger = LedgerClient::new(channel.clone());
-    let mut node_client = NodeClient::new(channel);
 
     let mut events = ledger
         .subscribe_to_events(SubscribeToEventsRequest {})
@@ -553,7 +597,7 @@ async fn test_subscribe_to_events_mapping() {
     assert!(evt.payload_json.contains(&tx.id));
 
     // block_mined on mine.
-    mine_block(&mut node_client).await;
+    node.mine().await.unwrap();
     let evt = tokio::time::timeout(Duration::from_secs(3), events.message())
         .await
         .expect("timeout waiting for block_mined")
@@ -561,4 +605,95 @@ async fn test_subscribe_to_events_mapping() {
         .expect("stream ended early");
     assert_eq!(evt.event_type, "block_mined");
     assert!(evt.payload_json.contains("\"block_index\":1"));
+}
+
+// ── Item 7: verify_endorsement real evaluation (ADR-008, ticket #45) ─────────
+
+#[tokio::test]
+async fn test_verify_endorsement_returns_a_real_evaluation() {
+    let node = start_node().await;
+    let identity = Identity::generate("gov-node");
+    let mut msp = glasschain_identity::MspEndorsementProvider::new();
+    msp.register_identity(&identity, Principal::new("network-governance"));
+    node.set_endorsement_provider(std::sync::Arc::new(msp))
+        .await;
+    let (channel, _handle) = start_server(node.clone()).await;
+    let mut identity_client = IdentityServiceClient::new(channel);
+
+    // A request signed by the registered principal satisfies the fail-closed
+    // default policy for the (supply, inventory) scope.
+    let payload = b"canonical-payload".to_vec();
+    let signed_request = EndorsementRequest {
+        target: ScopedTarget {
+            channel: "supply".into(),
+            contract: "inventory".into(),
+            keys: vec![],
+            collection: None,
+        },
+        payload: payload.clone(),
+        signers: vec![EndorserIdentity {
+            claimed_principal: Principal::new("network-governance"),
+            public_key: identity.public_key_bytes().to_vec(),
+            signature: identity.sign_bytes(&payload),
+        }],
+    };
+    let response = identity_client
+        .verify_endorsement(tonic::Request::new(VerifyEndorsementRequest {
+            proposal_json: serde_json::to_string(&signed_request).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(response.approved, "{:?}", response.rejection_reason);
+    assert_eq!(response.endorser_count, 1);
+    assert_eq!(response.proposal_id.len(), 64, "sha256 hex of the payload");
+
+    // An unregistered signer fails the evaluation with a reason.
+    let unsigned = EndorsementRequest {
+        target: signed_request.target.clone(),
+        payload,
+        signers: vec![],
+    };
+    let response = identity_client
+        .verify_endorsement(tonic::Request::new(VerifyEndorsementRequest {
+            proposal_json: serde_json::to_string(&unsigned).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!response.approved);
+    assert!(response.rejection_reason.contains("unsatisfied"));
+}
+
+#[tokio::test]
+async fn test_verify_endorsement_without_provider_reports_configuration_gap() {
+    let node = start_node().await;
+    let (channel, _handle) = start_server(node.clone()).await;
+    let mut identity_client = IdentityServiceClient::new(channel);
+
+    let request = EndorsementRequest {
+        target: ScopedTarget {
+            channel: "supply".into(),
+            contract: "inventory".into(),
+            keys: vec![],
+            collection: None,
+        },
+        payload: b"payload".to_vec(),
+        signers: vec![],
+    };
+    let response = identity_client
+        .verify_endorsement(tonic::Request::new(VerifyEndorsementRequest {
+            proposal_json: serde_json::to_string(&request).unwrap(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!response.approved);
+    assert!(
+        response
+            .rejection_reason
+            .contains("no endorsement provider"),
+        "{:?}",
+        response.rejection_reason
+    );
 }

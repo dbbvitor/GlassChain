@@ -1,15 +1,28 @@
 use crate::error::NetworkError;
 use crate::peer::{PeerReader, PeerWriter};
 use crate::protocol::{Message, PROTOCOL_VERSION};
-use glasschain_contracts::{ContractEngine, InventoryTrigger, WatcherService};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use glasschain_contracts::ContractEngine;
 use glasschain_core::crypto::sha256;
 use glasschain_core::providers::in_memory::InMemoryStorageProvider;
+#[cfg(feature = "bft")]
+use glasschain_core::BFT_CONSENSUS_CAPABILITY_ID;
+use glasschain_core::PDC_CAPABILITY_ID;
 use glasschain_core::{
-    Block, ExecutionProvider, Ledger, StorageProvider, Transaction, TransactionKind,
+    evaluate_transaction_endorsements, Block, CapabilityAdvertisement, CapabilityHistory,
+    CommitNotification, CoreError, EndorsementEvaluation, EndorsementProvider, EndorsementRequest,
+    ExecutionLimits, ExecutionProvider, ExecutionResult, Ledger, PersistentWrite, PolicyHistory,
+    QuorumCertificate, StorageProvider, Transaction, TransactionKind, WriteOp, WriteVisibility,
+    CAPABILITY_V1, ENDORSEMENT_CAPABILITY_ID,
 };
 use glasschain_identity::CertChainVerifier;
-use glasschain_identity::Identity;
-use glasschain_indexer::{EventBusProvider, InMemoryEventBus, InMemoryIndexer, IndexerProvider};
+use glasschain_identity::{Channel, Identity};
+use glasschain_indexer::{
+    indexed_transactions_of, AnalyticalFlattener, EventBusProvider, InMemoryEventBus,
+    InMemoryIndexer, IndexedBlock, IndexerProvider, ProvenanceIndex,
+};
+use glasschain_storage::TransientStore;
+use glasschain_workflows::{InventoryTrigger, WatcherService};
 use rcgen;
 use rustls;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -31,10 +44,30 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 pub enum NodeEvent {
     /// A new transaction was accepted into the pending pool.
     TransactionAccepted(Transaction),
-    /// A block was successfully mined **by this node** and appended to the chain.
-    BlockMined { index: u64, hash: String },
-    /// A block received from a remote peer was validated and appended to the chain.
-    BlockReceived { index: u64, hash: String },
+    /// A block was successfully mined **by this node** and appended to the
+    /// chain. `certificate` is the quorum certificate attesting the block
+    /// (degenerate for the retained `PoW` dev/test consensus).
+    BlockMined {
+        index: u64,
+        hash: String,
+        certificate: QuorumCertificate,
+    },
+    /// A block received from a remote peer was validated and appended to the
+    /// chain, with its quorum certificate.
+    BlockReceived {
+        index: u64,
+        hash: String,
+        certificate: QuorumCertificate,
+    },
+    /// A private data collection payload was received and stored in the
+    /// transient store (ADR-003, ticket #46). The event carries the collection
+    /// and the commitment — never the payload bytes.
+    PrivatePayloadReceived {
+        /// The collection the payload belongs to.
+        collection: String,
+        /// SHA-256 of the payload (the chain's commitment).
+        commitment: String,
+    },
     /// A peer connected and completed the handshake.
     PeerConnected(String),
     /// A peer disconnected.
@@ -152,6 +185,103 @@ struct NodeState {
     cert_verifier: Option<Arc<CertChainVerifier>>,
     /// Optional node identity for signing autonomous watcher transactions.
     identity: Option<Arc<Identity>>,
+    /// Derived world-state cache: the materialized committed write sets,
+    /// keyed by `ws:<channel>:<contract>:<key>`.  Rebuilt from committed
+    /// blocks on restart — never re-executed (ADR-007 decision 2).  PDC-scoped
+    /// keys hold their commitment until the private payload arrives through
+    /// ADR-003 dissemination (#46/#47).
+    world_state: HashMap<String, Vec<u8>>,
+    /// Optional VM execution provider, used to produce a candidate block's
+    /// write set at mining time.
+    executor: Option<Arc<dyn ExecutionProvider>>,
+    /// Optional endorsement provider, invoked at the commit path when the
+    /// `endorsement` capability is active (ADR-008 handoff 4).
+    endorsement: Option<Arc<dyn EndorsementProvider>>,
+    /// The private data collections this node is configured with (ADR-003,
+    /// ticket #46). Membership gates every private-payload path; membership is
+    /// never an endorsement (ADR-008).
+    collections: Vec<Channel>,
+    /// Transient pre-commit store for received private payloads, over the
+    /// node's `StorageProvider` (ADR-003; retention/purge is #47).
+    transient: TransientStore,
+    /// Optional Tendermint-class BFT provider (ticket #42, default-off). When
+    /// set **and** the `bft_consensus` capability is active at the candidate
+    /// height, the node attests blocks with a real quorum certificate instead
+    /// of dev/test `PoW`; the commit consumer is unchanged either way.
+    #[cfg(feature = "bft")]
+    consensus: Option<Arc<glasschain_core::BftConsensusProvider>>,
+    /// Endorsement-policy history replayed from committed blocks (ADR-008
+    /// decision 4): the pre-block policy set used for evaluation.
+    policies: PolicyHistory,
+}
+
+impl NodeState {
+    /// This node's organization: the identity's node identifier when
+    /// identity-backed, the plain node identifier otherwise. The
+    /// collection-membership principal (ADR-003).
+    fn local_org(&self, node_id: &str) -> String {
+        self.identity
+            .clone()
+            .map_or_else(|| node_id.to_owned(), |identity| identity.node_id.clone())
+    }
+
+    /// The configured collection with `name`, if any.
+    fn collection(&self, name: &str) -> Option<&Channel> {
+        self.collections.iter().find(|c| c.config.name == name)
+    }
+
+    /// `true` when `org` is a member of the collection `name` (ADR-003).
+    /// Membership is a read/write/receipt control and is never an endorsement
+    /// (ADR-008).
+    fn is_collection_member(&self, name: &str, org: &str) -> bool {
+        self.collection(name)
+            .is_some_and(|collection| collection.is_member(org))
+    }
+
+    /// The org a connected peer advertised in its `Hello`, if known.
+    fn peer_org(&self, addr: &str) -> Option<String> {
+        self.peer_registry
+            .peers
+            .get(addr)
+            .map(|peer| peer.org.clone())
+    }
+
+    /// Write channels of peers whose org is a member of `collection` — the
+    /// point-to-point private-payload targets (ADR-003). Nodes without the
+    /// collection or org never appear here.
+    fn payload_targets(&self, collection: &Channel) -> Vec<Sender<Message>> {
+        self.peer_senders
+            .iter()
+            .filter(|(addr, _)| {
+                self.peer_org(addr)
+                    .is_some_and(|org| collection.is_member(&org))
+            })
+            .map(|(_, sender)| sender.clone())
+            .collect()
+    }
+
+    /// Write channels of peers that support the `active` capability set;
+    /// read-only observers are excluded from active-write relay (ADR-010
+    /// decision 6).
+    fn relay_targets(&self, active: &glasschain_core::CapabilitySet) -> Vec<Sender<Message>> {
+        self.peer_senders
+            .iter()
+            .filter(|(addr, _)| !self.peer_registry.is_read_only(addr, active))
+            .map(|(_, sender)| sender.clone())
+            .collect()
+    }
+}
+
+/// The capability set effective at the local chain tip (ADR-010 decision 5).
+async fn active_set_at_tip(ledger: &Arc<Mutex<Ledger>>) -> glasschain_core::CapabilitySet {
+    let ledger_guard = ledger.lock().await;
+    match CapabilityHistory::build_from_blocks(&ledger_guard.chain) {
+        Ok(history) => history.effective_set(ledger_guard.chain.len().saturating_sub(1) as u64),
+        Err(e) => {
+            log::warn!("Capability history invalid; using genesis set for admission: {e}");
+            glasschain_core::CapabilitySet::genesis()
+        }
+    }
 }
 
 // ── TOFU Peer Registry ───────────────────────────────────────────────────────
@@ -161,6 +291,31 @@ struct NodeState {
 struct VerifiedPeer {
     node_id: String,
     cert_fingerprint: String,
+    /// The peer's organization (the collection-membership principal, ADR-003).
+    org: String,
+    /// `true` when the org was verified against the peer's TLS certificate
+    /// subject CN under a configured organization Root CA (ticket #47). Bare
+    /// TOFU leaves this `false`: the org is self-asserted.
+    org_verified: bool,
+    /// Capabilities the peer advertised in its most recent `Hello`.
+    advertised: Vec<CapabilityAdvertisement>,
+}
+
+impl VerifiedPeer {
+    /// `true` when the peer supports every capability in `set`, matching
+    /// `(id, version)`. A peer that cannot support an active capability may
+    /// parse and validate history but not propose, vote, or relay active
+    /// writes (ADR-010 decision 6).
+    fn supports(&self, set: &glasschain_core::CapabilitySet) -> bool {
+        CAPABILITY_V1.iter().all(|c| {
+            let Some((active_version, _)) = set.active_version(c.id) else {
+                return true;
+            };
+            self.advertised
+                .iter()
+                .any(|advert| advert.id == c.id && advert.version == active_version)
+        })
+    }
 }
 
 /// Stable peer identity store using a TOFU (Trust On First Use) model.
@@ -177,6 +332,15 @@ struct PeerRegistry {
 }
 
 impl PeerRegistry {
+    /// Whether the peer at `addr` claimed `org` with a certificate-verified
+    /// identity (ticket #47).
+    fn org_verified(&self, addr: &str, org: &str) -> Option<bool> {
+        self.peers
+            .get(addr)
+            .filter(|peer| peer.org == org)
+            .map(|peer| peer.org_verified)
+    }
+
     fn new() -> Self {
         Self {
             peers: HashMap::new(),
@@ -193,6 +357,8 @@ impl PeerRegistry {
         listen_addr: &str,
         node_id: &str,
         cert_fingerprint: &str,
+        org: &str,
+        org_verified: bool,
     ) -> Result<bool, String> {
         if let Some(existing) = self.peers.get(listen_addr) {
             if existing.node_id != node_id {
@@ -206,6 +372,15 @@ impl PeerRegistry {
                     "TLS certificate fingerprint changed for node '{node_id}'"
                 ));
             }
+            // Org drift: a returning peer claiming a different organization is
+            // either a re-keyed node or an impersonation; both are rejections
+            // (ticket #47 — the org gates private-payload delivery).
+            if existing.org != org {
+                return Err(format!(
+                    "org changed for node '{node_id}': expected '{}', got '{org}'",
+                    existing.org
+                ));
+            }
             Ok(false)
         } else {
             self.peers.insert(
@@ -213,10 +388,28 @@ impl PeerRegistry {
                 VerifiedPeer {
                     node_id: node_id.to_owned(),
                     cert_fingerprint: cert_fingerprint.to_owned(),
+                    org: org.to_owned(),
+                    org_verified,
+                    advertised: Vec::new(),
                 },
             );
             Ok(true)
         }
+    }
+
+    /// Record the capabilities a peer advertised in its latest `Hello`.
+    fn set_advertised(&mut self, listen_addr: &str, advertised: Vec<CapabilityAdvertisement>) {
+        if let Some(peer) = self.peers.get_mut(listen_addr) {
+            peer.advertised = advertised;
+        }
+    }
+
+    /// `true` when the peer at `listen_addr` cannot support `set` and is
+    /// therefore a read-only observer.
+    fn is_read_only(&self, listen_addr: &str, set: &glasschain_core::CapabilitySet) -> bool {
+        self.peers
+            .get(listen_addr)
+            .is_none_or(|peer| !peer.supports(set))
     }
 }
 
@@ -241,6 +434,11 @@ pub struct Node {
     event_tx: broadcast::Sender<NodeEvent>,
     indexer: Arc<InMemoryIndexer>,
     event_bus: Arc<InMemoryEventBus>,
+    /// Provenance index: custody chains by canonical asset id, ingested on
+    /// every commit and rebuilt from the chain on start/sync.
+    provenance: Arc<Mutex<ProvenanceIndex>>,
+    /// Analytical flattener: flat asset records for lineage queries.
+    flattener: Arc<Mutex<AnalyticalFlattener>>,
     /// Block storage backend — persists committed blocks across restarts.
     storage: Arc<dyn StorageProvider>,
     /// TLS context used to encrypt all peer connections.
@@ -268,10 +466,20 @@ impl Node {
                 peer_registry: PeerRegistry::new(),
                 cert_verifier: None,
                 identity: identity.clone(),
+                world_state: HashMap::new(),
+                executor: None,
+                endorsement: None,
+                policies: PolicyHistory::default(),
+                collections: Vec::new(),
+                transient: TransientStore::new(Arc::clone(&storage)),
+                #[cfg(feature = "bft")]
+                consensus: None,
             })),
             event_tx,
             indexer: Arc::new(InMemoryIndexer::new()),
             event_bus: Arc::new(InMemoryEventBus::new(4096)),
+            provenance: Arc::new(Mutex::new(ProvenanceIndex::new())),
+            flattener: Arc::new(Mutex::new(AnalyticalFlattener::new())),
             storage,
             tls: Arc::new(Self::build_tls(identity)),
         }
@@ -391,6 +599,26 @@ impl Node {
         Arc::clone(&self.ledger)
     }
 
+    /// Return a clone of the provenance index handle (custody chains keyed by
+    /// canonical asset id).
+    #[must_use]
+    pub fn provenance_index(&self) -> Arc<Mutex<ProvenanceIndex>> {
+        Arc::clone(&self.provenance)
+    }
+
+    /// Return a clone of the analytical flattener handle (flat asset records
+    /// for lineage queries).
+    #[must_use]
+    pub fn analytical_flattener(&self) -> Arc<Mutex<AnalyticalFlattener>> {
+        Arc::clone(&self.flattener)
+    }
+
+    /// Snapshot of the derived world state (committed write sets, keyed by
+    /// `ws:<channel>:<contract>:<key>`).
+    pub async fn world_state(&self) -> HashMap<String, Vec<u8>> {
+        self.state.lock().await.world_state.clone()
+    }
+
     /// Return the TCP address this node listens on.
     #[must_use]
     pub fn listen_addr(&self) -> &str {
@@ -508,16 +736,67 @@ impl Node {
     }
 
     /// Rebuild watcher runtime state by replaying committed inventory updates,
-    /// or restoring from a persisted snapshot if one is available.
+    /// or restoring from a persisted snapshot if one is available, and rebuild
+    /// the derived world state and the analytics projections from committed
+    /// blocks.
     async fn rebuild_runtime_state_from_chain(
         ledger: &Arc<Mutex<Ledger>>,
         state: &Arc<Mutex<NodeState>>,
         storage: &Arc<dyn StorageProvider>,
+        provenance: &Arc<Mutex<ProvenanceIndex>>,
+        flattener: &Arc<Mutex<AnalyticalFlattener>>,
     ) {
         let chain = { ledger.lock().await.chain.clone() };
+
+        // World state is a materialized projection of the chain: rebuild it
+        // from committed write sets in block order (never re-executing guest
+        // code), healing any partial apply and refreshing the storage state.
+        match Self::rebuild_world_state(storage) {
+            Ok(world_state) => {
+                state.lock().await.world_state = world_state;
+            }
+            Err(e) => {
+                log::warn!("Failed to rebuild world state from chain: {e}");
+            }
+        }
+
+        // Provenance and flattener are materialized projections of the chain:
+        // rebuild them from committed blocks (the chain is the authority).
+        {
+            let mut provenance_guard = provenance.lock().await;
+            *provenance_guard = ProvenanceIndex::new();
+            for block in &chain {
+                provenance_guard.ingest_block(block);
+            }
+        }
+        {
+            let mut flattener_guard = flattener.lock().await;
+            *flattener_guard = AnalyticalFlattener::new();
+            for block in &chain {
+                let txs = match indexed_transactions_of(block) {
+                    Ok(txs) => txs,
+                    Err(e) => {
+                        log::warn!(
+                            "flattener: failed to index block {} during rebuild: {e}",
+                            block.index
+                        );
+                        continue;
+                    }
+                };
+                flattener_guard.ingest_indexed_block(&IndexedBlock::from(block), &txs);
+            }
+        }
+
         let mut s = state.lock().await;
         // Always replay contracts from chain (authoritative source).
         s.engine = ContractEngine::rebuild_from_chain(&chain);
+
+        // Endorsement-policy metadata is replayed from committed blocks the
+        // same way (ADR-008 decision 4): versioned, append-only, deterministic.
+        match PolicyHistory::build_from_blocks(&chain) {
+            Ok(policies) => s.policies = policies,
+            Err(e) => log::warn!("Failed to rebuild policy history from chain: {e}"),
+        }
 
         // For watcher state (inventory levels + fire counts), try the persisted
         // snapshot first — it is more up-to-date than chain replay because it
@@ -551,6 +830,42 @@ impl Node {
         }
     }
 
+    /// Rebuild the derived world state from committed blocks in block order.
+    ///
+    /// Reads the persisted chain and applies each block's committed write set
+    /// to a fresh cache, re-applying it to the storage state (healing a
+    /// backend failure that persisted the block but not the state).  No guest
+    /// code is executed anywhere on this path (ADR-007 decision 2).
+    fn rebuild_world_state(
+        storage: &Arc<dyn StorageProvider>,
+    ) -> Result<HashMap<String, Vec<u8>>, NetworkError> {
+        let mut world_state = HashMap::new();
+        let Some(latest) = storage.latest_block_index()? else {
+            return Ok(world_state);
+        };
+        for index in 0..=latest {
+            let Some(block) = storage.get_block(index)? else {
+                // A gap in the persisted chain is storage corruption; surface
+                // it loudly and continue so the remaining blocks still heal.
+                log::warn!("world-state rebuild: block {index} missing from storage");
+                continue;
+            };
+            for write in &block.write_set {
+                match &write.op {
+                    glasschain_core::WriteOp::Set(value) => {
+                        world_state.insert(write.state_key(), value.clone());
+                        storage.put_state(&write.state_key(), value)?;
+                    }
+                    glasschain_core::WriteOp::Delete => {
+                        world_state.remove(&write.state_key());
+                        storage.delete_state(&write.state_key())?;
+                    }
+                }
+            }
+        }
+        Ok(world_state)
+    }
+
     /// Attach a WASM execution provider to the contract engine.
     ///
     /// After this call, contracts that carry a `wasm_code_b64` payload will be
@@ -558,13 +873,236 @@ impl Node {
     pub async fn set_execution_provider(&self, executor: Arc<dyn ExecutionProvider>) {
         let mut s = self.state.lock().await;
         s.engine.set_executor(Arc::clone(&executor));
-        s.watcher.set_executor(executor);
+        s.watcher.set_executor(Arc::clone(&executor));
+        s.executor = Some(executor);
     }
 
-    /// Enable CA-backed certificate verification for peer authentication.
+    /// Attach an endorsement provider (ADR-008 handoff 4).
     ///
-    /// When set, the Hello handshake rejects any peer whose TLS certificate
-    /// was not issued by this organization's Root CA.
+    /// After this call, transaction and block admission evaluate the committed
+    /// endorsement policies through the provider — but only once the
+    /// `endorsement` capability is active at the candidate height (ADR-010).
+    pub async fn set_endorsement_provider(&self, provider: Arc<dyn EndorsementProvider>) {
+        self.state.lock().await.endorsement = Some(provider);
+    }
+
+    /// Configure this node's private data collections (ADR-003, ticket #46).
+    ///
+    /// Membership gates every private-payload path: `submit_private_payload`
+    /// requires the local org to be a member, payloads are sent only to member
+    /// peers, and received payloads are stored only when this node is a
+    /// member. Membership is never an endorsement (ADR-008).
+    pub async fn set_collections(&self, collections: Vec<Channel>) {
+        self.state.lock().await.collections = collections;
+    }
+
+    /// Submit a private payload to the collection `collection` (ADR-003,
+    /// ticket #46).
+    ///
+    /// The payload is held in this member's transient store and sent
+    /// **point-to-point** to member peers only; the globally replicated chain
+    /// receives only `sha256(payload)` via the redacted write set. Rejected
+    /// when the `pdc` capability is inactive or the local org is not a member
+    /// of the collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError`] when the capability gate, membership gate, or
+    /// transient-store write fails.
+    pub async fn submit_private_payload(
+        &self,
+        collection: &str,
+        payload: Vec<u8>,
+    ) -> Result<(), NetworkError> {
+        // Membership gate (the collection-scoped check first, so a non-member
+        // gets the accurate rejection regardless of chain state).
+        {
+            let s = self.state.lock().await;
+            let org = s.local_org(&self.node_id);
+            if !s.is_collection_member(collection, &org) {
+                return Err(CoreError::InvalidTransaction(format!(
+                    "org '{org}' is not a member of collection '{collection}'"
+                ))
+                .into());
+            }
+        }
+        // Capability gate: the write carrying this payload commits at the
+        // NEXT height, so the gate is the capability set effective there
+        // (ADR-010 §4: a block is validated under the set active at its own
+        // height).
+        let pdc_active = {
+            let ledger = self.ledger.lock().await;
+            let next_height = ledger.chain.len() as u64;
+            CapabilityHistory::build_from_blocks(&ledger.chain).is_ok_and(|history| {
+                history
+                    .effective_set(next_height)
+                    .is_active(PDC_CAPABILITY_ID)
+            })
+        };
+        if !pdc_active {
+            return Err(CoreError::InvalidTransaction(
+                "private payloads require the 'pdc' capability to be active".into(),
+            )
+            .into());
+        }
+        let (commitment, targets, transient, retention_secs) = {
+            let s = self.state.lock().await;
+            let Some(configured) = s.collection(collection) else {
+                return Err(CoreError::InvalidTransaction(format!(
+                    "collection '{collection}' is not configured"
+                ))
+                .into());
+            };
+            let targets = s.payload_targets(configured);
+            let transient = s.transient.clone();
+            let retention_secs = configured.config.retention_secs;
+            let commitment = glasschain_core::crypto::sha256(&payload);
+            drop(s);
+            (commitment, targets, transient, retention_secs)
+        };
+        // Store outside the state lock (the store is a cheap Arc handle).
+        transient.put(collection, &commitment, &payload, retention_secs)?;
+        for target in targets {
+            if let Err(e) = target.try_send(Message::PrivatePayload {
+                collection: collection.to_owned(),
+                commitment: commitment.clone(),
+                payload: payload.clone(),
+            }) {
+                log::warn!("Private payload delivery to a member peer failed: {e}");
+            }
+        }
+        log::info!(
+            "Private payload stored (collection={collection}, commitment={}...)",
+            &commitment[..8]
+        );
+        Ok(())
+    }
+
+    /// Purge expired private payloads from the transient store (ADR-003
+    /// decision 3, ticket #47): payloads vanish, the chain's hash commitments
+    /// persist forever. Call periodically or after operations; retention is
+    /// also enforced on read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError`] when the backend fails.
+    pub async fn purge_expired_private_payloads(&self) -> Result<usize, NetworkError> {
+        let transient = self.state.lock().await.transient.clone();
+        Ok(transient.purge_expired()?)
+    }
+
+    /// Pull-reconcile private payloads for `collection` (ADR-003, ticket
+    /// #47): a peer that was offline at dissemination time scans the committed
+    /// chain for the collection's PDC writes and requests every payload its
+    /// transient store is missing from a member peer. The chain's commitments
+    /// drive the request, so nothing is invented and nothing leaks — the
+    /// request names only a commitment this node can already see.
+    ///
+    /// Returns the number of payloads requested (0 when this node holds
+    /// everything or is not a member).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError`] when a transient-store read fails.
+    pub async fn reconcile_private_payloads(
+        &self,
+        collection: &str,
+    ) -> Result<usize, NetworkError> {
+        // Membership gate + transient handle; the guard is released before the
+        // (possibly long) chain scan.
+        let transient = {
+            let s = self.state.lock().await;
+            if !s.is_collection_member(collection, &s.local_org(&self.node_id)) {
+                return Ok(0);
+            }
+            s.transient.clone()
+        };
+        // Snapshot the chain: the scan reads a consistent view and the guard is
+        // released immediately (reconcile is an infrequent operator action).
+        let chain = self.ledger.lock().await.chain.clone();
+        let mut missing: Vec<String> = Vec::new();
+        for block in &chain {
+            for write in &block.write_set {
+                let (WriteOp::Set(committed), WriteVisibility::Pdc(name)) =
+                    (&write.op, &write.visibility)
+                else {
+                    continue;
+                };
+                if name != collection {
+                    continue;
+                }
+                let commitment = String::from_utf8(committed.clone()).map_err(|_| {
+                    CoreError::InvalidBlock(format!(
+                        "PDC commitment for '{collection}' is not valid UTF-8"
+                    ))
+                })?;
+                if transient.get(collection, &commitment)?.is_none() {
+                    missing.push(commitment);
+                }
+            }
+        }
+        missing.sort_unstable();
+        missing.dedup();
+        let target = {
+            let s = self.state.lock().await;
+            let Some(configured) = s.collection(collection) else {
+                return Ok(0);
+            };
+            let target = s.payload_targets(configured).into_iter().next();
+            drop(s);
+            target
+        };
+        let Some(target) = target else {
+            log::warn!("Reconcile: no member peer is connected for collection '{collection}'");
+            return Ok(0);
+        };
+        for commitment in &missing {
+            if let Err(e) = target.try_send(Message::RequestPrivatePayload {
+                collection: collection.to_owned(),
+                commitment: commitment.clone(),
+            }) {
+                log::warn!("Reconcile request for '{collection}' failed: {e}");
+            }
+        }
+        log::info!(
+            "Reconcile: requested {} missing payloads for collection '{collection}'",
+            missing.len()
+        );
+        Ok(missing.len())
+    }
+
+    /// Read a private payload from the transient store (member read path,
+    /// ADR-003): `Some(payload)` only when this node holds it as a member.
+    pub async fn transient_payload(&self, collection: &str, commitment: &str) -> Option<Vec<u8>> {
+        self.state
+            .lock()
+            .await
+            .transient
+            .get(collection, commitment)
+            .ok()
+            .flatten()
+    }
+
+    /// Attach a Tendermint-class BFT provider (ticket #42, default-off).
+    ///
+    /// After this call the node attests blocks with `provider`'s real quorum
+    /// certificate instead of dev/test `PoW` — but only once the `bft_consensus`
+    /// capability is active at the candidate height (ADR-010). The commit
+    /// consumer is unchanged either way.
+    #[cfg(feature = "bft")]
+    pub async fn set_bft_consensus(&self, provider: Arc<glasschain_core::BftConsensusProvider>) {
+        self.state.lock().await.consensus = Some(provider);
+    }
+
+    /// Enable CA-backed certificate verification (ticket #47).
+    ///
+    /// When set, the Hello handshake rejects any peer whose **Hello-carried
+    /// organization certificate** does not verify against this organization's
+    /// Root CA with a subject CN equal to the claimed org (the TLS certificate
+    /// itself is a transport-only self-signed cert and is not used for
+    /// organization trust). The private-payload path additionally requires
+    /// senders to be certificate-verified; a reconnecting peer whose claimed
+    /// org changed is rejected (org drift).
     pub async fn set_cert_verifier(&self, verifier: CertChainVerifier) {
         self.state.lock().await.cert_verifier = Some(Arc::new(verifier));
     }
@@ -587,7 +1125,33 @@ impl Node {
     // Keep listener setup and connection fan-out in one lifecycle method.
     #[allow(clippy::too_many_lines)]
     pub async fn start(&self, seed_peers: Vec<String>) -> Result<(), NetworkError> {
-        Self::rebuild_runtime_state_from_chain(&self.ledger, &self.state, &self.storage).await;
+        Self::rebuild_runtime_state_from_chain(
+            &self.ledger,
+            &self.state,
+            &self.storage,
+            &self.provenance,
+            &self.flattener,
+        )
+        .await;
+
+        // Ensure the persisted chain matches the in-memory chain: a fresh
+        // node's genesis (and any restored-but-unpersisted blocks) must land
+        // through the atomic boundary so later blocks can chain to it.
+        {
+            let chain = self.ledger.lock().await.chain.clone();
+            for block in &chain {
+                let already_persisted = self.storage.get_block(block.index)?.is_some();
+                if already_persisted {
+                    continue;
+                }
+                if let Err(e) = self.storage.apply_block(block) {
+                    log::warn!(
+                        "Storage: failed to persist block {} on start: {e}",
+                        block.index
+                    );
+                }
+            }
+        }
 
         let listener = TcpListener::bind(&self.listen_addr).await?;
         log::info!("Node {} listening on {}", self.node_id, self.listen_addr);
@@ -604,6 +1168,8 @@ impl Node {
             self.event_tx.clone(),
             Arc::clone(&self.indexer),
             Arc::clone(&self.event_bus),
+            Arc::clone(&self.provenance),
+            Arc::clone(&self.flattener),
             Arc::clone(&self.storage),
             Arc::clone(&self.tls),
         );
@@ -615,6 +1181,8 @@ impl Node {
         let event_tx = self.event_tx.clone();
         let indexer = Arc::clone(&self.indexer);
         let event_bus = Arc::clone(&self.event_bus);
+        let provenance = Arc::clone(&self.provenance);
+        let flattener = Arc::clone(&self.flattener);
 
         let dtx = dial_tx.clone();
         let tls_l = Arc::clone(&self.tls);
@@ -632,6 +1200,8 @@ impl Node {
                         let et = event_tx.clone();
                         let ix = Arc::clone(&indexer);
                         let eb = Arc::clone(&event_bus);
+                        let pv = Arc::clone(&provenance);
+                        let fl = Arc::clone(&flattener);
                         let dx = dtx.clone();
                         let tls2 = Arc::clone(&tls_l);
                         let st2 = Arc::clone(&storage_l);
@@ -711,6 +1281,8 @@ impl Node {
                                     event_tx: et,
                                     indexer: ix,
                                     event_bus: eb,
+                                    provenance: pv,
+                                    flattener: fl,
                                     dial_tx: dx,
                                     storage: st2,
                                 },
@@ -745,6 +1317,8 @@ impl Node {
         event_tx: broadcast::Sender<NodeEvent>,
         indexer: Arc<InMemoryIndexer>,
         event_bus: Arc<InMemoryEventBus>,
+        provenance: Arc<Mutex<ProvenanceIndex>>,
+        flattener: Arc<Mutex<AnalyticalFlattener>>,
         storage: Arc<dyn StorageProvider>,
         tls: Arc<NodeTls>,
     ) {
@@ -757,11 +1331,13 @@ impl Node {
                 let et = event_tx.clone();
                 let ix = Arc::clone(&indexer);
                 let eb = Arc::clone(&event_bus);
+                let pv = Arc::clone(&provenance);
+                let fl = Arc::clone(&flattener);
                 let dx = dial_tx.clone();
                 let st = Arc::clone(&storage);
                 let tls_c = Arc::clone(&tls);
                 tokio::spawn(async move {
-                    connect_to_peer(addr, la, l2, s2, ni, et, ix, eb, dx, st, tls_c).await;
+                    connect_to_peer(addr, la, l2, s2, ni, et, ix, eb, pv, fl, dx, st, tls_c).await;
                 });
             }
         });
@@ -773,6 +1349,29 @@ impl Node {
     ///
     /// Returns [`NetworkError`] if the transaction cannot be added locally.
     pub async fn submit_transaction(&self, tx: Transaction) -> Result<(), NetworkError> {
+        // Transaction admission (ADR-008 §4): when enforcement is active, the
+        // transaction's declared carriers are evaluated immediately — an
+        // unauthorized policy update or record is rejected before it can sit
+        // in any pending pool. Write-scope binding happens at block admission.
+        {
+            let provider = self.state.lock().await.endorsement.clone();
+            if let Some(provider) = provider {
+                // Sequential lock acquisitions: the ledger guard is dropped
+                // before the state guard is taken (state→ledger is the only
+                // nested order used elsewhere).
+                let active = {
+                    let ledger = self.ledger.lock().await;
+                    let next_height = ledger.chain.len() as u64;
+                    CapabilityHistory::build_from_blocks(&ledger.chain)?
+                        .effective_set(next_height)
+                        .is_active(ENDORSEMENT_CAPABILITY_ID)
+                };
+                if active {
+                    let policies = self.state.lock().await.policies.clone();
+                    evaluate_transaction_endorsements(provider.as_ref(), &policies, &tx, &[])?;
+                }
+            }
+        }
         {
             let mut ledger = self.ledger.lock().await;
             ledger.add_transaction(tx.clone())?;
@@ -820,6 +1419,13 @@ impl Node {
 
     /// Mine a new block containing all pending transactions and broadcast it.
     ///
+    /// This is the **dev/test consensus driver**: the retained Proof-of-Work
+    /// path supplies a degenerate quorum certificate on the commit notification
+    /// (ADR-002 keeps `PoW` for testing). When a BFT provider is attached
+    /// (ticket #42, default-off) **and** the `bft_consensus` capability is
+    /// active at the candidate height, the block is attested with a real
+    /// quorum certificate instead; the commit consumer is unchanged.
+    ///
     /// # Errors
     ///
     /// Returns [`NetworkError`] if mining preparation or commit fails.
@@ -829,8 +1435,83 @@ impl Node {
             ledger.prepare_mining()?
         };
 
-        let mut block = Block::new(index, transactions, prev_hash.clone());
-        block.mine(difficulty);
+        // The committed block carries the canonical write set of the accepted
+        // persistent VM writes (ADR-007 decision 2): execute the candidate's
+        // ContractExecution transactions against the committed snapshot,
+        // canonicalize, and redact PDC values to commitments before inclusion.
+        let (write_set, per_tx_writes) =
+            Self::compute_write_set(&self.state, &transactions).await?;
+        // Consensus boundary (ADR-010 §1, #46): a PDC-scoped write may only be
+        // committed while the `pdc` capability is active at the candidate
+        // height — otherwise the candidate is dropped whole.
+        if write_set
+            .iter()
+            .any(|write| matches!(write.visibility, WriteVisibility::Pdc(_)))
+        {
+            let pdc_active = CapabilityHistory::build_from_blocks(&self.ledger.lock().await.chain)
+                .is_ok_and(|history| history.effective_set(index).is_active(PDC_CAPABILITY_ID));
+            if !pdc_active {
+                Self::restore_pending(&self.ledger, transactions).await;
+                return Err(CoreError::InvalidTransaction(
+                    "PDC-scoped writes require the 'pdc' capability to be active at the \
+                     candidate height"
+                        .into(),
+                )
+                .into());
+            }
+        }
+        let mut block =
+            Block::with_write_set(index, transactions.clone(), prev_hash.clone(), write_set);
+
+        // Endorsement enforcement (ADR-008 §4): every declared carrier must
+        // satisfy every applicable policy layer, and the committed write set
+        // must stay inside the signed scopes — before any materialization.
+        if let Err(error) =
+            Self::enforce_block_endorsements(&self.state, &self.ledger, &block, &per_tx_writes)
+                .await
+        {
+            // No partial state: the candidate is dropped and its transactions
+            // return to the pending pool (the stale-tip path's semantics).
+            Self::restore_pending(&self.ledger, transactions).await;
+            return Err(error);
+        }
+
+        // Attest the candidate: a BFT provider supplies a real quorum
+        // certificate when the `bft_consensus` capability is active at this
+        // height (ADR-010, ticket #42); otherwise dev/test `PoW` mines a
+        // degenerate one. The commit consumer below is identical either way.
+        #[cfg(feature = "bft")]
+        let notification = {
+            let history = CapabilityHistory::build_from_blocks(&self.ledger.lock().await.chain);
+            let bft_active = match history {
+                Ok(history) => history
+                    .effective_set(index)
+                    .is_active(BFT_CONSENSUS_CAPABILITY_ID),
+                Err(e) => {
+                    log::warn!(
+                        "Capability history invalid at height {index}; BFT stays dormant: {e}"
+                    );
+                    false
+                }
+            };
+            let provider = if bft_active {
+                self.state.lock().await.consensus.clone()
+            } else {
+                None
+            };
+            if let Some(provider) = provider {
+                provider.attest(block)
+            } else {
+                block.mine(difficulty);
+                CommitNotification::for_pow_block(block)
+            }
+        };
+        #[cfg(not(feature = "bft"))]
+        let notification = {
+            block.mine(difficulty);
+            CommitNotification::for_pow_block(block)
+        };
+        let block = notification.block;
 
         let appended = {
             let mut ledger = self.ledger.lock().await;
@@ -844,16 +1525,24 @@ impl Node {
                 &self.event_tx,
                 &self.indexer,
                 &self.event_bus,
+                &self.provenance,
+                &self.flattener,
                 &block,
                 &self.storage,
             )
             .await;
 
-            log::info!("Mined block {} ({}...)", block.index, &block.hash[..8]);
+            log::info!("Committed block {} ({}...)", block.index, &block.hash[..8]);
             let _ = self.event_tx.send(NodeEvent::BlockMined {
                 index: block.index,
                 hash: block.hash.clone(),
+                certificate: notification.certificate,
             });
+            // Disseminate this node's raw PDC writes point-to-point to
+            // collection members (ADR-003, #46): the block carries only the
+            // commitments, so members receive the payload out of band. The
+            // writer holds its own payloads in the transient store too.
+            self.disseminate_private_writes(&per_tx_writes).await;
             self.broadcast(Message::Block(block)).await;
             for tx in generated {
                 self.broadcast(Message::Transaction(tx)).await;
@@ -875,6 +1564,337 @@ impl Node {
         self.mine_async().await
     }
 
+    /// Send raw PDC-scoped writes to member peers' transient stores
+    /// (ADR-003, ticket #46). `per_tx_writes` carries the pre-redaction
+    /// values; the block itself receives only `block_form` commitments.
+    async fn disseminate_private_writes(&self, per_tx_writes: &[Vec<PersistentWrite>]) {
+        for writes in per_tx_writes {
+            for write in writes {
+                let (WriteOp::Set(value), WriteVisibility::Pdc(collection)) =
+                    (&write.op, &write.visibility)
+                else {
+                    continue;
+                };
+                let commitment = glasschain_core::crypto::sha256(value);
+                let (transient, targets, retention_secs) = {
+                    let s = self.state.lock().await;
+                    // A non-member node must never hold private cleartext, even
+                    // when it mines a relayed execution (ADR-003 boundary c).
+                    if !s.is_collection_member(collection, &s.local_org(&self.node_id)) {
+                        log::warn!(
+                            "Not disseminating payload for '{collection}': local org is \
+                             not a member"
+                        );
+                        continue;
+                    }
+                    let Some(configured) = s.collection(collection) else {
+                        log::warn!(
+                            "Write targets collection '{collection}' but it is not configured"
+                        );
+                        continue;
+                    };
+                    let targets = s.payload_targets(configured);
+                    let transient = s.transient.clone();
+                    let retention_secs = configured.config.retention_secs;
+                    drop(s);
+                    (transient, targets, retention_secs)
+                };
+                // Outside the state lock (the store is a cheap Arc handle).
+                if transient
+                    .put(collection, &commitment, value, retention_secs)
+                    .is_err()
+                {
+                    log::warn!("Failed to hold own payload for collection '{collection}'");
+                }
+                for target in targets {
+                    if let Err(e) = target.try_send(Message::PrivatePayload {
+                        collection: collection.clone(),
+                        commitment: commitment.clone(),
+                        payload: value.clone(),
+                    }) {
+                        log::warn!("Private payload delivery to a member peer failed: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The peer-block append: re-validate the candidate against the CURRENT
+    /// tip under the push lock, prune its transactions from the pending pool,
+    /// and push. The admission check ran outside this lock, so the tip may
+    /// have moved in between — pushing a stale candidate would fork the local
+    /// chain. Returns `true` when the block was appended.
+    ///
+    /// The guard must live across the re-validation, the pending prune, and
+    /// the push: they are one atomic append against the tip that the
+    /// admission check can no longer see.
+    #[allow(clippy::significant_drop_tightening)]
+    async fn append_peer_block(ledger: &Arc<Mutex<Ledger>>, block: &Block) -> bool {
+        let mut l = ledger.lock().await;
+        let still_valid = l
+            .chain
+            .last()
+            .map_or(block.index == 0 && block.previous_hash == "0", |tip| {
+                block.chains_to(tip).is_ok()
+            });
+        if !still_valid {
+            log::warn!("Dropping stale peer block {}: the tip moved", block.index);
+            return false;
+        }
+        let committed: std::collections::HashSet<&str> =
+            block.transactions.iter().map(|t| t.id.as_str()).collect();
+        l.pending_transactions
+            .retain(|t| !committed.contains(t.id.as_str()));
+        l.chain.push(block.clone());
+        true
+    }
+
+    /// Compute the candidate block's canonical write set: execute every
+    /// `ContractExecution` transaction against the committed world-state
+    /// snapshot, canonicalize the collected writes, and redact PDC values to
+    /// their commitments (ADR-007 decision 2 — the block never holds a
+    /// private value).
+    ///
+    /// Returns the block-form aggregate plus the per-transaction canonical
+    /// contributions (same order as `transactions`), which the endorsement
+    /// gate binds to each transaction's declared scopes (ADR-008 §4).
+    ///
+    /// Deterministic: the snapshot, transaction order, and canonicalized
+    /// output are all functions of committed chain state.  A transaction
+    /// whose execution fails (invalid WASM, gas exhaustion, …) accepts **no**
+    /// writes; the failure is a deterministic function of the same inputs, so
+    /// every node computes the identical write set and the block stays
+    /// consistent — an empty contribution is the complete write set for that
+    /// transaction, not a partial one.
+    async fn compute_write_set(
+        state: &Arc<Mutex<NodeState>>,
+        transactions: &[Transaction],
+    ) -> Result<(Vec<PersistentWrite>, Vec<Vec<PersistentWrite>>), NetworkError> {
+        let s = state.lock().await;
+        let Some(executor) = &s.executor else {
+            return Ok((Vec::new(), vec![Vec::new(); transactions.len()]));
+        };
+        // The snapshot exposes exactly the committed state this node holds:
+        // public values directly, PDC-scoped keys as their commitment until
+        // the private payload arrives through ADR-003 dissemination (#46/#47).
+        let mut result = ExecutionResult::default();
+        let mut per_transaction: Vec<Vec<PersistentWrite>> = Vec::with_capacity(transactions.len());
+        for tx in transactions {
+            let TransactionKind::ContractExecution(ref execution) = tx.kind else {
+                per_transaction.push(Vec::new());
+                continue;
+            };
+            let Some(contract) = s.engine.get_contract(&execution.contract_id) else {
+                per_transaction.push(Vec::new());
+                continue;
+            };
+            let Some(wasm_b64) = contract.definition.wasm_code_b64.as_ref() else {
+                per_transaction.push(Vec::new());
+                continue;
+            };
+            let wasm = match BASE64_STANDARD.decode(wasm_b64) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    log::warn!(
+                        "write-set: contract {} carried invalid WASM: {error}",
+                        execution.contract_id
+                    );
+                    per_transaction.push(Vec::new());
+                    continue;
+                }
+            };
+            let execution_id = format!("commit:{}:{}", execution.contract_id, tx.id);
+            match executor.execute_with_state(
+                &execution_id,
+                &wasm,
+                s.world_state.clone(),
+                ExecutionLimits::new(100_000, 100_000),
+            ) {
+                Ok(execution_result) => {
+                    // Canonicalize per transaction so the endorsement gate can
+                    // bind this contribution to the transaction's declared
+                    // scopes (validates scope components, rejects
+                    // intra-transaction duplicates, sorts deterministically).
+                    let contribution = ExecutionResult {
+                        ephemeral: Vec::new(),
+                        writes: execution_result.writes,
+                    }
+                    .canonicalize()?;
+                    result.writes.extend(contribution.writes.iter().cloned());
+                    per_transaction.push(contribution.writes);
+                }
+                Err(error) => {
+                    log::warn!(
+                        "write-set: execution of contract {} failed: {error}",
+                        execution.contract_id
+                    );
+                    per_transaction.push(Vec::new());
+                }
+            }
+        }
+        // Canonicalize (validates scopes, rejects intra-execution duplicates,
+        // sorts deterministically) and redact PDC values for the block.
+        let canonical = result.canonicalize()?;
+        Ok((
+            canonical
+                .writes
+                .iter()
+                .map(PersistentWrite::block_form)
+                .collect(),
+            per_transaction,
+        ))
+    }
+
+    /// Endorsement enforcement for a candidate replacement chain (ADR-008
+    /// §4): the sync path adopts blocks wholesale, so every candidate block is
+    /// evaluated under the capability set and policy history derived from the
+    /// candidate chain itself — a chain that would break enforcement cannot be
+    /// adopted. Carriers are evaluated against each block's pre-block policy
+    /// history; committed writes are checked for aggregate carrier coverage
+    /// (no per-transaction attribution on replay paths).
+    async fn enforce_chain_endorsements(
+        state: &Arc<Mutex<NodeState>>,
+        candidate: &[Block],
+    ) -> Result<(), NetworkError> {
+        let provider = state.lock().await.endorsement.clone();
+        let Some(provider) = provider else {
+            return Ok(());
+        };
+        let mut capabilities = CapabilityHistory::default();
+        let mut policies = PolicyHistory::default();
+        for block in candidate {
+            capabilities.validate_block(block)?;
+            if capabilities
+                .effective_set(block.index)
+                .is_active(ENDORSEMENT_CAPABILITY_ID)
+            {
+                for tx in &block.transactions {
+                    evaluate_transaction_endorsements(provider.as_ref(), &policies, tx, &[])?;
+                }
+                for write in &block.write_set {
+                    if !block
+                        .transactions
+                        .iter()
+                        .any(|tx| tx.endorsements.iter().any(|e| e.covers(write)))
+                    {
+                        return Err(NetworkError::Core(CoreError::InvalidTransaction(format!(
+                            "endorsement: committed write '{}' on ({}, {}) falls outside every \
+                             declared endorsement scope",
+                            write.key, write.channel, write.contract
+                        ))));
+                    }
+                }
+            }
+            policies.validate_block(block)?;
+        }
+        Ok(())
+    }
+
+    /// Return drained transactions to the pending pool after a rejected
+    /// candidate (stale tip or failed endorsement).
+    // The ledger guard must span the whole restore loop: the transactions go
+    // back atomically with the rejection.
+    #[allow(clippy::significant_drop_tightening)]
+    async fn restore_pending(ledger: &Arc<Mutex<Ledger>>, transactions: Vec<Transaction>) {
+        let mut l = ledger.lock().await;
+        for tx in transactions {
+            if let Err(e) = l.add_transaction(tx) {
+                log::warn!("Failed to restore transaction to the pending pool: {e}");
+            }
+        }
+    }
+
+    /// Endorsement enforcement for a candidate block (ADR-008 handoff 4):
+    /// invoked at the network commit path before any materialization.
+    ///
+    /// Gated on the `endorsement` capability being active at the candidate
+    /// height (ADR-010) **and** a provider being configured. Validates the
+    /// block's policy metadata and the same-block policy/write conflict rule,
+    /// then evaluates every transaction's declared carriers against the
+    /// *pre-block* policy history (a same-block policy update applies only
+    /// from the next block). `per_tx_writes` carries the per-transaction
+    /// contributions when the caller can attribute writes (mining); replay
+    /// paths pass an empty slice and get an aggregate coverage check instead.
+    async fn enforce_block_endorsements(
+        state: &Arc<Mutex<NodeState>>,
+        ledger: &Arc<Mutex<Ledger>>,
+        block: &Block,
+        per_tx_writes: &[Vec<PersistentWrite>],
+    ) -> Result<(), NetworkError> {
+        let provider = state.lock().await.endorsement.clone();
+        let Some(provider) = provider else {
+            return Ok(());
+        };
+        let active = {
+            let l = ledger.lock().await;
+            CapabilityHistory::build_from_blocks(&l.chain)?
+                .effective_set(block.index)
+                .is_active(ENDORSEMENT_CAPABILITY_ID)
+        };
+        if !active {
+            return Ok(());
+        }
+        let policies = state.lock().await.policies.clone();
+        // Structural metadata + same-block conflicts, on a scratch history —
+        // signature evaluation below uses the pre-block policy set.
+        let mut scratch = policies.clone();
+        scratch.validate_block(block)?;
+        for (tx_index, tx) in block.transactions.iter().enumerate() {
+            let writes = per_tx_writes.get(tx_index).map_or(&[][..], Vec::as_slice);
+            evaluate_transaction_endorsements(provider.as_ref(), &policies, tx, writes)?;
+        }
+        if per_tx_writes.is_empty() {
+            // No write attribution on replay paths: every committed write
+            // must still sit inside some declared carrier.
+            for write in &block.write_set {
+                if !block
+                    .transactions
+                    .iter()
+                    .any(|tx| tx.endorsements.iter().any(|e| e.covers(write)))
+                {
+                    return Err(NetworkError::Core(CoreError::InvalidTransaction(format!(
+                        "endorsement: committed write '{}' on ({}, {}) falls outside every \
+                         declared endorsement scope",
+                        write.key, write.channel, write.contract
+                    ))));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Evaluate an endorsement request against the committed policies
+    /// (ADR-008): every applicable policy layer for the request's target is
+    /// evaluated through the configured provider. Backs the
+    /// `VerifyEndorsement` RPC.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError`] when no provider is configured, a signer
+    /// cannot be authenticated, or a policy is not valid v1 metadata.
+    pub async fn verify_endorsement(
+        &self,
+        request: EndorsementRequest,
+    ) -> Result<Vec<EndorsementEvaluation>, NetworkError> {
+        let s = self.state.lock().await;
+        let Some(provider) = &s.endorsement else {
+            return Err(NetworkError::Core(CoreError::InvalidTransaction(
+                "no endorsement provider configured on this node".into(),
+            )));
+        };
+        let policies = s
+            .policies
+            .policies_for(&request.target.channel, &request.target.contract);
+        let provider = provider.clone();
+        drop(s);
+        let mut evaluations = Vec::new();
+        for policy in policies.applicable(&request.target) {
+            evaluations.push(provider.evaluate(&policy, &request)?);
+        }
+        Ok(evaluations)
+    }
+
+    /// Rebuild the derived world state from committed blocks in block order.
     /// Return a snapshot of the current ledger state.
     pub async fn ledger_snapshot(&self) -> Ledger {
         self.ledger.lock().await.clone()
@@ -892,15 +1912,19 @@ impl Node {
     }
 
     /// Broadcast a message to all connected peers via their persistent write channels.
+    ///
+    /// Transaction relays skip read-only observers: they may parse and
+    /// validate history, but not participate in relaying active writes
+    /// (ADR-010 decision 6). Blocks and sync traffic still reach them.
     async fn broadcast(&self, message: Message) {
         let senders: Vec<Sender<Message>> = {
-            self.state
-                .lock()
-                .await
-                .peer_senders
-                .values()
-                .cloned()
-                .collect()
+            let s = self.state.lock().await;
+            if matches!(message, Message::Transaction(_)) {
+                let active = active_set_at_tip(&self.ledger).await;
+                s.relay_targets(&active)
+            } else {
+                s.peer_senders.values().cloned().collect()
+            }
         };
         for sender in senders {
             match sender.try_send(message.clone()) {
@@ -912,20 +1936,59 @@ impl Node {
         }
     }
 
-    /// Post-commit hook: persist the block, index it, fire the event bus, run
-    /// watcher triggers, and add any autonomous transactions to the ledger.
+    /// Post-commit hook: persist the block, index it, fire the event bus,
+    /// ingest the analytics projections, run watcher triggers, and add any
+    /// autonomous transactions to the ledger.
+    // Each parameter is an injected seam (`Ledger`, `NodeState`, `StorageProvider`, …);
+    // bundling them would hide the injection graph behind an opaque context type.
+    // The body is one linear post-commit pipeline; split it when a caller needs a piece.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn after_block_commit(
         ledger: &Arc<Mutex<Ledger>>,
         state: &Arc<Mutex<NodeState>>,
         event_tx: &broadcast::Sender<NodeEvent>,
         indexer: &Arc<InMemoryIndexer>,
         event_bus: &Arc<InMemoryEventBus>,
+        provenance: &Arc<Mutex<ProvenanceIndex>>,
+        flattener: &Arc<Mutex<AnalyticalFlattener>>,
         block: &Block,
         storage: &Arc<dyn StorageProvider>,
     ) -> Vec<Transaction> {
-        // Persist this block so it survives a restart.
-        if let Err(e) = storage.put_block(block) {
-            log::warn!("Storage: failed to persist block {}: {e}", block.index);
+        // Persist the block and apply its canonical write set through one
+        // atomic commit boundary; on success, mirror the writes into the
+        // derived world-state cache.  On failure the chain stays authoritative
+        // (ADR-007 decision 2): the block is already committed to the ledger,
+        // and the next rebuild heals the storage divergence from the chain.
+        match storage.apply_block(block) {
+            Ok(()) => {
+                let mut s = state.lock().await;
+                for write in &block.write_set {
+                    write.apply_to_cache(&mut s.world_state);
+                }
+            }
+            Err(e) => {
+                log::warn!("Storage: failed to apply block {}: {e}", block.index);
+            }
+        }
+
+        // A committed policy update activates now: replay the policy history
+        // from the chain so evaluation uses the post-commit policy set
+        // (ADR-008 decision 4 — the new policy applies from the next block).
+        if block
+            .transactions
+            .iter()
+            .any(|tx| matches!(tx.kind, TransactionKind::PolicyUpdate(_)))
+        {
+            let chain = ledger.lock().await.chain.clone();
+            match PolicyHistory::build_from_blocks(&chain) {
+                Ok(policies) => state.lock().await.policies = policies,
+                Err(e) => {
+                    log::warn!(
+                        "Policy history rebuild failed after block {}: {e}",
+                        block.index
+                    );
+                }
+            }
         }
 
         if let Err(e) = indexer.index_block(block) {
@@ -933,6 +1996,23 @@ impl Node {
         }
         if let Err(e) = event_bus.publish_block(block) {
             log::warn!("EventBus error: {e}");
+        }
+
+        // Analytics projections: custody provenance and flat records.
+        {
+            let mut provenance_guard = provenance.lock().await;
+            provenance_guard.ingest_block(block);
+        }
+        match indexed_transactions_of(block) {
+            Ok(txs) => {
+                flattener
+                    .lock()
+                    .await
+                    .ingest_indexed_block(&IndexedBlock::from(block), &txs);
+            }
+            Err(e) => {
+                log::warn!("flattener: failed to index block {}: {e}", block.index);
+            }
         }
 
         let watcher_orders: Vec<Transaction> = {
@@ -1040,6 +2120,8 @@ struct PeerContext {
     event_tx: broadcast::Sender<NodeEvent>,
     indexer: Arc<InMemoryIndexer>,
     event_bus: Arc<InMemoryEventBus>,
+    provenance: Arc<Mutex<ProvenanceIndex>>,
+    flattener: Arc<Mutex<AnalyticalFlattener>>,
     dial_tx: UnboundedSender<String>,
     storage: Arc<dyn StorageProvider>,
 }
@@ -1077,11 +2159,28 @@ async fn handle_peer(
     // through the call chain — no shared mutable state needed.
 
     let chain_length = ctx.ledger.lock().await.chain.len() as u64;
+    let (org, certificate_pem) = {
+        let s = ctx.state.lock().await;
+        let certificate_pem = s
+            .identity
+            .as_ref()
+            .and_then(|identity| identity.certificate_pem.clone());
+        (s.local_org(&ctx.node_id), certificate_pem)
+    };
     let hello = Message::Hello {
         node_id: ctx.node_id.clone(),
         tls_cert_fingerprint: ctx.local_tls_cert_fingerprint.clone(),
         chain_length,
         version: PROTOCOL_VERSION.to_owned(),
+        capabilities: CAPABILITY_V1
+            .iter()
+            .map(|c| CapabilityAdvertisement {
+                id: c.id.to_owned(),
+                version: c.version,
+            })
+            .collect(),
+        org,
+        certificate_pem,
         listen_addr: ctx.listen_addr.clone(),
     };
     if write_tx.try_send(hello).is_err() {
@@ -1158,6 +2257,8 @@ async fn connect_to_peer(
     event_tx: broadcast::Sender<NodeEvent>,
     indexer: Arc<InMemoryIndexer>,
     event_bus: Arc<InMemoryEventBus>,
+    provenance: Arc<Mutex<ProvenanceIndex>>,
+    flattener: Arc<Mutex<AnalyticalFlattener>>,
     dial_tx: UnboundedSender<String>,
     storage: Arc<dyn StorageProvider>,
     tls: Arc<NodeTls>,
@@ -1240,6 +2341,8 @@ async fn connect_to_peer(
                     event_tx,
                     indexer,
                     event_bus,
+                    provenance,
+                    flattener,
                     dial_tx,
                     storage,
                 },
@@ -1272,7 +2375,7 @@ async fn process_message(
     write_tx: &Sender<Message>,
     current_stable_addr: Option<&str>,
     observed_cert_fingerprint: &str,
-    peer_cert_der: &[u8],
+    _peer_cert_der: &[u8],
 ) -> MessageEffect {
     match msg {
         Message::Hello {
@@ -1280,11 +2383,28 @@ async fn process_message(
             tls_cert_fingerprint,
             chain_length,
             listen_addr: peer_listen_addr,
-            ..
+            version,
+            capabilities,
+            org: peer_org,
+            certificate_pem: peer_certificate_pem,
         } => {
             log::info!(
                 "Hello from {addr} (id={peer_id}, chain_len={chain_length}, listen={peer_listen_addr})"
             );
+
+            // ── Step 0: wire-encoding compatibility gate (ADR-010 decision 6) ──
+            // PROTOCOL_VERSION is a wire-encoding gate, separate from ledger
+            // capabilities; incompatible peers are rejected.
+            if version != PROTOCOL_VERSION {
+                log::warn!(
+                    "Rejecting peer {peer_id} at {addr}: protocol version '{version}' \
+                     is incompatible with '{PROTOCOL_VERSION}'"
+                );
+                return MessageEffect {
+                    disconnect: true,
+                    ..Default::default()
+                };
+            }
 
             // Detect self-connections by comparing the peer's advertised TLS
             // fingerprint against our own local certificate fingerprint.
@@ -1305,18 +2425,52 @@ async fn process_message(
             // during the TLS handshake (connection-scoped, passed as a
             // parameter — never stored in shared mutable state).
             if tls_cert_fingerprint != observed_cert_fingerprint {
+                // The mismatch itself is the security event; the fingerprint
+                // values are deliberately not logged (CodeQL
+                // cleartext-logging) — the peer id and address identify the
+                // offender, and the fingerprints are recomputable from the
+                // presented certificates.
                 log::warn!(
                     "Rejecting peer {peer_id} at {addr}: advertised TLS fingerprint \
-                     does not match observed session certificate \
-                     (advertised={}, observed={})",
-                    &tls_cert_fingerprint[..16.min(tls_cert_fingerprint.len())],
-                    &observed_cert_fingerprint[..16.min(observed_cert_fingerprint.len())],
+                     does not match the observed session certificate"
                 );
                 return MessageEffect {
                     disconnect: true,
                     ..Default::default()
                 };
             }
+
+            // ── Step 2.5: certificate-verified org (ticket #47) ──────────
+            // When a verifier is configured, the claimed org counts only if
+            // the peer's organization-issued certificate verifies against this
+            // org's Root CA and its subject CN equals the claimed org. The TLS
+            // certificate is transport-only (self-signed), so this check runs
+            // on the Hello-carried certificate.
+            let org_verified = {
+                let s = ctx.state.lock().await;
+                let has_verifier = s.cert_verifier.is_some();
+                let verified = has_verifier
+                    && s.cert_verifier.as_ref().is_some_and(|verifier| {
+                        peer_certificate_pem.as_ref().is_some_and(|pem| {
+                            verifier
+                                .verified_subject_cn_pem(pem)
+                                .is_ok_and(|cn| cn == peer_org)
+                        })
+                    });
+                let rejected = has_verifier && !verified;
+                drop(s);
+                if rejected {
+                    log::warn!(
+                        "Rejecting peer {peer_id} at {peer_listen_addr}: organization \
+                         '{peer_org}' is not certificate-verified"
+                    );
+                    return MessageEffect {
+                        disconnect: true,
+                        ..Default::default()
+                    };
+                }
+                verified
+            };
 
             // ── Step 2: TOFU peer registry ────────────────────────────
             // First contact  → record identity (node_id + cert fingerprint).
@@ -1328,6 +2482,8 @@ async fn process_message(
                     &peer_listen_addr,
                     &peer_id,
                     observed_cert_fingerprint,
+                    &peer_org,
+                    org_verified,
                 ) {
                     Ok(is_new) => {
                         if is_new {
@@ -1351,29 +2507,22 @@ async fn process_message(
                     }
                 }
 
-                // ── Step 3: CA certificate verification (org mode) ───────────────
-                // If this node is configured with an Organization Root CA verifier,
-                // require that the peer's TLS certificate was issued by that CA.
-                // Peers with self-signed certs are still accepted in dev mode
-                // (when no cert_verifier is configured).
-                if let Some(ref verifier) = s.cert_verifier {
-                    if let Err(e) = verifier.verify_cert_der(peer_cert_der) {
-                        log::warn!(
-                            "Rejecting peer {peer_id} at {peer_listen_addr}: CA cert \
-                             verification failed: {e}"
-                        );
-                        return MessageEffect {
-                            disconnect: true,
-                            ..Default::default()
-                        };
-                    }
-                    log::info!(
-                        "CA cert verified for peer {peer_id} (org={})",
-                        verifier.org_name()
-                    );
-                }
+                // ── Step 3: certificate-verified org (moved to Step 2.5, #47) ──
+                // The TLS certificate is a transport-only self-signed cert, so
+                // organization trust does NOT ride on it: Step 2.5 verifies the
+                // Hello-carried organization certificate against the configured
+                // Root CA and gates both the connection and the private-payload
+                // path on that verification.
 
-                // ── Step 4: register live connection state ────────────
+                // ── Step 4: record advertised capabilities ──────────────
+                // Read-only status is not cached here: it is evaluated at
+                // each proposal/relay against the capability set effective at
+                // the current tip, so a peer that predates an activation loses
+                // write rights the moment the activation takes effect.
+                s.peer_registry
+                    .set_advertised(&peer_listen_addr, capabilities);
+
+                // ── Step 5: register live connection state ────────────
                 s.known_peers.insert(peer_listen_addr.clone());
                 s.peer_senders
                     .insert(peer_listen_addr.clone(), write_tx.clone());
@@ -1395,9 +2544,18 @@ async fn process_message(
 
         Message::Transaction(tx) => {
             // Reject messages from peers that have not completed a successful Hello.
-            if current_stable_addr.is_none() {
+            let Some(stable_addr) = current_stable_addr else {
                 log::warn!("Ignoring transaction from unauthenticated peer {addr}");
                 return MessageEffect::default();
+            };
+            // Read-only observers may not propose writes (ADR-010 decision 6).
+            {
+                let active = active_set_at_tip(&ctx.ledger).await;
+                let s = ctx.state.lock().await;
+                if s.peer_registry.is_read_only(stable_addr, &active) {
+                    log::warn!("Ignoring transaction from read-only observer {addr}");
+                    return MessageEffect::default();
+                }
             }
             let generated = {
                 let mut s = ctx.state.lock().await;
@@ -1433,14 +2591,11 @@ async fn process_message(
                 }
             }
 
-            let senders: Vec<Sender<Message>> = ctx
-                .state
-                .lock()
-                .await
-                .peer_senders
-                .values()
-                .cloned()
-                .collect();
+            let senders: Vec<Sender<Message>> = {
+                let active = active_set_at_tip(&ctx.ledger).await;
+                let s = ctx.state.lock().await;
+                s.relay_targets(&active)
+            };
             for gen_tx in generated {
                 for s in &senders {
                     let _ = s.try_send(Message::Transaction(gen_tx.clone()));
@@ -1451,9 +2606,18 @@ async fn process_message(
 
         Message::Block(block) => {
             // Reject messages from peers that have not completed a successful Hello.
-            if current_stable_addr.is_none() {
+            let Some(stable_addr) = current_stable_addr else {
                 log::warn!("Ignoring block from unauthenticated peer {addr}");
                 return MessageEffect::default();
+            };
+            // Read-only observers may not propose blocks (ADR-010 decision 6).
+            {
+                let active = active_set_at_tip(&ctx.ledger).await;
+                let s = ctx.state.lock().await;
+                if s.peer_registry.is_read_only(stable_addr, &active) {
+                    log::warn!("Ignoring block from read-only observer {addr}");
+                    return MessageEffect::default();
+                }
             }
             // Reject blocks with implausible timestamps (> 2 hours in the future).
             // Block 0 (genesis) uses timestamp 0 by design and is exempt.
@@ -1477,7 +2641,11 @@ async fn process_message(
                 let result = if block.index == expected {
                     let diff = l.difficulty;
                     l.chain.last().map_or((false, false), |prev| {
-                        let valid = block.chains_to(prev).is_ok() && block.has_valid_pow(diff);
+                        let valid = block.chains_to(prev).is_ok()
+                            && block.has_valid_pow(diff)
+                            && CapabilityHistory::build_from_blocks(&l.chain)
+                                .and_then(|mut history| history.validate_block(&block))
+                                .is_ok();
                         (valid, false)
                     })
                 } else {
@@ -1493,14 +2661,18 @@ async fn process_message(
             }
 
             if should_append {
+                // Endorsement enforcement on the peer-admission path
+                // (ADR-008 §4): policy metadata, the same-block rule, and
+                // declared-carrier evaluation run before the block is
+                // appended; write attribution is not recomputable here (no
+                // re-execution), so coverage is checked in aggregate.
+                if let Err(e) =
+                    Node::enforce_block_endorsements(&ctx.state, &ctx.ledger, &block, &[]).await
                 {
-                    let mut l = ctx.ledger.lock().await;
-                    let committed: std::collections::HashSet<&str> =
-                        block.transactions.iter().map(|t| t.id.as_str()).collect();
-                    l.pending_transactions
-                        .retain(|t| !committed.contains(t.id.as_str()));
-                    l.chain.push(block.clone());
+                    log::warn!("Rejected block {} from {addr}: {e}", block.index);
+                    return MessageEffect::default();
                 }
+                Node::append_peer_block(&ctx.ledger, &block).await;
 
                 let generated = Node::after_block_commit(
                     &ctx.ledger,
@@ -1508,6 +2680,8 @@ async fn process_message(
                     &ctx.event_tx,
                     &ctx.indexer,
                     &ctx.event_bus,
+                    &ctx.provenance,
+                    &ctx.flattener,
                     &block,
                     &ctx.storage,
                 )
@@ -1516,16 +2690,20 @@ async fn process_message(
                 let _ = ctx.event_tx.send(NodeEvent::BlockReceived {
                     index: block.index,
                     hash: block.hash.clone(),
+                    // PoW's attestation is the valid nonce in the block itself:
+                    // a verifying member derives and validates the degenerate
+                    // certificate on receipt. BFT-attested blocks are not
+                    // admissible here yet: certificate wire transport and
+                    // peer-path quorum verification are ADR-010 adoption-gate
+                    // work (staged, ticket #42).
+                    certificate: QuorumCertificate::pow(&block),
                 });
 
-                let senders: Vec<Sender<Message>> = ctx
-                    .state
-                    .lock()
-                    .await
-                    .peer_senders
-                    .values()
-                    .cloned()
-                    .collect();
+                let senders: Vec<Sender<Message>> = {
+                    let active = active_set_at_tip(&ctx.ledger).await;
+                    let s = ctx.state.lock().await;
+                    s.relay_targets(&active)
+                };
                 for tx in generated {
                     for s in &senders {
                         let _ = s.try_send(Message::Transaction(tx.clone()));
@@ -1544,6 +2722,13 @@ async fn process_message(
         }
 
         Message::Chain(candidate) => {
+            // A synced chain is adopted wholesale: endorsement enforcement
+            // must hold on the candidate itself before any block is adopted
+            // (ADR-008 §4 — no commit path bypasses evaluation).
+            if let Err(e) = Node::enforce_chain_endorsements(&ctx.state, &candidate).await {
+                log::warn!("Rejected chain replacement from {addr}: {e}");
+                return MessageEffect::default();
+            }
             let replaced = {
                 let mut l = ctx.ledger.lock().await;
                 l.try_replace_chain(candidate)
@@ -1557,7 +2742,31 @@ async fn process_message(
                     }
                 }
 
-                Node::rebuild_runtime_state_from_chain(&ctx.ledger, &ctx.state, &ctx.storage).await;
+                // Every block adopted by sync is a commit: emit the
+                // certificate-bearing notification so commit consumers receive
+                // the attestation set on this path too (degenerate `PoW`
+                // certificate here; BFT certificate replay on sync is ADR-010
+                // adoption-gate work — certificates are not persisted with
+                // blocks yet, ticket #42).
+                for block in &new_chain {
+                    if block.index == 0 {
+                        continue;
+                    }
+                    let _ = ctx.event_tx.send(NodeEvent::BlockReceived {
+                        index: block.index,
+                        hash: block.hash.clone(),
+                        certificate: QuorumCertificate::pow(block),
+                    });
+                }
+
+                Node::rebuild_runtime_state_from_chain(
+                    &ctx.ledger,
+                    &ctx.state,
+                    &ctx.storage,
+                    &ctx.provenance,
+                    &ctx.flattener,
+                )
+                .await;
                 log::info!(
                     "Contract engine and watcher state rebuilt from synced chain ({} blocks)",
                     new_chain.len()
@@ -1595,6 +2804,151 @@ async fn process_message(
             MessageEffect::default()
         }
 
+        Message::PrivatePayload {
+            collection,
+            commitment,
+            payload,
+        } => {
+            // ── The private-payload transport boundary (ADR-003, #46) ──────
+            // A payload is accepted only when the `pdc` capability is active,
+            // this node's org is a collection member, the sender's org is a
+            // member, and the commitment matches the payload. A non-member
+            // never holds private cleartext; the chain carries only the
+            // commitment.
+            // The payload is a pre-commit artifact for a write that lands at
+            // the NEXT height — it may arrive before its block does — so the
+            // gate is the capability set effective there (matching the
+            // submission gate). One lock scope for height and history so the
+            // chain cannot advance in between.
+            let pdc_active = {
+                let ledger = ctx.ledger.lock().await;
+                let next_height = ledger.chain.len() as u64;
+                CapabilityHistory::build_from_blocks(&ledger.chain).is_ok_and(|history| {
+                    history
+                        .effective_set(next_height)
+                        .is_active(PDC_CAPABILITY_ID)
+                })
+            };
+            if !pdc_active {
+                log::warn!(
+                    "Rejecting private payload for '{collection}' from {addr}: \
+                     the 'pdc' capability is not active"
+                );
+                return MessageEffect::default();
+            }
+            // Only peers that completed the handshake may send payloads.
+            let Some(stable_addr) = current_stable_addr else {
+                log::warn!("Ignoring private payload from unauthenticated peer {addr}");
+                return MessageEffect::default();
+            };
+            let local_org = ctx
+                .state
+                .lock()
+                .await
+                .identity
+                .clone()
+                .map_or_else(|| ctx.node_id.clone(), |identity| identity.node_id.clone());
+            let s = ctx.state.lock().await;
+            let sender_org = s.peer_org(stable_addr);
+            let sender_verified = sender_org
+                .as_ref()
+                .and_then(|org| s.peer_registry.org_verified(stable_addr, org));
+            // When this node runs certificate verification, a private payload
+            // may only come from a peer whose org was certificate-verified
+            // (ticket #47): the self-asserted Hello org is not trusted here.
+            let verification_required = s.cert_verifier.is_some();
+            let sender_ok = sender_org
+                .as_ref()
+                .is_some_and(|org| s.is_collection_member(&collection, org))
+                && (!verification_required || sender_verified == Some(true));
+            let commitment_ok = glasschain_core::crypto::sha256(&payload) == commitment;
+            let rejection = match (s.is_collection_member(&collection, &local_org), sender_ok) {
+                (false, _) => Some(format!("local org '{local_org}' is not a member")),
+                (true, false) => Some(sender_org.map_or_else(
+                    || "sender not in the peer registry".to_owned(),
+                    |org| format!("sender org '{org}' is not a member"),
+                )),
+                (true, true) if !commitment_ok => Some("commitment mismatch".to_owned()),
+                (true, true) => None,
+            };
+            if let Some(reason) = rejection {
+                log::warn!("Rejecting private payload for '{collection}' from {addr}: {reason}");
+            } else if s
+                .transient
+                .put(
+                    &collection,
+                    &commitment,
+                    &payload,
+                    s.collection(&collection).map_or(
+                        glasschain_identity::default_retention_secs(),
+                        |configured| configured.config.retention_secs,
+                    ),
+                )
+                .is_ok()
+            {
+                log::info!(
+                    "Private payload stored (collection={collection}, commitment={}...)",
+                    &commitment[..8]
+                );
+                drop(s);
+                let _ = ctx.event_tx.send(NodeEvent::PrivatePayloadReceived {
+                    collection,
+                    commitment,
+                });
+            } else {
+                log::warn!(
+                    "Rejecting private payload for '{collection}' from {addr}: \
+                     transient store failure"
+                );
+            }
+            MessageEffect::default()
+        }
+        Message::RequestPrivatePayload {
+            collection,
+            commitment,
+        } => {
+            // Pull reconciliation (ticket #47): only a member may ask, and
+            // only a member holding the payload may answer — the response is
+            // the ordinary PrivatePayload message, so every transport-boundary
+            // check applies to the answer too.
+            let Some(stable_addr) = current_stable_addr else {
+                log::warn!("Ignoring private-payload request from unauthenticated peer {addr}");
+                return MessageEffect::default();
+            };
+            let (transient, requester_member, holder_member) = {
+                let s = ctx.state.lock().await;
+                let requester_member = s
+                    .peer_org(stable_addr)
+                    .is_some_and(|org| s.is_collection_member(&collection, &org));
+                let holder_member = s.is_collection_member(&collection, &s.local_org(&ctx.node_id));
+                let transient = s.transient.clone();
+                drop(s);
+                (transient, requester_member, holder_member)
+            };
+            if !requester_member || !holder_member {
+                log::warn!(
+                    "Ignoring private-payload request for '{collection}' from {addr}: \
+                     requester or holder is not a member"
+                );
+                return MessageEffect::default();
+            }
+            match transient.get(&collection, &commitment) {
+                Ok(Some(payload)) => {
+                    if let Err(e) = write_tx.try_send(Message::PrivatePayload {
+                        collection,
+                        commitment,
+                        payload,
+                    }) {
+                        log::warn!("Reconcile response delivery failed: {e}");
+                    }
+                }
+                Ok(None) => {
+                    log::debug!("Reconcile: payload {commitment} not held for '{collection}'");
+                }
+                Err(e) => log::warn!("Reconcile lookup failed: {e}"),
+            }
+            MessageEffect::default()
+        }
         Message::Goodbye { reason } => {
             log::info!("Peer {addr} says goodbye: {reason}");
             MessageEffect::default()
@@ -1607,13 +2961,17 @@ async fn process_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glasschain_core::{InventoryUpdate, PurchaseConditions, SmartContractDef, SupplyOffer};
+    use glasschain_core::{
+        ContractExecution, CoreError, InventoryUpdate, PurchaseConditions, SmartContractDef,
+        SupplyOffer, TraceableAsset, TraceableAssetRegistration, WriteOp, WriteVisibility,
+    };
     use glasschain_identity::SignedTransaction;
+    use glasschain_vm::WasmExecutionProvider;
 
     #[test]
     fn tofu_first_contact_records_identity() {
         let mut reg = PeerRegistry::new();
-        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123");
+        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a", false);
         assert_eq!(result, Ok(true), "first contact should return Ok(true)");
         assert_eq!(reg.peers.len(), 1);
         let peer = &reg.peers["127.0.0.1:8000"];
@@ -1624,9 +2982,9 @@ mod tests {
     #[test]
     fn tofu_returning_peer_with_same_identity_passes() {
         let mut reg = PeerRegistry::new();
-        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123")
+        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a", false)
             .unwrap();
-        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123");
+        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a", false);
         assert_eq!(
             result,
             Ok(false),
@@ -1637,18 +2995,19 @@ mod tests {
     #[test]
     fn tofu_rejects_node_id_change() {
         let mut reg = PeerRegistry::new();
-        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123")
+        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a", false)
             .unwrap();
-        let result = reg.verify_or_register("127.0.0.1:8000", "node-IMPOSTER", "abc123");
+        let result =
+            reg.verify_or_register("127.0.0.1:8000", "node-IMPOSTER", "abc123", "org-b", false);
         assert!(result.is_err(), "changed node_id should be rejected");
     }
 
     #[test]
     fn tofu_rejects_cert_fingerprint_change() {
         let mut reg = PeerRegistry::new();
-        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123")
+        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a", false)
             .unwrap();
-        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "TAMPERED");
+        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "TAMPERED", "org-a", false);
         assert!(
             result.is_err(),
             "changed cert fingerprint should be rejected"
@@ -1656,23 +3015,35 @@ mod tests {
     }
 
     #[test]
+    fn tofu_rejects_org_drift() {
+        let mut reg = PeerRegistry::new();
+        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a", true)
+            .unwrap();
+        // A returning peer claiming a different organization is rejected:
+        // the org gates private-payload delivery (ticket #47).
+        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-b", true);
+        let err = result.expect_err("org drift should be rejected");
+        assert!(err.contains("org changed"), "{err}");
+    }
+
+    #[test]
     fn tofu_independent_addresses_are_independent() {
         let mut reg = PeerRegistry::new();
-        reg.verify_or_register("127.0.0.1:8000", "node-a", "aaa")
+        reg.verify_or_register("127.0.0.1:8000", "node-a", "aaa", "org-a", false)
             .unwrap();
-        reg.verify_or_register("127.0.0.1:9000", "node-b", "bbb")
+        reg.verify_or_register("127.0.0.1:9000", "node-b", "bbb", "org-b", false)
             .unwrap();
         assert_eq!(reg.peers.len(), 2);
         // Each address keeps its own identity.
         assert!(reg
-            .verify_or_register("127.0.0.1:8000", "node-a", "aaa")
+            .verify_or_register("127.0.0.1:8000", "node-a", "aaa", "org-a", false)
             .is_ok());
         assert!(reg
-            .verify_or_register("127.0.0.1:9000", "node-b", "bbb")
+            .verify_or_register("127.0.0.1:9000", "node-b", "bbb", "org-b", false)
             .is_ok());
         // Cross-contamination is rejected.
         assert!(reg
-            .verify_or_register("127.0.0.1:8000", "node-b", "aaa")
+            .verify_or_register("127.0.0.1:8000", "node-b", "aaa", "org-b", false)
             .is_err());
     }
 
@@ -1926,6 +3297,8 @@ mod tests {
             &node.event_tx,
             &node.indexer,
             &node.event_bus,
+            &node.provenance,
+            &node.flattener,
             &block,
             &node.storage,
         )
@@ -1971,7 +3344,14 @@ mod tests {
         storage.put_state("watcher:state", &bytes).unwrap();
 
         let node = Node::new_with_storage("n1", "127.0.0.1:0", 2, Arc::clone(&storage));
-        Node::rebuild_runtime_state_from_chain(&node.ledger, &node.state, &node.storage).await;
+        Node::rebuild_runtime_state_from_chain(
+            &node.ledger,
+            &node.state,
+            &node.storage,
+            &node.provenance,
+            &node.flattener,
+        )
+        .await;
 
         let restored = node
             .state
@@ -1992,7 +3372,8 @@ mod tests {
             .put_state("watcher:state", b"not-valid-json")
             .unwrap();
 
-        // Build a persisted chain that commits an InventoryUpdate.
+        // Build a persisted chain that commits an InventoryUpdate and an
+        // AssetRegistration (so the analytics projections have data to rebuild).
         let genesis = Ledger::new(2).chain[0].clone();
         storage.put_block(&genesis).unwrap();
         let tx = Transaction::with_id(
@@ -2004,12 +3385,40 @@ mod tests {
                 reason: "x".into(),
             }),
         );
-        let mut block = Block::new(1, vec![tx], genesis.hash);
+        let asset_tx = Transaction::with_id(
+            "asset-1",
+            TransactionKind::AssetRegistration(TraceableAssetRegistration {
+                asset: TraceableAsset {
+                    gtin: Some("07891234100016".into()),
+                    batch_number: None,
+                    expiry_date: None,
+                    serial_number: Some("SN-REBUILD".into()),
+                    anvisa_registration: None,
+                    manufacturer_id: None,
+                    product_name: "Dipirona 500mg".into(),
+                    custodian_id: "plant-1".into(),
+                    country_of_origin: None,
+                    storage_temp_celsius: None,
+                    quantity: 1,
+                },
+                event_type: "manufacture".into(),
+                originator_id: "plant-1".into(),
+                purchase_order_ref: None,
+            }),
+        );
+        let mut block = Block::new(1, vec![tx, asset_tx], genesis.hash);
         block.mine(2);
         storage.put_block(&block).unwrap();
 
         let node = Node::new_with_storage("n1", "127.0.0.1:0", 2, Arc::clone(&storage));
-        Node::rebuild_runtime_state_from_chain(&node.ledger, &node.state, &node.storage).await;
+        Node::rebuild_runtime_state_from_chain(
+            &node.ledger,
+            &node.state,
+            &node.storage,
+            &node.provenance,
+            &node.flattener,
+        )
+        .await;
 
         let restored = node
             .state
@@ -2020,6 +3429,23 @@ mod tests {
         assert_eq!(
             restored, 7,
             "invalid snapshot must fall back to replaying committed inventory updates"
+        );
+
+        // The analytics projections must rebuild from the committed chain.
+        let canonical_id = "GTIN:07891234100016:SN:SN-REBUILD";
+        assert_eq!(
+            node.provenance
+                .lock()
+                .await
+                .get_custody_chain(canonical_id)
+                .len(),
+            1,
+            "provenance must rebuild custody chains from persisted blocks"
+        );
+        assert_eq!(
+            node.flattener.lock().await.records().len(),
+            1,
+            "flattener must rebuild flat records from persisted blocks"
         );
     }
 
@@ -2073,5 +3499,397 @@ mod tests {
         assert_eq!(summary.status, "Active");
         assert_eq!(summary.quantity_purchased, 10);
         assert_eq!(summary.max_quantity, 50);
+    }
+
+    // ── 8. Committed write sets (ticket #41) ────────────────────────────────
+
+    /// A contract that persists one public write and one PDC write.
+    fn write_set_wasm_b64() -> String {
+        let wat = r#"
+(module
+  (import "env" "persist_state" (func $persist (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "env" "set_state" (func $set_state (param i32 i32 i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "ch")
+  (data (i32.const 16) "contract-1")
+  (data (i32.const 32) "public-key")
+  (data (i32.const 48) "public-value")
+  (data (i32.const 64) "pdc-key")
+  (data (i32.const 80) "secret")
+  (data (i32.const 96) "collection-1")
+  (data (i32.const 112) "approve")
+  (data (i32.const 120) "1")
+  (func (export "execute")
+    ;; public set: ch / contract-1 / public-key = public-value
+    (call $persist (i32.const 0) (i32.const 2) (i32.const 16) (i32.const 10)
+                   (i32.const 32) (i32.const 10) (i32.const 48) (i32.const 12)
+                   (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))
+    (drop)
+    ;; PDC set: ch / contract-1 / pdc-key = secret → collection-1
+    (call $persist (i32.const 0) (i32.const 2) (i32.const 16) (i32.const 10)
+                   (i32.const 64) (i32.const 7) (i32.const 80) (i32.const 6)
+                   (i32.const 0) (i32.const 1) (i32.const 96) (i32.const 12))
+    (drop)
+    (call $set_state (i32.const 112) (i32.const 7) (i32.const 120) (i32.const 1))
+  )
+)
+"#;
+        let wasm = wat::parse_str(wat).expect("fixture WAT must compile");
+        BASE64_STANDARD.encode(wasm)
+    }
+
+    fn write_set_contract() -> SmartContractDef {
+        SmartContractDef {
+            contract_id: "c-ws".into(),
+            buyer_id: "buyer-1".into(),
+            product_id: "SKU-1".into(),
+            conditions: PurchaseConditions {
+                max_price_per_unit: 1_000,
+                min_quantity: 1,
+                max_quantity: 10,
+                max_lead_time_days: 5,
+                preferred_seller_id: None,
+                currency: "USD".into(),
+                auto_execute: false,
+            },
+            wasm_code_b64: Some(write_set_wasm_b64()),
+        }
+    }
+
+    fn write_set_execution() -> Transaction {
+        Transaction::new(TransactionKind::ContractExecution(ContractExecution {
+            contract_id: "c-ws".into(),
+            purchase_order_tx_id: "po-1".into(),
+            buyer_id: "buyer-1".into(),
+            seller_id: "seller-1".into(),
+            product_id: "SKU-1".into(),
+            quantity: 5,
+            total_price: 5_000,
+            currency: "USD".into(),
+        }))
+    }
+
+    async fn commit_write_set_scenario(
+        storage: Arc<dyn StorageProvider>,
+    ) -> (Arc<Node>, HashMap<String, Vec<u8>>) {
+        let node = Node::new_with_storage("n-ws", "127.0.0.1:0", 1, Arc::clone(&storage));
+        node.start(vec![]).await.unwrap();
+        node.set_execution_provider(Arc::new(
+            WasmExecutionProvider::new().expect("wasmtime must init"),
+        ))
+        .await;
+        // PDC-scoped writes require the `pdc` capability active at the
+        // candidate height (ADR-010, ticket #46): activate it for height 2 so
+        // the execution block below may carry the PDC write.
+        node.submit_transaction(Transaction::with_id(
+            "cap:pdc:2".to_owned(),
+            TransactionKind::CapabilityActivation(CapabilityActivation {
+                capability_id: "pdc".into(),
+                version: 1,
+                hash: capability_hash("pdc", 1),
+                activation_height: 2,
+                signatures: vec![RecordSignature {
+                    signer: "org-gov".into(),
+                    signature_bytes: vec![0x42],
+                }],
+            }),
+        ))
+        .await
+        .unwrap();
+        node.mine().await.unwrap();
+        node.submit_transaction(Transaction::new(TransactionKind::ContractCreation(
+            write_set_contract(),
+        )))
+        .await
+        .unwrap();
+        node.submit_transaction(write_set_execution())
+            .await
+            .unwrap();
+        node.mine().await.unwrap();
+
+        let expected = HashMap::from([
+            (
+                "ws:ch:contract-1:public-key".to_owned(),
+                b"public-value".to_vec(),
+            ),
+            (
+                "ws:ch:contract-1:pdc-key".to_owned(),
+                sha256(b"secret").into_bytes(),
+            ),
+        ]);
+        (Arc::new(node), expected)
+    }
+
+    #[tokio::test]
+    async fn committed_block_carries_canonical_write_set_with_pdc_commitment() {
+        let storage: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
+        let (node, expected) = commit_write_set_scenario(Arc::clone(&storage)).await;
+
+        let block = storage
+            .get_block(2)
+            .unwrap()
+            .expect("execution block committed");
+        assert_eq!(block.write_set.len(), 2, "one public + one PDC write");
+        // Canonicalized: scope-sorted, deterministic order.
+        assert_eq!(block.write_set[0].key, "pdc-key");
+        assert_eq!(block.write_set[1].key, "public-key");
+
+        let public_write = &block.write_set[1];
+        assert_eq!(
+            public_write.op,
+            WriteOp::Set(b"public-value".to_vec()),
+            "public writes carry their value"
+        );
+
+        let pdc_write = &block.write_set[0];
+        assert_eq!(
+            pdc_write.visibility,
+            WriteVisibility::Pdc("collection-1".into())
+        );
+        let WriteOp::Set(commitment) = &pdc_write.op else {
+            panic!("expected a commitment Set");
+        };
+        assert_eq!(commitment, &sha256(b"secret").into_bytes());
+        assert_ne!(
+            commitment, b"secret",
+            "the private value must never enter the block"
+        );
+
+        // The derived cache holds the public value and the PDC commitment.
+        assert_eq!(node.world_state().await, expected);
+    }
+
+    #[tokio::test]
+    async fn restart_rebuilds_world_state_from_committed_write_sets_without_reexecution() {
+        let storage: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
+        let (_, expected) = commit_write_set_scenario(Arc::clone(&storage)).await;
+
+        // A fresh node over the same storage, with **no** execution provider:
+        // the world state must rebuild from the committed write sets alone —
+        // no guest code is re-executed anywhere on the rebuild path.
+        let restarted = Node::new_with_storage("n-restart", "127.0.0.1:0", 1, storage);
+        restarted.start(vec![]).await.unwrap();
+        assert_eq!(
+            restarted.world_state().await,
+            expected,
+            "restart rebuild must materialize the same committed state"
+        );
+    }
+
+    /// A backend that persists the block durably and then fails before the
+    /// derived state is applied — the AC3 failure shape.
+    struct FailStateApply {
+        inner: Arc<dyn StorageProvider>,
+    }
+
+    impl StorageProvider for FailStateApply {
+        fn put_block(&self, block: &Block) -> Result<(), CoreError> {
+            self.inner.put_block(block)
+        }
+        fn get_block(&self, index: u64) -> Result<Option<Block>, CoreError> {
+            self.inner.get_block(index)
+        }
+        fn latest_block_index(&self) -> Result<Option<u64>, CoreError> {
+            self.inner.latest_block_index()
+        }
+        fn apply_block(&self, block: &Block) -> Result<(), CoreError> {
+            // Simulated crash: the block lands durably, then the backend dies
+            // before any state application.
+            self.inner.put_block(block)?;
+            Err(CoreError::Storage(
+                "simulated crash after block durability".to_owned(),
+            ))
+        }
+        fn put_state(&self, key: &str, value: &[u8]) -> Result<(), CoreError> {
+            self.inner.put_state(key, value)
+        }
+        fn get_state(&self, key: &str) -> Result<Option<Vec<u8>>, CoreError> {
+            self.inner.get_state(key)
+        }
+        fn delete_state(&self, key: &str) -> Result<(), CoreError> {
+            self.inner.delete_state(key)
+        }
+        fn name(&self) -> &'static str {
+            "fail-state-apply"
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_after_block_durable_is_healed_by_rebuild() {
+        let inner: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
+        let failing: Arc<dyn StorageProvider> = Arc::new(FailStateApply {
+            inner: Arc::clone(&inner),
+        });
+        let (node, expected) = commit_write_set_scenario(Arc::clone(&failing)).await;
+
+        // Every apply_block failed after the block write: history is durable,
+        // the derived cache and storage state are not.
+        assert!(
+            node.world_state().await.is_empty(),
+            "the derived cache must be empty after the failures"
+        );
+        assert!(inner
+            .get_state("ws:ch:contract-1:public-key")
+            .unwrap()
+            .is_none());
+
+        // Rebuild consumes the committed write sets in block order — no
+        // rollback, no history edit — and heals both projections.
+        let healed = Node::rebuild_world_state(&failing).expect("rebuild must succeed");
+        assert_eq!(healed, expected);
+        assert_eq!(
+            inner.get_state("ws:ch:contract-1:public-key").unwrap(),
+            Some(b"public-value".to_vec()),
+            "rebuild must heal the storage state"
+        );
+        assert_eq!(
+            inner.get_block(2).unwrap().unwrap().write_set.len(),
+            2,
+            "history must stay untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn sled_backed_restart_rebuilds_world_state_across_persistence() {
+        use glasschain_storage::SledStorageProvider;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(SledStorageProvider::open(dir.path()).expect("sled must open"));
+        let (_, expected) = commit_write_set_scenario(Arc::clone(&storage)).await;
+
+        // A genuinely fresh node over the same on-disk directory, without an
+        // execution provider: the committed write sets alone must rebuild the
+        // world state (persistence + restart rebuild, AC5).
+        let restarted = Node::new_with_storage("n-sled-restart", "127.0.0.1:0", 1, storage);
+        restarted.start(vec![]).await.unwrap();
+        assert_eq!(restarted.world_state().await, expected);
+    }
+
+    #[tokio::test]
+    async fn failing_execution_accepts_no_writes_and_block_stays_consistent() {
+        let storage: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
+        let node = Node::new_with_storage("n-bad-wasm", "127.0.0.1:0", 1, Arc::clone(&storage));
+        node.start(vec![]).await.unwrap();
+        node.set_execution_provider(Arc::new(
+            WasmExecutionProvider::new().expect("wasmtime must init"),
+        ))
+        .await;
+
+        // A contract whose WASM is not valid base64: execution fails, the
+        // transaction accepts no writes, and the block still commits with an
+        // empty write set — the same result on every node (deterministic).
+        let mut def = write_set_contract();
+        def.wasm_code_b64 = Some("not-base64".to_owned());
+        node.submit_transaction(Transaction::new(TransactionKind::ContractCreation(def)))
+            .await
+            .unwrap();
+        node.mine().await.unwrap();
+        node.submit_transaction(write_set_execution())
+            .await
+            .unwrap();
+        node.mine().await.unwrap();
+
+        let block = storage
+            .get_block(2)
+            .unwrap()
+            .expect("execution block committed");
+        assert!(
+            block.write_set.is_empty(),
+            "a failed execution accepts no writes"
+        );
+        assert!(node.world_state().await.is_empty());
+    }
+
+    // ── 7. enforce_chain_endorsements (sync-path gate, ADR-008 §4) ────────────
+
+    use glasschain_core::{
+        capability_hash, CapabilityActivation, EndorserIdentity, PolicyExpression, PolicyUpdate,
+        RecordSignature, ScopedPolicies, ScopedTarget,
+    };
+    use glasschain_identity::MspEndorsementProvider;
+
+    fn chain_activation_tx(height: u64) -> Transaction {
+        Transaction::with_id(
+            format!("cap:endorsement:{height}"),
+            TransactionKind::CapabilityActivation(CapabilityActivation {
+                capability_id: "endorsement".into(),
+                version: 1,
+                hash: capability_hash("endorsement", 1),
+                activation_height: height,
+                signatures: vec![RecordSignature {
+                    signer: "governance".into(),
+                    signature_bytes: vec![0x42],
+                }],
+            }),
+        )
+    }
+
+    fn chain_policy_update_tx(signer: Option<&Identity>) -> Transaction {
+        let mut tx = Transaction::new(TransactionKind::PolicyUpdate(PolicyUpdate {
+            channel: "supply".into(),
+            contract: String::new(),
+            policies: ScopedPolicies {
+                channel_default: PolicyExpression::signed_by("org-a"),
+                contract_default: None,
+                collection_policy: None,
+                key_policies: Vec::new(),
+            },
+        }));
+        if let Some(identity) = signer {
+            let payload = glasschain_core::TransactionEndorsement::payload(&tx).unwrap();
+            tx.endorsements
+                .push(glasschain_core::TransactionEndorsement {
+                    target: ScopedTarget {
+                        channel: "supply".into(),
+                        contract: String::new(),
+                        keys: Vec::new(),
+                        collection: None,
+                    },
+                    signers: vec![EndorserIdentity {
+                        claimed_principal: glasschain_core::Principal::new("network-governance"),
+                        public_key: identity.public_key_bytes().to_vec(),
+                        signature: identity.sign_bytes(&payload),
+                    }],
+                });
+        }
+        tx
+    }
+
+    fn candidate_chain(second_tx: Transaction) -> Vec<Block> {
+        let genesis = Ledger::new(1).chain.remove(0);
+        let mut b1 = Block::new(1, vec![chain_activation_tx(2)], genesis.hash.clone());
+        b1.mine(1);
+        let mut b2 = Block::new(2, vec![second_tx], b1.hash.clone());
+        b2.mine(1);
+        vec![genesis, b1, b2]
+    }
+
+    #[tokio::test]
+    async fn sync_gate_rejects_an_unsigned_policy_update_in_a_candidate_chain() {
+        let node = Node::new("n-sync", "127.0.0.1:0", 1);
+        let mut msp = MspEndorsementProvider::new();
+        let gov = Identity::generate("gov");
+        msp.register_identity(&gov, glasschain_core::Principal::new("network-governance"));
+        node.set_endorsement_provider(Arc::new(msp)).await;
+
+        let candidate = candidate_chain(chain_policy_update_tx(None));
+        let error = Node::enforce_chain_endorsements(&node.state, &candidate)
+            .await
+            .expect_err("an unsigned policy update must reject the candidate chain");
+        assert!(error.to_string().contains("no endorsement"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn sync_gate_accepts_a_fully_endorsed_candidate_chain() {
+        let node = Node::new("n-sync", "127.0.0.1:0", 1);
+        let mut msp = MspEndorsementProvider::new();
+        let gov = Identity::generate("gov");
+        msp.register_identity(&gov, glasschain_core::Principal::new("network-governance"));
+        node.set_endorsement_provider(Arc::new(msp)).await;
+
+        let candidate = candidate_chain(chain_policy_update_tx(Some(&gov)));
+        Node::enforce_chain_endorsements(&node.state, &candidate)
+            .await
+            .expect("a signed policy update must pass the sync gate");
     }
 }
