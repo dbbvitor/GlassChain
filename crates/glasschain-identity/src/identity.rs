@@ -3,7 +3,6 @@
 use crate::error::IdentityError;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use glasschain_core::Transaction;
-use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
 /// An on-ledger participant identity, consisting of an ed25519 key pair and a
@@ -34,9 +33,15 @@ impl Clone for Identity {
 
 impl Identity {
     /// Generate a fresh identity with a randomly-generated ed25519 key pair.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the operating system's entropy source is unavailable — the
+    /// same unrecoverable-system-state stance as the clock `.expect`s in
+    /// `Block`/`Transaction` construction.
     pub fn generate(node_id: impl Into<String>) -> Self {
         let mut seed = [0_u8; 32];
-        OsRng.fill_bytes(&mut seed);
+        getrandom::fill(&mut seed).expect("OS entropy source unavailable");
         let signing_key = SigningKey::from_bytes(&seed);
         Self {
             node_id: node_id.into(),

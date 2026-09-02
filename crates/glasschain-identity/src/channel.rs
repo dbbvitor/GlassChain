@@ -25,6 +25,8 @@
 //!     name: "pharma-channel".into(),
 //!     member_ids: vec!["fabricante-abc".into(), "farmacia-sul".into()],
 //!     description: "Private channel for Anvisa-regulated products".into(),
+//!     endorsement_policy: None,
+//!     retention_secs: 72 * 60 * 60,
 //! };
 //! let mut channel = Channel::new(config);
 //! assert!(channel.is_member("fabricante-abc"));
