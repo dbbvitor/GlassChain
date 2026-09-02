@@ -10,7 +10,7 @@ GlassChain connects buyers and sellers across a peer-to-peer network, giving par
 
 | Feature | Description |
 |---|---|
-| **Distributed Ledger** | SHA-256 chained blocks with Proof-of-Work consensus and longest-chain resolution |
+| **Distributed Ledger** | SHA-256 chained blocks committed behind a `ConsensusProvider` seam that carries a quorum certificate. Proof-of-Work is the working default; longest-chain fork resolution was retired for a no-fork model |
 | **Supply-Chain Transactions** | `SupplyOffer`, `PurchaseOrder`, `InventoryUpdate`, `AssetRegistration`, and canonical v1 records (`CanonicalRecord`) |
 | **Canonical Schema v1** | 13 strict record families (lots, shipments, recall, certification, audit, state commitments, …) validated against an immutable network-wide registry before admission and commit |
 | **Contract Automation** | `ContractCreation` rules auto-execute purchase flows on matching offers |
@@ -26,21 +26,26 @@ GlassChain connects buyers and sellers across a peer-to-peer network, giving par
 
 ```text
 GlassChain/
-├── Cargo.toml                      # Workspace manifest
+├── Cargo.toml                      # Workspace manifest (12 crates)
+├── docs/                           # In-depth documentation and ADRs
 └── crates/
-    ├── glasschain-core/            # Ledger, blocks, tx model, provider traits, trust scoring
+    ├── glasschain-core/            # Ledger, blocks, tx model, canonical schema, provider traits
     ├── glasschain-contracts/       # Deterministic contract layer: registry, matching, approval gate
     ├── glasschain-workflows/       # I/O-driven automation: flows, checkpoints, watcher service
-    ├── glasschain-network/         # P2P node, protocol, peer handling
-    ├── glasschain-node/            # Interactive CLI node binary
-    ├── glasschain-storage/         # Storage backends/adapters
-    ├── glasschain-identity/        # Identity and signing primitives
-    ├── glasschain-vm/              # Wasmtime-backed execution provider
-    ├── glasschain-indexer/         # Indexing, event bus, provenance model
-    └── glasschain-rpc/             # gRPC service definitions and server
+    ├── glasschain-vm/              # Wasmtime-backed execution provider and gas metering
+    ├── glasschain-identity/        # MSP, identities, certificate verification, channels
+    ├── glasschain-storage/         # Storage backends: in-memory, Sled, transient (private payloads)
+    ├── glasschain-indexer/         # Indexing, event bus, provenance and lineage
+    ├── glasschain-network/         # P2P node, wire protocol, peer handling
+    ├── glasschain-rpc/             # gRPC service definitions and server
+    ├── glasschain-sdk/             # Client SDK
+    ├── glasschain-cli/             # Client CLI (contract, identity, inspect)
+    └── glasschain-node/            # Interactive REPL node binary
 ```
 
-(The workspace also ships `glasschain-sdk` and `glasschain-cli` client crates.)
+Dependencies flow downward only — `glasschain-core` depends on nothing internal,
+and the workspace has no cycles. See [`docs/architecture.md`](docs/architecture.md)
+for the full graph and the provider seams that make it work.
 
 ### Packaging: contracts vs workflows (ticket #49)
 
@@ -182,6 +187,9 @@ The `glasschain-rpc` crate exposes the current gRPC server implementation. The `
 - `NodeService`
   - `GetNodeStatus`
   - `GetPeers`
+- `IdentityService`
+  - `ExchangeCertificate`
+  - `VerifyEndorsement`
 
 Analytics read path: `QueryAssetHistory` and `GetVerifiableLineage` are answered from the in-memory provenance index and analytical flattener — not by scanning the raw chain. `QueryAssetHistory` matches exact canonical asset ids (`GTIN:<gtin>[:SN:<sn>|:BATCH:<b>]`, `SN:<sn>`), boundary-anchored so a short GTIN never cross-matches a longer one, and each result's `payload_json` carries the custody event rather than the raw transaction JSON.
 
@@ -332,13 +340,118 @@ Example contract condition payload:
 
 ## Testing
 
-Focused test run for actively wired crates:
+The full workspace suite passes on the pinned 1.95 toolchain — **546 tests**, with
+clippy clean at `-D warnings`:
+
+```bash
+cargo fmt --all --check
+cargo check   --workspace --all-targets --all-features --locked
+cargo test    --workspace --all-targets --all-features --locked
+cargo clippy  --workspace --all-targets --all-features --locked -- -D warnings
+```
+
+All four are CI gates on Ubuntu, macOS, and Windows. Consensus changes must be
+validated in **both** feature configurations (default and `--all-features`),
+because the `bft` feature gates real code paths.
+
+A focused run while iterating:
 
 ```bash
 cargo test -p glasschain-network -p glasschain-rpc -p glasschain-node
 ```
 
-For full workspace tests (`cargo test`), ensure your local Rust toolchain is compatible with all transitive dependencies (notably `wasmtime` in `glasschain-vm`).
+See [`docs/operations.md`](docs/operations.md) for benchmarks and the capacity gate.
+
+---
+
+## Documentation
+
+[`docs/`](docs/README.md) holds the in-depth technical documentation — written
+against the shipped code, and explicit about what is designed but not yet wired.
+
+| Document | What it covers |
+|---|---|
+| [Architecture](docs/architecture.md) | Crate map, dependency rule, provider seams, a transaction traced end to end |
+| [Data model](docs/data-model.md) | Transaction kinds, all 13 canonical schema v1 record families, blocks, write sets, capabilities |
+| [Consensus](docs/consensus.md) | What runs today, the staged BFT engine, the adoption gates, the membership ladder |
+| [Privacy and identity](docs/privacy-and-identity.md) | MSP, certificate verification, endorsement policy, private data collections |
+| [Workflows and contracts](docs/workflows-and-contracts.md) | The contract/workflow split, the WASM host ABI, flows, watcher automation |
+| [Operations](docs/operations.md) | Build, flags, REPL, gRPC, storage, wire protocol, operator security warnings |
+
+[`docs/adr/`](docs/adr/) holds the nine accepted architecture decision records.
+Read the one covering your area before designing a change.
+
+---
+
+## Roadmap
+
+The live programme is tracked in
+[`.agents/plans/requirements-alignment.md`](.agents/plans/requirements-alignment.md)
+— a 26-requirement traceability matrix against the Hybrid Distributed Inventory
+System specification. Canonical schema v1, VM write sets, capabilities, the
+endorsement engine and its enforcement gates, quorum certificates, staged BFT,
+private data collections with reconciliation, the analytics read path, and the
+workflow flows have all shipped.
+
+Next up:
+
+| Work | Status |
+|---|---|
+| [Federation trust model](https://github.com/dbbvitor/GlassChain/issues/57) — certificate verification is inert in production and fails open | Needs a decision |
+| [Certificate revocation](https://github.com/dbbvitor/GlassChain/issues/58) — no CRL or OCSP | Unplanned gap |
+| [Endorsement provider at node startup](https://github.com/dbbvitor/GlassChain/issues/59) — the engine is inert outside tests | Ready |
+| [Record signature binding](https://github.com/dbbvitor/GlassChain/issues/60) — record and capability-activation signatures are count-only | Needs a decision |
+| [`glasschain-demo`](https://github.com/dbbvitor/GlassChain/issues/61) — a visual demo and benchmark harness | Planned |
+| [Performance](https://github.com/dbbvitor/GlassChain/issues/62) — measure real BFT rounds, then wire encoding, batch verification, BLS | Ordered, step 0 blocking |
+| BFT production adoption | Blocked on the four ADR-010 gates |
+
+### Performance — the constraint is the advantage
+
+Latency and scalability are treated as **sell factors**, subject to zero trust
+between validators, Brazilian legal compliance, and ICP-Brasil interoperability.
+
+On scalability the peer group is Hyperledger Fabric and Corda, and this is where
+the constraints pay: Fabric's default ordering service is Raft — **crash-fault
+tolerant only**, which assumes orderers do not lie, exactly the assumption a
+consortium of commercial rivals cannot make. So the claim is not "limited to 300
+validators" but **300 mutually-distrusting validators with deterministic
+finality, plus an authenticated light-client ladder to the 70M-participant
+horizon**.
+
+On latency the bar is sub-second, and it is reachable **inside** the consensus
+family ADR-002 already chose — the in-family reference point is Malachite's own
+~780 ms finalization at 100 validators with 1 MB blocks, against our 11.5 KB
+blocks. No family swap is needed to be best in class.
+
+**What is honestly missing is the measurement.** The committed capacity gate
+measures the dev/test Proof-of-Work engine and contains no attestation rounds, so
+there is currently no BFT finality number — producing one is the blocking first
+step. After it: the peer wire protocol is JSON, which renders byte arrays as
+decimal digits and inflates a quorum certificate about five-fold, and certificates
+are not persisted with blocks yet, so the encoding is cheap to fix now and
+expensive later. Then batch signature verification, then BLS aggregation to make
+light-client proofs cheap. Speculative fast paths and a DAG mempool are
+candidates behind those, not ahead of them.
+
+[`docs/consensus.md` §10](docs/consensus.md) has the detail;
+[`.agents/plans/performance.md`](.agents/plans/performance.md) has the ordered
+path and what the constraints permit.
+
+### `glasschain-demo` — seeing it work
+
+A planned desktop application, built on [gpui](https://crates.io/crates/gpui),
+that drives a live in-process federation with synthetic supply-chain traffic and
+renders it: custody transfers and endorsements as they happen, private-payload
+exchange, a recall cascading across organizations, live throughput plots, and a
+lot traced from shelf back to origin in a few clicks. Synthetic records go
+through real validation, real endorsement, and the real PDC boundary — a demo
+that can produce a record the node would reject is a demo that lies.
+
+It will live outside the Cargo workspace with its own lockfile and CI job, so a
+pre-1.0 GUI dependency can never affect the four mandatory gates. Its numbers
+are illustrative and are explicitly **not** the ADR-010 adoption-gate benchmark;
+[`docs/benchmarks/`](docs/benchmarks/consensus-capacity.md) stays authoritative.
+Plan: [`.agents/plans/gui-demo-benchmark.md`](.agents/plans/gui-demo-benchmark.md).
 
 ---
 
