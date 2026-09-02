@@ -20,7 +20,7 @@ thiserror = "2.0"
 hex = "0.4"
 log = "0.4"
 x509-cert = "0.3"
-rustls-pki-types = "1.0"
+rustls-pki-types = "1.15"
 # lib name is `webpki`; `ring` matches the provider glasschain-network already
 # selects for rustls, so both crates share one crypto backend.
 rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }

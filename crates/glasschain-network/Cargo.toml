@@ -18,7 +18,7 @@ glasschain-identity   = { path = "../glasschain-identity" }
 glasschain-storage    = { path = "../glasschain-storage" }
 serde        = { version = "1.0", features = ["derive"] }
 serde_json   = "1.0"
-tokio        = { version = "1.52", features = [
+tokio        = { version = "1.53", features = [
     "rt-multi-thread",
     "macros",
     "net",
@@ -48,7 +48,7 @@ futures      = "0.3"
 [dev-dependencies]
 env_logger   = "0.11"
 x509-parser  = "0.18"
-wat          = "1.256"
+wat          = "1.258"
 tempfile     = "3"
 # ed25519 key material for the bft_finality scenario (tests/bft_finality.rs,
 # cfg-gated to the `bft` feature). Dev-deps compile unconditionally; the crate

@@ -17,7 +17,7 @@ thiserror  = "2.0"
 log        = "0.4"
 base64     = "0.23"
 # test_wasm fixtures compile WAT at runtime; other crates' tests consume them.
-wat        = "1.256"
+wat        = "1.258"
 
 [dev-dependencies]
 env_logger = "0.11"

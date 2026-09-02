@@ -24,7 +24,7 @@ thiserror = "2.0"
 log = "0.4"
 
 [dev-dependencies]
-wat = "1.256"
+wat = "1.258"
 criterion = "0.8"
 
 [[bench]]
