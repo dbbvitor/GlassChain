@@ -2425,12 +2425,14 @@ async fn process_message(
             // during the TLS handshake (connection-scoped, passed as a
             // parameter — never stored in shared mutable state).
             if tls_cert_fingerprint != observed_cert_fingerprint {
+                // The mismatch itself is the security event; the fingerprint
+                // values are deliberately not logged (CodeQL
+                // cleartext-logging) — the peer id and address identify the
+                // offender, and the fingerprints are recomputable from the
+                // presented certificates.
                 log::warn!(
                     "Rejecting peer {peer_id} at {addr}: advertised TLS fingerprint \
-                     does not match observed session certificate \
-                     (advertised={}, observed={})",
-                    &tls_cert_fingerprint[..16.min(tls_cert_fingerprint.len())],
-                    &observed_cert_fingerprint[..16.min(observed_cert_fingerprint.len())],
+                     does not match the observed session certificate"
                 );
                 return MessageEffect {
                     disconnect: true,
