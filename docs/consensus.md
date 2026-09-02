@@ -769,6 +769,22 @@ dangerous one is unbuilt, and we are blind.**
   peer and fires every request at it with no timeout, retry, or failover. Small
   blast radius (an operator action), cheap fix (fan across all member peers).
   Note more generally that **there are no timeouts anywhere on the peer path**.
+- **Persistence sits in front of broadcast.** `after_block_commit` runs
+  `storage.apply_block` — synchronous, blocking disk work with no
+  `spawn_blocking` — *between* ledger append and broadcast on the mine path, so
+  the leader's storage latency is inserted in front of fan-out to every peer.
+  On the peer path the same call blocks that peer's read task. It does **not**
+  compound per hop: `Message::Block` is broadcast only from `mine_async`, and
+  gossipsub forwarding happens inside libp2p. The fix is scheduling, not
+  durability: broadcast first, persist after. The ledger is already appended by
+  then, and ADR-007 decision 2 already makes the chain authoritative with rebuild
+  healing divergence, so no invariant moves.
+- **A write-ahead log is not the mitigation.** Sled is already log-structured
+  with its own WAL, and the block-log-then-derived-state ordering plus
+  rebuild-on-recovery is already WAL-and-replay. `fsync` is a *cause* of tail
+  latency, not a cure. Group commit stays on the shelf for whenever explicit
+  durability is decided — today nothing flushes outside tests, so there is
+  nothing to batch (and that is a separate, recorded durability gap).
 - **The propagation instrument measures itself** — see §7.1 and the benchmark
   document's caveat 2. Fixing it is a prerequisite for step 0 above meaning
   anything.

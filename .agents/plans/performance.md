@@ -209,7 +209,82 @@ O(connected) lock acquisitions per 20 ms tick, so the instrument degrades as the
 thing it measures grows. `consensus-capacity.md` calls this family
 "supplementary"; that is too generous.
 
-### 5.5 Actions, ranked
+### 5.5 A write-ahead log is not the answer — but the question found one
+
+Assessed 2026-09-02. **No: we should not build a WAL. We already have two, and a
+third would make the tail worse.** The investigation did surface a real exposure
+at the same location, so the question earned its keep.
+
+Why not:
+
+1. **Sled is already a log-structured store with its own write-ahead log.**
+   Hand-rolling one on top of `sled 0.34.7` reimplements the dependency we
+   already pay for.
+2. **The block log is semantically already a WAL.** `apply_block`
+   (`crates/glasschain-storage/src/sled_backend.rs:85`) writes the block and its
+   derived write set in one multi-tree transaction; on failure the chain stays
+   authoritative and rebuild-from-chain heals the derived state (ADR-007
+   decision 2). Write-ahead, then replay on recovery — that *is* the pattern, and
+   `failure_after_block_durable_is_healed_by_rebuild`
+   (`node.rs:3718`) is the test that proves it.
+3. **A WAL is a durability mechanism, and `fsync` is a *cause* of tail latency,
+   not a cure.** Dean & Barroso name background daemons and queueing among the
+   sources of tail; a synchronous log flush on the commit path adds one.
+
+#### What the question actually found: persistence sits in front of relay
+
+`after_block_commit` calls `storage.apply_block(block)` — synchronous, blocking
+disk and CPU work — directly on a Tokio worker thread with **no
+`spawn_blocking`**. On the mine path it sits **between ledger append and
+broadcast**:
+
+| | Ledger append | Blocking persist | Broadcast |
+|---|---|---|---|
+| `mine_async` | `node.rs:1518` | `node.rs:1962` | `node.rs:1546` |
+| `process_message` | `node.rs:2675` | `node.rs:1962` | — (see below) |
+
+**Scope this honestly — it does not compound per hop.** `Message::Block` is
+broadcast from `mine_async` and *nowhere else*; a peer receiving a block never
+re-relays it on the TCP path, and gossipsub mesh forwarding happens inside libp2p
+before our handler runs. So there is no multi-hop amplification. Two narrower
+effects remain, and both are real:
+
+- **Mine path:** the leader's storage latency is inserted in front of fan-out to
+  *every* peer. One node's p99 disk becomes everyone's propagation p50 — the
+  tail-at-scale shape, at one hop rather than many.
+- **Peer path:** the blocking call runs on the per-peer read task, so subsequent
+  messages from that peer queue behind it (head-of-line blocking on that
+  connection), and it occupies a runtime worker thread while it runs.
+
+Magnitude is unmeasured (§2 applies). The fix is scheduling, not durability, and
+it is a smaller diff than a WAL: broadcast first, persist after. The in-memory
+ledger is *already* appended before `after_block_commit`, and ADR-007 decision 2
+already makes the chain authoritative with rebuild healing any storage
+divergence — so moving persistence behind the broadcast changes no invariant.
+`spawn_blocking` is the fallback if ordering turns out to matter somewhere not
+yet identified; it fixes the reactor-blocking but keeps the latency in the path.
+
+#### A real durability gap, recorded but not fixed here
+
+`SledStorageProvider::flush` is **never called outside tests**, and sled 0.34's
+`flush_every_ms` defaults to `Some(500)`. Up to half a second of committed blocks
+can therefore be lost to power loss. Replication masks this — a recovered node
+resyncs from peers — *except under correlated failure*, which §6 Step 7 already
+names as the bound that actually bites.
+
+Do not reflexively "fix" this by adding a flush: it trades exactly the tail
+latency this section is about, on a path that is already in front of relay. It
+needs Step 0's measurement first, and then it is a policy decision with a knob,
+not a default.
+
+#### The one WAL technique worth keeping on the shelf
+
+**Group commit.** If durability is ever made explicit, batch the flush across
+concurrent commits rather than paying it per block — that is the WAL family's own
+answer to the tail it would otherwise create. Trigger is the durability decision
+above, not this one. Nothing to batch today, because nothing flushes today.
+
+### 5.6 Actions, ranked
 
 1. **Delete or fix the 50% fan-out column.** It is actively misleading, and it is
    the only instrument currently pointed at propagation. Fix = poll concurrently
@@ -218,8 +293,13 @@ thing it measures grows. `consensus-capacity.md` calls this family
 2. **Count the `try_send` drops, per peer.** A counter turns an invisible
    straggler into a visible one. This is the thing that tells you a tail exists
    at all, and it is the cheapest item in this document.
-3. **Fan reconcile across all member peers**, and put a timeout on it (§5.3).
-4. **Carry §5.2 into the quorum-gathering work** when Step 5 or Malachite lands.
+3. **Move persistence behind broadcast** on the mine path, and off the reactor on
+   the peer path (§5.5). Takes the leader's disk latency out of fan-out and stops
+   blocking a runtime worker, for a diff of a few lines.
+4. **Fan reconcile across all member peers**, and put a timeout on it (§5.3).
+5. **Carry §5.2 into the quorum-gathering work** when Step 5 or Malachite lands.
+6. **Record the flush gap** (§5.5) as a durability *decision* with a knob, gated
+   on Step 0 — not as a default change.
 
 Items 1 and 2 are prerequisites for Step 0 meaning anything: the plan's first
 step is "measure," and this section says the measuring tools need fixing before
@@ -381,9 +461,12 @@ more than any protocol item above. Belongs with the federation trust model
 - **Step 0** is itself the validation instrument; nothing after it is claimable
   without it. `#[ignore]`-gated, reproducible, with the same honest-scope
   caveats `consensus-capacity.md` already carries. It is not trustworthy until
-  §5.5 items 1 and 2 land — a broken instrument produces confident wrong numbers,
+  §5.6 items 1 and 2 land — a broken instrument produces confident wrong numbers,
   which is worse than no numbers.
-- §5.5 item 3: a test proving reconcile still completes when one member peer
+- §5.6 item 3: a propagation measurement taken with persistence behind broadcast,
+  compared against the current ordering — the number that says whether moving it
+  is worth the change.
+- §5.6 item 4: a test proving reconcile still completes when one member peer
   never answers.
 - Steps 1–2: unit test asserting serialized certificate size at a synthetic
   201-attestation quorum stays under budget; a batch-verify test proving the
@@ -425,6 +508,14 @@ A tail-at-scale assessment was added as §5 on the same day, in response to a
 direct question. It did not change any conclusion above, but it moved two items
 ahead of Step 0: the propagation instrument is measuring itself, and dropped
 messages to a slow peer leave no trace but a log line.
+
+§5.5 was added on the same day, in response to a direct question about whether a
+write-ahead log could mitigate the tail. The answer is no — sled is already
+log-structured, the block log is already write-ahead-then-replay, and `fsync` is
+a tail *source*. But reading the commit path to answer it found that blocking
+persistence sits in front of broadcast on the mine path and on the reactor on the
+peer path, and that nothing flushes outside tests, which is a genuine durability
+gap. Both are now ranked in §5.6; neither changes the ordered path.
 
 ---
 
