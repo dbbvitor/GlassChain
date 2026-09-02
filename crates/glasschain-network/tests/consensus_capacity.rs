@@ -282,7 +282,7 @@ fn percentile<I: IntoIterator<Item = u128>>(values: I, percent: usize) -> u128 {
 fn print_summary(label: &str, rounds: &[RoundMetrics]) {
     let mine: Vec<u128> = rounds.iter().map(|r| r.mine_ms).collect();
     let sizes: Vec<usize> = rounds.iter().map(|r| r.block_bytes).collect();
-    let certs: Vec<usize> = rounds.iter().map(|r| r.attestation_set_bytes).collect();
+    let attestation_sizes: Vec<usize> = rounds.iter().map(|r| r.attestation_set_bytes).collect();
     let pools: Vec<usize> = rounds.iter().map(|r| r.pool_depth_before_mine).collect();
     let p100 = rounds.iter().map(|r| r.propagation_100);
     println!(
@@ -291,7 +291,7 @@ fn print_summary(label: &str, rounds: &[RoundMetrics]) {
         percentile(mine.clone(), 50),
         percentile(mine, 95),
         sizes.iter().sum::<usize>() / sizes.len().max(1),
-        certs.iter().sum::<usize>() / certs.len().max(1),
+        attestation_sizes.iter().sum::<usize>() / attestation_sizes.len().max(1),
         pools.iter().copied().max().unwrap_or(0),
         percentile(p100.into_iter().flatten(), 50),
     );
