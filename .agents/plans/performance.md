@@ -127,7 +127,107 @@ designed operating point rather than a ceiling to apologise for.
 
 ---
 
-## 5. Ordered path
+## 5. Tail at scale
+
+Assessed 2026-09-02 against the shipped code, in the sense of Dean & Barroso's
+"The Tail at Scale": in a system where one operation touches many components,
+the p99 of each component becomes the p50 of the whole.
+
+**Verdict: the built paths are structurally sound — the dangerous one is
+unbuilt, one path is genuinely exposed, and we are blind.**
+
+### 5.1 Broadcast is tail-tolerant, and that is the important one
+
+`Node::broadcast` (`crates/glasschain-network/src/node.rs:1919`) snapshots the
+sender list, then `try_send`s into per-peer bounded channels (256 slots,
+`handle_peer`, same file), each drained by its own writer task. **The broadcaster
+never awaits a peer.** One slow validator cannot stall fan-out to the other 299;
+it fills its own channel and nothing more. That is precisely the
+decouple-the-caller-from-the-straggler pattern, and it is the single most
+important thing to have got right.
+
+The cost is that the tail is converted from latency into **silent message loss**:
+a full channel logs `"Dropping outbound message: peer channel full"` and moves
+on. A chronically slow peer silently misses blocks and resyncs later. That is a
+defensible trade — but it is a `log::warn!` and nothing else. No counter, no
+per-peer metric. **The straggler is invisible.**
+
+### 5.2 The dangerous path does not exist yet
+
+The classic BFT tail exposure is waiting for the 201st of 300 attestations.
+**That code is not written.** `BftConsensusProvider::attest` produces one local
+attestation, and `bft.rs`'s own module doc records that gathering attestations
+from remote validators is an ADR-010 adoption gate.
+
+So we are not vulnerable *because the vulnerable component is unbuilt* — the
+decision is ahead of us, not behind us. Two things to carry into it:
+
+- A ⅔ quorum is **inherently a partial hedge**: you take the 201st fastest and
+  discard the slowest 99. That is far better than any fan-out that waits for all
+  `n`. But 201/300 is the 67th percentile of the response distribution, which
+  under Pareto tails is still deep — this is the `n^(1/α)` order statistic from
+  Step 7, made concrete.
+- **Do not invent hedging.** Tendermint's round timeout already *is* the hedge.
+  The risk when Step 5 or the Malachite path lands is re-deriving it badly, not
+  omitting it.
+
+### 5.3 One path is genuinely exposed
+
+`Node::reconcile_private_payloads` (`node.rs:1055`) picks **exactly one** target
+peer, then fires every missing-payload request at it with **no timeout, no retry,
+no failover, and no hedge** — and returns the count of requests *sent*, not
+received. One slow member and reconciliation silently does nothing.
+
+Blast radius is small (an infrequent operator action, not a hot path) and the fix
+is cheap: fan the requests across all member peers instead of choosing one.
+
+Relatedly, **there are no timeouts anywhere on the peer path**. `peer.rs`
+`send`/`receive` have none; the only `Duration` in `node.rs` is a 5-second
+reconnect sleep. Today that is masked by the `try_send` decoupling. It will not
+be once any request/response path matters.
+
+### 5.4 The measurement instrument is broken — act on this first
+
+From the recorded gate (`docs/benchmarks/consensus-capacity.md`, 200 validators):
+
+| Round | fan-out 50% | fan-out 100% |
+|---|---|---|
+| 1 | 496 ms | 0 ms |
+| 5 | 7 941 ms | 98 ms |
+| 9 | **16 354 ms** | 34 ms |
+
+That is **incoherent as a network measurement** — 100% cannot be reached in 34 ms
+immediately after 50% took 16 seconds. The cause is in `propagation_ms`
+(`crates/glasschain-network/tests/consensus_capacity.rs:193`): each poll sweeps
+*every* connected validator taking `.lock().await` on its ledger, then sleeps
+20 ms, and the three thresholds run as sequential polls with independent start
+times. The 50% poll absorbs all the lock contention with ongoing commit work; by
+the time the later polls begin, everything has already arrived.
+
+**It measures the harness, not the network** — and the sweep is itself
+O(connected) lock acquisitions per 20 ms tick, so the instrument degrades as the
+thing it measures grows. `consensus-capacity.md` calls this family
+"supplementary"; that is too generous.
+
+### 5.5 Actions, ranked
+
+1. **Delete or fix the 50% fan-out column.** It is actively misleading, and it is
+   the only instrument currently pointed at propagation. Fix = poll concurrently
+   from a single start, or drop the threshold family and keep
+   recovery-convergence. Belongs with Step 0.
+2. **Count the `try_send` drops, per peer.** A counter turns an invisible
+   straggler into a visible one. This is the thing that tells you a tail exists
+   at all, and it is the cheapest item in this document.
+3. **Fan reconcile across all member peers**, and put a timeout on it (§5.3).
+4. **Carry §5.2 into the quorum-gathering work** when Step 5 or Malachite lands.
+
+Items 1 and 2 are prerequisites for Step 0 meaning anything: the plan's first
+step is "measure," and this section says the measuring tools need fixing before
+they can.
+
+---
+
+## 6. Ordered path
 
 Each step is independently shippable. The ordering is deliberate: the free
 structural wins come before the sophisticated ones, because a speculative fast
@@ -141,8 +241,13 @@ across real validators** and reports p50/p95/p99 finality at 100/200/300. Extend
 `crates/glasschain-network/tests/consensus_capacity.rs` rather than starting
 over; keep it `#[ignore]`-gated.
 
-In the same pass, establish the competitive bar from primary sources (Mysticeti,
-Aptos, Malachite, SmartBFT/Fabric) so the target in §1 is citable.
+**Fix the instrument in the same pass** — the existing fan-out thresholds measure
+the harness's own lock contention rather than propagation (§5.4), and a
+straggler currently leaves no trace but a log line (§5.1). Percentiles are
+worthless if the tool that produces them is the bottleneck.
+
+Also establish the competitive bar from primary sources (Mysticeti, Aptos,
+Malachite, SmartBFT/Fabric) so the target in §1 is citable.
 
 **Until this exists, no performance claim goes in marketing copy or the README.**
 
@@ -275,7 +380,11 @@ more than any protocol item above. Belongs with the federation trust model
 
 - **Step 0** is itself the validation instrument; nothing after it is claimable
   without it. `#[ignore]`-gated, reproducible, with the same honest-scope
-  caveats `consensus-capacity.md` already carries.
+  caveats `consensus-capacity.md` already carries. It is not trustworthy until
+  §5.5 items 1 and 2 land — a broken instrument produces confident wrong numbers,
+  which is worse than no numbers.
+- §5.5 item 3: a test proving reconcile still completes when one member peer
+  never answers.
 - Steps 1–2: unit test asserting serialized certificate size at a synthetic
   201-attestation quorum stays under budget; a batch-verify test proving the
   sequential fallback still names the bad signer.
@@ -288,7 +397,7 @@ more than any protocol item above. Belongs with the federation trust model
 
 - **Raising the validator ceiling by protocol optimization.** Settled in §4; send
   new proposals back here. Note this is a *scoping* ruling, not a performance
-  ceiling: §5 is where the performance work lives.
+  ceiling: §6 is where the performance work lives.
 - Reopening ADR-002's consensus family or ADR-004's ladder. Best-in-class latency
   is reachable inside both (§1).
 - Committee sampling, VRF sortition, separate finality gadgets — rejected with
@@ -310,7 +419,12 @@ finding survives unchanged. Three things did not:
 2. It deferred fast paths for want of a sub-second requirement. That requirement
    now exists.
 3. It treated BLS as merely "not an escape route." Under a
-   sell-the-scalability framing it is the enabler of the ladder claim (§4, §5.4).
+   sell-the-scalability framing it is the enabler of the ladder claim (§4, §6.4).
+
+A tail-at-scale assessment was added as §5 on the same day, in response to a
+direct question. It did not change any conclusion above, but it moved two items
+ahead of Step 0: the propagation instrument is measuring itself, and dropped
+messages to a slow peer leave no trace but a log line.
 
 ---
 
