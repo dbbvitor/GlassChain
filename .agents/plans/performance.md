@@ -365,6 +365,15 @@ replay, and light-client-proof cost**, not per-round bandwidth. In a
 leader-based protocol per-round bytes are ~`n·(payload + signature)` regardless.
 That makes it matter more for ADR-004's ladder than for round latency.
 
+**Fold the algorithm discriminant in here.** Nothing on the wire currently says
+which algorithm produced a signature — `Attestation`, `RecordSignature` and
+`EndorserIdentity` carry bare byte vectors, and `ValidatorInfo.public_key` is a
+`[u8; 32]` that cannot physically hold a post-quantum key. Since this step is
+already taking a wire-version bump, adding a discriminant costs almost nothing
+now and a second break later. See
+[`post-quantum.md`](post-quantum.md) §3 — this is that plan's action 2, and it
+has no separate schedule.
+
 ### Step 2 — Batch signature verification
 
 `BftConsensusProvider::verify_certificate` verifies sequentially: ~50 µs per
@@ -408,6 +417,13 @@ Honest costs, unchanged:
 - **It is a primitive swap.** `AGENTS.md` pins ed25519; Malachite is ed25519
   throughout. Sequence it *with or after* the Malachite decision, not before.
   Needs an ADR.
+- **It is not future-proofing.** BLS is pairing-based, so Shor breaks it exactly
+  as it breaks ed25519, and there is no post-quantum aggregate signature with
+  comparable properties today. This does not cancel Step 4 — NIST IR 8547 (ipd)
+  puts the horizon at 2035, a full useful life — but the ADR must not sell it as
+  durable, and the algorithm discriminant in
+  [`post-quantum.md`](post-quantum.md) §3 becomes *more* important, because BLS
+  is a second signature scheme on the wire before any post-quantum one.
 
 ### Step 5 — Speculative fast paths (HotStuff-1, SBFT) — candidate, no longer deferred
 
