@@ -258,13 +258,13 @@ sequenceDiagram
     W->>W: canonicalize: validate scopes, sort, reject duplicates, redact PDC to sha256
     N->>P: enforce_block_endorsements: per-tx write attribution + policy layers
     N->>K: attest: PoW mine (default) or BFT attest (if bft capability active)
-    K->>L: commit_mined_block: re-validate capability + policy history; append
+    K->>L: commit_mined_block: re-validate capability + policy history, append
     L->>A: after_block_commit
     A->>S: apply_block: atomic block + write-set commit, chains to tip
     A->>A: mirror write set into world_state cache
     A->>X: index_block / publish_block / ingest_block / ingest_indexed_block
     A->>R: on_inventory_update (autonomous PurchaseOrders, signed, re-queued)
-    A->>N: broadcast Message::Block; emit NodeEvent::BlockMined
+    A->>N: broadcast Message::Block, emit NodeEvent::BlockMined
 ```
 
 ### Step 1 — Submission and admission: `Node::submit_transaction` (node.rs)
