@@ -113,8 +113,10 @@ pub struct CapabilityActivation {
     pub activation_height: u64,
     /// The required governance signature set.
     ///
-    /// ponytail: v1 requires presence only, consistent with canonical records;
-    /// cryptographic verification lands with the endorsement engine (#37).
+    /// ponytail: presence-only, consistent with canonical records — and it
+    /// stays that way. The endorsement engine verifies
+    /// `Transaction.endorsements` carriers, never these; binding governance
+    /// signatures to MSP keys needs its own decision.
     pub signatures: Vec<RecordSignature>,
 }
 

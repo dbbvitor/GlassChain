@@ -1141,7 +1141,10 @@ Three services are exposed on a single port (default `0.0.0.0:50051`):
 |:----|:------------|
 | `GetNodeStatus` | Node ID, address, version, chain length, peer count |
 | `GetPeers` | List of known peer addresses |
-| `MineBlock` | Trigger manual PoW mining (dev/testing only) |
+
+(`MineBlock` was retired with the quorum-certificate seam — block production is
+driven by the consensus layer, not by an RPC. The dev/test Proof-of-Work driver
+remains available programmatically as `Node::mine()`.)
 
 ### `IdentityService` ✨ Phase 2
 
@@ -1183,12 +1186,13 @@ used as templates.
 
 ```
 GlassChain/
-├── Cargo.toml                  # Workspace manifest (11 crates)
+├── Cargo.toml                  # Workspace manifest (12 crates)
 ├── PLUGIN_KIT.md               # This document
 ├── README.md                   # Project overview and quick-start
 └── crates/
     ├── glasschain-core/        # Block, Transaction, Ledger, provider traits, schema
-    ├── glasschain-contracts/   # ContractEngine, WatcherService (ECA triggers)
+    ├── glasschain-contracts/   # ContractEngine, approval gate (deterministic layer)
+    ├── glasschain-workflows/   # Flow state machines, checkpoints, WatcherService
     ├── glasschain-network/     # TCP+TLS P2P node + experimental unwired libp2p Swarm
     ├── glasschain-node/        # Interactive REPL binary + gRPC wiring
     ├── glasschain-storage/     # SledStorageProvider (persistent on-disk backend)

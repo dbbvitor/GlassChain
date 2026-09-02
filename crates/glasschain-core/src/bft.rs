@@ -123,6 +123,14 @@ impl BftConsensusProvider {
                 "bft: degenerate (empty) quorum certificate is not final".into(),
             ));
         }
+        // Index the validator set once. Scanning it per attestation is O(n·m) —
+        // at n=300 with a 201-attestation quorum that is ~60k comparisons, and
+        // it is the only quadratic term on the verification path.
+        let known: std::collections::HashSet<&[u8; 32]> = self
+            .validators
+            .iter()
+            .map(|validator| &validator.public_key)
+            .collect();
         let mut distinct = std::collections::HashSet::new();
         for attestation in &certificate.attestations {
             let key_bytes: [u8; 32] = attestation
@@ -130,11 +138,7 @@ impl BftConsensusProvider {
                 .as_slice()
                 .try_into()
                 .map_err(|_| CoreError::InvalidBlock("bft: non-32-byte public key".into()))?;
-            if !self
-                .validators
-                .iter()
-                .any(|validator| validator.public_key == key_bytes)
-            {
+            if !known.contains(&key_bytes) {
                 return Err(CoreError::InvalidBlock(format!(
                     "bft: attestation from unknown validator '{}'",
                     attestation.validator
@@ -145,6 +149,10 @@ impl BftConsensusProvider {
             })?;
             let sig = Signature::from_slice(&attestation.signature)
                 .map_err(|_| CoreError::InvalidBlock("bft: invalid ed25519 signature".into()))?;
+            // ponytail: sequential verification, ~50 µs per signature — ~10 ms at a
+            // 201-attestation quorum, the dominant cost here. `verify_batch` is
+            // ~2× faster but reports only "some signature failed", so adopting it
+            // needs a sequential fallback to name the bad signer. See #62.
             verifier.verify(block.hash.as_bytes(), &sig).map_err(|_| {
                 CoreError::InvalidBlock(format!(
                     "bft: signature from '{}' does not verify block {}",

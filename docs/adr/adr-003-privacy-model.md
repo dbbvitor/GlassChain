@@ -3,7 +3,7 @@
 **Status:** **Accepted 2026-08-20** — Option A confirmed; boundary, auditor,
 purge, and reconciliation answers in the Decision section
 **Date:** 2026-08-18
-**Relates to:** §1.4, §3.2, §6.1 · [`requirements-alignment.md`](requirements-alignment.md) D3 ·
+**Relates to:** §1.4, §3.2, §6.1 · [`requirements-alignment.md`](../../.agents/plans/requirements-alignment.md) D3 ·
 [ADR-008](adr-008-endorsement-policy-model.md) (endorsement separate from membership)
 
 ## Context

@@ -18,7 +18,7 @@
 
 ### Actual validator counts (primary, live)
 
-- **Cosmos Hub runs 200 bonded validators today** (the network's `max_validators` param is `200`). Verified 2026-08-24:
+- **Cosmos Hub runs 200 bonded validators today** (the network's `max_validators` param is `200`). Verified 2026-08-24 — **superseded: the cap is `180` as of 2026-09-02; see the follow-up review below.** As read on 2026-08-24:
   - Bonded validators returned: `200` — `GET /cosmos/staking/v1beta1/validators?status=BOND_STATUS_BONDED`
   - Staking params: `"max_validators": 200` — `GET /cosmos/staking/v1beta1/params`
   - So the issue's "~180" lead corresponds to an earlier cap; the current live cap is **200**. This is the largest continuously-running Tendermint/CometBFT production deployment and the single strongest data point for "200 validators works in production."
@@ -131,13 +131,34 @@ Bottom line for the record: the committee (sortition) and async-BFT families eit
 - Narwhal & Tusk — Danezis et al., arXiv:2105.11827 (2022): DAG async BFT, WAN throughput, tens of nodes.
 - Bullshark — Spiegelman et al., arXiv:2201.05677 (2022): "125k tx/s … 50 parties."
 - Hashgraph — Swirlds whitepaper TR-2016-01 (Baird, 2016); Hedera docs (council ≤ 39 nodes).
-- ADR-002 (`GlassChain/.agents/plans/adr-002-consensus-finality.md`, resolved 2026-08-20): the settled family decision this research supports.
+- ADR-002 (`GlassChain/docs/adr/adr-002-consensus-finality.md`, resolved 2026-08-20): the settled family decision this research supports.
 
 ## Confidence / unknowns summary
 
 - **HIGH:** Cosmos Hub = 200 bonded validators, ~5.5–6 s blocks (live data); Malachite alpha/unaudited/pre-1.0 under Circle; tendermint-rs is a client toolkit, not an engine; no other serious Rust Tendermint-class path.
 - **MEDIUM:** Malachite's ~50k tps is an extrapolation at 100 validators; valid as a ceiling *only* with that context.
 - **UNKNOWN / blocker:** **no public benchmark at 180–300 validators for any Tendermint-class engine.** CometBFT "10k TPS" has no disclosed methodology. GlassChain must run its own 200-validator testnet to produce the §8.2 sizing number — this is the explicit blocker to replacing "high throughput" with a measured figure.
+
+## Follow-up review — 2026-09-02
+
+**Cosmos Hub `max_validators` is now `180`**, down from the `200` recorded above
+on 2026-08-24. The Q1 reading was correct when taken; the cap moved. This
+*strengthens* rather than weakens the finding — the largest continuously running
+Tendermint/CometBFT deployment moved **down**, not up, and there is still no
+production Tendermint-class network above ~209 with all `n` voting per round.
+
+Evaluated the same day (issue [#62](https://github.com/dbbvitor/GlassChain/issues/62),
+[`../plans/performance.md`](../plans/performance.md)) whether
+in-family fast paths (HotStuff-1, SBFT) or a Narwhal-style DAG mempool could push
+past 300: **no**. Every network operating a larger set changed the participation
+model (Ethereum committee sampling, Algorand VRF sortition) or decoupled finality
+(Polkadot's GRANDPA) or weakened it (Solana, Avalanche). Narwhal's published
+claims are throughput and latency only; no Narwhal-family paper claims improved
+validator-count scaling. Two corrections that came out of it are recorded in
+`participation-model.md` §2, §3, and §3a — most usefully, that the quorum
+certificate is ~5× larger than it needs to be purely because JSON renders
+`Vec<u8>` as decimal arrays, and certificates are not yet persisted, so the fix
+is nearly free right now.
 
 ## Follow-up review — 2026-08-25
 
@@ -161,4 +182,4 @@ pre-1.0 maturity, stewardship, licensing, audit, and GlassChain 200/300-validato
 compact-workload testnet remain adoption gates. `tendermint-rs` is complementary
 type and light-client tooling, not a consensus engine. The capability and
 historical-versioning policy that carries these boundaries is recorded in
-[ADR-010](../plans/adr-010-capability-versioning-policy.md).
+[ADR-010](../../docs/adr/adr-010-capability-versioning-policy.md).

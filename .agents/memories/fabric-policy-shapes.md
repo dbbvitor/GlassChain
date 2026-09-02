@@ -40,7 +40,7 @@ rules remain defined by ADR-003.
 
 ## Design consequence for GlassChain
 
-[ADR-008](../plans/adr-008-endorsement-policy-model.md) adopts the small
+[ADR-008](../../docs/adr/adr-008-endorsement-policy-model.md) adopts the small
 signature-policy tree over verified MSP organization members, with channel and
 contract defaults, optional collection policy, and fully scoped key-level
 constraints. It keeps roles for the RBAC work, separates PDC membership from

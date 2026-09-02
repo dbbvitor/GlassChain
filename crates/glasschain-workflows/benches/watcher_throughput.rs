@@ -2,7 +2,7 @@
 //!
 //! Run with:
 //! ```text
-//! cargo bench -p glasschain-contracts
+//! cargo bench -p glasschain-workflows
 //! ```
 //!
 //! Target: handle 1,000+ autonomous inventory triggers per second.

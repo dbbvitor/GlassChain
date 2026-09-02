@@ -4,7 +4,7 @@
 participation by every member organization (see Decision below). "Immediate"
 confirmed literal (Options A and D rejected).
 **Date:** 2026-08-18
-**Relates to:** §8.2, §1.1, §1.3 · [`requirements-alignment.md`](requirements-alignment.md) D2
+**Relates to:** §8.2, §1.1, §1.3 · [`requirements-alignment.md`](../../.agents/plans/requirements-alignment.md) D2
 
 ## Context
 
@@ -173,7 +173,7 @@ this ADR.
   set still cannot manufacture a custody transfer), and must not carry governance
   standing, fee advantage, or settlement privilege. Keep the three axes separate;
   every design pass so far has collapsed them. See
-  [`participation-model.md`](../memories/participation-model.md).
+  [`participation-model.md`](../../.agents/memories/participation-model.md).
 - **Consensus input is bounded by design.** The BFT core receives approved public
   canonical records and commitment envelopes, not private commercial payloads,
   raw evidence, or unbatched high-frequency telemetry. This avoids treating 70M

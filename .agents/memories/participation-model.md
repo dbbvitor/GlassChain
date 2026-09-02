@@ -2,8 +2,8 @@
 
 **Learned:** 2026-08-24
 **Scope:** clarifies the membership ladder already settled by
-[ADR-002](../plans/adr-002-consensus-finality.md) decision 3 and
-[ADR-004](../plans/adr-004-scale-topology.md) decision 3. Does **not** reopen
+[ADR-002](../../docs/adr/adr-002-consensus-finality.md) decision 3 and
+[ADR-004](../../docs/adr/adr-004-scale-topology.md) decision 3. Does **not** reopen
 either. Records the reasoning that three separate design passes rediscovered —
 and the four wrong answers they each converged on first.
 
@@ -27,22 +27,51 @@ Verification is a unilateral local act. Voting is a global agreement act.
 Agreement is what costs quadratically, because agreement requires everyone to
 hear from everyone. This is the whole reason the validator set is bounded.
 
-### 2. Liveness — not bandwidth — is the decisive reason voting can't be universal
+### 2. Liveness is why voting can't be *universal* — but it is not what bounds an institutional set at ~300
 
-Tendermint-class BFT needs **⅔+ of the validator set online and responsive to
-commit anything**. If the validator set is every member, then a third of members
-being offline means no block ever commits. At ADR-004's 70M-entity horizon —
-including Tier-3 smallholders transacting from phones — a third offline is the
-normal state of the world, not an edge case.
+**Scope of this argument (narrowed 2026-09-02):** it settles *universal* voting.
+It does **not** set the ceiling among institutional validators. Both halves
+matter; conflating them has already produced one wrong inference.
+
+**Universal voting fails on liveness.** Tendermint-class BFT needs **⅔+ of the
+validator set online and responsive to commit anything**. If the validator set is
+every member, then a third of members being offline means no block ever commits.
+At ADR-004's 70M-entity horizon — including Tier-3 smallholders transacting from
+phones — per-node offline probability is far above ⅓, so that is the normal state
+of the world, not an edge case.
 
 **Universal voting is self-defeating**: the standard fix is to evict absent
 validators (jailing), and evicting the absent *is* the split it was meant to
 avoid. Bounding the set is a liveness requirement, not an exclusion mechanism.
+For *this* case the argument is stronger than the O(n²) cost argument, because it
+is a correctness argument rather than a budget argument. Lead with it.
 
-This argument is stronger than the O(n²) cost argument because it is a
-correctness argument, not a budget argument. Lead with it.
+**But it does not carry to `n = 300` among institutions.** There, per-node
+offline probability is well under ⅓, and Chernoff makes a ⅔ quorum *easier* to
+reach as `n` grows, not harder. Independent uptime is the wrong model at that
+scale. The real bounds are:
 
-### 3. Signature aggregation does not escape the bound
+- **Correlated failure** — one BGP event, one cloud region, one DDoS takes many
+  orgs at once. Quorum availability is governed by the min-cut of correlated
+  sets, not by counting organizations. A federation of Brazilian pharma companies
+  sharing three cloud providers gains little independence from more members.
+- **Heavy-tailed latency** — the round timeout tracks the (⅔n)-th order statistic
+  of validator response time. With Pareto-shaped tails that grows roughly as
+  `n^(1/α)`; a few chronically slow members percolate into every quorum.
+- **Governance** — as `n` grows, P(at least one quorum member is having a bad
+  operations week) approaches 1. That conversation gets worse with more orgs.
+- **Bandwidth genuinely does bite for our family.** "Not bandwidth" holds for
+  leader-based protocols (O(n) per round). CometBFT's all-to-all vote gossip is
+  **O(n²) bytes per round** — at n=1000, ~2×10⁸ B/round. For ADR-002's chosen
+  family bandwidth is a real wall, just further out than 300.
+
+The conclusion — bound the set — is unchanged. Reaching 300 *reliably* is
+liveness engineering (provider and geographic diversity requirements, per-org SLA
+expectations, monitored participation), not protocol work. See
+[`../plans/performance.md`](../plans/performance.md) and
+[#62](https://github.com/dbbvitor/GlassChain/issues/62).
+
+### 3. Signature aggregation does not escape the bound — but it is the highest-value optimization below it
 
 BLS aggregation kills the linear commit-size term (ADR-002's quorum certificate
 is embedded in every block forever). It does not get you out, for four reasons:
@@ -61,6 +90,39 @@ is embedded in every block forever). It does not get you out, for four reasons:
 **General principle:** any scheme that compresses many votes into few messages
 creates a distinguished role. The split is not an arbitrary design preference —
 it falls out of needing agreement among many parties in bounded time.
+
+**Reframed 2026-09-02:** "does not escape the bound" is right, and it was
+misread as "not worth doing." With latency and scalability treated as sell
+factors, BLS is **the enabler of the scalability claim**, not a footnote: the
+sellable number is not `n`, it is how many participants can *verify*, and
+ADR-004's light-client ladder is what reaches them. A ⅔ certificate lands in
+every block forever and in every proof a light client checks; BLS collapses
+~79 KB to ~0.15 KB and turns 201 verifications into one. Two corrections to the
+four reasons above: plain n-of-n aggregation needs only a proof of possession,
+**not** a DKG (O(1) at a ⅔ *threshold* is what needs threshold BLS and resharing
+on membership change) — and permissioned membership makes that a rare auditable
+ceremony rather than an ongoing burden. Verification saves almost no round CPU
+(~1–3 ms aggregate vs. tens of ms to batch-verify 200 ed25519); the win is bytes,
+storage, and third-party proof size. Sequence it *with or after* the Malachite
+decision, since it is a primitive swap. And fix the JSON encoding first — §3a.
+
+### 3a. Before any of that: the wire protocol is JSON, and it costs ~5× for free
+
+Every peer message and gossipsub payload is `serde_json`, which renders `Vec<u8>`
+as decimal arrays (`[12,34,255,…]`) — so `Attestation`'s 96 bytes of key and
+signature become ~393. Measured: 508 B for a one-attestation certificate against
+a 115 B empty baseline; ~79 KB projected for a 201-of-300 quorum against a
+measured 11 567 B block. `serde_bytes` takes that to ~34 KB for one serde
+attribute and a wire-version bump; a binary codec to ~20 KB.
+
+Certificates are **not persisted with blocks yet** (open ADR-010 gate), so this is
+the cheap moment. Reaching for BLS before fixing a decimal-array encoding solves
+a 3× problem with a cryptographic migration.
+
+**And note what is not measured:** the committed capacity gate reports *PoW mine
+latency* on the dev engine with a degenerate certificate and zero vote rounds.
+There is no BFT finality number anywhere. Any latency argument — including one
+that defers an optimization as unnecessary — is unfounded until there is.
 
 ### 4. Light client ≠ verifying member. This was conflated in three separate passes.
 
@@ -139,12 +201,16 @@ component that is not the bottleneck.
   bottleneck 3.
 - Sortition rejection: ADR-002 Q4 comparison table (Algorand VRF).
 - Reference-architecture reward models: `reference-architectures.md`.
+- §2 narrowing, §3 reframing, and §3a certificate measurements: recorded
+  2026-09-02 in [`../plans/performance.md`](../plans/performance.md)
+  ([#62](https://github.com/dbbvitor/GlassChain/issues/62)), against the primary
+  protocol papers and live chain data listed there.
 
 ### Two fact-checks worth keeping
 
 Both of these were asserted confidently by a design pass and are false:
 
-- **Gas is execution metering, not a fee.** `reconcile-gas-and-status.md`:
+- **Gas is execution metering, not a fee.** Per the shipped gas/status reconciliation (plan since deleted):
   `ExecutionLimits { fuel_limit, operation_gas_limit }`, trap on exhaustion,
   and constraint 6 is *"Keep `GasReport` out of the execution result."* There is
   no gas price, no payer, and no balance to debit. `requirements-alignment.md`

@@ -10,7 +10,7 @@ GlassChain is a federated distributed ledger for transparent supply-chain
 transactions, written in Rust. It has SHA-256 chained blocks with Proof-of-Work
 consensus, supply-chain transaction types, a contract/watcher automation engine, a
 TLS-encrypted TCP + libp2p P2P layer, and a Tonic/Prost gRPC API. It is a Cargo
-workspace of 11 crates (~16k lines of Rust) on the Rust **1.95** toolchain pinned
+workspace of 12 crates (~37k lines of Rust) on the Rust **1.95** toolchain pinned
 by `rust-toolchain.toml`, edition 2021, async on Tokio.
 
 ## Build and validate

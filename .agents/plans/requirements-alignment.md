@@ -1,15 +1,17 @@
 # Requirements Alignment — Hybrid Distributed Inventory System
 
-**Status:** active — D1–D6 resolved; Stage 0 safety net and the first Stage 1
-item shipped
-**Date:** 2026-08-24
-**Baseline:** `eea0f325877c42069908e8a778cf798e898f2299` (branch `rework`), plus
-uncommitted work described in Stage 0/Stage 1 below
-**Relates to:** [`integration-completion.md`](integration-completion.md) — that plan is
-still valid but is now **Stage 1 of a much larger program**, and one of its
-recommendations is reversed below. VM state semantics and endorsement policy are
-settled in [ADR-007](adr-007-vm-state-semantics.md) and
-[ADR-008](adr-008-endorsement-policy-model.md).
+**Status:** active — D1–D6 resolved; Stage 0 complete; the debt-gap programme
+(#34–#49) shipped Stages 1–3 and the staged BFT/PDC/analytics work
+**Date:** 2026-08-24 · **Reviewed:** 2026-09-02
+**Baseline:** `fed76c7` on `main`, working tree clean. What actually shipped
+per ticket is recorded in
+[`../memories/debt-gap-handoff.md`](../memories/debt-gap-handoff.md); read that
+before re-planning anything below as if it were still open.
+**Note:** `integration-completion.md` is deleted — it was superseded by this
+plan and its state claims all shipped. Its one reversed recommendation (libp2p)
+is preserved below. VM state semantics and endorsement policy are settled in
+[ADR-007](../../docs/adr/adr-007-vm-state-semantics.md) and
+[ADR-008](../../docs/adr/adr-008-endorsement-policy-model.md).
 
 ---
 
@@ -30,7 +32,7 @@ code — it invalidates code that already exists and is tested.
 
 ## The decisions that gate everything
 
-### D1. Execution layer — ✅ **RESOLVED** → [ADR-001](adr-001-execution-layer.md)
+### D1. Execution layer — ✅ **RESOLVED** → [ADR-001](../../docs/adr/adr-001-execution-layer.md)
 
 The requirement was clarified into three items of differing strength: smart
 contract support is a **MUST** (already met by `WasmExecutionProvider`), EVM
@@ -42,7 +44,7 @@ item in the programme is removed, and — because EVM's global state trie was th
 reason "EVM-compatible" and "no global ledger replication" were mutually
 exclusive — **D3 is unblocked**.
 
-### D2. Deterministic finality (§8.2) vs. Proof-of-Work — ✅ **RESOLVED** → [ADR-002](adr-002-consensus-finality.md)
+### D2. Deterministic finality (§8.2) vs. Proof-of-Work — ✅ **RESOLVED** → [ADR-002](../../docs/adr/adr-002-consensus-finality.md)
 
 §8.2 requires "immediate, deterministic transaction finality (preventing chain
 forks)". The ledger uses PoW with longest-chain resolution — which is probabilistic
@@ -61,7 +63,7 @@ be resolved afterwards.
 participating organization in v1, including commercial rivals. Use
 Tendermint/CometBFT-class BFT, with full participation through the practical
 validator ceiling and an authenticated light-client ladder beyond it. See
-[ADR-002](adr-002-consensus-finality.md) and [ADR-004](adr-004-scale-topology.md).
+[ADR-002](../../docs/adr/adr-002-consensus-finality.md) and [ADR-004](../../docs/adr/adr-004-scale-topology.md).
 
 **Implementation consequence:** `ConsensusProvider` in `glasschain-core/src/providers.rs`
 is the right seam, but the production implementation must replace PoW with the
@@ -72,7 +74,7 @@ subsystem.
 With the consensus family settled, endorsement, channels, and the workflow engine
 can be implemented against the committed-block semantics.
 
-### D3. Global state (§6.1) vs. selective disclosure (§1.4, §3.2) — ✅ **RESOLVED** → [ADR-003](adr-003-privacy-model.md)
+### D3. Global state (§6.1) vs. selective disclosure (§1.4, §3.2) — ✅ **RESOLVED** → [ADR-003](../../docs/adr/adr-003-privacy-model.md)
 
 §3.2 requires sensitive terms be shared "strictly on a need-to-know basis…avoiding
 global ledger replication". This *used to* conflict with §2.1: EVM contracts assume a
@@ -88,11 +90,11 @@ does.
 ordered chain carries public custody commitments and hashes; private commercial
 payloads are disseminated point-to-point to authorized collection members. Regulator
 visibility, purge, and the default 72-hour transient reconciliation window are
-specified in [ADR-003](adr-003-privacy-model.md).
+specified in [ADR-003](../../docs/adr/adr-003-privacy-model.md).
 
 ---
 
-### D4. VM state mutation semantics — ✅ **RESOLVED** → [ADR-007](adr-007-vm-state-semantics.md)
+### D4. VM state mutation semantics — ✅ **RESOLVED** → [ADR-007](../../docs/adr/adr-007-vm-state-semantics.md)
 
 The VM uses a hybrid state model. Existing invocation-local output remains
 ephemeral and continues to drive approval decisions; a separate explicit host
@@ -108,7 +110,7 @@ not an open architectural decision.
 
 ---
 
-### D5. State-based endorsement policy — ✅ **RESOLVED** → [ADR-008](adr-008-endorsement-policy-model.md)
+### D5. State-based endorsement policy — ✅ **RESOLVED** → [ADR-008](../../docs/adr/adr-008-endorsement-policy-model.md)
 
 Endorsement is application authorization, separate from Tendermint-class BFT
 finality and PDC membership. v1 uses a deterministic Fabric-style signature
@@ -126,7 +128,7 @@ and a same-block policy update plus write to that key is rejected in v1.
 This settles the model; Stage 2 still has to wire certificate-backed evaluation
 through `EndorsementProvider`, channel/PDC policy storage, and the commit path.
 
-### D6. Capability/versioning and the consensus boundary — ✅ **RESOLVED** → [ADR-010](adr-010-capability-versioning-policy.md)
+### D6. Capability/versioning and the consensus boundary — ✅ **RESOLVED** → [ADR-010](../../docs/adr/adr-010-capability-versioning-policy.md)
 
 The BFT scaling review is accepted as a constraint on the chosen architecture,
 not as a reason to replace it with ZK validiums, SCITT, KERI, execution shards,
@@ -168,20 +170,20 @@ Verified against the working tree.
 |---|---|---|---|
 | 1.1 | MSP / X.509 identity | **Partial** | `glasschain-identity` exists; certificate chain verification **implemented** (`cert_verifier.rs`, webpki, `Full` by default). Remaining: verifier is `None` in all four `Node` constructors; no auditor/logistics roles |
 | 1.2 | RBAC | **Absent** | `MspAuthInterceptor` is authentication only — no roles, no policy evaluation |
-| 1.3 | Multi-party endorsement | **Partial; model specified** | `EndorsementEngine` complete + tested; state/key policy model is defined by [ADR-008](adr-008-endorsement-policy-model.md), but certificate-backed enforcement remains unwired (`server.rs:553` stub) |
-| 1.4 | Channels / private partitions | **Partial** | `Channel` type exists, unwired; transport broadcasts globally; collection membership and endorsement are separate per [ADR-003](adr-003-privacy-model.md) and [ADR-008](adr-008-endorsement-policy-model.md) |
-| 2.1 | Smart contracts (MUST) | **MET** | `WasmExecutionProvider` + gas metering + reentrancy guard; state persistence semantics are defined by [ADR-007](adr-007-vm-state-semantics.md). EVM compat is a deferred SHOULD; Solidity out of scope — [ADR-001](adr-001-execution-layer.md) |
-| 2.2 | Canonical business events | **Partial** | `NodeEvent` + `event_bus` exist; not a canonical schema over all business actions. Signed certification/audit anchors are now required first-class events — [ADR-005](adr-005-certification-and-audit.md) |
+| 1.3 | Multi-party endorsement | **Partial; model specified** | `EndorsementEngine` complete + tested; state/key policy model is defined by [ADR-008](../../docs/adr/adr-008-endorsement-policy-model.md), but certificate-backed enforcement remains unwired (`server.rs:553` stub) |
+| 1.4 | Channels / private partitions | **Partial** | `Channel` type exists, unwired; transport broadcasts globally; collection membership and endorsement are separate per [ADR-003](../../docs/adr/adr-003-privacy-model.md) and [ADR-008](../../docs/adr/adr-008-endorsement-policy-model.md) |
+| 2.1 | Smart contracts (MUST) | **MET** | `WasmExecutionProvider` + gas metering + reentrancy guard; state persistence semantics are defined by [ADR-007](../../docs/adr/adr-007-vm-state-semantics.md). EVM compat is a deferred SHOULD; Solidity out of scope — [ADR-001](../../docs/adr/adr-001-execution-layer.md) |
+| 2.2 | Canonical business events | **Partial** | `NodeEvent` + `event_bus` exist; not a canonical schema over all business actions. Signed certification/audit anchors are now required first-class events — [ADR-005](../../docs/adr/adr-005-certification-and-audit.md) |
 | 2.3 | WebSocket / log subscriptions | **Partial** | gRPC `SubscribeToEvents` server stream only; no WebSocket, no REST |
 | 2.4 | Sponsored transactions / fee delegation | **Absent** | **No account, balance, or fee model exists at all** |
-| 3.1 | Workflow-first modeling | **Absent** | 6 transaction kinds, no state machine. RFQ/Quote/Acceptance/Shipment/Receipt/Dispute/Settlement do not exist; the VM contract-state boundary is settled by [ADR-007](adr-007-vm-state-semantics.md) for the future workflow engine |
+| 3.1 | Workflow-first modeling | **Absent** | 6 transaction kinds, no state machine. RFQ/Quote/Acceptance/Shipment/Receipt/Dispute/Settlement do not exist; the VM contract-state boundary is settled by [ADR-007](../../docs/adr/adr-007-vm-state-semantics.md) for the future workflow engine |
 | 3.2 | Selective privacy | **Absent** | Global JSON broadcast to all peers |
-| 3.3 | Legal commitment semantics | **Partial** | Certification and audit are now defined as signed, append-only processes referencing immutable lot commitments; full workflow semantics remain Stage 3 — [ADR-005](adr-005-certification-and-audit.md) |
+| 3.3 | Legal commitment semantics | **Partial** | Certification and audit are now defined as signed, append-only processes referencing immutable lot commitments; full workflow semantics remain Stage 3 — [ADR-005](../../docs/adr/adr-005-certification-and-audit.md) |
 | 3.4 | Domain app packaging | **Partial** | WASM contracts + `PLUGIN_KIT` provider traits |
-| 4.1 | Canonical minimum schema (9 entity types) | **Specified; implementation pending** | Canonical v1 defines 13 record families, including state commitments, `QualityCertification`, and `AuditAttestation`; strict field catalog remains to be implemented — [ADR-006](adr-006-canonical-schema-v1.md) |
-| 4.2 | Extension namespaces | **Specified; implementation pending** | Registered, versioned namespace schemas; unknown namespaces rejected and core fields cannot be overridden — [ADR-006](adr-006-canonical-schema-v1.md) |
-| 4.3 | Schema + policy registry | **Specified; implementation pending** | Immutable network-wide `(schema_id, version, hash)` registry; capability activation controls new-block use and historical versions remain valid — [ADR-006](adr-006-canonical-schema-v1.md), [ADR-010](adr-010-capability-versioning-policy.md) |
-| 5.1 | Autonomous replenishment | **MET** | Watcher → WASM → signed PO, with stress tests. Needs the Stage 2 endorsement enforcement from [ADR-008](adr-008-endorsement-policy-model.md) for "subject to approval policies" |
+| 4.1 | Canonical minimum schema (9 entity types) | **Specified; implementation pending** | Canonical v1 defines 13 record families, including state commitments, `QualityCertification`, and `AuditAttestation`; strict field catalog remains to be implemented — [ADR-006](../../docs/adr/adr-006-canonical-schema-v1.md) |
+| 4.2 | Extension namespaces | **Specified; implementation pending** | Registered, versioned namespace schemas; unknown namespaces rejected and core fields cannot be overridden — [ADR-006](../../docs/adr/adr-006-canonical-schema-v1.md) |
+| 4.3 | Schema + policy registry | **Specified; implementation pending** | Immutable network-wide `(schema_id, version, hash)` registry; capability activation controls new-block use and historical versions remain valid — [ADR-006](../../docs/adr/adr-006-canonical-schema-v1.md), [ADR-010](../../docs/adr/adr-010-capability-versioning-policy.md) |
+| 5.1 | Autonomous replenishment | **MET** | Watcher → WASM → signed PO, with stress tests. Needs the Stage 2 endorsement enforcement from [ADR-008](../../docs/adr/adr-008-endorsement-policy-model.md) for "subject to approval policies" |
 | 5.2 | Recall / quarantine / dispute flows | **Partial** | A recall *test* exists; no flow engine, quarantine, or dispute; future flows consume immutable lot commitments and certification/audit status without mutating source transactions |
 | 6.1 | Off-chain analytics | **MET** (by design) | Ledger is source of truth; analytics live outside |
 | 6.2 | Indexer service | **Partial** | In-memory indexer built; not wired into RPC |
@@ -197,7 +199,7 @@ Verified against the working tree.
 
 ## Revised position on two earlier recommendations
 
-**1. libp2p: reversed.** In `integration-completion.md` I recommended feature-gating
+**1. libp2p: reversed.** In the (since-deleted) `integration-completion.md` I recommended feature-gating
 or removing `LibP2pNode` because no binary can reach it. **§1.4 and §3.2 reverse
 that.** Selective disclosure needs addressed point-to-point messaging and peer
 discovery — precisely what the unused gossipsub + Kademlia swarm provides. The
@@ -217,21 +219,22 @@ the node itself.
 
 ### Stage 0 — Decisions and safety net *(blocking, small)*
 
-- [x] **D1** (execution layer) — resolved: [ADR-001](adr-001-execution-layer.md). WASM stands.
+- [x] **D1** (execution layer) — resolved: [ADR-001](../../docs/adr/adr-001-execution-layer.md). WASM stands.
 - [x] **D2** (consensus / finality) — resolved: Tendermint/CometBFT-class BFT,
       with full participation through the practical validator ceiling and a
-      light-client ladder beyond it. [ADR-002](adr-002-consensus-finality.md).
+      light-client ladder beyond it. [ADR-002](../../docs/adr/adr-002-consensus-finality.md).
 - [x] **D3** (privacy model) — resolved: Fabric-style private data collections,
       public custody commitments, private commercial payloads, default regulator
-      visibility, and configurable purge/reconciliation. [ADR-003](adr-003-privacy-model.md).
+      visibility, and configurable purge/reconciliation. [ADR-003](../../docs/adr/adr-003-privacy-model.md).
 - [x] **D4** (VM state semantics) — resolved: explicit persistent writes, committed
-      write sets, and explicit public/PDC scope. [ADR-007](adr-007-vm-state-semantics.md).
+      write sets, and explicit public/PDC scope. [ADR-007](../../docs/adr/adr-007-vm-state-semantics.md).
 - [x] **D5** (endorsement policy) — resolved: deterministic signature policies over
       verified MSP principals, scoped defaults/overrides, distinct signers, and
-      explicit custody/regulatory protections. [ADR-008](adr-008-endorsement-policy-model.md).
-- [x] **CI** — `.github/workflows/ci.yml`: check, test, and a clippy no-new-warnings
-      gate against `.github/clippy-baseline.txt` (2163). Verified locally to pass at
-      baseline and to fail on an injected warning.
+      explicit custody/regulatory protections. [ADR-008](../../docs/adr/adr-008-endorsement-policy-model.md).
+- [x] **CI** — `.github/workflows/ci.yml`: fmt, check, test, clippy, coverage, and a
+      RustSec audit. The clippy no-new-warnings baseline gate has been **retired**:
+      clippy is clean at `-D warnings`, so `.github/clippy-baseline.txt` was deleted
+      2026-09-02.
 
 Stages 2–4 are unblocked now that D2 and D3 are resolved. Stage 1 remains the
 schema prerequisite for the workflow engine.
@@ -254,15 +257,15 @@ resolved WASM, BFT, privacy, and VM-state boundaries:
       Thor and Fabric both colocate ([study §6](../memories/reference-architectures.md)).
 - [ ] **Schema registry + extension namespaces (§4.2, §4.3)** — implement the
       immutable network-wide registry and capability-controlled activation defined
-      in [ADR-006](adr-006-canonical-schema-v1.md); validate registered namespace
+      in [ADR-006](../../docs/adr/adr-006-canonical-schema-v1.md); validate registered namespace
       schemas and reject unknown namespaces.
 - [ ] **Canonical schema expansion (§4.1)** — implement the 13 specified record
       families with strict v1 validation, including `QualityCertification`,
       `AuditAttestation`, `StateCommitment`, and the embedded evidence-manifest
       reference. Certification/audit records reference immutable lot commitments
-      and never mutate source transactions ([ADR-005](adr-005-certification-and-audit.md)).
+      and never mutate source transactions ([ADR-005](../../docs/adr/adr-005-certification-and-audit.md)).
       This remains the data-model prerequisite for the Stage 3 workflow engine.
-- [ ] **VM state write-set plumbing (§2.1)** — implement [ADR-007](adr-007-vm-state-semantics.md):
+- [ ] **VM state write-set plumbing (§2.1)** — implement [ADR-007](../../docs/adr/adr-007-vm-state-semantics.md):
       separate ephemeral output from explicit persistent set/delete operations,
       carry canonical scoped write sets in committed records, apply public/PDC
       visibility correctly, materialize atomically, and rebuild from blocks
@@ -273,7 +276,7 @@ resolved WASM, BFT, privacy, and VM-state boundaries:
 - [ ] Consensus replacement per D2, behind `ConsensusProvider`. Expose a **quorum
       certificate** on the seam from the start so a later Raft→BFT swap is additive
       rather than a rewrite of every commit consumer (ADR-002 consequences).
-- [ ] Endorsement enforcement per [ADR-008](adr-008-endorsement-policy-model.md),
+- [ ] Endorsement enforcement per [ADR-008](../../docs/adr/adr-008-endorsement-policy-model.md),
       via a new `EndorsementProvider` trait in `glasschain-core`, implemented in
       `glasschain-identity`, and invoked from `glasschain-network`. **Core must not
       depend on identity** — verify with `cargo tree -p glasschain-core -i glasschain-identity`.
@@ -284,11 +287,11 @@ resolved WASM, BFT, privacy, and VM-state boundaries:
 - [ ] Wire `LibP2pNode`; implement channels (§1.4) and private data collections (§3.2).
       Split the work along Fabric's three concerns — policy (`identity`),
       dissemination *and reconciliation* (`network`/libp2p), transient pre-commit
-      store (`storage`) — per [ADR-003](adr-003-privacy-model.md).
+      store (`storage`) — per [ADR-003](../../docs/adr/adr-003-privacy-model.md).
 - [ ] Capability/versioning mechanism, landed with the wire-protocol change rather
       than after it: network-wide committed capabilities, future-height activation,
       historical validation, read-only downgrade for unsupported peers, and a strict
-      public/private consensus boundary ([ADR-010](adr-010-capability-versioning-policy.md)).
+      public/private consensus boundary ([ADR-010](../../docs/adr/adr-010-capability-versioning-policy.md)).
 
 > If D3 slips, mark `LibP2pNode` **experimental** rather than deleting or
 > feature-gating it. Corda carries a top-level `experimental/` for exactly this
@@ -307,8 +310,8 @@ component for stuck flows.
 - [ ] Recall, quarantine, dispute flows (§5.2) as first-class flows, replacing the
       current recall *simulation test*.
 - [ ] Commitment semantics (§3.3), including the strict canonical records and
-      signed certification/audit processes specified by [ADR-005](adr-005-certification-and-audit.md)
-      and [ADR-006](adr-006-canonical-schema-v1.md).
+      signed certification/audit processes specified by [ADR-005](../../docs/adr/adr-005-certification-and-audit.md)
+      and [ADR-006](../../docs/adr/adr-006-canonical-schema-v1.md).
 - [ ] **Contract/workflow packaging split (§3.4)** — Corda ships `finance/contracts`
       and `finance/workflows` as separate deployable modules: contract code is
       verification-only and deterministic, workflow code drives I/O. This maps
@@ -367,24 +370,24 @@ Not blocking any stage, but they get more expensive the longer they wait:
 
 1. ~~Is §2.1 (EVM/Solidity) a real constraint?~~ **Answered** — smart contracts are
    the MUST and are already met; EVM is a SHOULD; Solidity is out of scope. See
-   [ADR-001](adr-001-execution-layer.md).
+   [ADR-001](../../docs/adr/adr-001-execution-layer.md).
 2. ~~Byzantine or crash-fault tolerance?~~ **Answered** — every member org is a
    zero-trust validator in v1; Tendermint/CometBFT-class BFT is selected, with a
-   light-client ladder at national scale. See [ADR-002](adr-002-consensus-finality.md)
-   and [ADR-004](adr-004-scale-topology.md).
+   light-client ladder at national scale. See [ADR-002](../../docs/adr/adr-002-consensus-finality.md)
+   and [ADR-004](../../docs/adr/adr-004-scale-topology.md).
 3. ~~What must stay globally visible for regulatory traceability?~~ **Answered** —
    custody edges, identities, GTIN/batch/lot identifiers, timestamps, and recalls
    are public; commercial terms, quantities, and client relationships are private.
-   See [ADR-003](adr-003-privacy-model.md).
+   See [ADR-003](../../docs/adr/adr-003-privacy-model.md).
 4. ~~What is the target deployment scale?~~ **Answered** — the design horizon is
    70M entities; on-chain load is commitments and approved public records rather
    than raw events. Exact capacity remains unquantified until the 200/300-validator
-   compact-workload testnet specified by [ADR-010](adr-010-capability-versioning-policy.md).
+   compact-workload testnet specified by [ADR-010](../../docs/adr/adr-010-capability-versioning-policy.md).
 5. **Is there a delivery deadline?** The honest read is a multi-quarter program for a
    team. If the horizon is weeks, scope must be cut to a defensible subset —
    Stage 0 + Stage 1 + §5.1 hardening would be a coherent, demonstrable slice.
 6. ~~Where do VM state mutations land?~~ **Answered** — hybrid explicit persistence,
-   committed write sets, and explicit public/PDC scope. See [ADR-007](adr-007-vm-state-semantics.md).
+   committed write sets, and explicit public/PDC scope. See [ADR-007](../../docs/adr/adr-007-vm-state-semantics.md).
 7. ~~What does state-based endorsement require?~~ **Answered** — Fabric-style signature
    policies over verified MSP principals, scoped defaults and key constraints, distinct
-   signers, and explicit custody/regulatory protections. See [ADR-008](adr-008-endorsement-policy-model.md).
+   signers, and explicit custody/regulatory protections. See [ADR-008](../../docs/adr/adr-008-endorsement-policy-model.md).

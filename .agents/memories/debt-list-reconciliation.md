@@ -17,7 +17,7 @@ are genuine unplanned deltas.
 | Debt-list claim | Verified reality at `516f4f9` | Verdict |
 |---|---|---|
 | core: no strict schema validation | `schema.rs` has `validate_asset` + `SNCM_SCHEMA` (6-field const) for assets only; no runtime registry, no extension namespaces, 8 entity types undefined | Real; already Stage 1 (§4.1–4.3) |
-| vm: lacks EVM parity | No EVM runtime is planned; compatibility remains a decoupled optional adapter behind `ExecutionProvider`, never a `core` dependency ([ADR-001](../plans/adr-001-execution-layer.md)) | Runtime out of scope; adapter backlog only |
+| vm: lacks EVM parity | No EVM runtime is planned; compatibility remains a decoupled optional adapter behind `ExecutionProvider`, never a `core` dependency ([ADR-001](../../docs/adr/adr-001-execution-layer.md)) | Runtime out of scope; adapter backlog only |
 | vm: state outputs not hooked to world state | `ExecutionProvider::execute_with_state` returns `(key, value)` mutations; only `ApprovalGate` consumes them (reads `approve == b"1"`, discards rest). `StorageProvider::put_state`/`get_state` keyspace carries only `watcher:state` and `signed_tx:*` | Real, **unplanned delta** |
 | identity: lacks state-based endorsement | `EndorsementEngine` complete + tested; enforcement stub at `server.rs` ("endorsement engine not yet wired"); `EndorsementProvider` seam already planned (integration plan Phase 2). The *state-based policy model* itself is undesigned | Real, partially planned; policy-model decision open |
 | network: incomplete RPC streaming hooks | `StreamBlocks` + `SubscribeToEvents` server-streaming RPCs **implemented** in `server.rs` | Stale claim |
@@ -27,7 +27,7 @@ are genuine unplanned deltas.
 | contracts: needs PO→Receipt→Settlement workflow engine | True — ECA watcher + offer→PO engine only, no state machine | Real; already Stage 3 (largest build; after Stage 1 schema) |
 | Fee sponsorship in `vm::gas` | No account, balance, or fee type exists anywhere in the workspace | Real but mis-sited — needs an account/balance model first (Stage 4), not a gas-meter feature |
 | PDC hashing in `identity::channel` | **Already exists**: `submit_private_data` / `get_private_data` / `committed_hashes`, member-gated, SHA-256 commitments (`channel.rs`) | Already built. Missing parts are dissemination + reconciliation (network), transient store (storage) — blocked on D3 |
-| *(omitted by the list)* consensus / deterministic finality | D2 still open (Raft vs BFT on validator-set ownership) | The actual critical path — see [ADR-002](../plans/adr-002-consensus-finality.md) |
+| *(omitted by the list)* consensus / deterministic finality | D2 still open (Raft vs BFT on validator-set ownership) | The actual critical path — see [ADR-002](../../docs/adr/adr-002-consensus-finality.md) |
 
 ## Scope decision (2026-08-20)
 
@@ -51,10 +51,10 @@ Plan against `requirements-alignment.md`, not the debt list. The two deltas the
 list added that the programme did not already track were: (1) where VM state
 mutations land, and (2) the state-based endorsement policy model. VM state
 semantics are now resolved by wayfinder [#21](https://github.com/dbbvitor/GlassChain/issues/21)
-and [ADR-007](../plans/adr-007-vm-state-semantics.md): explicit persistent
+and [ADR-007](../../docs/adr/adr-007-vm-state-semantics.md): explicit persistent
 writes use a committed write set, while approval output remains ephemeral and
 public/PDC visibility is explicit. The endorsement policy model is now resolved by wayfinder [#22](https://github.com/dbbvitor/GlassChain/issues/22)
-and [ADR-008](../plans/adr-008-endorsement-policy-model.md): deterministic
+and [ADR-008](../../docs/adr/adr-008-endorsement-policy-model.md): deterministic
 Fabric-style signature policies over verified MSP principals, scoped defaults and
 key constraints, distinct signers, and explicit custody/regulatory protections.
 Treat the scope decisions above as boundaries, not missing implementation work.
@@ -74,4 +74,4 @@ and separate aBFT-core alternatives remain outside v1. Malachite stays a
 default-off staged candidate behind `ConsensusProvider`, subject to a real
 200/300-validator compact-workload benchmark and security/stewardship gates.
 Capability/versioning policy is now resolved in
-[ADR-010](../plans/adr-010-capability-versioning-policy.md).
+[ADR-010](../../docs/adr/adr-010-capability-versioning-policy.md).

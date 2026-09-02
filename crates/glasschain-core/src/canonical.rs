@@ -756,9 +756,10 @@ pub fn validate_record_with(
             }
             // Counterparty MSP signatures: the issuer's opaque signature set
             // must carry at least one entry per named counterparty.
-            // ponytail: signature content/binding to each counterparty is
-            // verified by the endorsement engine (tickets #37/#45); v1 only
-            // enforces the count mechanically.
+            // ponytail: count-only, and it stays that way. The endorsement
+            // engine verifies `Transaction.endorsements` carriers, never
+            // `record.signatures` — binding these to MSP keys needs its own
+            // decision, not an incidental fix.
             if record.signatures.len() < counterparties.len() {
                 return Err(err(
                     "state_commitment",
