@@ -184,6 +184,11 @@ struct NodeState {
     /// A chronically rising count is a peer that cannot keep up and is
     /// silently missing blocks until it resyncs.
     dropped_outbound: HashMap<String, u64>,
+    /// Incremental capability history: advanced block-by-block at the commit
+    /// choke point and rebuilt from the chain on start/sync/replacement —
+    /// never re-derived from genesis per admission (#62 Step-0 attribution:
+    /// full-chain replays per received block were the dominant, growing cost).
+    capability_history: Option<CapabilityHistory>,
     /// TOFU peer registry: verified peer identities keyed by stable listen address.
     peer_registry: PeerRegistry,
     /// Optional CA certificate verifier; when set, peer certs must be org-issued.
@@ -278,7 +283,16 @@ impl NodeState {
 }
 
 /// The capability set effective at the local chain tip (ADR-010 decision 5).
-async fn active_set_at_tip(ledger: &Arc<Mutex<Ledger>>) -> glasschain_core::CapabilitySet {
+/// Reads the incremental cache held in `state` (the caller holds the state
+/// lock); falls back to a full rebuild only when the cache is missing.
+async fn active_set_at_tip(
+    state: &NodeState,
+    ledger: &Arc<Mutex<Ledger>>,
+) -> glasschain_core::CapabilitySet {
+    if let Some(history) = &state.capability_history {
+        let tip = ledger.lock().await.chain.len().saturating_sub(1) as u64;
+        return history.effective_set(tip);
+    }
     let ledger_guard = ledger.lock().await;
     match CapabilityHistory::build_from_blocks(&ledger_guard.chain) {
         Ok(history) => history.effective_set(ledger_guard.chain.len().saturating_sub(1) as u64),
@@ -479,6 +493,7 @@ impl Node {
                 known_peers: HashSet::new(),
                 peer_senders: HashMap::new(),
                 dropped_outbound: HashMap::new(),
+                capability_history: None,
                 peer_registry: PeerRegistry::new(),
                 cert_verifier: None,
                 identity: identity.clone(),
@@ -840,6 +855,13 @@ impl Node {
             Err(e) => log::warn!("Failed to rebuild policy history from chain: {e}"),
         }
 
+        // Capability history likewise: built once from the committed chain,
+        // then advanced block-by-block at the commit choke point (#62 Step 0).
+        match CapabilityHistory::build_from_blocks(&chain) {
+            Ok(history) => s.capability_history = Some(history),
+            Err(e) => log::warn!("Failed to rebuild capability history from chain: {e}"),
+        }
+
         // For watcher state (inventory levels + fire counts), try the persisted
         // snapshot first — it is more up-to-date than chain replay because it
         // captures post-commit updates that haven't been mined into a block yet.
@@ -972,15 +994,11 @@ impl Node {
         // NEXT height, so the gate is the capability set effective there
         // (ADR-010 §4: a block is validated under the set active at its own
         // height).
-        let pdc_active = {
-            let ledger = self.ledger.lock().await;
-            let next_height = ledger.chain.len() as u64;
-            CapabilityHistory::build_from_blocks(&ledger.chain).is_ok_and(|history| {
-                history
-                    .effective_set(next_height)
-                    .is_active(PDC_CAPABILITY_ID)
-            })
-        };
+        let next_height = self.ledger.lock().await.chain.len() as u64;
+        let pdc_active = self
+            .capability_effective_set(next_height)
+            .await
+            .is_ok_and(|set| set.is_active(PDC_CAPABILITY_ID));
         if !pdc_active {
             return Err(CoreError::InvalidTransaction(
                 "private payloads require the 'pdc' capability to be active".into(),
@@ -1415,13 +1433,14 @@ impl Node {
                 // Sequential lock acquisitions: the ledger guard is dropped
                 // before the state guard is taken (state→ledger is the only
                 // nested order used elsewhere).
-                let active = {
-                    let ledger = self.ledger.lock().await;
-                    let next_height = ledger.chain.len() as u64;
-                    CapabilityHistory::build_from_blocks(&ledger.chain)?
-                        .effective_set(next_height)
-                        .is_active(ENDORSEMENT_CAPABILITY_ID)
-                };
+                // The ledger guard is dropped before the helper runs (it
+                // takes its own state→ledger locks; tokio Mutexes are not
+                // reentrant).
+                let next_height = self.ledger.lock().await.chain.len() as u64;
+                let active = self
+                    .capability_effective_set(next_height)
+                    .await?
+                    .is_active(ENDORSEMENT_CAPABILITY_ID);
                 if active {
                     let policies = self.state.lock().await.policies.clone();
                     evaluate_transaction_endorsements(provider.as_ref(), &policies, &tx, &[])?;
@@ -1504,8 +1523,10 @@ impl Node {
             .iter()
             .any(|write| matches!(write.visibility, WriteVisibility::Pdc(_)))
         {
-            let pdc_active = CapabilityHistory::build_from_blocks(&self.ledger.lock().await.chain)
-                .is_ok_and(|history| history.effective_set(index).is_active(PDC_CAPABILITY_ID));
+            let pdc_active = self
+                .capability_effective_set(index)
+                .await
+                .is_ok_and(|set| set.is_active(PDC_CAPABILITY_ID));
             if !pdc_active {
                 Self::restore_pending(&self.ledger, transactions).await;
                 return Err(CoreError::InvalidTransaction(
@@ -1538,11 +1559,8 @@ impl Node {
         // degenerate one. The commit consumer below is identical either way.
         #[cfg(feature = "bft")]
         let notification = {
-            let history = CapabilityHistory::build_from_blocks(&self.ledger.lock().await.chain);
-            let bft_active = match history {
-                Ok(history) => history
-                    .effective_set(index)
-                    .is_active(BFT_CONSENSUS_CAPABILITY_ID),
+            let bft_active = match self.capability_effective_set(index).await {
+                Ok(set) => set.is_active(BFT_CONSENSUS_CAPABILITY_ID),
                 Err(e) => {
                     log::warn!(
                         "Capability history invalid at height {index}; BFT stays dormant: {e}"
@@ -1885,12 +1903,9 @@ impl Node {
         let Some(provider) = provider else {
             return Ok(());
         };
-        let active = {
-            let l = ledger.lock().await;
-            CapabilityHistory::build_from_blocks(&l.chain)?
-                .effective_set(block.index)
-                .is_active(ENDORSEMENT_CAPABILITY_ID)
-        };
+        let active = Self::capability_effective_set_static(state, ledger, block.index)
+            .await?
+            .is_active(ENDORSEMENT_CAPABILITY_ID);
         if !active {
             return Ok(());
         }
@@ -1980,7 +1995,7 @@ impl Node {
         let senders: Vec<(String, Sender<Message>)> = {
             let s = self.state.lock().await;
             if matches!(message, Message::Transaction(_)) {
-                let active = active_set_at_tip(&self.ledger).await;
+                let active = active_set_at_tip(&s, &self.ledger).await;
                 // Relayed transactions are counted under a shared label: the
                 // per-peer counter exists to expose stragglers on the block
                 // fan-out path, which is where a full channel costs a peer
@@ -2017,6 +2032,44 @@ impl Node {
         }
     }
 
+    /// The capability set effective at `height`, read from the incremental
+    /// cache (rebuilding it once from the chain if missing) instead of
+    /// replaying every block per call (#62 Step-0 attribution).
+    async fn capability_effective_set(
+        &self,
+        height: u64,
+    ) -> Result<glasschain_core::CapabilitySet, CoreError> {
+        let mut state = self.state.lock().await;
+        if state.capability_history.is_none() {
+            let ledger = self.ledger.lock().await;
+            state.capability_history = Some(CapabilityHistory::build_from_blocks(&ledger.chain)?);
+        }
+        Ok(state
+            .capability_history
+            .as_ref()
+            .expect("just populated")
+            .effective_set(height))
+    }
+
+    /// Static twin of [`capability_effective_set`](Self::capability_effective_set)
+    /// for commit-path helpers that receive `state`/`ledger` as parameters.
+    async fn capability_effective_set_static(
+        state: &Arc<Mutex<NodeState>>,
+        ledger: &Arc<Mutex<Ledger>>,
+        height: u64,
+    ) -> Result<glasschain_core::CapabilitySet, CoreError> {
+        let mut state = state.lock().await;
+        if state.capability_history.is_none() {
+            let ledger = ledger.lock().await;
+            state.capability_history = Some(CapabilityHistory::build_from_blocks(&ledger.chain)?);
+        }
+        Ok(state
+            .capability_history
+            .as_ref()
+            .expect("just populated")
+            .effective_set(height))
+    }
+
     /// Cumulative outbound drops per peer address (read-only visibility for
     /// operators and tests; #62 §5.6 item 2).
     pub async fn dropped_outbound(&self, addr: &str) -> u64 {
@@ -2047,6 +2100,50 @@ impl Node {
         block: &Block,
         storage: &Arc<dyn StorageProvider>,
     ) -> Vec<Transaction> {
+        // Advance the incremental capability cache first (single choke point
+        // for every commit path — mine, peer, sync). A duplicate apply (peer
+        // path re-processing a block that admission already validated) just
+        // invalidates the cache; the next read rebuilds it lazily.
+        let cache_missing = {
+            let s = state.lock().await;
+            s.capability_history.is_none()
+        };
+        if cache_missing {
+            let history = {
+                let ledger = ledger.lock().await;
+                CapabilityHistory::build_from_blocks(&ledger.chain).ok()
+            };
+            if let Some(history) = history {
+                state.lock().await.capability_history = Some(history);
+            }
+        }
+        let pending_activations: Vec<_> = block
+            .transactions
+            .iter()
+            .filter_map(|tx| match &tx.kind {
+                TransactionKind::CapabilityActivation(activation) => {
+                    Some((activation.clone(), block.index))
+                }
+                _ => None,
+            })
+            .collect();
+        {
+            let mut s = state.lock().await;
+            if let Some(history) = s.capability_history.as_mut() {
+                for (activation, containing) in pending_activations {
+                    if let Err(e) = history.apply(activation, containing) {
+                        log::warn!(
+                            "Capability cache drift at block {}: {e}; invalidating",
+                            block.index
+                        );
+                        s.capability_history = None;
+                        break;
+                    }
+                }
+            }
+            drop(s);
+        }
+
         // Persist the block and apply its canonical write set through one
         // atomic commit boundary; on success, mirror the writes into the
         // derived world-state cache.  On failure the chain stays authoritative
@@ -2658,8 +2755,8 @@ async fn process_message(
             };
             // Read-only observers may not propose writes (ADR-010 decision 6).
             {
-                let active = active_set_at_tip(&ctx.ledger).await;
                 let s = ctx.state.lock().await;
+                let active = active_set_at_tip(&s, &ctx.ledger).await;
                 if s.peer_registry.is_read_only(stable_addr, &active) {
                     log::warn!("Ignoring transaction from read-only observer {addr}");
                     return MessageEffect::default();
@@ -2700,8 +2797,8 @@ async fn process_message(
             }
 
             let senders: Vec<Sender<Message>> = {
-                let active = active_set_at_tip(&ctx.ledger).await;
                 let s = ctx.state.lock().await;
+                let active = active_set_at_tip(&s, &ctx.ledger).await;
                 s.relay_targets(&active)
             };
             for gen_tx in generated {
@@ -2720,8 +2817,8 @@ async fn process_message(
             };
             // Read-only observers may not propose blocks (ADR-010 decision 6).
             {
-                let active = active_set_at_tip(&ctx.ledger).await;
                 let s = ctx.state.lock().await;
+                let active = active_set_at_tip(&s, &ctx.ledger).await;
                 if s.peer_registry.is_read_only(stable_addr, &active) {
                     log::warn!("Ignoring block from read-only observer {addr}");
                     return MessageEffect::default();
@@ -2744,16 +2841,27 @@ async fn process_message(
             }
 
             let (should_append, too_far_ahead) = {
+                let mut s = ctx.state.lock().await;
+                if s.capability_history.is_none() {
+                    let l = ctx.ledger.lock().await;
+                    match CapabilityHistory::build_from_blocks(&l.chain) {
+                        Ok(history) => s.capability_history = Some(history),
+                        Err(e) => log::warn!("Capability history rebuild failed: {e}"),
+                    }
+                }
                 let l = ctx.ledger.lock().await;
                 let expected = l.chain.len() as u64;
                 let result = if block.index == expected {
                     let diff = l.difficulty;
                     l.chain.last().map_or((false, false), |prev| {
+                        // Validate on a CLONE of the incremental cache —
+                        // never a genesis replay (#62 Step-0 attribution).
+                        // The clone is discarded; the commit choke point
+                        // advances the shared cache.
+                        let mut history = s.capability_history.clone().unwrap_or_default();
                         let valid = block.chains_to(prev).is_ok()
                             && block.has_valid_pow(diff)
-                            && CapabilityHistory::build_from_blocks(&l.chain)
-                                .and_then(|mut history| history.validate_block(&block))
-                                .is_ok();
+                            && history.validate_block(&block).is_ok();
                         (valid, false)
                     })
                 } else {
@@ -2808,8 +2916,8 @@ async fn process_message(
                 });
 
                 let senders: Vec<Sender<Message>> = {
-                    let active = active_set_at_tip(&ctx.ledger).await;
                     let s = ctx.state.lock().await;
+                    let active = active_set_at_tip(&s, &ctx.ledger).await;
                     s.relay_targets(&active)
                 };
                 for tx in generated {
@@ -2929,13 +3037,26 @@ async fn process_message(
             // submission gate). One lock scope for height and history so the
             // chain cannot advance in between.
             let pdc_active = {
-                let ledger = ctx.ledger.lock().await;
-                let next_height = ledger.chain.len() as u64;
-                CapabilityHistory::build_from_blocks(&ledger.chain).is_ok_and(|history| {
-                    history
-                        .effective_set(next_height)
-                        .is_active(PDC_CAPABILITY_ID)
-                })
+                let cached = {
+                    let s = ctx.state.lock().await;
+                    s.capability_history.clone()
+                };
+                let next_height = ctx.ledger.lock().await.chain.len() as u64;
+                // single_match_else is allowed here: the fallback branch
+                // takes its own ledger lock, which cannot sit inside a
+                // map_or_else closure.
+                #[allow(clippy::single_match_else)]
+                let set = match cached {
+                    Some(history) => history.effective_set(next_height),
+                    None => {
+                        let ledger = ctx.ledger.lock().await;
+                        CapabilityHistory::build_from_blocks(&ledger.chain).map_or_else(
+                            |_| glasschain_core::CapabilitySet::genesis(),
+                            |history| history.effective_set(next_height),
+                        )
+                    }
+                };
+                set.is_active(PDC_CAPABILITY_ID)
             };
             if !pdc_active {
                 log::warn!(

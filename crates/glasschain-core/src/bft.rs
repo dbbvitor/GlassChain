@@ -135,9 +135,15 @@ impl BftConsensusProvider {
             .iter()
             .map(|validator| validator.public_key.as_slice())
             .collect();
+
+        // Parse every attestation up front: an unknown validator or a
+        // malformed key/signature rejects the whole certificate before any
+        // expensive cryptography runs.
+        let mut parsed: Vec<(VerifyingKey, Signature, &[u8; 32], &str)> =
+            Vec::with_capacity(certificate.attestations.len());
         let mut distinct = std::collections::HashSet::new();
         for attestation in &certificate.attestations {
-            let key_bytes: [u8; 32] = attestation
+            let key_bytes: &[u8; 32] = attestation
                 .public_key
                 .as_slice()
                 .try_into()
@@ -148,22 +154,13 @@ impl BftConsensusProvider {
                     attestation.validator
                 )));
             }
-            let verifier = VerifyingKey::from_bytes(&key_bytes).map_err(|_| {
+            let verifier = VerifyingKey::from_bytes(key_bytes).map_err(|_| {
                 CoreError::InvalidBlock("bft: invalid ed25519 verifying key".into())
             })?;
             let sig = Signature::from_slice(&attestation.signature)
                 .map_err(|_| CoreError::InvalidBlock("bft: invalid ed25519 signature".into()))?;
-            // ponytail: sequential verification, ~50 µs per signature — ~10 ms at a
-            // 201-attestation quorum, the dominant cost here. `verify_batch` is
-            // ~2× faster but reports only "some signature failed", so adopting it
-            // needs a sequential fallback to name the bad signer. See #62.
-            verifier.verify(block.hash.as_bytes(), &sig).map_err(|_| {
-                CoreError::InvalidBlock(format!(
-                    "bft: signature from '{}' does not verify block {}",
-                    attestation.validator, block.index
-                ))
-            })?;
-            distinct.insert(key_bytes);
+            parsed.push((verifier, sig, key_bytes, attestation.validator.as_str()));
+            distinct.insert(*key_bytes);
         }
         if distinct.len() < self.quorum() {
             return Err(CoreError::InvalidBlock(format!(
@@ -171,6 +168,26 @@ impl BftConsensusProvider {
                 self.quorum(),
                 distinct.len()
             )));
+        }
+
+        // Step 2 (#62): optimistic batch verification — ~2× faster than the
+        // sequential loop at a 201-attestation quorum. The zero-trust catch:
+        // batch reports only "some signature in this set failed", without
+        // naming it — so on any batch failure, fall back to sequential
+        // verification, which attributes the misbehaving validator exactly.
+        let messages: Vec<&[u8]> = parsed.iter().map(|_| block.hash.as_bytes()).collect();
+        let signatures: Vec<Signature> = parsed.iter().map(|(_, sig, _, _)| *sig).collect();
+        let verifying_keys: Vec<VerifyingKey> = parsed.iter().map(|(key, ..)| *key).collect();
+        if ed25519_dalek::verify_batch(&messages, &signatures, &verifying_keys).is_err() {
+            for (verifier, sig, key_bytes, name) in &parsed {
+                verifier.verify(block.hash.as_bytes(), sig).map_err(|_| {
+                    CoreError::InvalidBlock(format!(
+                        "bft: signature from '{}' does not verify block {}",
+                        name, block.index
+                    ))
+                })?;
+                let _ = key_bytes;
+            }
         }
         Ok(())
     }
@@ -367,5 +384,71 @@ mod tests {
             .verify_certificate(&certificate, &block)
             .unwrap_err();
         assert!(err.to_string().contains("quorum"), "{err}");
+    }
+
+    #[test]
+    fn test_batch_verify_fallback_names_the_bad_signer() {
+        // Step 2 (#62): the optimistic batch fails when any signature is
+        // corrupted; the sequential fallback must attribute THAT validator,
+        // not just report "some signature failed".
+        let mut ledger = Ledger::new(1);
+        let genesis = ledger.mine_pending_transactions().expect("genesis").clone();
+        let (provider, keys) = provider(5);
+        let notification = provider
+            .propose_block(1, vec![], &genesis)
+            .expect("propose");
+
+        // Build a valid certificate, then corrupt one attestation's signature.
+        let mut certificate = notification.certificate.clone();
+        certificate.attestations.clear();
+        for key in &keys {
+            use ed25519_dalek::Signer as _;
+            let signature = key.sign(notification.block.hash.as_bytes());
+            certificate.attestations.push(Attestation {
+                validator: format!("validator-{}", certificate.attestations.len()),
+                public_key: key.verifying_key().to_bytes().to_vec(),
+                signature: signature.to_bytes().to_vec(),
+                algorithm: crate::wire::SignatureAlgorithm::Ed25519,
+            });
+        }
+        assert!(provider
+            .verify_certificate(&certificate, &notification.block)
+            .is_ok());
+        let guilty = 2;
+        certificate.attestations[guilty].signature[0] ^= 0xFF;
+
+        let error = provider
+            .verify_certificate(&certificate, &notification.block)
+            .expect_err("a corrupted attestation must be attributed");
+        assert!(
+            error.to_string().contains(&format!("validator-{guilty}")),
+            "the fallback must name the bad signer: {error}"
+        );
+    }
+
+    #[test]
+    fn test_batch_verify_accepts_a_full_quorum() {
+        let mut ledger = Ledger::new(1);
+        let genesis = ledger.mine_pending_transactions().expect("genesis").clone();
+        let count = 10;
+        let (provider, keys) = provider(count);
+        let notification = provider
+            .propose_block(1, vec![], &genesis)
+            .expect("propose");
+        let mut certificate = notification.certificate.clone();
+        certificate.attestations.clear();
+        for key in &keys {
+            use ed25519_dalek::Signer as _;
+            let signature = key.sign(notification.block.hash.as_bytes());
+            certificate.attestations.push(Attestation {
+                validator: format!("validator-{}", certificate.attestations.len()),
+                public_key: key.verifying_key().to_bytes().to_vec(),
+                signature: signature.to_bytes().to_vec(),
+                algorithm: crate::wire::SignatureAlgorithm::Ed25519,
+            });
+        }
+        assert!(provider
+            .verify_certificate(&certificate, &notification.block)
+            .is_ok());
     }
 }

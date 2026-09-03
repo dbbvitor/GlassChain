@@ -319,6 +319,16 @@ they can.
 
 ### Step 0 status (2026-09-03)
 
+**Fan-out growth attributed and fixed.** The instrument's own sweep was one
+cause (fixed by stride sampling); the dominant cause was every received block
+replaying the full capability history from genesis — O(height) per block per
+peer, growing linearly with the round count. Fixed with an incremental
+capability cache on `NodeState` (advanced at the commit choke point, rebuilt on
+start/sync/replacement, validated on a clone at admission). Post-fix: 200
+validators, round 10 fan-out **459 ms** (was 1 751 ms), first-reached flat at
+25–99 ms; 300 validators median **344 ms**. Residual mild growth noted in
+`consensus-capacity.md`.
+
 The instrument fixes (items 1–2) are in, and the fixed harness has been run at
 200/300 (see `docs/benchmarks/consensus-capacity.md`). **BFT finality latency
 remains unmeasurable**: no cross-validator attestation/vote gathering exists
