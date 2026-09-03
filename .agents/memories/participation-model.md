@@ -241,4 +241,4 @@ The real open risk is not the existence of a bounded set but **how members enter
 it** — ADR-002 open questions 4 (voting power) and 5 (churn mechanics), both
 unresolved and unowned. Objective published eligibility, self-selection with
 opt-out, and capped consecutive epochs make it a duty roster; discretionary
-admission makes it a cartel. Proposed home for that decision: `adr-009`.
+admission makes it a cartel. Decision made: [ADR-009](../../docs/adr/adr-009-validator-eligibility.md) (duty roster, objective eligibility bar, no-repeat epoch rotation) — 2026-09-03.

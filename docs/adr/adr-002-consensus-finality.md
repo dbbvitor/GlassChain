@@ -197,23 +197,23 @@ this ADR.
    Throughput remains unquantified ("high throughput", §8.2). Production evidence
    at 200 validators establishes feasibility, not a ceiling; the compact GlassChain
    workload at 200/300 validators must be measured before a number is claimed.
-4. **Voting power:** one-org-one-vote is assumed for v1. Weighting (stake or
-   reputation) would require governance input and an economics model that does
-   not exist (Stage 4). Recorded as an explicit assumption — revisit before the
-   consensus swap ships; do not let it stay silent. **Constraint on any answer:**
+4. **Voting power:** ~~one-org-one-vote is assumed for v1.~~ **RESOLVED by
+   [ADR-009](adr-009-validator-eligibility.md):** one org, one vote, equal
+   weight — the assumption is now an explicit decision. **Constraint on any answer:**
    governance standing attaches to membership, not to validation (CONTEXT.md).
    A proposal that grants network-rule votes only to validators is rejected on
    sight — it disenfranchises the members least able to run infrastructure and
    hands the rules of a compliance ledger to its largest commercial actors.
-5. **Validator-set churn mechanics** (join/leave cadence, per-height updates):
-   part of the consensus-swap execution plan, to be designed when #23's
-   implementation-path findings land. **This, not the size of the set, is where
-   the legitimacy risk actually lives.** Objective published eligibility,
+5. **Validator-set churn mechanics** ~~to be designed when #23's
+   implementation-path findings land~~ **RESOLVED by
+   [ADR-009](adr-009-validator-eligibility.md):** objective published
+   eligibility bar, epoch rotation with no-repeat constraint, per-height
+   proposer rotation, equivocation suspension, no jailing. Objective published eligibility,
    self-selection with opt-out, and a cap on consecutive epochs make it a duty
    roster; discretionary admission makes it a cartel. Random sampling (VRF/RANDAO
    sortition) is **not** an answer here — it was rejected in the Decision above,
    and GlassChain has no stake weighting to make committee capture improbable.
 
-Open questions 4 and 5 together determine whether the membership ladder is
-legitimate, and both are currently unowned. Proposed home for the decision:
-`adr-009-validator-eligibility.md`.
+Open questions 4 and 5 determined whether the membership ladder is
+legitimate. Both are now owned and closed: see
+[ADR-009](adr-009-validator-eligibility.md).
