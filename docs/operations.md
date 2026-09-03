@@ -88,7 +88,7 @@ Verified from the argument parser in `crates/glasschain-node/src/main.rs`
 | `--storage-path <PATH>` | Directory for persistent Sled block storage. When provided, the chain is reloaded from disk on restart; when omitted, storage is in-memory only | none (in-memory) | no |
 | `--org <NAME>` | Organization name. Causes the node to create an organization Root CA and issue an identity-backed TLS certificate | none (anonymous self-signed cert) | no |
 | `--identity-node-id <ID>` | Node ID embedded in the issued TLS identity certificate (CN) | value of `--id` | no |
-| `--trust-store <PATH>` | PEM file or directory of `*.pem` files holding the Root CA certificates of the peer organizations to trust (ADR-011). **Requires `--org`.** Without it, peer organizations are not certificate-verified (logged at startup) | none | no |
+| `--trust-store <PATH>` | PEM file or directory holding the peer organizations' Root/intermediate CA certificates (`*.pem`) and their signed CRLs (`*.crl`, ADR-013). **Requires `--org`.** Verification is fail-closed: a peer whose issuing CA has no current CRL in the store is rejected. Without it, peer organizations are not certificate-verified (logged at startup) | none | no |
 | `--rpc-addr <ADDR>` | Address to bind the gRPC server (e.g. `0.0.0.0:50051`). **When omitted, the gRPC server is not started** | none | no |
 | `--help`, `-h` | Print usage text and exit | — | — |
 

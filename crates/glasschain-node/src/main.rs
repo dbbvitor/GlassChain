@@ -538,13 +538,19 @@ async fn main() {
             let load = |v: &mut CertChainVerifier, p: &std::path::Path| {
                 v.add_federation_root_file(p).map_err(|e| e.to_string())
             };
-            let result: Result<usize, String> = match std::fs::metadata(path) {
+            let load_crl = |v: &mut CertChainVerifier, p: &std::path::Path| {
+                v.add_crl_file(p).map_err(|e| e.to_string())
+            };
+            let result: Result<(usize, usize), String> = match std::fs::metadata(path) {
                 Ok(meta) if meta.is_dir() => {
                     let mut added = 0usize;
                     let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(path) {
                         Ok(entries) => entries
                             .filter_map(|entry| entry.ok().map(|e| e.path()))
-                            .filter(|p| p.extension().is_some_and(|ext| ext == "pem"))
+                            .filter(|p| {
+                                p.extension()
+                                    .is_some_and(|ext| ext == "pem" || ext == "crl")
+                            })
                             .collect(),
                         Err(e) => {
                             log::error!("Failed to read trust store directory `{path}`: {e}");
@@ -553,7 +559,15 @@ async fn main() {
                     };
                     files.sort();
                     for file in &files {
-                        if let Err(e) = load(&mut verifier, file) {
+                        // `*.crl` files hold the organizations' signed CRLs
+                        // (ADR-013); `*.pem` files hold Root/intermediate CA
+                        // certificates.
+                        let res = if file.extension().is_some_and(|ext| ext == "crl") {
+                            load_crl(&mut verifier, file)
+                        } else {
+                            load(&mut verifier, file)
+                        };
+                        if let Err(e) = res {
                             log::error!(
                                 "Failed to load trust anchor from `{}`: {e}",
                                 file.display()
@@ -562,17 +576,26 @@ async fn main() {
                         }
                         added += 1;
                     }
-                    Ok(added)
+                    // ADR-013 fail-closed: without CRLs every peer verification
+                    // rejects, so make the omission loud at startup.
+                    if verifier.federation_anchor_count() > 0 && verifier.crl_count() == 0 {
+                        log::warn!(
+                            "Trust store has federation anchors but no CRLs: every peer \
+                             verification will fail until '*.crl' files are added"
+                        );
+                    }
+                    Ok((added, verifier.crl_count()))
                 }
-                Ok(_) => load(&mut verifier, std::path::Path::new(path)).map(|()| 1usize),
+                Ok(_) => load(&mut verifier, std::path::Path::new(path))
+                    .map(|()| (1usize, verifier.crl_count())),
                 Err(e) => Err(e.to_string()),
             };
             match result {
-                Ok(files) => {
-                    node.set_cert_verifier(verifier).await;
+                Ok((files, crls)) => {
                     log::info!(
-                        "Certificate verification enabled: own organization `{org}` plus {files} trust-store file(s) from `{path}` (peers from untrusted organizations are rejected on org-gated paths)"
+                        "Certificate verification enabled: own organization `{org}` plus {files} trust-store file(s) from `{path}` — {crls} CRL(s) loaded; revocation is fail-closed (peers whose issuing CA has no current CRL are rejected)"
                     );
+                    node.set_cert_verifier(verifier).await;
                 }
                 Err(e) => {
                     log::error!("Failed to load trust store at `{path}`: {e}");

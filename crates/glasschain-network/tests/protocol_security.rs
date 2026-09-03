@@ -835,9 +835,11 @@ async fn hello_with_unverified_org_certificate_stays_connected_but_unverified() 
     let member = Node::new("org-member", &addr, 1);
     member.start(vec![]).await.unwrap();
     let org = glasschain_identity::Organization::new("PharmaCorp").unwrap();
-    member
-        .set_cert_verifier(glasschain_identity::CertChainVerifier::from_org(&org).unwrap())
-        .await;
+    let mut verifier = glasschain_identity::CertChainVerifier::from_org(&org).unwrap();
+    verifier
+        .add_crl_pem(&org.crl_pem().unwrap())
+        .expect("org CRL");
+    member.set_cert_verifier(verifier).await;
 
     let (mut reader, mut writer, _node_cert) = connect_raw(&addr, CLIENT_CERT_A).await;
     read_node_hello(&mut reader).await;
