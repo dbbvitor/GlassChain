@@ -1,8 +1,8 @@
 use glasschain_core::{
-    InventoryUpdate, PurchaseConditions, PurchaseOrder, SmartContractDef, SupplyOffer,
-    TraceableAsset, TraceableAssetRegistration, Transaction, TransactionKind,
+    endorsement::Principal, InventoryUpdate, PurchaseConditions, PurchaseOrder, SmartContractDef,
+    SupplyOffer, TraceableAsset, TraceableAssetRegistration, Transaction, TransactionKind,
 };
-use glasschain_identity::Organization;
+use glasschain_identity::{MspEndorsementProvider, Organization};
 use glasschain_network::{Node, NodeEvent};
 use glasschain_rpc::GlasschainServer;
 use glasschain_storage::SledStorageProvider;
@@ -481,6 +481,28 @@ async fn main() {
         }
         Err(e) => {
             log::warn!("WASM execution provider unavailable: {e}");
+        }
+    }
+
+    // Attach the MSP endorsement provider when the node has an organizational
+    // identity. Attaching it is necessary but not sufficient: enforcement also
+    // requires the `endorsement` capability to be active at the candidate
+    // height, which is activated in-band via a committed CapabilityActivation
+    // record (ADR-008). Without a provider every endorsement gate
+    // short-circuits.
+    match (org_name.as_ref(), identity.as_ref()) {
+        (Some(org), Some(identity)) => {
+            let mut msp = MspEndorsementProvider::new();
+            msp.register_identity(identity, Principal::new(org.clone()));
+            node.set_endorsement_provider(Arc::new(msp)).await;
+            log::info!(
+                "MSP endorsement provider enabled for organization `{org}` (enforcement begins once the `endorsement` capability is active at the candidate height)"
+            );
+        }
+        _ => {
+            log::warn!(
+                "No endorsement provider configured: endorsement enforcement is disabled (start with --org to attach one)"
+            );
         }
     }
 

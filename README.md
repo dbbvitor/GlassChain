@@ -100,6 +100,8 @@ cargo run --release -p glasschain-node -- \
   --identity-node-id node-1
 ```
 
+Starting with `--org` also attaches an MSP endorsement provider (see [Automation Model](#automation-model)): the node's identity is registered under a principal named after the organization, and enforcement begins once the `endorsement` capability is activated in-band.
+
 Run two local peers:
 
 ```bash
@@ -319,6 +321,7 @@ claim is made — ADR-010 §7's testnet/API/audit gates still apply.
 - **Watcher path:** committed `InventoryUpdate` events are processed in post-commit hooks and may generate autonomous reorder `PurchaseOrder` transactions.
 - **Restart / sync behavior:** contract runtime state is rebuilt from the committed chain, and watcher inventory state is replayed from committed `InventoryUpdate` transactions after restore or chain replacement.
 - **Identity-backed transport option:** starting the node with `--org <NAME>` and optional `--identity-node-id <ID>` derives the TLS certificate from the node's identity key. This binds the certificate fingerprint to the advertised node identity via the TOFU peer registry, but does not establish shared-CA trust between organizations.
+- **Endorsement enforcement option:** starting with `--org <NAME>` also attaches an MSP endorsement provider (the node's own identity is registered under a principal named after the organization). Attaching the provider is necessary but not sufficient: enforcement additionally requires the `endorsement` capability to be active at the candidate height, activated in-band via a committed `CapabilityActivation` record. Without `--org`, no provider is attached and endorsement gates short-circuit; the startup log states explicitly which mode the node is in.
 
 Example contract condition payload:
 
