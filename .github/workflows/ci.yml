@@ -165,7 +165,12 @@ jobs:
         # --engine llvm: wasmtime delivers WASM traps (e.g. `unreachable`, fuel
         # exhaustion) via SIGILL/SIGSEGV caught by its own signal handler; the
         # default ptrace engine intercepts those signals and aborts the run.
-        run: cargo tarpaulin --verbose --workspace --all-features --all-targets --locked --timeout 120 --engine llvm --out xml
+        # --test-threads 1: tests reserve loopback ports with a
+        # bind→drop→rebind pattern (free_addr helpers); under tarpaulin's
+        # instrumented parallel execution that window widened enough to hit
+        # AddrInUse (sncm_compliance, 2026-09-03). Coverage timing does not
+        # need intra-binary parallelism; normal `cargo test` runs unaffected.
+        run: cargo tarpaulin --verbose --workspace --all-features --all-targets --locked --timeout 120 --engine llvm --out xml -- --test-threads=1
 
       - name: Upload coverage to Codecov
         if: ${{ env.CODECOV_TOKEN != '' }}
