@@ -23,6 +23,8 @@ hex = "0.4"
 log = "0.4"
 x509-cert = "0.3"
 rustls-pki-types = "1.15"
+# CRL `next_update` arithmetic (ADR-013); same 0.3 tree rcgen already uses.
+time = { version = "0.3", default-features = false, features = ["std"] }
 # lib name is `webpki`; `ring` matches the provider glasschain-network already
 # selects for rustls, so both crates share one crypto backend.
 rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }

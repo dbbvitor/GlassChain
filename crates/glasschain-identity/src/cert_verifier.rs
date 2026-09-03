@@ -35,7 +35,7 @@
 //! use glasschain_identity::{CertChainVerifier, Organization};
 //!
 //! let mut org = Organization::new("PharmaOrg").unwrap();
-//! let mut verifier = CertChainVerifier::from_org(&org).unwrap();
+//! let mut verifier = verifier_with_crl(&org);
 //!
 //! // Optionally trust a federation peer's organization Root CA:
 //! // verifier.add_federation_root_file("peer-root-ca.pem").unwrap();
@@ -123,6 +123,24 @@ pub enum CertVerificationError {
     #[error("certificate expired or not yet valid")]
     InvalidValidity,
 
+    /// The peer certificate's serial is on the issuing CA's CRL (ADR-013).
+    #[error("certificate has been revoked")]
+    Revoked,
+
+    /// The issuing CA's CRL is missing, or an intermediate CA's is — revocation
+    /// status could not be determined and the verifier fails closed (ADR-013).
+    #[error("revocation status unknown: the issuing CA's CRL is missing from the trust store")]
+    RevocationStatusUnknown,
+
+    /// The issuing CA's CRL is present but past its `next_update` — the org
+    /// broke its freshness cadence, so verification fails closed (ADR-013).
+    #[error("CRL is expired: the issuing CA must publish a fresh one")]
+    CrlExpired,
+
+    /// No CRL was loaded at all. Verifiers require CRLs — fail closed.
+    #[error("no CRL loaded: every trusted CA must have a current CRL in the trust store")]
+    CrlMissing,
+
     /// The Root CA's signature over the peer certificate did not verify.
     ///
     /// Raised only at [`VerificationLevel::Full`]. A certificate can match the
@@ -156,9 +174,6 @@ impl From<CertVerificationError> for IdentityError {
 struct TrustAnchor {
     /// Human-readable organization name, used in error/log messages.
     org_name: String,
-    /// Root CA `Subject` DN re-encoded as raw DER bytes, compared byte-for-byte
-    /// with the peer cert's `Issuer` DN.
-    subject_der: Vec<u8>,
     /// Full DER encoding of the Root CA certificate — the trust anchor for
     /// signature verification at [`VerificationLevel::Full`].
     cert_der: Vec<u8>,
@@ -177,12 +192,6 @@ struct TrustAnchor {
 /// [`VerificationLevel::Structural`] reduces the check to a Distinguished Name
 /// comparison that any party can satisfy by self-signing; do that only in tests.
 pub struct CertChainVerifier {
-    /// Root CA `Subject` DN re-encoded as raw DER bytes.
-    ///
-    /// Compared byte-for-byte with the peer cert's `Issuer` DN DER bytes,
-    /// which avoids any string-canonicalization ambiguity.
-    root_subject_der: Vec<u8>,
-
     /// Full DER encoding of the Root CA certificate.
     ///
     /// Used as the trust anchor for signature verification at
@@ -199,6 +208,17 @@ pub struct CertChainVerifier {
     /// to trust (ADR-011 federation trust store). A peer certificate chains
     /// against the own-organization anchor first, then these.
     federation_anchors: Vec<TrustAnchor>,
+
+    /// Subordinate CA certificates from the trust store — not self-signed, so
+    /// they are not trust anchors; webpki builds leaf → intermediate → anchor
+    /// paths through them (ADR-013).
+    intermediates: Vec<TrustAnchor>,
+
+    /// CRLs loaded from the trust store (ADR-013). Verification fails closed:
+    /// without a current CRL from the issuing CA, revocation status is unknown
+    /// and the certificate is rejected (webpki `UnknownStatusPolicy::Deny`),
+    /// and an expired CRL is an error too (`ExpirationPolicy::Enforce`).
+    crls: Vec<webpki::CertRevocationList<'static>>,
 }
 
 // ── Constructors ──────────────────────────────────────────────────────────────
@@ -246,24 +266,17 @@ impl CertChainVerifier {
         org_name: impl Into<String>,
         root_ca_der: &[u8],
     ) -> Result<Self, CertVerificationError> {
-        let root_cert = Certificate::from_der(root_ca_der)
-            .map_err(|e| CertVerificationError::ParseError(e.to_string()))?;
-
-        // Re-encode the Subject DN to obtain canonical DER bytes that can be
-        // compared directly with the Issuer DN bytes inside peer certificates.
-        let mut root_subject_der = Vec::new();
-        root_cert
-            .tbs_certificate()
-            .subject()
-            .encode_to_vec(&mut root_subject_der)
+        // Parse to validate the DER structure up front.
+        Certificate::from_der(root_ca_der)
             .map_err(|e| CertVerificationError::ParseError(e.to_string()))?;
 
         Ok(Self {
-            root_subject_der,
             root_cert_der: root_ca_der.to_vec(),
             org_name: org_name.into(),
             level: VerificationLevel::default(),
             federation_anchors: Vec::new(),
+            intermediates: Vec::new(),
+            crls: Vec::new(),
         })
     }
 
@@ -334,26 +347,93 @@ impl CertChainVerifier {
         Ok(())
     }
 
-    /// Build and append one anchor from DER bytes.
+    /// Build and append one trust-store CA from DER bytes: self-signed
+    /// certificates are trust anchors, anything else is an intermediate that
+    /// paths may be built through (ADR-013).
     fn add_anchor(
         &mut self,
         org_label: String,
         root_ca_der: &[u8],
     ) -> Result<(), CertVerificationError> {
-        let root_cert = Certificate::from_der(root_ca_der)
+        let parsed = Certificate::from_der(root_ca_der)
             .map_err(|e| CertVerificationError::ParseError(e.to_string()))?;
         let mut subject_der = Vec::new();
-        root_cert
+        parsed
             .tbs_certificate()
             .subject()
             .encode_to_vec(&mut subject_der)
             .map_err(|e| CertVerificationError::ParseError(e.to_string()))?;
-        self.federation_anchors.push(TrustAnchor {
+        let mut issuer_der = Vec::new();
+        parsed
+            .tbs_certificate()
+            .issuer()
+            .encode_to_vec(&mut issuer_der)
+            .map_err(|e| CertVerificationError::ParseError(e.to_string()))?;
+        let entry = TrustAnchor {
             org_name: org_label,
-            subject_der,
             cert_der: root_ca_der.to_vec(),
-        });
+        };
+        if subject_der == issuer_der {
+            self.federation_anchors.push(entry);
+        } else {
+            self.intermediates.push(entry);
+        }
         Ok(())
+    }
+
+    /// Add a CRL from a PEM string (ADR-013). Verification fails closed when
+    /// a peer's issuing CA has no current CRL here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CertVerificationError::PemError`] if the PEM cannot be decoded,
+    /// or [`CertVerificationError::ParseError`] if the CRL is malformed.
+    pub fn add_crl_pem(&mut self, crl_pem: &str) -> Result<(), CertVerificationError> {
+        let der =
+            rustls_pki_types::CertificateRevocationListDer::from_pem_slice(crl_pem.as_bytes())
+                .map_err(|e| CertVerificationError::PemError(e.to_string()))?;
+        let crl = webpki::OwnedCertRevocationList::from_der(der.as_ref())
+            .map_err(|e| CertVerificationError::ParseError(e.to_string()))?;
+        self.crls.push(crl.into());
+        Ok(())
+    }
+
+    /// Add CRL(s) from a PEM file — every `X509 CRL` block becomes a loaded
+    /// CRL (ADR-013).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CertVerificationError::PemError`] if the file cannot be read
+    /// or contains no CRL block.
+    pub fn add_crl_file(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(), CertVerificationError> {
+        let path = path.as_ref();
+        let mut added = 0;
+        for crl in rustls_pki_types::CertificateRevocationListDer::pem_file_iter(path)
+            .map_err(|e| CertVerificationError::PemError(e.to_string()))?
+        {
+            let crl = crl.map_err(|e| CertVerificationError::PemError(e.to_string()))?;
+            let crl = webpki::OwnedCertRevocationList::from_der(crl.as_ref())
+                .map_err(|e| CertVerificationError::ParseError(e.to_string()))?;
+            self.crls.push(crl.into());
+            added += 1;
+        }
+        if added == 0 {
+            return Err(CertVerificationError::PemError(format!(
+                "no X509 CRL block found in {}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Number of CRLs loaded (ADR-013). Exposed so startup logging can report
+    /// the trust store's revocation coverage.
+    #[must_use]
+    pub const fn crl_count(&self) -> usize {
+        self.crls.len()
     }
 
     /// Number of federation anchors configured (excludes the own-organization
@@ -366,6 +446,22 @@ impl CertChainVerifier {
 
 // ── Verification ──────────────────────────────────────────────────────────────
 
+/// Map a webpki path-building failure to the granular error type. Revocation
+/// failures keep their identity: `Revoked` is the control working, the
+/// unknown/expired variants are the fail-closed posture of ADR-013.
+fn map_webpki_error(err: webpki::Error) -> CertVerificationError {
+    match err {
+        webpki::Error::CertRevoked => CertVerificationError::Revoked,
+        webpki::Error::UnknownRevocationStatus => CertVerificationError::RevocationStatusUnknown,
+        webpki::Error::CrlExpired { .. } => CertVerificationError::CrlExpired,
+        webpki::Error::UnknownIssuer => CertVerificationError::IssuerMismatch {
+            expected_org: String::new(),
+            actual_issuer: "no path to a trust anchor".to_owned(),
+        },
+        other => CertVerificationError::SignatureInvalid(other.to_string()),
+    }
+}
+
 impl CertChainVerifier {
     /// Verify a DER-encoded peer certificate against a trusted Root CA.
     ///
@@ -374,16 +470,16 @@ impl CertChainVerifier {
     /// 1. Parse the DER bytes as an X.509 certificate.
     /// 2. Re-encode the cert's `Issuer` DN and compare it byte-for-byte with
     ///    each trusted Root CA's `Subject` DN — the own-organization anchor
-    ///    first, then the federation anchors (ADR-011).
+    ///    first, then the federation anchors (ADR-011), with intermediates
+    ///    from the trust store available for path building (ADR-013).
     /// 3. Check that `SystemTime::now()` falls inside the cert's validity window.
-    /// 4. At [`VerificationLevel::Full`], verify the matching Root CA's
-    ///    signature over the certificate.
+    /// 4. At [`VerificationLevel::Full`], build and verify a full path to an
+    ///    anchor — and check revocation: the issuing CA's CRL must be present
+    ///    and current, or the certificate is rejected (fail-closed, ADR-013).
     ///
     /// Steps 2 and 3 run first so that a misconfigured peer produces a specific,
-    /// actionable error rather than a generic chain-verification failure. An
-    /// anchor whose Issuer DN matches but whose signature fails is an
-    /// impostor-or-stale case: the remaining matching anchors are still tried,
-    /// and the peer is accepted only if one verifies.
+    /// actionable error rather than a generic chain-verification failure. Each
+    /// anchor is tried in turn; the peer is accepted if any path verifies.
     ///
     /// # Errors
     ///
@@ -393,42 +489,38 @@ impl CertChainVerifier {
         let peer_cert = Certificate::from_der(peer_cert_der)
             .map_err(|e| CertVerificationError::ParseError(e.to_string()))?;
 
-        // ── 2. Issuer DN must match a trusted Root CA Subject DN ─────────────
-        let mut peer_issuer_der = Vec::new();
-        peer_cert
-            .tbs_certificate()
-            .issuer()
-            .encode_to_vec(&mut peer_issuer_der)
-            .map_err(|e| CertVerificationError::ParseError(e.to_string()))?;
+        // ── 2. Validity period check ─────────────────────────────────────────
+        Self::check_validity(&peer_cert)?;
 
+        // ── 3. Structural mode stops here: no path build, no revocation.
+        if self.level == VerificationLevel::Structural {
+            log::debug!("cert_verifier: structural verification passed (no crypto, no CRL check)");
+            return Ok(());
+        }
+
+        // ── 4. Revocation is fail-closed (ADR-013): no CRLs, no verification.
+        if self.crls.is_empty() {
+            return Err(CertVerificationError::CrlMissing);
+        }
+
+        // ── 5. Cryptographic path verification against each anchor ──────────
         let mut last_err: Option<CertVerificationError> = None;
         let own = TrustAnchor {
             org_name: self.org_name.clone(),
-            subject_der: self.root_subject_der.clone(),
             cert_der: self.root_cert_der.clone(),
         };
         for anchor in std::iter::once(&own).chain(self.federation_anchors.iter()) {
-            if peer_issuer_der != anchor.subject_der {
-                continue;
-            }
-            // ── 3. Validity period check ─────────────────────────────────────
-            if let Err(e) = Self::check_validity(&peer_cert) {
-                last_err = Some(e);
-                continue;
-            }
-            // ── 4. Cryptographic chain verification ──────────────────────────
-            if self.level == VerificationLevel::Full {
-                if let Err(e) = Self::verify_signature(&anchor.cert_der, peer_cert_der) {
-                    last_err = Some(e);
-                    continue;
+            match self.verify_path(anchor, peer_cert_der) {
+                Ok(()) => {
+                    log::debug!(
+                        "cert_verifier: {:?} verification passed for cert issued by '{}'",
+                        self.level,
+                        anchor.org_name,
+                    );
+                    return Ok(());
                 }
+                Err(e) => last_err = Some(e),
             }
-            log::debug!(
-                "cert_verifier: {:?} verification passed for cert issued by '{}'",
-                self.level,
-                anchor.org_name,
-            );
-            return Ok(());
         }
 
         Err(
@@ -458,26 +550,39 @@ impl CertChainVerifier {
         Ok(())
     }
 
-    /// Verify the Root CA's signature over `peer_cert_der`.
+    /// Build and verify a certification path from `peer_cert_der` to `anchor`,
+    /// possibly through intermediate CAs loaded from the trust store, with
+    /// fail-closed revocation checking (ADR-013).
     ///
-    /// Builds a one-hop path from the peer certificate to the trusted Root CA.
-    /// There are no intermediates: [`Organization::issue_identity`]
-    /// signs member certificates directly with the root.
-    ///
-    /// Revocation is not checked — there is no CRL or OCSP distribution point in
-    /// the ledger's trust model today (#58). Membership revocation is a governance
-    /// concern that belongs in the MSP, not in TLS certificate validation.
-    fn verify_signature(
-        root_ca_der: &[u8],
+    /// Revocation semantics (all webpki, all fail-closed):
+    /// - `UnknownStatusPolicy::Deny` — the issuing CA's CRL missing from the
+    ///   trust store rejects the certificate;
+    /// - `ExpirationPolicy::Enforce` — an expired CRL rejects;
+    /// - depth `Chain` — intermediates are revocation-checked too.
+    fn verify_path(
+        &self,
+        anchor: &TrustAnchor,
         peer_cert_der: &[u8],
     ) -> Result<(), CertVerificationError> {
-        let root_der = rustls_pki_types::CertificateDer::from(root_ca_der);
+        let root_der = rustls_pki_types::CertificateDer::from(anchor.cert_der.as_slice());
         let anchor = webpki::anchor_from_trusted_cert(&root_der)
             .map_err(|e| CertVerificationError::SignatureInvalid(e.to_string()))?;
 
         let peer_der = rustls_pki_types::CertificateDer::from(peer_cert_der);
         let end_entity = webpki::EndEntityCert::try_from(&peer_der)
             .map_err(|e| CertVerificationError::ParseError(e.to_string()))?;
+
+        let intermediate_certs: Vec<rustls_pki_types::CertificateDer<'_>> = self
+            .intermediates
+            .iter()
+            .map(|i| rustls_pki_types::CertificateDer::from(i.cert_der.as_slice()))
+            .collect();
+
+        let crls: Vec<&webpki::CertRevocationList<'static>> = self.crls.iter().collect();
+        let revocation = webpki::RevocationOptionsBuilder::new(&crls)
+            .map_err(|_| CertVerificationError::CrlMissing)?
+            .with_expiration_policy(webpki::ExpirationPolicy::Enforce)
+            .build();
 
         let now = rustls_pki_types::UnixTime::since_unix_epoch(
             std::time::SystemTime::now()
@@ -494,14 +599,13 @@ impl CertChainVerifier {
             .verify_for_usage(
                 SUPPORTED_SIG_ALGS,
                 &[anchor],
-                &[],
+                &intermediate_certs,
                 now,
                 webpki::KeyUsage::client_auth(),
-                None,
+                Some(revocation),
                 None,
             )
-            .map_err(|e| CertVerificationError::SignatureInvalid(e.to_string()))?;
-
+            .map_err(map_webpki_error)?;
         Ok(())
     }
 
@@ -622,12 +726,20 @@ mod tests {
         (genuine, impostor_cert_pem)
     }
 
+    /// A Full-level verifier for `org` with the org's (revocation-empty) CRL
+    /// attached — the ADR-013 fail-closed default requires a current CRL.
+    fn verifier_with_crl(org: &Organization) -> CertChainVerifier {
+        let mut verifier = CertChainVerifier::from_org(org).unwrap();
+        verifier.add_crl_pem(&org.crl_pem().unwrap()).unwrap();
+        verifier
+    }
+
     // ── 1. Construction from Organization ────────────────────────────────────
 
     #[test]
     fn test_from_org_constructs_verifier() {
         let org = Organization::new("PharmaOrg").unwrap();
-        let verifier = CertChainVerifier::from_org(&org).unwrap();
+        let verifier = verifier_with_crl(&org);
 
         assert_eq!(verifier.org_name(), "PharmaOrg");
         assert_eq!(
@@ -635,7 +747,7 @@ mod tests {
             VerificationLevel::Full,
             "verification must be cryptographic by default"
         );
-        assert!(!verifier.root_subject_der.is_empty());
+        assert!(!verifier.root_cert_der.is_empty());
         assert!(!verifier.root_cert_der.is_empty());
     }
 
@@ -644,7 +756,7 @@ mod tests {
     #[test]
     fn test_member_cert_passes_verification() {
         let (org, cert_pem) = org_with_member("PharmaOrg", "node-x");
-        let verifier = CertChainVerifier::from_org(&org).unwrap();
+        let verifier = verifier_with_crl(&org);
 
         assert!(
             verifier.verify_cert_pem(&cert_pem).is_ok(),
@@ -659,7 +771,7 @@ mod tests {
         let (org1, _) = org_with_member("Org1", "node-1");
         let (_, cert_pem_org2) = org_with_member("Org2", "node-2");
 
-        let verifier = CertChainVerifier::from_org(&org1).unwrap();
+        let verifier = verifier_with_crl(&org1);
         let err = verifier
             .verify_cert_pem(&cert_pem_org2)
             .expect_err("cert from Org2 must not verify against Org1's CA");
@@ -675,7 +787,7 @@ mod tests {
     #[test]
     fn test_self_signed_cert_fails() {
         let org = Organization::new("TestOrg").unwrap();
-        let verifier = CertChainVerifier::from_org(&org).unwrap();
+        let verifier = verifier_with_crl(&org);
 
         let key_pair = rcgen::KeyPair::generate().unwrap();
         let params = rcgen::CertificateParams::new(vec!["test".into()]).unwrap();
@@ -701,7 +813,7 @@ mod tests {
 
         assert_eq!(verifier.org_name(), "TestOrg");
         assert!(!verifier.root_cert_der.is_empty());
-        assert!(!verifier.root_subject_der.is_empty());
+        assert!(!verifier.root_cert_der.is_empty());
     }
 
     // ── 6. from_der round-trips: PEM -> DER -> verifier -> member cert OK ─────
@@ -714,7 +826,8 @@ mod tests {
         let root_der = CertificateDer::from_pem_slice(org.root_ca_cert_pem.as_bytes()).unwrap();
 
         // Build verifier from DER and confirm it has the right org name.
-        let verifier = CertChainVerifier::from_der("RoundTripOrg", root_der.as_ref()).unwrap();
+        let mut verifier = CertChainVerifier::from_der("RoundTripOrg", root_der.as_ref()).unwrap();
+        verifier.add_crl_pem(&org.crl_pem().unwrap()).unwrap();
         assert_eq!(verifier.org_name(), "RoundTripOrg");
 
         // Issue a member cert and verify it passes — confirms that the Subject DN
@@ -729,7 +842,7 @@ mod tests {
     #[test]
     fn test_verify_cert_pem() {
         let (org, cert_pem) = org_with_member("PemOrg", "node-pem");
-        let verifier = CertChainVerifier::from_org(&org).unwrap();
+        let verifier = verifier_with_crl(&org);
 
         // Happy path via the PEM convenience wrapper.
         assert!(verifier.verify_cert_pem(&cert_pem).is_ok());
@@ -744,7 +857,7 @@ mod tests {
     #[test]
     fn test_impostor_ca_with_identical_dn_is_rejected() {
         let (genuine, impostor_cert_pem) = impostor_pair("PharmaOrg");
-        let verifier = CertChainVerifier::from_org(&genuine).unwrap();
+        let verifier = verifier_with_crl(&genuine);
 
         let err = verifier
             .verify_cert_pem(&impostor_cert_pem)
@@ -761,9 +874,7 @@ mod tests {
     #[test]
     fn test_structural_level_accepts_impostor() {
         let (genuine, impostor_cert_pem) = impostor_pair("PharmaOrg");
-        let verifier = CertChainVerifier::from_org(&genuine)
-            .unwrap()
-            .with_level(VerificationLevel::Structural);
+        let verifier = verifier_with_crl(&genuine).with_level(VerificationLevel::Structural);
 
         // Documents the exact gap that VerificationLevel::Full closes. If this
         // ever starts failing, the two levels have stopped being distinguishable
@@ -781,7 +892,7 @@ mod tests {
     #[test]
     fn test_expired_cert_is_rejected_invalid_validity() {
         let org = Organization::new("PharmaOrg").unwrap();
-        let verifier = CertChainVerifier::from_org(&org).unwrap();
+        let verifier = verifier_with_crl(&org);
 
         // Replicate the org Root CA's Subject DN so the Issuer DN byte-matches
         // (as `impostor_pair` does), but set a validity window that expired in
@@ -812,7 +923,7 @@ mod tests {
     #[test]
     fn test_verify_cert_pem_rejects_garbage_pem() {
         let (org, _) = org_with_member("PemOrg", "node-x");
-        let verifier = CertChainVerifier::from_org(&org).unwrap();
+        let verifier = verifier_with_crl(&org);
 
         let err = verifier
             .verify_cert_pem("not a pem")
@@ -862,7 +973,7 @@ mod tests {
     #[test]
     fn test_tampered_certificate_is_rejected() {
         let (org, cert_pem) = org_with_member("PharmaOrg", "node-tamper");
-        let verifier = CertChainVerifier::from_org(&org).unwrap();
+        let verifier = verifier_with_crl(&org);
 
         let der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).unwrap();
         let mut tampered = der.as_ref().to_vec();
@@ -883,16 +994,101 @@ mod tests {
         );
     }
 
+    // ── 16. Revocation (ADR-013) ─────────────────────────────────────────────
+
+    #[test]
+    fn test_revoked_member_cert_is_rejected() {
+        let (mut org, good_pem) = org_with_member("OrgR", "good-node");
+        let revoked = org.issue_identity("bad-node").unwrap().clone();
+        org.revoke_identity("bad-node").unwrap();
+
+        let verifier = verifier_with_crl(&org);
+        // An unrevoked member still passes...
+        assert!(verifier.verify_cert_pem(&good_pem).is_ok());
+        // ...and the revoked one is rejected — the control working.
+        let err = verifier
+            .verify_cert_pem(revoked.certificate_pem.as_ref().unwrap())
+            .expect_err("a revoked certificate must be rejected");
+        assert!(matches!(err, CertVerificationError::Revoked), "got {err}");
+    }
+
+    #[test]
+    fn test_missing_crl_fails_closed() {
+        let (org, cert_pem) = org_with_member("OrgNoCrl", "node-x");
+        let verifier = CertChainVerifier::from_org(&org).unwrap();
+        let err = verifier
+            .verify_cert_pem(&cert_pem)
+            .expect_err("verification without any CRL must fail closed");
+        assert!(
+            matches!(err, CertVerificationError::CrlMissing),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn test_expired_crl_fails_closed() {
+        let (org, cert_pem) = org_with_member("OrgStale", "node-x");
+        let mut verifier = CertChainVerifier::from_org(&org).unwrap();
+        verifier
+            .add_crl_pem(&org.crl_with_validity(60, 30).unwrap())
+            .unwrap();
+        let err = verifier
+            .verify_cert_pem(&cert_pem)
+            .expect_err("an expired CRL must fail closed");
+        assert!(
+            matches!(err, CertVerificationError::CrlExpired),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn test_intermediate_ca_chain_verifies_and_revokes() {
+        let mut org = Organization::new("RootOrg").unwrap();
+        let mut intermediate = org.issue_intermediate_ca("InterOrg").unwrap();
+        let good = intermediate.issue_identity("node-i").unwrap();
+
+        let mut verifier = verifier_with_crl(&org);
+        // The intermediate cert is not self-signed → classified as an
+        // intermediate, and webpki builds leaf → intermediate → root.
+        verifier
+            .add_federation_root_pem("InterOrg", intermediate.cert_pem())
+            .unwrap();
+        verifier
+            .add_crl_pem(&intermediate.crl_pem().unwrap())
+            .unwrap();
+
+        assert!(verifier
+            .verify_cert_pem(good.certificate_pem.as_ref().unwrap())
+            .is_ok());
+
+        // Revoking through the intermediate CA rejects the member.
+        let bad = intermediate.issue_identity("node-bad").unwrap();
+        intermediate.revoke_identity("node-bad").unwrap();
+        let mut strict = verifier_with_crl(&org);
+        strict
+            .add_federation_root_pem("InterOrg", intermediate.cert_pem())
+            .unwrap();
+        strict
+            .add_crl_pem(&intermediate.crl_pem().unwrap())
+            .unwrap();
+        let err = strict
+            .verify_cert_pem(bad.certificate_pem.as_ref().unwrap())
+            .expect_err("a revoked intermediate-issued cert must be rejected");
+        assert!(matches!(err, CertVerificationError::Revoked), "got {err}");
+    }
+
     #[test]
     fn test_federation_anchor_accepts_peer_from_trusted_org() {
         let (own, _) = org_with_member("OrgOwn", "own-node");
         let (peer_org, peer_cert_pem) = org_with_member("OrgPeer", "peer-node");
 
-        let mut verifier = CertChainVerifier::from_org(&own).unwrap();
+        let mut verifier = verifier_with_crl(&own);
         assert_eq!(verifier.federation_anchor_count(), 0);
         verifier
             .add_federation_root_pem("OrgPeer", &peer_org.root_ca_cert_pem)
             .unwrap();
+        // The peer cert's issuer needs a current CRL too (ADR-013 fail-closed).
+        verifier.add_crl_pem(&peer_org.crl_pem().unwrap()).unwrap();
         assert_eq!(verifier.federation_anchor_count(), 1);
 
         assert!(verifier.verify_cert_pem(&peer_cert_pem).is_ok());
@@ -907,7 +1103,7 @@ mod tests {
         let (own, own_member_pem) = org_with_member("OrgOwn", "own-node");
         let (peer_org, _) = org_with_member("OrgPeer", "peer-node");
 
-        let mut verifier = CertChainVerifier::from_org(&own).unwrap();
+        let mut verifier = verifier_with_crl(&own);
         verifier
             .add_federation_root_pem("OrgPeer", &peer_org.root_ca_cert_pem)
             .unwrap();
@@ -921,9 +1117,12 @@ mod tests {
         let (trusted_peer, _) = org_with_member("OrgPeer", "peer-node");
         let (_, untrusted_pem) = org_with_member("OrgStranger", "stranger");
 
-        let mut verifier = CertChainVerifier::from_org(&own).unwrap();
+        let mut verifier = verifier_with_crl(&own);
         verifier
             .add_federation_root_pem("OrgPeer", &trusted_peer.root_ca_cert_pem)
+            .unwrap();
+        verifier
+            .add_crl_pem(&trusted_peer.crl_pem().unwrap())
             .unwrap();
 
         let err = verifier
@@ -949,8 +1148,11 @@ mod tests {
         ));
         std::fs::write(&path, &bundle).unwrap();
 
-        let mut verifier = CertChainVerifier::from_org(&own).unwrap();
+        let mut verifier = verifier_with_crl(&own);
         verifier.add_federation_root_file(&path).unwrap();
+        // The bundle members' issuers need current CRLs too (ADR-013).
+        verifier.add_crl_pem(&org_a.crl_pem().unwrap()).unwrap();
+        verifier.add_crl_pem(&org_b.crl_pem().unwrap()).unwrap();
         assert_eq!(verifier.federation_anchor_count(), 2);
         assert!(verifier.verify_cert_pem(&member_a).is_ok());
         assert!(verifier.verify_cert_pem(&member_b).is_ok());

@@ -18,6 +18,13 @@ const MEMBER_PEER: &str = "org-member";
 const COLLECTION: &str = "pricing";
 const PRIVATE_VALUE: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
 
+/// A fail-closed verifier (ADR-013): the org's CRL rides along with its root.
+fn verifier_with_crl(org: &Organization) -> CertChainVerifier {
+    let mut verifier = CertChainVerifier::from_org(org).unwrap();
+    verifier.add_crl_pem(&org.crl_pem().unwrap()).unwrap();
+    verifier
+}
+
 fn free_addr() -> String {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -309,9 +316,7 @@ async fn identity_verified_payload_delivery() {
     let member = Node::new_with_identity(MEMBER_PEER, free_addr(), 1, Arc::new(member_identity));
     // The member verifies private-payload senders against the org Root CA —
     // configured before start so the first handshake is already verified.
-    member
-        .set_cert_verifier(CertChainVerifier::from_org(&org).unwrap())
-        .await;
+    member.set_cert_verifier(verifier_with_crl(&org)).await;
     member.set_collections(vec![pricing_collection(3600)]).await;
     member.start(vec![writer_addr]).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -389,9 +394,13 @@ async fn federation_trust_store_enables_cross_org_payload_delivery() {
     // Member trusting the writer's org Root CA via a federation anchor:
     // the cross-org payload is delivered.
     let member = Node::new_with_identity(MEMBER_PEER, free_addr(), 1, Arc::new(member_identity));
-    let mut verifier = CertChainVerifier::from_org(&member_org).unwrap();
+    let mut verifier = verifier_with_crl(&member_org);
     verifier
         .add_federation_root_pem(WRITER, &writer_org.root_ca_cert_pem)
+        .unwrap();
+    // The writer org's CRL rides its anchor (ADR-013 fail-closed).
+    verifier
+        .add_crl_pem(&writer_org.crl_pem().unwrap())
         .unwrap();
     member.set_cert_verifier(verifier).await;
     member.set_collections(vec![pricing_collection(3600)]).await;
@@ -412,8 +421,7 @@ async fn federation_trust_store_enables_cross_org_payload_delivery() {
         1,
         Arc::new(member_org.issue_identity(MEMBER_PEER).unwrap().clone()),
     );
-    solo.set_cert_verifier(CertChainVerifier::from_org(&member_org).unwrap())
-        .await;
+    solo.set_cert_verifier(verifier_with_crl(&member_org)).await;
     solo.set_collections(vec![pricing_collection(3600)]).await;
     solo.start(vec![writer_addr]).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;

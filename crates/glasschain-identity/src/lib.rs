@@ -66,5 +66,6 @@ pub use endorsement::{
 };
 pub use error::IdentityError;
 pub use identity::{Identity, SignedTransaction};
+pub use msp::IntermediateCa;
 pub use msp::Organization;
 pub use msp_policy::MspEndorsementProvider;
