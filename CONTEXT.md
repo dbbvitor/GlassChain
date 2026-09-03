@@ -24,6 +24,10 @@ _Avoid_: order, purchase transaction
 A participating organization holding a verifiable MSP identity; may submit and endorse transactions.
 _Avoid_: participant, peer (a peer is the network process, not the organization)
 
+**Federation trust store**:
+The operator-configured set of peer-organization Root CAs a node accepts as certificate issuers, alongside its own organization's Root CA. An organization outside the store stays connected but is not trusted on organization-gated paths (private payloads). Distribution between organizations is manual and out-of-band; trust anchors are configuration and persist across restarts.
+_Avoid_: shared CA (no single root exists), on-chain registry (a considered but rejected alternative, ADR-011)
+
 **Validator**:
 A member organization that participates in block finality voting. In v1 every member organization is a validator (full participation); bounding the validator set later is configuration, not redesign — the consensus family supports per-height validator-set changes. Validating is an operational role, not a status: it confers no read access, no authority to authorize a business change, and no fee or settlement advantage. Bounding the set is a liveness requirement (a quorum needs ⅔+ of validators responsive), not an exclusion mechanism.
 _Avoid_: miner (the retired proof-of-work role); tier, rank (validator is a role a member holds, not a class it belongs to)
