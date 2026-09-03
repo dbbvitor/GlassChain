@@ -433,6 +433,11 @@ impl PeerRegistry {
 pub struct Node {
     pub node_id: String,
     listen_addr: String,
+    /// The address advertised to peers in `Hello` — the address they dial and
+    /// key TOFU/reconnect state by. Defaults to `listen_addr`; override it
+    /// when the node sits behind a NAT, port-forward, or test-harness proxy
+    /// that is the only route to it.
+    advertise_addr: Option<String>,
     /// The distributed ledger — accessible directly for sharing with the RPC layer.
     ledger: Arc<Mutex<Ledger>>,
     state: Arc<Mutex<NodeState>>,
@@ -448,6 +453,9 @@ pub struct Node {
     storage: Arc<dyn StorageProvider>,
     /// TLS context used to encrypt all peer connections.
     tls: Arc<NodeTls>,
+    /// The dial queue spawned by [`start`](Self::start); explicit reconnects
+    /// route through it.
+    dial_tx: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl Node {
@@ -462,6 +470,8 @@ impl Node {
         Self {
             node_id,
             listen_addr,
+            advertise_addr: None,
+            dial_tx: std::sync::OnceLock::new(),
             ledger,
             state: Arc::new(Mutex::new(NodeState {
                 engine: ContractEngine::new(),
@@ -629,6 +639,32 @@ impl Node {
     #[must_use]
     pub fn listen_addr(&self) -> &str {
         &self.listen_addr
+    }
+
+    /// Override the address advertised to peers in `Hello` (the address they
+    /// dial and key TOFU/reconnect state by). Must be called before
+    /// [`start`](Self::start). Use when the node is reachable only through a
+    /// NAT, port-forward, or test-harness proxy rather than its bind address.
+    pub fn set_advertise_addr(&mut self, addr: impl Into<String>) {
+        self.advertise_addr = Some(addr.into());
+    }
+
+    /// The address this node advertises to peers.
+    fn advertised_addr(&self) -> String {
+        self.advertise_addr
+            .clone()
+            .unwrap_or_else(|| self.listen_addr.clone())
+    }
+
+    /// Dial `addr` and run the peer lifecycle. Seeds are dialed by `start`;
+    /// this exposes the same path for explicit reconnection after a network
+    /// partition is repaired (the built-in reconnect is a single 5-second
+    /// retry that gives up if the peer is unreachable).
+    pub fn connect_peer(&self, addr: &str) {
+        // Reaches the dial queue spawned by `start`; a no-op before start.
+        if let Some(dial_tx) = self.dial_tx.get() {
+            let _ = dial_tx.send(addr.to_owned());
+        }
     }
 
     /// Register an inventory watcher trigger on this node.
@@ -1174,6 +1210,7 @@ impl Node {
         log::info!("Node {} listening on {}", self.node_id, self.listen_addr);
 
         let (dial_tx, dial_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let _ = self.dial_tx.set(dial_tx.clone());
 
         Self::spawn_dial_queue(
             dial_rx,
@@ -1181,7 +1218,7 @@ impl Node {
             Arc::clone(&self.ledger),
             Arc::clone(&self.state),
             self.node_id.clone(),
-            self.listen_addr.clone(),
+            self.advertised_addr(),
             self.event_tx.clone(),
             Arc::clone(&self.indexer),
             Arc::clone(&self.event_bus),
@@ -1194,7 +1231,9 @@ impl Node {
         let ledger = Arc::clone(&self.ledger);
         let state = Arc::clone(&self.state);
         let node_id = self.node_id.clone();
-        let listen_addr = self.listen_addr.clone();
+        // The advertised address rides `Hello` and keys remote TOFU/reconnect
+        // state, so peers behind NAT/proxies are reachable on reconnect.
+        let listen_addr = self.advertised_addr();
         let event_tx = self.event_tx.clone();
         let indexer = Arc::clone(&self.indexer);
         let event_bus = Arc::clone(&self.event_bus);
