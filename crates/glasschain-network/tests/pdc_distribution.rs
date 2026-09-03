@@ -351,3 +351,78 @@ async fn identity_verified_payload_delivery() {
         .await
         .expect_err("a non-member org cannot submit payloads");
 }
+
+/// Federation trust store (ADR-011, ticket #57): a member whose verifier is
+/// configured with its own org Root CA **plus** the writer org's Root CA as a
+/// federation anchor accepts a cross-org payload. A member holding only its
+/// own org anchor withholds the same payload — fail closed, not fail open.
+#[tokio::test]
+async fn federation_trust_store_enables_cross_org_payload_delivery() {
+    let _ = env_logger::try_init();
+    let mut writer_org = Organization::new(WRITER).unwrap();
+    let writer_identity = writer_org.issue_identity(WRITER).unwrap().clone();
+    let mut member_org = Organization::new(MEMBER_PEER).unwrap();
+    let member_identity = member_org.issue_identity(MEMBER_PEER).unwrap().clone();
+
+    let writer_addr = free_addr();
+    let writer = Node::new_with_identity(WRITER, &writer_addr, 1, Arc::new(writer_identity));
+    writer.start(vec![]).await.unwrap();
+    writer.set_collections(vec![pricing_collection(3600)]).await;
+    writer
+        .set_execution_provider(Arc::new(
+            glasschain_vm::WasmExecutionProvider::new().unwrap(),
+        ))
+        .await;
+    writer.submit_transaction(activation_tx(2)).await.unwrap();
+    writer.mine().await.unwrap();
+    writer
+        .submit_transaction(contract_creation_tx("pdc-federation"))
+        .await
+        .unwrap();
+    writer
+        .submit_transaction(contract_execution_tx("pdc-federation"))
+        .await
+        .unwrap();
+    writer.mine().await.unwrap();
+    let commitment = sha256(PRIVATE_VALUE);
+
+    // Member trusting the writer's org Root CA via a federation anchor:
+    // the cross-org payload is delivered.
+    let member = Node::new_with_identity(MEMBER_PEER, free_addr(), 1, Arc::new(member_identity));
+    let mut verifier = CertChainVerifier::from_org(&member_org).unwrap();
+    verifier
+        .add_federation_root_pem(WRITER, &writer_org.root_ca_cert_pem)
+        .unwrap();
+    member.set_cert_verifier(verifier).await;
+    member.set_collections(vec![pricing_collection(3600)]).await;
+    member.start(vec![writer_addr.clone()]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_for_sync(&writer, &member).await;
+    let _ = member.reconcile_private_payloads(COLLECTION).await;
+    poll_until("member received the cross-org payload", 3, || async {
+        member.transient_payload(COLLECTION, &commitment).await == Some(PRIVATE_VALUE.to_vec())
+    })
+    .await;
+
+    // Control: a member verifying only its own org withholds the same
+    // payload — the writer's org is outside its trust store.
+    let solo = Node::new_with_identity(
+        MEMBER_PEER,
+        free_addr(),
+        1,
+        Arc::new(member_org.issue_identity(MEMBER_PEER).unwrap().clone()),
+    );
+    solo.set_cert_verifier(CertChainVerifier::from_org(&member_org).unwrap())
+        .await;
+    solo.set_collections(vec![pricing_collection(3600)]).await;
+    solo.start(vec![writer_addr]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_for_sync(&writer, &solo).await;
+    let _ = solo.reconcile_private_payloads(COLLECTION).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        solo.transient_payload(COLLECTION, &commitment).await,
+        None,
+        "a member without the writer org's anchor must not store the cross-org payload"
+    );
+}

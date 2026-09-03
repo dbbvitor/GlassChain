@@ -2,7 +2,7 @@ use glasschain_core::{
     endorsement::Principal, InventoryUpdate, PurchaseConditions, PurchaseOrder, SmartContractDef,
     SupplyOffer, TraceableAsset, TraceableAssetRegistration, Transaction, TransactionKind,
 };
-use glasschain_identity::{MspEndorsementProvider, Organization};
+use glasschain_identity::{CertChainVerifier, MspEndorsementProvider, Organization};
 use glasschain_network::{Node, NodeEvent};
 use glasschain_rpc::GlasschainServer;
 use glasschain_storage::SledStorageProvider;
@@ -57,6 +57,10 @@ OPTIONS:
     --org <NAME>            Organization name for issuing an identity-backed TLS certificate.
     --identity-node-id <ID> Node ID to embed in the issued TLS identity certificate.
                             Defaults to the value passed to --id.
+    --trust-store <PATH>    PEM file or directory of *.pem files holding the Root CA
+                            certificates of the peer organizations to trust (ADR-011).
+                            Requires --org. Without it, peer organizations are NOT
+                            certificate-verified.
     --rpc-addr <ADDR>       Address to bind the gRPC server (e.g. "0.0.0.0:50051").
                             When omitted, the gRPC server is not started.
     --help                  Show this help message
@@ -342,6 +346,7 @@ async fn main() {
     let mut storage_path: Option<String> = None;
     let mut org_name: Option<String> = None;
     let mut identity_node_id: Option<String> = None;
+    let mut trust_store: Option<String> = None;
     let mut rpc_addr: Option<String> = None;
 
     let mut i = 1;
@@ -389,6 +394,12 @@ async fn main() {
                     identity_node_id = Some(v.clone());
                 }
             }
+            "--trust-store" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    trust_store = Some(v.clone());
+                }
+            }
             "--rpc-addr" => {
                 i += 1;
                 if let Some(v) = args.get(i) {
@@ -404,6 +415,7 @@ async fn main() {
         "Starting GlassChain node id={node_id}  listen={listen_addr}  difficulty={difficulty}"
     );
 
+    let mut org_root_pem: Option<String> = None;
     let identity = org_name.as_ref().map(|org| {
         let identity_name = identity_node_id.clone().unwrap_or_else(|| node_id.clone());
         let mut organization = match Organization::new(org.clone()) {
@@ -425,6 +437,7 @@ async fn main() {
         log::info!(
             "Using identity-backed TLS certificate for node `{identity_name}` issued by organization `{org}`"
         );
+        org_root_pem = Some(organization.root_ca_cert_pem.clone());
         Arc::new(issued_identity)
     });
 
@@ -504,6 +517,81 @@ async fn main() {
                 "No endorsement provider configured: endorsement enforcement is disabled (start with --org to attach one)"
             );
         }
+    }
+
+    // Install the federation certificate verifier (ADR-011). Without it, the
+    // private-payload path fails open to the self-asserted `Hello` org — that
+    // must be an operator-visible decision, not a silent default.
+    match (
+        org_name.as_deref(),
+        org_root_pem.as_deref(),
+        trust_store.as_deref(),
+    ) {
+        (Some(org), Some(root_pem), Some(path)) => {
+            let mut verifier = match CertChainVerifier::from_pem(org, root_pem) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!("Failed to build certificate verifier for `{org}`: {e}");
+                    std::process::exit(1);
+                }
+            };
+            let load = |v: &mut CertChainVerifier, p: &std::path::Path| {
+                v.add_federation_root_file(p).map_err(|e| e.to_string())
+            };
+            let result: Result<usize, String> = match std::fs::metadata(path) {
+                Ok(meta) if meta.is_dir() => {
+                    let mut added = 0usize;
+                    let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(path) {
+                        Ok(entries) => entries
+                            .filter_map(|entry| entry.ok().map(|e| e.path()))
+                            .filter(|p| p.extension().is_some_and(|ext| ext == "pem"))
+                            .collect(),
+                        Err(e) => {
+                            log::error!("Failed to read trust store directory `{path}`: {e}");
+                            std::process::exit(1);
+                        }
+                    };
+                    files.sort();
+                    for file in &files {
+                        if let Err(e) = load(&mut verifier, file) {
+                            log::error!(
+                                "Failed to load trust anchor from `{}`: {e}",
+                                file.display()
+                            );
+                            std::process::exit(1);
+                        }
+                        added += 1;
+                    }
+                    Ok(added)
+                }
+                Ok(_) => load(&mut verifier, std::path::Path::new(path)).map(|()| 1usize),
+                Err(e) => Err(e.to_string()),
+            };
+            match result {
+                Ok(files) => {
+                    node.set_cert_verifier(verifier).await;
+                    log::info!(
+                        "Certificate verification enabled: own organization `{org}` plus {files} trust-store file(s) from `{path}` (peers from untrusted organizations are rejected on org-gated paths)"
+                    );
+                }
+                Err(e) => {
+                    log::error!("Failed to load trust store at `{path}`: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        (Some(_), Some(_), None) => {
+            log::warn!(
+                "No federation trust store configured: peer organizations are NOT certificate-verified and the private-payload path trusts the self-asserted org (start with --trust-store <PATH> to enable verification)"
+            );
+        }
+        (None, _, Some(_)) => {
+            log::error!(
+                "--trust-store requires --org: there is no organization Root CA to verify against"
+            );
+            std::process::exit(1);
+        }
+        _ => {}
     }
 
     // Spawn event logger.

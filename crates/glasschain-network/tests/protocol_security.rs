@@ -816,11 +816,15 @@ async fn hello_with_old_wire_version_is_disconnected() {
     assert!(matches!(result, NetworkError::PeerDisconnected(_)));
 }
 
-/// Certificate-verified org (ticket #47): a node running a cert verifier
-/// disconnects a peer whose Hello-carried organization certificate does not
-/// verify against the org Root CA with the claimed subject CN.
+/// Certificate-verified org (ticket #47, ADR-011): a node running a cert
+/// verifier does **not** disconnect a peer whose Hello-carried organization
+/// certificate does not verify — the peer stays connected (it may still sync
+/// and verify public history) but is recorded as org-unverified, so every
+/// org-gated path (private payloads) fails closed against its self-asserted
+/// org. The fail-closed behaviour is covered end-to-end by
+/// `pdc_distribution::federation_trust_store_enables_cross_org_payload_delivery`.
 #[tokio::test]
-async fn hello_with_unverified_org_certificate_is_disconnected() {
+async fn hello_with_unverified_org_certificate_stays_connected_but_unverified() {
     // A certificate from a DIFFERENT organization (CN = "imposter"): the
     // claimed org "org-member" cannot be verified from it.
     let mut other_org = glasschain_identity::Organization::new("MedCorp").unwrap();
@@ -849,9 +853,11 @@ async fn hello_with_unverified_org_certificate_is_disconnected() {
     };
     writer.send(&hello).await.unwrap();
 
-    let result = timeout(Duration::from_secs(2), reader.receive())
-        .await
-        .expect("timeout waiting for org-verification disconnect")
-        .expect_err("an unverified org certificate must trigger a disconnect");
-    assert!(matches!(result, NetworkError::PeerDisconnected(_)));
+    // The connection stays open: no disconnect arrives. (Whether the payload
+    // path trusts this peer is decided per-message by the org gates.)
+    let result = timeout(Duration::from_millis(500), reader.receive()).await;
+    assert!(
+        result.is_err(),
+        "an unverified org must stay connected (downgrade, not disconnect)"
+    );
 }

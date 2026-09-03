@@ -2460,14 +2460,15 @@ async fn process_message(
                 let rejected = has_verifier && !verified;
                 drop(s);
                 if rejected {
+                    // ADR-011 decision: an unverified organization stays
+                    // connected (it may still sync and verify public history)
+                    // but every org-gated path — private-payload send and
+                    // receive — fails closed against its self-asserted org.
                     log::warn!(
-                        "Rejecting peer {peer_id} at {peer_listen_addr}: organization \
-                         '{peer_org}' is not certificate-verified"
+                        "Peer {peer_id} at {peer_listen_addr}: organization \
+                         '{peer_org}' is not certificate-verified; org-gated \
+                         paths will not trust it"
                     );
-                    return MessageEffect {
-                        disconnect: true,
-                        ..Default::default()
-                    };
                 }
                 verified
             };
