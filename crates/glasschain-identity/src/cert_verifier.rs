@@ -1,22 +1,30 @@
 //! CA-backed certificate chain verifier for `GlassChain`.
 //!
 //! [`CertChainVerifier`] replaces the `AcceptAnyCert` model for org-mode nodes:
-//! any peer whose certificate was **not** issued by this organisation's Root CA
-//! is rejected at the application layer, even though the TLS handshake still
+//! any peer whose certificate was **not** issued by a trusted Root CA is
+//! rejected at the application layer, even though the TLS handshake still
 //! uses `AcceptAnyCert` for transport encryption.
 //!
 //! ## Trust model
 //!
+//! A verifier holds one **own-organization** anchor (the Root CA that issued
+//! this node's identity) plus an optional set of **federation anchors** — the
+//! Root CAs of other organizations the deployment has decided to trust, loaded
+//! from configuration ([`add_federation_root_file`](Self::add_federation_root_file),
+//! [`add_federation_root_pem`](Self::add_federation_root_pem)). A peer
+//! certificate is accepted if it chains to *any* anchor. With no federation
+//! anchors this is exactly the single-org model.
+//!
 //! [`VerificationLevel::Full`] — the default — performs:
 //!
-//! 1. The peer cert's `Issuer` DN must byte-match the Root CA's `Subject` DN.
+//! 1. The peer cert's `Issuer` DN must byte-match a trusted Root CA's `Subject` DN.
 //! 2. The peer cert must be within its stated validity period.
-//! 3. The Root CA's signature over the peer cert's TBS bytes must verify,
-//!    anchoring the peer cert cryptographically to this organisation's CA.
+//! 3. The matching Root CA's signature over the peer cert's TBS bytes must verify,
+//!    anchoring the peer cert cryptographically to that organization's CA.
 //!
 //! Step 3 is what makes the check meaningful: a Distinguished Name is attacker
 //! chosen data, so any party can mint a certificate whose `Issuer` DN matches
-//! ours. Only the signature proves our CA actually issued it.
+//! ours. Only the signature proves a trusted CA actually issued it.
 //!
 //! [`VerificationLevel::Structural`] drops step 3. It exists for tests and for
 //! diagnosing DN-encoding mismatches — not as a deployment posture.
@@ -27,7 +35,10 @@
 //! use glasschain_identity::{CertChainVerifier, Organization};
 //!
 //! let mut org = Organization::new("PharmaOrg").unwrap();
-//! let verifier = CertChainVerifier::from_org(&org).unwrap();
+//! let mut verifier = CertChainVerifier::from_org(&org).unwrap();
+//!
+//! // Optionally trust a federation peer's organization Root CA:
+//! // verifier.add_federation_root_file("peer-root-ca.pem").unwrap();
 //!
 //! // Verify a peer's DER-encoded TLS certificate.
 //! // verifier.verify_cert_der(peer_cert_der).unwrap();
@@ -141,6 +152,18 @@ impl From<CertVerificationError> for IdentityError {
 
 // ── Verifier ──────────────────────────────────────────────────────────────────
 
+/// One trusted Root CA: an own-organization anchor or a federation anchor.
+struct TrustAnchor {
+    /// Human-readable organization name, used in error/log messages.
+    org_name: String,
+    /// Root CA `Subject` DN re-encoded as raw DER bytes, compared byte-for-byte
+    /// with the peer cert's `Issuer` DN.
+    subject_der: Vec<u8>,
+    /// Full DER encoding of the Root CA certificate — the trust anchor for
+    /// signature verification at [`VerificationLevel::Full`].
+    cert_der: Vec<u8>,
+}
+
 /// Verifies that a peer TLS certificate was issued by a known Organisation Root CA.
 ///
 /// Construct with [`from_org`](Self::from_org), [`from_pem`](Self::from_pem), or
@@ -171,6 +194,11 @@ pub struct CertChainVerifier {
 
     /// Determines how thoroughly peer certificates are checked.
     pub level: VerificationLevel,
+
+    /// Root CAs of other organizations this deployment has explicitly decided
+    /// to trust (ADR-011 federation trust store). A peer certificate chains
+    /// against the own-organization anchor first, then these.
+    federation_anchors: Vec<TrustAnchor>,
 }
 
 // ── Constructors ──────────────────────────────────────────────────────────────
@@ -235,6 +263,7 @@ impl CertChainVerifier {
             root_cert_der: root_ca_der.to_vec(),
             org_name: org_name.into(),
             level: VerificationLevel::default(),
+            federation_anchors: Vec::new(),
         })
     }
 
@@ -247,24 +276,114 @@ impl CertChainVerifier {
         self.level = level;
         self
     }
+
+    /// Add a federation Root CA from a PEM string (ADR-011).
+    ///
+    /// The first `CERTIFICATE` block found in `root_ca_pem` is used. The
+    /// `org_label` is only used in error and log messages.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`from_pem`](Self::from_pem).
+    pub fn add_federation_root_pem(
+        &mut self,
+        org_label: impl Into<String>,
+        root_ca_pem: &str,
+    ) -> Result<(), CertVerificationError> {
+        let org_label = org_label.into();
+        let root_der = CertificateDer::from_pem_slice(root_ca_pem.as_bytes())
+            .map_err(|e| CertVerificationError::PemError(e.to_string()))?;
+        self.add_anchor(org_label, root_der.as_ref())?;
+        Ok(())
+    }
+
+    /// Add federation Root CA(s) from a PEM file (ADR-011).
+    ///
+    /// Every `CERTIFICATE` block in the file becomes an anchor, so a bundle
+    /// file holding several organizations' roots works as-is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CertVerificationError::PemError`] if the file cannot be read
+    /// or contains no valid `CERTIFICATE` block, or
+    /// [`CertVerificationError::ParseError`] for malformed certificates.
+    pub fn add_federation_root_file(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(), CertVerificationError> {
+        let path = path.as_ref();
+        let label = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("federation-root")
+            .to_owned();
+        let mut added = 0;
+        for cert in CertificateDer::pem_file_iter(path)
+            .map_err(|e| CertVerificationError::PemError(e.to_string()))?
+        {
+            let cert = cert.map_err(|e| CertVerificationError::PemError(e.to_string()))?;
+            self.add_anchor(format!("{label}#{added}"), cert.as_ref())?;
+            added += 1;
+        }
+        if added == 0 {
+            return Err(CertVerificationError::PemError(format!(
+                "no CERTIFICATE block found in {}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Build and append one anchor from DER bytes.
+    fn add_anchor(
+        &mut self,
+        org_label: String,
+        root_ca_der: &[u8],
+    ) -> Result<(), CertVerificationError> {
+        let root_cert = Certificate::from_der(root_ca_der)
+            .map_err(|e| CertVerificationError::ParseError(e.to_string()))?;
+        let mut subject_der = Vec::new();
+        root_cert
+            .tbs_certificate()
+            .subject()
+            .encode_to_vec(&mut subject_der)
+            .map_err(|e| CertVerificationError::ParseError(e.to_string()))?;
+        self.federation_anchors.push(TrustAnchor {
+            org_name: org_label,
+            subject_der,
+            cert_der: root_ca_der.to_vec(),
+        });
+        Ok(())
+    }
+
+    /// Number of federation anchors configured (excludes the own-organization
+    /// anchor). Exposed so startup logging can report the trust store size.
+    #[must_use]
+    pub const fn federation_anchor_count(&self) -> usize {
+        self.federation_anchors.len()
+    }
 }
 
 // ── Verification ──────────────────────────────────────────────────────────────
 
 impl CertChainVerifier {
-    /// Verify a DER-encoded peer certificate against this organisation's Root CA.
+    /// Verify a DER-encoded peer certificate against a trusted Root CA.
     ///
     /// # Checks performed
     ///
     /// 1. Parse the DER bytes as an X.509 certificate.
     /// 2. Re-encode the cert's `Issuer` DN and compare it byte-for-byte with
-    ///    the Root CA's `Subject` DN.
+    ///    each trusted Root CA's `Subject` DN — the own-organization anchor
+    ///    first, then the federation anchors (ADR-011).
     /// 3. Check that `SystemTime::now()` falls inside the cert's validity window.
-    /// 4. At [`VerificationLevel::Full`], verify the Root CA's signature over
-    ///    the certificate.
+    /// 4. At [`VerificationLevel::Full`], verify the matching Root CA's
+    ///    signature over the certificate.
     ///
     /// Steps 2 and 3 run first so that a misconfigured peer produces a specific,
-    /// actionable error rather than a generic chain-verification failure.
+    /// actionable error rather than a generic chain-verification failure. An
+    /// anchor whose Issuer DN matches but whose signature fails is an
+    /// impostor-or-stale case: the remaining matching anchors are still tried,
+    /// and the peer is accepted only if one verifies.
     ///
     /// # Errors
     ///
@@ -274,7 +393,7 @@ impl CertChainVerifier {
         let peer_cert = Certificate::from_der(peer_cert_der)
             .map_err(|e| CertVerificationError::ParseError(e.to_string()))?;
 
-        // ── 2. Issuer DN must match Root CA Subject DN ───────────────────────
+        // ── 2. Issuer DN must match a trusted Root CA Subject DN ─────────────
         let mut peer_issuer_der = Vec::new();
         peer_cert
             .tbs_certificate()
@@ -282,15 +401,46 @@ impl CertChainVerifier {
             .encode_to_vec(&mut peer_issuer_der)
             .map_err(|e| CertVerificationError::ParseError(e.to_string()))?;
 
-        if peer_issuer_der != self.root_subject_der {
-            let actual_issuer = format!("{:?}", peer_cert.tbs_certificate().issuer());
-            return Err(CertVerificationError::IssuerMismatch {
-                expected_org: self.org_name.clone(),
-                actual_issuer,
-            });
+        let mut last_err: Option<CertVerificationError> = None;
+        let own = TrustAnchor {
+            org_name: self.org_name.clone(),
+            subject_der: self.root_subject_der.clone(),
+            cert_der: self.root_cert_der.clone(),
+        };
+        for anchor in std::iter::once(&own).chain(self.federation_anchors.iter()) {
+            if peer_issuer_der != anchor.subject_der {
+                continue;
+            }
+            // ── 3. Validity period check ─────────────────────────────────────
+            if let Err(e) = Self::check_validity(&peer_cert) {
+                last_err = Some(e);
+                continue;
+            }
+            // ── 4. Cryptographic chain verification ──────────────────────────
+            if self.level == VerificationLevel::Full {
+                if let Err(e) = Self::verify_signature(&anchor.cert_der, peer_cert_der) {
+                    last_err = Some(e);
+                    continue;
+                }
+            }
+            log::debug!(
+                "cert_verifier: {:?} verification passed for cert issued by '{}'",
+                self.level,
+                anchor.org_name,
+            );
+            return Ok(());
         }
 
-        // ── 3. Validity period check ─────────────────────────────────────────
+        Err(
+            last_err.unwrap_or_else(|| CertVerificationError::IssuerMismatch {
+                expected_org: self.org_name.clone(),
+                actual_issuer: format!("{:?}", peer_cert.tbs_certificate().issuer()),
+            }),
+        )
+    }
+
+    /// Check that `now` falls inside the peer certificate's validity window.
+    fn check_validity(peer_cert: &Certificate) -> Result<(), CertVerificationError> {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -305,32 +455,23 @@ impl CertChainVerifier {
         if now_secs < not_before || now_secs > not_after {
             return Err(CertVerificationError::InvalidValidity);
         }
-
-        // ── 4. Cryptographic chain verification ──────────────────────────────
-        if self.level == VerificationLevel::Full {
-            self.verify_signature(peer_cert_der)?;
-        }
-
-        log::debug!(
-            "cert_verifier: {:?} verification passed for cert issued by '{}'",
-            self.level,
-            self.org_name,
-        );
-
         Ok(())
     }
 
     /// Verify the Root CA's signature over `peer_cert_der`.
     ///
-    /// Builds a one-hop path from the peer certificate to this organisation's
-    /// Root CA. There are no intermediates: [`Organization::issue_identity`]
+    /// Builds a one-hop path from the peer certificate to the trusted Root CA.
+    /// There are no intermediates: [`Organization::issue_identity`]
     /// signs member certificates directly with the root.
     ///
     /// Revocation is not checked — there is no CRL or OCSP distribution point in
-    /// the ledger's trust model today. Membership revocation is a governance
+    /// the ledger's trust model today (#58). Membership revocation is a governance
     /// concern that belongs in the MSP, not in TLS certificate validation.
-    fn verify_signature(&self, peer_cert_der: &[u8]) -> Result<(), CertVerificationError> {
-        let root_der = rustls_pki_types::CertificateDer::from(self.root_cert_der.as_slice());
+    fn verify_signature(
+        root_ca_der: &[u8],
+        peer_cert_der: &[u8],
+    ) -> Result<(), CertVerificationError> {
+        let root_der = rustls_pki_types::CertificateDer::from(root_ca_der);
         let anchor = webpki::anchor_from_trusted_cert(&root_der)
             .map_err(|e| CertVerificationError::SignatureInvalid(e.to_string()))?;
 
@@ -716,6 +857,8 @@ mod tests {
         );
     }
 
+    // ── 15. Federation anchors (ADR-011) ─────────────────────────────────────
+
     #[test]
     fn test_tampered_certificate_is_rejected() {
         let (org, cert_pem) = org_with_member("PharmaOrg", "node-tamper");
@@ -738,5 +881,79 @@ mod tests {
             matches!(err, CertVerificationError::SignatureInvalid(_)),
             "expected SignatureInvalid, got {err}"
         );
+    }
+
+    #[test]
+    fn test_federation_anchor_accepts_peer_from_trusted_org() {
+        let (own, _) = org_with_member("OrgOwn", "own-node");
+        let (peer_org, peer_cert_pem) = org_with_member("OrgPeer", "peer-node");
+
+        let mut verifier = CertChainVerifier::from_org(&own).unwrap();
+        assert_eq!(verifier.federation_anchor_count(), 0);
+        verifier
+            .add_federation_root_pem("OrgPeer", &peer_org.root_ca_cert_pem)
+            .unwrap();
+        assert_eq!(verifier.federation_anchor_count(), 1);
+
+        assert!(verifier.verify_cert_pem(&peer_cert_pem).is_ok());
+        assert_eq!(
+            verifier.verified_subject_cn_pem(&peer_cert_pem).unwrap(),
+            "peer-node"
+        );
+    }
+
+    #[test]
+    fn test_own_org_member_still_verified_with_federation_anchors() {
+        let (own, own_member_pem) = org_with_member("OrgOwn", "own-node");
+        let (peer_org, _) = org_with_member("OrgPeer", "peer-node");
+
+        let mut verifier = CertChainVerifier::from_org(&own).unwrap();
+        verifier
+            .add_federation_root_pem("OrgPeer", &peer_org.root_ca_cert_pem)
+            .unwrap();
+
+        assert!(verifier.verify_cert_pem(&own_member_pem).is_ok());
+    }
+
+    #[test]
+    fn test_untrusted_org_still_rejected_with_federation_anchors() {
+        let (own, _) = org_with_member("OrgOwn", "own-node");
+        let (trusted_peer, _) = org_with_member("OrgPeer", "peer-node");
+        let (_, untrusted_pem) = org_with_member("OrgStranger", "stranger");
+
+        let mut verifier = CertChainVerifier::from_org(&own).unwrap();
+        verifier
+            .add_federation_root_pem("OrgPeer", &trusted_peer.root_ca_cert_pem)
+            .unwrap();
+
+        let err = verifier
+            .verify_cert_pem(&untrusted_pem)
+            .expect_err("an org outside the trust store must be rejected");
+        assert!(
+            matches!(err, CertVerificationError::IssuerMismatch { .. }),
+            "expected IssuerMismatch, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_federation_root_file_loads_bundle() {
+        let (own, _) = org_with_member("OrgOwn", "own-node");
+        let (org_a, member_a) = org_with_member("OrgA", "node-a");
+        let (org_b, member_b) = org_with_member("OrgB", "node-b");
+
+        // A bundle file holding two organizations' roots.
+        let bundle = format!("{}\n{}", org_a.root_ca_cert_pem, org_b.root_ca_cert_pem);
+        let path = std::env::temp_dir().join(format!(
+            "glasschain-trust-store-test-{}.pem",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bundle).unwrap();
+
+        let mut verifier = CertChainVerifier::from_org(&own).unwrap();
+        verifier.add_federation_root_file(&path).unwrap();
+        assert_eq!(verifier.federation_anchor_count(), 2);
+        assert!(verifier.verify_cert_pem(&member_a).is_ok());
+        assert!(verifier.verify_cert_pem(&member_b).is_ok());
+        std::fs::remove_file(&path).ok();
     }
 }

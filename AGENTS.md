@@ -229,17 +229,19 @@ Treat these as invariants, not suggestions:
   `glasschain-network`) disables verification. It is a **local-debugging escape
   hatch only**. Never make it the default, never widen its reach, and never add
   new env-var kill switches for security controls.
-- **TOFU is the deliberate current trust default.**
+- **TOFU remains the fingerprint-pinning default; the org trust model is ADR-011.**
   `glasschain-identity`'s `CertChainVerifier` performs a real `rustls-webpki`
-  chain check against an organisation Root CA and defaults to
-  `VerificationLevel::Full`, but `Node.cert_verifier` remains `None` in all four
-  constructors. Keep the peer handshake described as TOFU-only until a shared or
-  multi-organization trust model is chosen; do not silently enable local-CA
-  verification, which would reject peers from other organizations.
+  chain check against the own-organization Root CA plus any federation anchors
+  loaded via `--trust-store <PATH>` (a PEM file or directory of peer-org Root
+  CAs). `glasschain-node` installs the verifier only when both `--org` and
+  `--trust-store` are given, and logs explicitly when verification is off.
+  Unverified organizations stay connected but every org-gated path
+  (private-payload send/receive) fails closed — downgrade, not disconnect.
 - **Known, accepted limitations** (documented in README — do not "fix" them
   silently as part of an unrelated change): TOFU trust is address-bound and
-  in-memory, there is no shared CA across organisations, and there is no trust
-  persistence across restarts.
+  in-memory, trust-store distribution between organizations is manual and
+  out-of-band (no shared CA), and TOFU fingerprints do not persist across
+  restarts (trust-store anchors do — they are config).
 - Never commit keys, certificates, or `.pem` files. Identity material is generated
   at runtime by `glasschain-identity`.
 - Signing is ed25519 (`ed25519-dalek`), hashing is SHA-256. Don't swap primitives

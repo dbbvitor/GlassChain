@@ -214,6 +214,8 @@ Current trust model:
 
 > **Note:** TOFU trust is address-bound and in-memory. There is no shared CA between organizations and no trust persistence across process restarts. A peer that changes its listen address is treated as a new peer. These are known limitations, not bugs.
 >
+> For certificate-verified cross-organization trust, see [ADR-011](docs/adr/adr-011-federation-trust-store.md): start the node with `--trust-store <PATH>` (a PEM file or directory of the peer organizations' Root CA certificates, requires `--org`). Peers whose organization is not in the trust store stay connected but are not trusted on org-gated paths (private payloads). Without `--trust-store`, peer organizations are not certificate-verified and the startup log says so.
+>
 > Certificate-chain validation itself *is* implemented — `glasschain-identity`'s `CertChainVerifier` verifies a peer certificate against an organization Root CA using `rustls-webpki`, rejecting forged and tampered certificates — but it is intentionally not attached to the current TOFU handshake. A shared or multi-organization trust model must be chosen before enabling it.
 
 Message types:
