@@ -700,3 +700,48 @@ async fn enforcement_stays_dormant_until_the_capability_activates() {
         "the write commits without endorsement while the capability is inactive"
     );
 }
+
+#[tokio::test]
+async fn same_unendorsed_write_is_rejected_when_wired_and_accepted_when_unwired() {
+    // Unwired node (the pre-#59 default): the identical unendorsed execution
+    // writes and commits.
+    let unwired = Node::new("unwired-node", free_addr(), 1);
+    unwired.start(vec![]).await.unwrap();
+    unwired
+        .set_execution_provider(Arc::new(WritingExecutionProvider {
+            writes: vec![write(SUPPLY, INVENTORY, "k1")],
+        }))
+        .await;
+    unwired
+        .submit_transaction(writer_contract_tx())
+        .await
+        .unwrap();
+    unwired.mine().await.unwrap();
+    unwired
+        .submit_transaction(writer_execution_tx())
+        .await
+        .unwrap();
+    unwired.mine().await.unwrap();
+    assert!(
+        unwired
+            .world_state()
+            .await
+            .contains_key("ws:supply:inventory:k1"),
+        "without a provider the unendorsed write commits"
+    );
+
+    // Wired node with the capability active: the same unendorsed execution is
+    // rejected at block admission (write-scope binding) and nothing changes.
+    let Harness { node, .. } = setup(vec![write(SUPPLY, INVENTORY, "k1")]).await;
+    setup_writer(&node).await;
+    let before = chain_len(&node).await;
+    node.submit_transaction(writer_execution_tx())
+        .await
+        .unwrap();
+    let error = node
+        .mine()
+        .await
+        .expect_err("an unendorsed write must be rejected once endorsement is wired and active");
+    assert!(error.to_string().contains("endorsement"), "{error}");
+    assert_eq!(chain_len(&node).await, before, "nothing committed");
+}
