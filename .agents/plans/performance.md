@@ -286,17 +286,29 @@ above, not this one. Nothing to batch today, because nothing flushes today.
 
 ### 5.6 Actions, ranked
 
-1. **Delete or fix the 50% fan-out column.** It is actively misleading, and it is
-   the only instrument currently pointed at propagation. Fix = poll concurrently
-   from a single start, or drop the threshold family and keep
-   recovery-convergence. Belongs with Step 0.
-2. **Count the `try_send` drops, per peer.** A counter turns an invisible
-   straggler into a visible one. This is the thing that tells you a tail exists
-   at all, and it is the cheapest item in this document.
-3. **Move persistence behind broadcast** on the mine path, and off the reactor on
-   the peer path (§5.5). Takes the leader's disk latency out of fan-out and stops
-   blocking a runtime worker, for a diff of a few lines.
-4. **Fan reconcile across all member peers**, and put a timeout on it (§5.3).
+1. ~~**Delete or fix the 50% fan-out column.**~~ *(done 2026-09-03)* All three
+   thresholds now measured from one start in one poll loop
+   (`consensus_capacity.rs::propagation_ms`); output is monotone within every
+   round. Residual recorded in `consensus-capacity.md`: the sweep is still
+   O(connected) locks/tick and the cross-round fan-out growth (47 → 1 227 ms at
+   200) is unattributed — carry into Step 0 attribution.
+2. ~~**Count the `try_send` drops, per peer.**~~ *(done 2026-09-03)*
+   `NodeState.dropped_outbound: HashMap<addr, u64>`; the warn now names the
+   peer and the cumulative count; `Node::dropped_outbound(addr)` exposes it.
+   A full metrics registry remains §8.1/Stage 1 work — not built here.
+3. ~~**Move persistence behind broadcast** on the mine path, and off the
+   reactor on the peer path (§5.5).~~ *(done 2026-09-03)* `mine_async`
+   broadcasts the block before `after_block_commit`; on the peer path
+   `apply_block` runs in `spawn_blocking` (awaited, preserving per-peer block
+   order).
+4. ~~**Fan reconcile across all member peers**, and put a timeout on it
+   (§5.3).~~ *(done 2026-09-03)* `reconcile_private_payloads` sends every
+   missing-payload request to every member peer (the single arbitrary target
+   was a silent coin flip between holder and non-holder). A timeout was *not*
+   added: requests are fire-and-forget `try_send` into per-peer channels and
+   the answer arrives asynchronously — there is no in-function await to time
+   out. The validation test (`pdc_distribution::reconcile_fans_out_across_all_member_peers`)
+   proves completion with a payload-less member present.
 5. **Carry §5.2 into the quorum-gathering work** when Step 5 or Malachite lands.
 6. **Record the flush gap** (§5.5) as a durability *decision* with a knob, gated
    on Step 0 — not as a default change.
@@ -304,6 +316,17 @@ above, not this one. Nothing to batch today, because nothing flushes today.
 Items 1 and 2 are prerequisites for Step 0 meaning anything: the plan's first
 step is "measure," and this section says the measuring tools need fixing before
 they can.
+
+### Step 0 status (2026-09-03)
+
+The instrument fixes (items 1–2) are in, and the fixed harness has been run at
+200/300 (see `docs/benchmarks/consensus-capacity.md`). **BFT finality latency
+remains unmeasurable**: no cross-validator attestation/vote gathering exists
+(`core/bft.rs` produces a one-attestation certificate; the wire protocol has no
+Attestation/Vote variants; peers reject BFT blocks at `has_valid_pow`) — all of
+it is the ADR-010 adoption-gate work. Until that lands, Step 0's honest output
+is the propagation/recovery/PDC numbers above plus the competitive-bar
+research; p50/p95/p99 *finality* at 100/200/300 stays blocked.
 
 ---
 

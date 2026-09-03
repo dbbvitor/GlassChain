@@ -179,6 +179,11 @@ struct NodeState {
     known_peers: HashSet<String>,
     /// Per-peer write channels; keyed by the peer's stable listen address.
     peer_senders: HashMap<String, Sender<Message>>,
+    /// Cumulative outbound messages dropped because a peer's 256-slot write
+    /// channel was full — the tail-at-scale straggler counter (#62 §5.1/§5.6).
+    /// A chronically rising count is a peer that cannot keep up and is
+    /// silently missing blocks until it resyncs.
+    dropped_outbound: HashMap<String, u64>,
     /// TOFU peer registry: verified peer identities keyed by stable listen address.
     peer_registry: PeerRegistry,
     /// Optional CA certificate verifier; when set, peer certs must be org-issued.
@@ -463,6 +468,7 @@ impl Node {
                 watcher: WatcherService::new(),
                 known_peers: HashSet::new(),
                 peer_senders: HashMap::new(),
+                dropped_outbound: HashMap::new(),
                 peer_registry: PeerRegistry::new(),
                 cert_verifier: None,
                 identity: identity.clone(),
@@ -1043,30 +1049,41 @@ impl Node {
         }
         missing.sort_unstable();
         missing.dedup();
-        let target = {
+        let targets = {
             let s = self.state.lock().await;
             let Some(configured) = s.collection(collection) else {
                 return Ok(0);
             };
-            let target = s.payload_targets(configured).into_iter().next();
+            let targets = s.payload_targets(configured);
             drop(s);
-            target
+            targets
         };
-        let Some(target) = target else {
+        if targets.is_empty() {
             log::warn!("Reconcile: no member peer is connected for collection '{collection}'");
             return Ok(0);
-        };
-        for commitment in &missing {
-            if let Err(e) = target.try_send(Message::RequestPrivatePayload {
-                collection: collection.to_owned(),
-                commitment: commitment.clone(),
-            }) {
-                log::warn!("Reconcile request for '{collection}' failed: {e}");
+        }
+        // Fan every missing-payload request across **all** member peers (#62
+        // §5.3): one slow or payload-less member must not starve
+        // reconciliation, which is what picking a single arbitrary target
+        // did. Responders answer asynchronously via `Message::PrivatePayload`.
+        let mut sent = 0usize;
+        for target in &targets {
+            for commitment in &missing {
+                if let Err(e) = target.try_send(Message::RequestPrivatePayload {
+                    collection: collection.to_owned(),
+                    commitment: commitment.clone(),
+                }) {
+                    log::warn!("Reconcile request for '{collection}' failed: {e}");
+                } else {
+                    sent += 1;
+                }
             }
         }
         log::info!(
-            "Reconcile: requested {} missing payloads for collection '{collection}'",
-            missing.len()
+            "Reconcile: requested {} missing payloads for collection '{collection}' \
+             across {} member peer(s) ({sent} requests sent)",
+            missing.len(),
+            targets.len()
         );
         Ok(missing.len())
     }
@@ -1519,6 +1536,11 @@ impl Node {
         };
 
         if appended {
+            // Broadcast before persistence (#62 §5.5/§5.6-3): the in-memory
+            // ledger is already authoritative and rebuild-from-chain heals any
+            // storage divergence (ADR-007 decision 2), so the leader's disk
+            // latency must not sit in front of fan-out to every peer.
+            self.broadcast(Message::Block(block.clone())).await;
             let generated = Self::after_block_commit(
                 &self.ledger,
                 &self.state,
@@ -1543,7 +1565,6 @@ impl Node {
             // commitments, so members receive the payload out of band. The
             // writer holds its own payloads in the transient store too.
             self.disseminate_private_writes(&per_tx_writes).await;
-            self.broadcast(Message::Block(block)).await;
             for tx in generated {
                 self.broadcast(Message::Transaction(tx)).await;
             }
@@ -1917,23 +1938,56 @@ impl Node {
     /// validate history, but not participate in relaying active writes
     /// (ADR-010 decision 6). Blocks and sync traffic still reach them.
     async fn broadcast(&self, message: Message) {
-        let senders: Vec<Sender<Message>> = {
+        let senders: Vec<(String, Sender<Message>)> = {
             let s = self.state.lock().await;
             if matches!(message, Message::Transaction(_)) {
                 let active = active_set_at_tip(&self.ledger).await;
+                // Relayed transactions are counted under a shared label: the
+                // per-peer counter exists to expose stragglers on the block
+                // fan-out path, which is where a full channel costs a peer
+                // its chain position (#62 §5.1).
                 s.relay_targets(&active)
+                    .into_iter()
+                    .map(|sender| ("relay".to_owned(), sender))
+                    .collect()
             } else {
-                s.peer_senders.values().cloned().collect()
+                s.peer_senders
+                    .iter()
+                    .map(|(addr, sender)| (addr.clone(), sender.clone()))
+                    .collect()
             }
         };
-        for sender in senders {
+        for (addr, sender) in senders {
             match sender.try_send(message.clone()) {
                 Err(TrySendError::Full(_)) => {
-                    log::warn!("Dropping outbound message: peer channel full");
+                    let total = {
+                        let mut s = self.state.lock().await;
+                        let entry = s.dropped_outbound.entry(addr.clone()).or_insert(0);
+                        *entry += 1;
+                        let total = *entry;
+                        drop(s);
+                        total
+                    };
+                    log::warn!(
+                        "Dropping outbound message: peer channel full (peer {addr}, \
+                         {total} dropped cumulative)"
+                    );
                 }
                 Ok(()) | Err(TrySendError::Closed(_)) => {}
             }
         }
+    }
+
+    /// Cumulative outbound drops per peer address (read-only visibility for
+    /// operators and tests; #62 §5.6 item 2).
+    pub async fn dropped_outbound(&self, addr: &str) -> u64 {
+        self.state
+            .lock()
+            .await
+            .dropped_outbound
+            .get(addr)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Post-commit hook: persist the block, index it, fire the event bus,
@@ -1959,7 +2013,21 @@ impl Node {
         // derived world-state cache.  On failure the chain stays authoritative
         // (ADR-007 decision 2): the block is already committed to the ledger,
         // and the next rebuild heals the storage divergence from the chain.
-        match storage.apply_block(block) {
+        //
+        // `apply_block` is blocking disk+CPU work, so it runs on the blocking
+        // thread pool — on the peer path this function is called from the
+        // per-peer read task, and an inline call would block a runtime worker
+        // and head-of-line-block that connection (#62 §5.5). Awaiting the
+        // handle keeps per-peer block ordering.
+        let persist_storage = storage.clone();
+        let owned_block = block.clone();
+        let apply_result =
+            tokio::task::spawn_blocking(move || persist_storage.apply_block(&owned_block))
+                .await
+                .unwrap_or_else(|e| {
+                    Err(CoreError::InvalidBlock(format!("persist task failed: {e}")))
+                });
+        match apply_result {
             Ok(()) => {
                 let mut s = state.lock().await;
                 for write in &block.write_set {
