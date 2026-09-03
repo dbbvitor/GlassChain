@@ -16,8 +16,8 @@
 - **Measurements:** leader submit time, leader mine/commit latency, serialized
   block size, quorum-certificate size (from the commit notification's
   `BlockMined` event), pending-pool depth at mine time (backpressure), and a
-  sequential propagation poll (50%/95%/100% of the connected validators reach
-  the new height; see caveat 2).
+  single-start propagation poll (50%/95%/100% of the connected validators
+  reach the new height, all thresholds measured concurrently — see caveat 2).
 - **Certificate honesty:** the mesh validators run dev/test PoW admission, so
   the leader stays on the PoW path and the measured certificate is the
   **degenerate PoW attestation (115 B — empty attestation set)**. The staged
@@ -33,7 +33,44 @@
 
 ## Results
 
-### 200 validators
+> **2026-09-03 re-run — instrument fixed.** The fan-out instrument was fixed
+> (single start, single poll loop for all three thresholds — see caveat 2) and
+> persistence was moved behind block broadcast on the mine path (#62 §5.6-3).
+> The tables below are the current evidence.
+
+### 200 validators (2026-09-03 re-run, release build)
+
+| Metric | Value |
+|---|---|
+| Leader mine/commit latency | p50 **10 ms**, p95 **17 ms** |
+| Block size (20 compact records) | **11 567 B** avg |
+| Quorum certificate size | degenerate PoW attestation (empty set on this path; staged BFT one-attestation cert: 508 B) |
+| Pending-pool depth at mine | 20 (one round's submissions; drained every block) |
+| Fan-out to 100% of connected | median **557 ms** (47–1 227 ms across rounds; monotone within every round) |
+| Partition recovery (67 join) | **573 ms** to full convergence |
+| PDC dissemination (20 members) | **53.2 ms**, 20/20 delivered |
+
+### 300 validators (2026-09-03 re-run, release build)
+
+| Metric | Value |
+|---|---|
+| Leader mine/commit latency | p50 **12 ms**, p95 **25 ms** |
+| Block size (20 compact records) | **11 567 B** avg |
+| Quorum certificate size | degenerate PoW attestation |
+| Pending-pool depth at mine | 20 |
+| Fan-out to 100% of connected | median **834 ms** |
+| Partition recovery (100 join) | **912 ms** to full convergence |
+| PDC dissemination (30 members) | **53.3 ms**, 30/30 delivered |
+
+**Observed, honestly:** fan-out now grows monotonically *across* rounds
+(47 → 1 227 ms at 200 validators). Within every round 50% ≤ 95% ≤ 100% — the
+instrument is coherent — but the cross-round growth is not yet attributed: the
+sweep is still O(connected) ledger locks per 20 ms tick, and per-peer write
+queues may be absorbing backlog as rounds accumulate. The recovery-convergence
+figure (573/912 ms) remains the cleaner end-to-end number. Attributing the
+growth is follow-up Step 0 work.
+
+### 200 validators (2026-09-01 original run — instrument broken, superseded)
 
 | Metric | Value |
 |---|---|
@@ -46,7 +83,7 @@
 | Partition recovery (67 join) | **1 257 ms** to full convergence |
 | PDC dissemination (20 members) | **73.5 ms**, 20/20 delivered |
 
-### 300 validators
+### 300 validators (2026-09-01 original run — superseded)
 
 | Metric | Value |
 |---|---|
@@ -69,20 +106,16 @@
    gossip bandwidth. Real Tendermint-class vote gossip (O(n²)) and BFT peer
    admission are the ADR-010 testnet/adoption gates and are not substitutable
    by this in-process gate.
-2. **Fan-out thresholds are not a usable measurement — do not cite the 50%
-   column.** The three thresholds (50%/95%/100%) are sequential polls, each with
-   its own start time, and each poll sweeps every connected validator taking a
-   lock on its ledger before sleeping 20 ms. The 50% poll therefore absorbs the
-   lock contention from ongoing commit work while the later polls find the block
-   already delivered. The recorded output shows the result directly: the 50%
-   column grows 496 → 16 354 ms across nine rounds while the 100% column stays at
-   0–98 ms in the same rounds, which is incoherent as a propagation measurement
-   — 100% cannot follow 50% by a negative interval. The sweep is also
-   O(connected) locks per tick, so the instrument degrades as the system it
-   measures grows. **Treat the recovery-convergence figure as the only reliable
-   end-to-end propagation number here**; the threshold family measures the
-   harness. Fixing or deleting it is tracked in
-   [`.agents/plans/performance.md`](../../.agents/plans/performance.md) §5.4.
+2. **Fan-out thresholds — FIXED 2026-09-03 (#62 §5.4/§5.6-1).** The original
+   run's three thresholds were sequential polls, each with its own start time,
+   and each poll swept every connected validator taking a lock on its ledger
+   before sleeping 20 ms; the 50% poll absorbed the lock contention while the
+   later polls found the block already delivered (50% grew 496 → 16 354 ms
+   while 100% stayed at 0–98 ms — incoherent). All three thresholds are now
+   measured from one start in one poll loop, and the recorded output is
+   monotone within every round. Residual: the sweep is still O(connected)
+   locks per tick, and the cross-round fan-out growth is unattributed (see
+   the 2026-09-03 table).
 3. **Recovery** models an application-layer partition (validators that never
    dialed join late); it does not sever established TCP sessions. WAN delay is
    not injected; madsim's deterministic scheduling covers ordering, not

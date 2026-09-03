@@ -188,13 +188,23 @@ struct ValidatorSet {
 }
 
 impl ValidatorSet {
-    /// Time until `percent`% of the validators hold at least `height` blocks
-    /// (integer percent keeps the math off float casts).
-    async fn propagation_ms(&self, height: usize, percent: usize) -> Option<u128> {
+    /// Time until 50%/95%/100% of the validators hold at least `height`
+    /// blocks (integer percent keeps the math off float casts).
+    ///
+    /// All three thresholds are measured from **one** start in **one** poll
+    /// loop (#62 §5.4): the previous implementation ran three sequential
+    /// polls, each with its own start time, so the 50% poll absorbed all the
+    /// lock contention with ongoing commit work and the later thresholds
+    /// measured an already-converged network — incoherent as a propagation
+    /// measurement.
+    async fn propagation_ms(&self, height: usize) -> (Option<u128>, Option<u128>, Option<u128>) {
         let start = Instant::now();
         // Fan-out is measured over the CONNECTED validators; the partitioned
         // group converges during recovery, not per-block.
-        let wanted = (percent * self.connected).div_ceil(100);
+        let want50 = (50 * self.connected).div_ceil(100);
+        let want95 = (95 * self.connected).div_ceil(100);
+        let want100 = self.connected;
+        let mut reached_at: (Option<u128>, Option<u128>, Option<u128>) = (None, None, None);
         loop {
             let mut reached = 0;
             for node in &self.validators[..self.connected] {
@@ -204,11 +214,18 @@ impl ValidatorSet {
                     reached += 1;
                 }
             }
-            if reached >= wanted {
-                return Some(start.elapsed().as_millis());
+            let elapsed = start.elapsed().as_millis();
+            if reached >= want50 && reached_at.0.is_none() {
+                reached_at.0 = Some(elapsed);
             }
-            if start.elapsed() > Duration::from_secs(90) {
-                return None;
+            if reached >= want95 && reached_at.1.is_none() {
+                reached_at.1 = Some(elapsed);
+            }
+            if reached >= want100 && reached_at.2.is_none() {
+                reached_at.2 = Some(elapsed);
+            }
+            if reached_at.2.is_some() || start.elapsed() > Duration::from_secs(90) {
+                return reached_at;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -347,9 +364,7 @@ async fn run_round(
     };
 
     let height = set.leader.ledger_snapshot().await.chain.len();
-    let propagation_50 = set.propagation_ms(height, 50).await;
-    let propagation_95 = set.propagation_ms(height, 95).await;
-    let propagation_100 = set.propagation_ms(height, 100).await;
+    let (propagation_50, propagation_95, propagation_100) = set.propagation_ms(height).await;
 
     let last = set
         .leader
@@ -478,8 +493,9 @@ async fn capacity_gate(validator_count: usize, txs_per_round: usize, rounds: usi
         .unwrap();
     set.leader.mine().await.unwrap();
     let height = set.leader.ledger_snapshot().await.chain.len();
-    set.propagation_ms(height, 100)
+    set.propagation_ms(height)
         .await
+        .2
         .expect("activation propagates to the connected validators");
 
     // ── Sustained compact workload ──────────────────────────────────────

@@ -426,3 +426,94 @@ async fn federation_trust_store_enables_cross_org_payload_delivery() {
         "a member without the writer org's anchor must not store the cross-org payload"
     );
 }
+
+/// Reconcile fan-out (#62 §5.3/§5.6-4): requests go to **all** member peers,
+/// so a member that holds nothing (the would-be single arbitrary target) can
+/// no longer starve reconciliation — the member that holds the payload still
+/// answers.
+#[tokio::test]
+async fn reconcile_fans_out_across_all_member_peers() {
+    let four_member_collection = || {
+        Channel::new(ChannelConfig {
+            name: COLLECTION.to_owned(),
+            member_ids: vec![
+                WRITER.to_owned(),
+                "org-member-a".to_owned(),
+                "org-member-b".to_owned(),
+                "org-member-m".to_owned(),
+            ],
+            description: "reconcile fan-out collection".to_owned(),
+            endorsement_policy: None,
+            retention_secs: 3600,
+        })
+    };
+    let writer_addr = free_addr();
+    let writer = Node::new(WRITER, &writer_addr, 1);
+    writer.start(vec![]).await.unwrap();
+    writer.set_collections(vec![four_member_collection()]).await;
+    writer
+        .set_execution_provider(Arc::new(
+            glasschain_vm::WasmExecutionProvider::new().unwrap(),
+        ))
+        .await;
+
+    // Member A is connected when the write commits, so it receives the
+    // payload by dissemination; member B joins after and holds nothing.
+    let a_addr = free_addr();
+    let member_a = Node::new("org-member-a", &a_addr, 1);
+    member_a.start(vec![writer_addr.clone()]).await.unwrap();
+    member_a
+        .set_collections(vec![four_member_collection()])
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    writer.submit_transaction(activation_tx(2)).await.unwrap();
+    writer.mine().await.unwrap();
+    writer
+        .submit_transaction(contract_creation_tx("pdc-fanout"))
+        .await
+        .unwrap();
+    writer
+        .submit_transaction(contract_execution_tx("pdc-fanout"))
+        .await
+        .unwrap();
+    writer.mine().await.unwrap();
+    let commitment = sha256(PRIVATE_VALUE);
+    poll_until("member A received the disseminated payload", 3, || async {
+        member_a.transient_payload(COLLECTION, &commitment).await == Some(PRIVATE_VALUE.to_vec())
+    })
+    .await;
+
+    let b_addr = free_addr();
+    let member_b = Node::new("org-member-b", &b_addr, 1);
+    member_b.start(vec![writer_addr]).await.unwrap();
+    member_b
+        .set_collections(vec![four_member_collection()])
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Member M syncs from A and B and reconciles: with a single arbitrary
+    // target this was a coin flip between a holder and a non-holder.
+    let member_m = Node::new("org-member-m", free_addr(), 1);
+    member_m
+        .set_collections(vec![four_member_collection()])
+        .await;
+    member_m.start(vec![a_addr, b_addr]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_for_sync(&member_a, &member_m).await;
+
+    let requested = member_m
+        .reconcile_private_payloads(COLLECTION)
+        .await
+        .expect("reconcile");
+    assert_eq!(requested, 1, "one missing payload requested");
+    poll_until(
+        "M received the payload despite the payload-less member",
+        3,
+        || async {
+            member_m.transient_payload(COLLECTION, &commitment).await
+                == Some(PRIVATE_VALUE.to_vec())
+        },
+    )
+    .await;
+}
