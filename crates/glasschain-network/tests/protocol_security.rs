@@ -657,6 +657,7 @@ async fn private_payload_to_non_member_is_rejected() {
                     hash: glasschain_core::capability_hash("pdc", 1),
                     activation_height: 2,
                     signatures: vec![glasschain_core::RecordSignature {
+                        algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
                         signer: "org-gov".into(),
                         signature_bytes: vec![0x42],
                     }],
@@ -734,6 +735,7 @@ async fn private_payload_with_commitment_mismatch_is_rejected() {
                     hash: glasschain_core::capability_hash("pdc", 1),
                     activation_height: 2,
                     signatures: vec![glasschain_core::RecordSignature {
+                        algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
                         signer: "org-gov".into(),
                         signature_bytes: vec![0x42],
                     }],

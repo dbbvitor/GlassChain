@@ -120,6 +120,7 @@ impl RecallContext {
     /// reach the other two chains.
     async fn commit_record(&self, node: &Node, mut record: CanonicalRecord, issuer: &str) {
         record.signatures.push(RecordSignature {
+            algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
             signer: issuer.to_owned(),
             signature_bytes: vec![0x42],
         });

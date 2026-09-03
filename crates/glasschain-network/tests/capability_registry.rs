@@ -101,6 +101,7 @@ fn activation_tx(id: &str, height: u64) -> Transaction {
             hash: capability_hash(id, 1),
             activation_height: height,
             signatures: vec![RecordSignature {
+                algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
                 signer: "org-issuer".into(),
                 signature_bytes: vec![0x42],
             }],

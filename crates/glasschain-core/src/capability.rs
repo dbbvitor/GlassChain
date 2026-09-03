@@ -349,6 +349,7 @@ mod tests {
             hash: capability_hash(id, 1),
             activation_height: height,
             signatures: vec![RecordSignature {
+                algorithm: crate::wire::SignatureAlgorithm::Ed25519,
                 signer: "org-issuer".into(),
                 signature_bytes: vec![0x42],
             }],
@@ -370,10 +371,12 @@ mod tests {
         .unwrap();
         let mut record = CanonicalRecord::new(0, "state_commitment", payload, "org-issuer");
         record.signatures.push(RecordSignature {
+            algorithm: crate::wire::SignatureAlgorithm::Ed25519,
             signer: "org-issuer".into(),
             signature_bytes: vec![0x42],
         });
         record.signatures.push(RecordSignature {
+            algorithm: crate::wire::SignatureAlgorithm::Ed25519,
             signer: "org-a".into(),
             signature_bytes: vec![0x43],
         });

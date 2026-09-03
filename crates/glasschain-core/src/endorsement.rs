@@ -249,10 +249,18 @@ pub struct EndorserIdentity {
     /// The principal the signer claims. Rejected when it conflicts with the
     /// principal bound to `public_key` (ADR-008 decision 2).
     pub claimed_principal: Principal,
-    /// Raw 32-byte ed25519 public key.
+    /// Raw 32-byte ed25519 public key, base64 on the wire.
+    #[serde(with = "crate::wire::base64_bytes")]
     pub public_key: Vec<u8>,
-    /// Signature over [`EndorsementRequest::payload`].
+    /// Signature over [`EndorsementRequest::payload`], base64 on the wire.
+    #[serde(with = "crate::wire::base64_bytes")]
     pub signature: Vec<u8>,
+    /// The algorithm that produced `signature` (post-quantum plan action 2).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::wire::SignatureAlgorithm::is_ed25519"
+    )]
+    pub algorithm: crate::wire::SignatureAlgorithm,
 }
 
 /// An endorsement evaluation request: the exact payload being endorsed (the
@@ -952,6 +960,7 @@ mod tests {
 
     fn signer(principal: &str) -> EndorserIdentity {
         EndorserIdentity {
+            algorithm: crate::wire::SignatureAlgorithm::Ed25519,
             claimed_principal: Principal::new(principal),
             public_key: vec![0x42; 32],
             signature: vec![0x42; 64],
@@ -1345,6 +1354,7 @@ mod tests {
                 hash: crate::capability_hash("endorsement", 1),
                 activation_height: 2,
                 signatures: vec![crate::RecordSignature {
+                    algorithm: crate::wire::SignatureAlgorithm::Ed25519,
                     signer: "governance".into(),
                     signature_bytes: vec![0x42],
                 }],
@@ -1386,6 +1396,7 @@ mod tests {
         .collect();
         let mut record = CanonicalRecord::new(0, "state_commitment", payload, "issuer-org");
         record.signatures.push(crate::RecordSignature {
+            algorithm: crate::wire::SignatureAlgorithm::Ed25519,
             signer: "issuer-org".into(),
             signature_bytes: vec![0x42],
         });

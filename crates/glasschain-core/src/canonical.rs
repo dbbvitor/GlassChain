@@ -35,8 +35,17 @@ pub const SCHEMA_VERSION_V1: u32 = 1;
 pub struct RecordSignature {
     /// Human-readable signer identity (MSP member / node identifier).
     pub signer: String,
-    /// Raw signature bytes over the record's [`CanonicalRecord::canonical_form`].
+    /// Raw signature bytes over the record's [`CanonicalRecord::canonical_form`],
+    /// base64 on the wire.
+    #[serde(with = "crate::wire::base64_bytes")]
     pub signature_bytes: Vec<u8>,
+    /// The algorithm that produced `signature_bytes` (post-quantum plan
+    /// action 2).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::wire::SignatureAlgorithm::is_ed25519"
+    )]
+    pub algorithm: crate::wire::SignatureAlgorithm,
 }
 
 /// One registered namespace extension attached to a record.
@@ -998,6 +1007,7 @@ mod tests {
 
     fn sign(record: &mut CanonicalRecord) {
         record.signatures.push(RecordSignature {
+            algorithm: crate::wire::SignatureAlgorithm::Ed25519,
             signer: record.issuer.clone(),
             signature_bytes: vec![0x42; 8],
         });

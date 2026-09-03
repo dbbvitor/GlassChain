@@ -27,8 +27,11 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 pub struct ValidatorInfo {
     /// Validator identifier (MSP principal).
     pub name: String,
-    /// Raw 32-byte ed25519 public key.
-    pub public_key: [u8; 32],
+    /// Public key bytes. Variable-length so a future signature algorithm
+    /// (post-quantum plan action 2) is a config change, not a type break;
+    /// today every key is 32 ed25519 bytes and verification still enforces
+    /// that length per attestation.
+    pub public_key: Vec<u8>,
 }
 
 /// The Tendermint-class BFT consensus provider.
@@ -82,10 +85,11 @@ impl BftConsensusProvider {
         let local = self.signing_key.verifying_key().to_bytes();
         let signature = self.signing_key.sign(block.hash.as_bytes());
         let attestation = Attestation {
+            algorithm: crate::wire::SignatureAlgorithm::Ed25519,
             validator: self
                 .validators
                 .iter()
-                .find(|validator| validator.public_key == local)
+                .find(|validator| validator.public_key.as_slice() == local)
                 .map_or_else(
                     || hex::encode(&local[..8]),
                     |validator| validator.name.clone(),
@@ -126,10 +130,10 @@ impl BftConsensusProvider {
         // Index the validator set once. Scanning it per attestation is O(n·m) —
         // at n=300 with a 201-attestation quorum that is ~60k comparisons, and
         // it is the only quadratic term on the verification path.
-        let known: std::collections::HashSet<&[u8; 32]> = self
+        let known: std::collections::HashSet<&[u8]> = self
             .validators
             .iter()
-            .map(|validator| &validator.public_key)
+            .map(|validator| validator.public_key.as_slice())
             .collect();
         let mut distinct = std::collections::HashSet::new();
         for attestation in &certificate.attestations {
@@ -138,7 +142,7 @@ impl BftConsensusProvider {
                 .as_slice()
                 .try_into()
                 .map_err(|_| CoreError::InvalidBlock("bft: non-32-byte public key".into()))?;
-            if !known.contains(&key_bytes) {
+            if !known.contains(key_bytes.as_slice()) {
                 return Err(CoreError::InvalidBlock(format!(
                     "bft: attestation from unknown validator '{}'",
                     attestation.validator
@@ -220,7 +224,7 @@ mod tests {
             .enumerate()
             .map(|(i, k)| ValidatorInfo {
                 name: format!("validator-{i}"),
-                public_key: k.verifying_key().to_bytes(),
+                public_key: k.verifying_key().to_bytes().to_vec(),
             })
             .collect();
         (BftConsensusProvider::new(validators, keys[0].clone()), keys)
@@ -273,6 +277,7 @@ mod tests {
         };
         for _ in 0..provider.quorum() {
             certificate.attestations.push(Attestation {
+                algorithm: crate::wire::SignatureAlgorithm::Ed25519,
                 validator: format!("outsider-{}", outsider.verifying_key().to_bytes()[0]),
                 public_key: outsider.verifying_key().to_bytes().to_vec(),
                 signature: outsider.sign(block.hash.as_bytes()).to_bytes().to_vec(),
@@ -300,6 +305,7 @@ mod tests {
         for (i, key) in keys.iter().take(provider.quorum()).enumerate() {
             let bad_bytes = format!("wrong-for-block-{i}");
             certificate.attestations.push(Attestation {
+                algorithm: crate::wire::SignatureAlgorithm::Ed25519,
                 validator: format!("validator-{i}"),
                 public_key: key.verifying_key().to_bytes().to_vec(),
                 signature: key.sign(bad_bytes.as_bytes()).to_bytes().to_vec(),
@@ -325,6 +331,7 @@ mod tests {
         // Only two distinct validators attest, but quorum(4) = 3.
         for key in keys.iter().take(2) {
             certificate.attestations.push(Attestation {
+                algorithm: crate::wire::SignatureAlgorithm::Ed25519,
                 validator: format!("v-{}", key.verifying_key().to_bytes()[0]),
                 public_key: key.verifying_key().to_bytes().to_vec(),
                 signature: key.sign(block.hash.as_bytes()).to_bytes().to_vec(),
@@ -346,6 +353,7 @@ mod tests {
         // count is still 1, below quorum(3) — duplicates never inflate quorum.
         let key = &keys[0];
         let attestation = Attestation {
+            algorithm: crate::wire::SignatureAlgorithm::Ed25519,
             validator: "validator-0".into(),
             public_key: key.verifying_key().to_bytes().to_vec(),
             signature: key.sign(block.hash.as_bytes()).to_bytes().to_vec(),

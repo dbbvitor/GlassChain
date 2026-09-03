@@ -58,6 +58,7 @@ fn activation_tx(height: u64) -> Transaction {
             hash: capability_hash("pdc", 1),
             activation_height: height,
             signatures: vec![RecordSignature {
+                algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
                 signer: "org-gov".into(),
                 signature_bytes: vec![0x42],
             }],
@@ -99,6 +100,7 @@ fn commitment_record(seq: usize) -> CanonicalRecord {
     record.commitment = record.commitment().ok();
     record.signatures = (0..2)
         .map(|i| RecordSignature {
+            algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
             signer: format!("org-{i}"),
             signature_bytes: vec![0x42],
         })
@@ -134,6 +136,7 @@ fn certification_record(seq: usize) -> CanonicalRecord {
 fn signed(record: CanonicalRecord, issuer: &str) -> Transaction {
     let mut signed = record;
     signed.signatures.push(RecordSignature {
+        algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
         signer: issuer.to_owned(),
         signature_bytes: vec![0x42],
     });

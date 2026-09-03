@@ -105,4 +105,7 @@ pub enum Message {
 /// neither request missing payloads nor answer requests, so the gate keeps
 /// such peers from silently missing private writes. (The `/2` bump marked the
 /// BFT consensus seam.)
-pub const PROTOCOL_VERSION: &str = "glasschain/4";
+/// `/5` switched signature-adjacent byte fields from JSON decimal arrays to
+/// base64 and added the signature algorithm discriminant (#62 Step 1,
+/// post-quantum plan action 2) — a `/4` peer cannot parse the new encoding.
+pub const PROTOCOL_VERSION: &str = "glasschain/5";

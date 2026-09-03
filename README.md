@@ -223,7 +223,7 @@ Current trust model:
 Message types:
 
 - `Hello` — advertises the wire `version` (mismatches are disconnected; current
-  version is `glasschain/4`, bumped when the private-payload protocol gained
+  version is `glasschain/5`, bumped when the private-payload protocol gained
   pull-based reconciliation),
   the sender's `org` (the collection-membership principal), and the
   capabilities the peer supports. A peer lacking an active capability is

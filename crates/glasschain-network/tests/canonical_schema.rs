@@ -89,12 +89,14 @@ fn record(schema_id: &str) -> CanonicalRecord {
     };
     let mut record = CanonicalRecord::new(0, schema_id, payload, "org-issuer");
     record.signatures.push(RecordSignature {
+        algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
         signer: "org-issuer".into(),
         signature_bytes: vec![0x42; 8],
     });
     if schema_id == "state_commitment" {
         // v1 requires one opaque signature per named counterparty.
         record.signatures.push(RecordSignature {
+            algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
             signer: "org-a".into(),
             signature_bytes: vec![0x43; 8],
         });

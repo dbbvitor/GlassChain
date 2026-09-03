@@ -31,6 +31,7 @@ fn activation_tx(height: u64) -> Transaction {
             hash: capability_hash("bft_consensus", 1),
             activation_height: height,
             signatures: vec![RecordSignature {
+                algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
                 signer: "org-gov".into(),
                 signature_bytes: vec![0x42],
             }],
@@ -43,7 +44,7 @@ fn single_validator_provider() -> BftConsensusProvider {
     let signing_key = SigningKey::from_bytes(&[7u8; 32]);
     let validators = vec![ValidatorInfo {
         name: "validator-0".into(),
-        public_key: signing_key.verifying_key().to_bytes(),
+        public_key: signing_key.verifying_key().to_bytes().to_vec(),
     }];
     BftConsensusProvider::new(validators, signing_key)
 }

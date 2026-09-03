@@ -140,6 +140,7 @@ mod tests {
 
     fn signer(identity: &Identity, claimed: &str) -> EndorserIdentity {
         EndorserIdentity {
+            algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
             claimed_principal: Principal::new(claimed),
             public_key: identity.public_key_bytes().to_vec(),
             signature: identity.sign_bytes(b"canonical-payload"),

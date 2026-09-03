@@ -12,6 +12,7 @@
 
 use crate::block::Block;
 use crate::error::CoreError;
+use crate::wire::{base64_bytes, SignatureAlgorithm};
 use serde::{Deserialize, Serialize};
 
 /// One validator attestation over a block hash.
@@ -19,11 +20,19 @@ use serde::{Deserialize, Serialize};
 pub struct Attestation {
     /// Validator identifier (MSP principal).
     pub validator: String,
-    /// Raw 32-byte ed25519 public key of the validator.
+    /// Raw 32-byte ed25519 public key of the validator, base64 on the wire.
+    #[serde(with = "base64_bytes")]
     pub public_key: Vec<u8>,
     /// Signature over the block hash (cryptographic verification lands with
-    /// the BFT engine, ticket #42).
+    /// the BFT engine, ticket #42), base64 on the wire.
+    #[serde(with = "base64_bytes")]
     pub signature: Vec<u8>,
+    /// The algorithm that produced `signature` (post-quantum plan action 2).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::wire::SignatureAlgorithm::is_ed25519"
+    )]
+    pub algorithm: SignatureAlgorithm,
 }
 
 /// The attestation set for a committed block (ADR-002: quorum certificate).
@@ -176,6 +185,7 @@ mod tests {
         let mut ledger = Ledger::new(1);
         let block = ledger.mine_pending_transactions().expect("mine").clone();
         let well_formed = Attestation {
+            algorithm: crate::wire::SignatureAlgorithm::Ed25519,
             validator: "org-a".into(),
             public_key: vec![0x42; 32],
             signature: vec![0x24; 64],
@@ -204,6 +214,56 @@ mod tests {
             ..good
         };
         assert!(empty_sig.validate(&block).is_err());
+    }
+
+    #[cfg(feature = "bft")]
+    #[test]
+    fn test_quorum_certificate_size_budget_at_201_attestations() {
+        // #62 Step 1 validation: a synthetic 201-of-300 quorum certificate
+        // must stay under the 40 KB base64 budget (was ~79 KB as decimal
+        // arrays). The measured 11.5 KB block is the comparison point.
+        let mut seed = 0u8;
+        let mut keys = Vec::new();
+        let mut validators = Vec::new();
+        for _ in 0..300usize {
+            // Repetition of seed bytes is harmless for the size budget —
+            // only the attestation count matters.
+            seed = seed.wrapping_add(1);
+            let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+            validators.push(crate::bft::ValidatorInfo {
+                name: format!("validator-{}", keys.len() + 1),
+                public_key: key.verifying_key().to_bytes().to_vec(),
+            });
+            keys.push(key);
+        }
+        let provider = crate::bft::BftConsensusProvider::new(validators, keys[0].clone());
+        let mut ledger = Ledger::new(1);
+        let block = ledger.mine_pending_transactions().expect("mine").clone();
+        let notification = provider.attest(block.clone());
+        let mut certificate = notification.certificate;
+        certificate.attestations.clear();
+        for key in keys.iter().take(201) {
+            use ed25519_dalek::Signer as _;
+            let signature = key.sign(block.hash.as_bytes());
+            certificate.attestations.push(Attestation {
+                validator: format!("validator-{}", certificate.attestations.len() + 1),
+                public_key: key.verifying_key().to_bytes().to_vec(),
+                signature: signature.to_bytes().to_vec(),
+                algorithm: crate::wire::SignatureAlgorithm::Ed25519,
+            });
+        }
+        assert!(
+            certificate.validate(&block).is_ok(),
+            "the synthetic quorum must be well-formed"
+        );
+        let json = serde_json::to_vec(&certificate).expect("serialize");
+        assert!(
+            json.len() < 40_000,
+            "201-attestation certificate is {} B, over the 40 KB budget",
+            json.len()
+        );
+        let round: QuorumCertificate = serde_json::from_slice(&json).expect("deserialize");
+        assert_eq!(round, certificate, "base64 fields must round-trip");
     }
 
     #[test]

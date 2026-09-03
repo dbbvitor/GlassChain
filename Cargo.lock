@@ -1645,6 +1645,7 @@ dependencies = [
 name = "glasschain-core"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "ed25519-dalek 3.0.0",
  "env_logger",
  "hex",

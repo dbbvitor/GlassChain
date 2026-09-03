@@ -357,6 +357,7 @@ mod tests {
         .expect("payload map");
         let mut record = CanonicalRecord::new(0, "lot", payload, "org-issuer");
         record.signatures.push(RecordSignature {
+            algorithm: crate::wire::SignatureAlgorithm::Ed25519,
             signer: "org-issuer".into(),
             signature_bytes: vec![0x42],
         });
@@ -377,6 +378,7 @@ mod tests {
                 hash: capability_hash(id, 1),
                 activation_height,
                 signatures: vec![RecordSignature {
+                    algorithm: crate::wire::SignatureAlgorithm::Ed25519,
                     signer: "org-issuer".into(),
                     signature_bytes: vec![0x42],
                 }],

@@ -356,6 +356,16 @@ Malachite, SmartBFT/Fabric) so the target in §1 is citable.
 
 ### Step 1 — The wire protocol is JSON. This is the biggest structural tax.
 
+> **Status (2026-09-03): base64 encoding + algorithm discriminant shipped.**
+> Signature-adjacent byte fields (`Attestation`, `EndorserIdentity`,
+> `RecordSignature`) are base64 on the wire via `core::wire::base64_bytes`;
+> each carrier names its algorithm (`core::wire::SignatureAlgorithm`, omitted
+> when Ed25519, unknown discriminants rejected — post-quantum action 2);
+> `ValidatorInfo.public_key` widened to `Vec<u8>`; `PROTOCOL_VERSION` bumped
+> to `glasschain/5`. Validated by the 201-attestation size-budget test
+> (< 40 KB, was ~79 KB) and the unknown-discriminant round-trip test. The
+> full binary-codec swap remains the separate, ADR-sized decision below.
+
 Every peer message and every gossipsub payload is `serde_json`
 (`crates/glasschain-network/src/peer.rs` `send`/`receive`;
 `libp2p_swarm.rs` transaction and block topics). Two costs: bytes on the wire,

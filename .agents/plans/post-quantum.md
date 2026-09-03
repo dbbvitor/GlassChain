@@ -278,10 +278,12 @@ correct choice and there is no argument to have. It is not on any current path.
    together**, verify the build on all three CI platforms, and confirm the
    negotiated group in a test. Closes the only harvest-now-decrypt-later
    exposure. *Ready to start.*
-2. **Add an algorithm discriminant** to `Attestation`, `RecordSignature` and
+2. ~~**Add an algorithm discriminant** to `Attestation`, `RecordSignature` and
    `EndorserIdentity`, and widen `ValidatorInfo.public_key` from `[u8; 32]` to a
    variable-length representation. **Fold into performance Step 1**, not a
-   separate wire break.
+   separate wire break.~~ **Done 2026-09-03** (`core::wire::SignatureAlgorithm`
+   on all three carriers with Ed25519 omitted on the wire and unknown
+   discriminants rejected by test; `ValidatorInfo.public_key: Vec<u8>`).
 3. **Note in the libp2p module docs** that promoting it to the active transport
    requires revisiting PQ key exchange, since Noise/X25519 has no shipping option.
 4. **Decide on ML-DSA when ICP-Brasil makes it mandatory**, not before. Re-read

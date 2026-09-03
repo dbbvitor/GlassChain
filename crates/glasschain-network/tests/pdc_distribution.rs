@@ -52,6 +52,7 @@ fn activation_tx(height: u64) -> Transaction {
             hash: glasschain_core::capability_hash("pdc", 1),
             activation_height: height,
             signatures: vec![RecordSignature {
+                algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
                 signer: "org-gov".into(),
                 signature_bytes: vec![0x42],
             }],

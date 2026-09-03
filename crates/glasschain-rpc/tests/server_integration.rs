@@ -632,6 +632,7 @@ async fn test_verify_endorsement_returns_a_real_evaluation() {
         },
         payload: payload.clone(),
         signers: vec![EndorserIdentity {
+            algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
             claimed_principal: Principal::new("network-governance"),
             public_key: identity.public_key_bytes().to_vec(),
             signature: identity.sign_bytes(&payload),
