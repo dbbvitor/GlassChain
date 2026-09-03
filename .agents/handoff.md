@@ -65,7 +65,8 @@ Detail and the reason each was left alone in
    The endorsement engine verifies `Transaction.endorsements`, never these. No
    ticket will fix it incidentally — binding them needs its own decision.
 5. **`madsim_chaos.rs` TCP-level fault injection.** Long-standing `TODO`;
-   partitions are simulated at the application layer. Not filed — test-harness
+   partitions are simulated at the application layer. Filed as
+   [#70](https://github.com/dbbvitor/GlassChain/issues/70) — test-harness
    fidelity, not a product gap.
 6. **The peer wire protocol is JSON, and it costs ~5× on the hot path**
    ([#62](https://github.com/dbbvitor/GlassChain/issues/62)). `serde_json`
