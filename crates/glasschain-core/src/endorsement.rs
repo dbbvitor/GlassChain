@@ -526,6 +526,14 @@ impl PolicyHistory {
 // issuer equals the payload authority; per-channel configured multi-party
 // policies for record families land with channel wiring.
 pub fn operation_default(tx: &Transaction) -> Result<Option<PolicyExpression>, CoreError> {
+    // Governance default (ADR-012): a capability activation switches
+    // network-wide, validation-affecting behaviour, so it requires the
+    // network-governance principal. The fixed principal is the v1 genesis
+    // fallback — fail-closed — until a deployment commits a `PolicyUpdate`
+    // naming its real governance principals.
+    if matches!(tx.kind, TransactionKind::CapabilityActivation(_)) {
+        return Ok(Some(PolicyExpression::signed_by("network-governance")));
+    }
     let TransactionKind::CanonicalRecord(record) = &tx.kind else {
         return Ok(None);
     };
@@ -569,6 +577,35 @@ pub fn operation_default(tx: &Transaction) -> Result<Option<PolicyExpression>, C
                 ));
             };
             Ok(Some(PolicyExpression::signed_by(issuer)))
+        }
+        "state_commitment" => {
+            // ADR-012: the default matches what the record's own count-only
+            // signature check already pretends to require — the issuer and
+            // every named counterparty sign.
+            let Some(counterparties) = record
+                .payload
+                .get("counterparties")
+                .and_then(Value::as_array)
+            else {
+                return Err(CoreError::InvalidTransaction(
+                    "endorsement: state commitment record is missing 'counterparties'".into(),
+                ));
+            };
+            let mut rules = vec![PolicyExpression::signed_by(record.issuer.clone())];
+            for counterparty in counterparties {
+                let Some(name) = counterparty.as_str().filter(|v| !v.is_empty()) else {
+                    return Err(CoreError::InvalidTransaction(
+                        "endorsement: state commitment counterparty must be a non-empty \
+                         organization name"
+                            .into(),
+                    ));
+                };
+                rules.push(PolicyExpression::signed_by(name));
+            }
+            Ok(Some(PolicyExpression::NOutOf {
+                required: rules.len(),
+                rules,
+            }))
         }
         _ => Ok(None),
     }
@@ -1294,6 +1331,85 @@ mod tests {
         assert!(
             evaluate_transaction_endorsements(&provider, &history, &authorized, &[]).is_ok(),
             "the network-governance principal authorizes the update"
+        );
+    }
+
+    #[test]
+    fn test_governance_operation_default_for_capability_activation() {
+        let provider = provider(&["network-governance"]);
+        let history = PolicyHistory::default();
+        let activation = Transaction::new(TransactionKind::CapabilityActivation(
+            crate::CapabilityActivation {
+                capability_id: "endorsement".into(),
+                version: 1,
+                hash: crate::capability_hash("endorsement", 1),
+                activation_height: 2,
+                signatures: vec![crate::RecordSignature {
+                    signer: "governance".into(),
+                    signature_bytes: vec![0x42],
+                }],
+            },
+        ));
+
+        // The decorative signatures field does not authorize: no carrier, no
+        // governance principal — fail closed.
+        let error = evaluate_transaction_endorsements(&provider, &history, &activation, &[])
+            .expect_err("an unendorsed capability activation must reject");
+        assert!(error.to_string().contains("operation default"), "{error}");
+
+        // A carrier whose verified signer is the governance principal satisfies
+        // the default.
+        let mut authorized = activation;
+        authorized.endorsements.push(carrier("", "", &[]));
+        authorized.endorsements[0].signers = vec![signer("network-governance")];
+        assert!(
+            evaluate_transaction_endorsements(&provider, &history, &authorized, &[]).is_ok(),
+            "the governance principal authorizes the activation"
+        );
+    }
+
+    #[test]
+    fn test_state_commitment_operation_default_requires_issuer_and_counterparties() {
+        let provider = provider(&["issuer-org", "counter-a", "counter-b"]);
+        let history = PolicyHistory::default();
+        let payload = [
+            (
+                "merkle_root".to_owned(),
+                serde_json::Value::String(format!("{:064x}", 1u128)),
+            ),
+            (
+                "counterparties".to_owned(),
+                serde_json::json!(["counter-a", "counter-b"]),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut record = CanonicalRecord::new(0, "state_commitment", payload, "issuer-org");
+        record.signatures.push(crate::RecordSignature {
+            signer: "issuer-org".into(),
+            signature_bytes: vec![0x42],
+        });
+        let tx = Transaction::new(TransactionKind::CanonicalRecord(record));
+
+        // Only the issuer signs the carrier: the counterparties are missing.
+        let mut partial = tx.clone();
+        partial.endorsements.push(carrier("", "", &[]));
+        partial.endorsements[0].signers = vec![signer("issuer-org")];
+        let error = evaluate_transaction_endorsements(&provider, &history, &partial, &[])
+            .expect_err("issuer alone must not satisfy the state-commitment default");
+        assert!(error.to_string().contains("operation default"), "{error}");
+
+        // Issuer + both counterparties: satisfied.
+        let mut full = tx;
+        full.endorsements.push(carrier("", "", &[]));
+        full.endorsements[0].signers = vec![
+            signer("issuer-org"),
+            signer("counter-a"),
+            signer("counter-b"),
+        ];
+        assert!(
+            evaluate_transaction_endorsements(&provider, &history, &full, &[]).is_ok(),
+            "issuer plus every named counterparty satisfies the default"
         );
     }
 

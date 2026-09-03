@@ -579,16 +579,17 @@ on the peer/sync/restart paths today: `Message::Block` admission,
 PoW nonce (`has_valid_pow`), and certificates are not persisted with blocks —
 all recorded as ADR-010 adoption-gate work (ticket #42, README).
 
-### 7.5 Record and capability-activation signatures are count-only — issue #60
+### 7.5 Record and capability-activation signatures — resolved by ADR-012 (issue #60)
 
-`CanonicalRecord.signatures` and `CapabilityActivation.signatures` are
-validated for *presence/count* only; nothing cryptographically verifies them
-(the endorsement engine verifies `Transaction.endorsements` carriers, a
-different structure — a grep confirms `endorsement.rs` never reads
-`.signatures`). The `CapabilityActivation` case is the sharp one: ADR-010 makes
-the committed capability set the network-wide switch, and its governance
-signature field is currently decorative. See
-[issue #60](https://github.com/dbbvitor/GlassChain/issues/60).
+`CanonicalRecord.signatures` and `CapabilityActivation.signatures` are advisory
+metadata: schema validation checks presence/count only, and nothing
+cryptographically verifies the bytes. Authorization is the endorsement layer's
+job ([ADR-012](adr/adr-012-signature-binding.md), resolving
+[issue #60](https://github.com/dbbvitor/GlassChain/issues/60)): when the
+`endorsement` capability is active, the operation defaults require verified
+carriers — `network-governance` for every `CapabilityActivation`, and issuer
+plus every named counterparty for `state_commitment` records. The decorative
+fields stay in the record shape for hash stability and ADR-006 schema identity.
 
 ### 7.6 No revocation — issue #58
 

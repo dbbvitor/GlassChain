@@ -755,11 +755,12 @@ pub fn validate_record_with(
                 ));
             }
             // Counterparty MSP signatures: the issuer's opaque signature set
-            // must carry at least one entry per named counterparty.
-            // ponytail: count-only, and it stays that way. The endorsement
-            // engine verifies `Transaction.endorsements` carriers, never
-            // `record.signatures` — binding these to MSP keys needs its own
-            // decision, not an incidental fix.
+            // must carry at least one entry per named counterparty. This is a
+            // structural schema check only — the bytes are advisory metadata.
+            // Authorization is the endorsement layer's job (ADR-008/ADR-012):
+            // when the `endorsement` capability is active, the operation
+            // default requires the issuer and every named counterparty as
+            // verified endorsement carriers.
             if record.signatures.len() < counterparties.len() {
                 return Err(err(
                     "state_commitment",
