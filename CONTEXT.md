@@ -122,3 +122,7 @@ _Avoid_: consensus version
 **Read-only observer**:
 A peer that may inspect and validate compatible committed history but cannot propose, vote, relay active writes, or participate in consensus after it lacks an active capability.
 _Avoid_: legacy validator
+
+**Duty roster**:
+The validator-slot allocation model: eligible organizations take turns serving bounded terms in the validator set, on a published schedule and objective criteria, with opt-out. Holding a slot is an operational duty, not a status or privilege.
+_Avoid_: election (discretionary), sortition (lottery among non-eligible pools is rejected), tier (rotating duty is not a rank)
