@@ -111,12 +111,13 @@ pub struct CapabilityActivation {
     /// Height at which the new set takes effect; strictly greater than the
     /// height of the block carrying this activation.
     pub activation_height: u64,
-    /// The required governance signature set.
+    /// The governance signature set — advisory metadata only.
     ///
-    /// ponytail: presence-only, consistent with canonical records — and it
-    /// stays that way. The endorsement engine verifies
-    /// `Transaction.endorsements` carriers, never these; binding governance
-    /// signatures to MSP keys needs its own decision.
+    /// These bytes are never verified; authorization is the endorsement
+    /// layer's job. When the `endorsement` capability is active, the
+    /// operation default (ADR-012) requires a verified carrier from the
+    /// `network-governance` principal — that is the security control, not
+    /// this field.
     pub signatures: Vec<RecordSignature>,
 }
 

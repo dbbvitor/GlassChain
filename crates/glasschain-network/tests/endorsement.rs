@@ -136,6 +136,13 @@ fn writer_execution_tx() -> Transaction {
     }))
 }
 
+/// Endorse a governance-scoped transaction (a `CapabilityActivation`) with an
+/// empty-scope carrier: the carrier declares no write scope, its verified
+/// signer satisfies the governance operation default (ADR-012).
+fn governance_endorsed(tx: Transaction, gov: &Identity) -> Transaction {
+    endorsed(tx, target("", "", &[]), &[(gov, "network-governance")])
+}
+
 fn activation_tx(height: u64) -> Transaction {
     Transaction::with_id(
         format!("cap:endorsement:{height}"),
@@ -265,18 +272,24 @@ async fn setup(writes: Vec<PersistentWrite>) -> Harness {
     // PDC-scoped writes are capability-gated (ADR-010, ticket #46), and one
     // test below commits one.
     node.submit_transaction(activation_tx(2)).await.unwrap();
-    node.submit_transaction(Transaction::with_id(
-        "cap:pdc:2".to_owned(),
-        TransactionKind::CapabilityActivation(CapabilityActivation {
-            capability_id: "pdc".into(),
-            version: 1,
-            hash: capability_hash("pdc", 1),
-            activation_height: 2,
-            signatures: vec![RecordSignature {
-                signer: "governance".into(),
-                signature_bytes: vec![0x42],
-            }],
-        }),
+    // The `pdc` activation is submitted while the `endorsement` capability is
+    // already active at the candidate height, so it must carry the governance
+    // operation default's endorsement carrier (ADR-012).
+    node.submit_transaction(governance_endorsed(
+        Transaction::with_id(
+            "cap:pdc:2".to_owned(),
+            TransactionKind::CapabilityActivation(CapabilityActivation {
+                capability_id: "pdc".into(),
+                version: 1,
+                hash: capability_hash("pdc", 1),
+                activation_height: 2,
+                signatures: vec![RecordSignature {
+                    signer: "governance".into(),
+                    signature_bytes: vec![0x42],
+                }],
+            }),
+        ),
+        &gov,
     ))
     .await
     .unwrap();
@@ -744,4 +757,145 @@ async fn same_unendorsed_write_is_rejected_when_wired_and_accepted_when_unwired(
         .expect_err("an unendorsed write must be rejected once endorsement is wired and active");
     assert!(error.to_string().contains("endorsement"), "{error}");
     assert_eq!(chain_len(&node).await, before, "nothing committed");
+}
+
+#[tokio::test]
+async fn capability_activation_requires_governance_endorsement_once_active() {
+    // ADR-012: with the `endorsement` capability active, a further capability
+    // activation must carry the governance operation default's carrier. The
+    // decorative `signatures` field does not satisfy it — the endorsement
+    // layer does the authorizing.
+    let Harness { node, gov, .. } = setup(vec![]).await;
+
+    // The `pdc` activation in setup() carried the governance carrier and
+    // committed; now an unendorsed activation of a *different* capability
+    // (append-only registry — `endorsement` itself cannot re-activate) must
+    // be rejected at admission.
+    let before = chain_len(&node).await;
+    let unendorsed = Transaction::with_id(
+        "cap:bft_consensus:10".to_owned(),
+        TransactionKind::CapabilityActivation(CapabilityActivation {
+            capability_id: "bft_consensus".into(),
+            version: 1,
+            hash: capability_hash("bft_consensus", 1),
+            activation_height: 10,
+            signatures: vec![RecordSignature {
+                signer: "governance".into(),
+                signature_bytes: vec![0x42],
+            }],
+        }),
+    );
+    let error = node
+        .submit_transaction(unendorsed)
+        .await
+        .expect_err("an unendorsed capability activation must be rejected");
+    assert!(error.to_string().contains("operation default"), "{error}");
+    assert_eq!(chain_len(&node).await, before);
+
+    // The same activation with the governance carrier commits.
+    let endorsed_activation = Transaction::with_id(
+        "cap:bft_consensus:10".to_owned(),
+        TransactionKind::CapabilityActivation(CapabilityActivation {
+            capability_id: "bft_consensus".into(),
+            version: 1,
+            hash: capability_hash("bft_consensus", 1),
+            activation_height: 10,
+            signatures: vec![RecordSignature {
+                signer: "governance".into(),
+                signature_bytes: vec![0x42],
+            }],
+        }),
+    );
+    node.submit_transaction(governance_endorsed(endorsed_activation, &gov))
+        .await
+        .unwrap();
+    node.mine().await.unwrap();
+    assert_eq!(chain_len(&node).await, before + 1);
+}
+
+#[tokio::test]
+async fn state_commitment_record_requires_issuer_and_counterparty_endorsement() {
+    // ADR-012: the operation default matches the count-only signature check's
+    // intent — issuer plus every named counterparty sign.
+    let Harness {
+        node,
+        org_a,
+        org_b,
+        auditor,
+        ..
+    } = setup(vec![]).await;
+    let before = chain_len(&node).await;
+
+    let mut payload = BTreeMap::new();
+    payload.insert(
+        "merkle_root".to_owned(),
+        serde_json::Value::String(format!("{:064x}", 1u128)),
+    );
+    payload.insert(
+        "counterparties".to_owned(),
+        serde_json::json!(["org-a", "org-b"]),
+    );
+    let record = CanonicalRecord::new(0, "state_commitment", payload, "org-maker");
+    let missing = Transaction::new(TransactionKind::CanonicalRecord(record));
+    let error = node
+        .submit_transaction(missing)
+        .await
+        .expect_err("a state commitment without issuer+counterparty carriers must be rejected");
+    assert!(error.to_string().contains("operation default"), "{error}");
+    assert_eq!(chain_len(&node).await, before);
+
+    let mut payload = BTreeMap::new();
+    payload.insert(
+        "merkle_root".to_owned(),
+        serde_json::Value::String(format!("{:064x}", 1u128)),
+    );
+    payload.insert(
+        "counterparties".to_owned(),
+        serde_json::json!(["org-a", "org-b"]),
+    );
+    let mut record = CanonicalRecord::new(0, "state_commitment", payload, "org-maker");
+    record.signatures.push(RecordSignature {
+        signer: "org-maker".into(),
+        signature_bytes: vec![0x42],
+    });
+    // The advisory `signatures` field does not authorize anything: even with
+    // one decorative signature present, the endorsement carriers decide.
+    let error = node
+        .submit_transaction(Transaction::new(TransactionKind::CanonicalRecord(record)))
+        .await
+        .expect_err("advisory record signatures must not satisfy the operation default");
+    assert!(error.to_string().contains("operation default"), "{error}");
+
+    // Endorsed by issuer + both counterparties: commits. The issuer and
+    // counterparties resolve through the directory-registered principals
+    // carried by the endorsement layer.
+    let mut payload = BTreeMap::new();
+    payload.insert(
+        "merkle_root".to_owned(),
+        serde_json::Value::String(format!("{:064x}", 1u128)),
+    );
+    payload.insert(
+        "counterparties".to_owned(),
+        serde_json::json!(["org-b", "auditor"]),
+    );
+    let mut record = CanonicalRecord::new(0, "state_commitment", payload, "org-a");
+    // The structural (count-only) signature check still applies at schema
+    // validation; authorization itself rides the endorsement carriers below.
+    record.signatures.push(RecordSignature {
+        signer: "org-a".into(),
+        signature_bytes: vec![0x42],
+    });
+    record.signatures.push(RecordSignature {
+        signer: "org-b".into(),
+        signature_bytes: vec![0x43],
+    });
+    record.commitment = Some(record.commitment().expect("commitment"));
+    let endorsed_tx = endorsed(
+        Transaction::new(TransactionKind::CanonicalRecord(record)),
+        target("", "", &[]),
+        &[(&org_a, "org-a"), (&org_b, "org-b"), (&auditor, "auditor")],
+    );
+    node.submit_transaction(endorsed_tx).await.unwrap();
+    node.mine().await.unwrap();
+    assert_eq!(chain_len(&node).await, before + 1);
 }

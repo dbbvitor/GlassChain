@@ -402,10 +402,10 @@ Next up:
 
 | Work | Status |
 |---|---|
-| [Federation trust model](https://github.com/dbbvitor/GlassChain/issues/57) — certificate verification is inert in production and fails open | Needs a decision |
+| [Federation trust model](https://github.com/dbbvitor/GlassChain/issues/57) — certificate verification is inert in production and fails open | Resolved — [ADR-011](docs/adr/adr-011-federation-trust-store.md), `--trust-store` |
 | [Certificate revocation](https://github.com/dbbvitor/GlassChain/issues/58) — no CRL or OCSP | Unplanned gap |
 | [Endorsement provider at node startup](https://github.com/dbbvitor/GlassChain/issues/59) — the engine is inert outside tests | Ready |
-| [Record signature binding](https://github.com/dbbvitor/GlassChain/issues/60) — record and capability-activation signatures are count-only | Needs a decision |
+| [Record signature binding](https://github.com/dbbvitor/GlassChain/issues/60) — record and capability-activation signatures are advisory; endorsement carriers authorize (ADR-012) | In progress |
 | [`glasschain-demo`](https://github.com/dbbvitor/GlassChain/issues/61) — a visual demo and benchmark harness | Planned |
 | [Performance](https://github.com/dbbvitor/GlassChain/issues/62) — measure real BFT rounds, then wire encoding, batch verification, BLS | Ordered, step 0 blocking |
 | BFT production adoption | Blocked on the four ADR-010 gates |

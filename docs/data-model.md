@@ -163,7 +163,7 @@ Envelope rules enforced for **every** family (`validate_record_with`,
 | 10 | `recall` | no | `lot_ref`, `reason`, `status`, `issued_by` | — | `issued` / `active` / `completed` | append-only status trail (recall workflow) |
 | 11 | `quality_certification` | **yes** | `lot_ref`, `issuer`, `scope`, `valid_from`, `valid_to`, `status`, `evidence_manifest` | — | `valid` / `suspended` / `revoked` | dates ISO-8601; `valid_to >= valid_from`; `evidence_manifest` is an *object* with 64-hex `manifest_commitment` |
 | 12 | `audit_attestation` | **yes** | same as #11 | — | `valid` / `suspended` / `revoked` | same rules as #11 |
-| 13 | `state_commitment` | **yes** | `merkle_root`, `counterparties` | `aggregation_ratio` | — | `merkle_root` 64-hex; `counterparties` a non-empty array of non-empty org names; `signatures.len() >= counterparties.len()` (count-only); `aggregation_ratio >= 1` when present |
+| 13 | `state_commitment` | **yes** | `merkle_root`, `counterparties` | `aggregation_ratio` | — | `merkle_root` 64-hex; `counterparties` a non-empty array of non-empty org names; `signatures.len() >= counterparties.len()` (structural count check — authorization rides the ADR-012 operation default); `aggregation_ratio >= 1` when present |
 
 ### 3.2 The complex families in prose
 
@@ -484,12 +484,13 @@ committing PDC-scoped writes (`pdc` at the candidate height, `node.rs`
 `mine_async`) and when selecting the BFT engine (`bft_consensus`); the
 `endorsement` capability gates endorsement enforcement (ADR-008 §4).
 
-**Honest note.** `CapabilityActivation.signatures` is **presence-checked only**
-(`apply` requires a non-empty set) and never cryptographically verified. The
-endorsement engine verifies `Transaction.endorsements` — signatures over
-`TransactionEndorsement::payload(tx)`, a different structure — never these
-carriers. The `ponytail:` comment at the field (capability.rs) says it stays
-that way pending an explicit decision. **Tracked as issue #60.**
+**Honest note — resolved (ADR-012, #60).** `CapabilityActivation.signatures` is
+**advisory metadata** and is never cryptographically verified. Authorization is
+the endorsement layer's job: when the `endorsement` capability is active, the
+governance operation default requires a verified endorsement carrier from the
+`network-governance` principal (fail-closed until a deployment commits a
+`PolicyUpdate` naming its real governance principals). The decorative field
+stays in the record shape for hash stability and ADR-006 schema identity.
 
 ---
 
@@ -511,16 +512,15 @@ record. What the validator actually checks:
   counterparties ("signature set must carry at least one signature per
   counterparty").
 
-That is the ceiling. Nothing in the workspace verifies the bytes, binds a
-`signer` to an MSP key, or checks that a counterparty actually signed. The
-validator's own comment (canonical.rs, around the counterparty check) is a
-`ponytail:` note: *"count-only, and it stays that way. The endorsement engine
-verifies `Transaction.endorsements` carriers, never `record.signatures` —
-binding these to MSP keys needs its own decision, not an incidental fix."*
-Core docs describe `RecordSignature` as opaque presence data; the
-identity-layer endorsement engine (`glasschain-identity/src/endorsement.rs`)
-verifies `EndorsementSignature`/`SignedTransaction` structures, which are a
-different path. **Tracked as issue #60** — same gap as §7.
+That is the structural ceiling: schema validation checks shape and count, never
+the bytes. **Authorization is a separate layer (ADR-012, resolving #60):** the
+`signatures` field is advisory metadata — the bytes are opaque, a `signer` is a
+label, and nothing binds them to MSP keys. When the `endorsement` capability is
+active, the operation defaults do the real work with verified endorsement
+carriers: `state_commitment` records require the issuer plus every named
+counterparty as carriers, and `CapabilityActivation` requires the
+`network-governance` principal. The count-only check remains as schema
+validation, not as a security control.
 
 Related precision: `CanonicalRecord::canonical_form` (the tuple that
 signatures would cover, and that `commitment()` hashes) includes `record_id`,
