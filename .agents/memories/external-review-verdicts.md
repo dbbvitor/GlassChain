@@ -92,3 +92,59 @@ decision.
   unplanned — no ADR covers it.
 - When an external report names a priority, **check the closed tickets first.**
   This report's headline priority had been shipped for two commits.
+
+---
+
+## 2026-09-03 — "Zero-Trust Hybrid BFT" report (VRF sortition, SGX attestation, ephemeral mTLS, slashing)
+
+Reviewed against ADR-002, ADR-011, and the participation model. **Verdict: ~10%
+adopt, the rest already rejected by name or inapplicable.** The report targets a
+public/permissionless threat model; GlassChain is a permissioned consortium of
+known, mutually-distrusting rival orgs.
+
+### Adopted
+
+- **Equivocation proofs → governance-driven validator exclusion** — filed as
+  [#75-adjacent ticket](https://github.com/dbbvitor/GlassChain/issues/76) (the
+  self-verifying two-conflicting-signatures record; the governance *act* of
+  exclusion belongs to ADR-002 open questions 4/5 churn mechanics). Cheap,
+  reuses ADR-008 verification machinery.
+
+### Already true — the report's "Standard BFT" column misdescribes us
+
+- Every vote individually signed and cryptographically verified
+  (`consensus.rs::verify_certificate`); no aggregate accepted on trust.
+- No perimeter trust: TLS default, TOFU pinning, fail-closed CRLs (ADR-013),
+  downgrade-not-disconnect (ADR-011), fail-closed governance defaults
+  (ADR-012).
+- Explicit timeouts and QC-proof view changes are the standard Tendermint round
+  protocol, not missing work.
+- BLS threshold signatures = performance Step 4 (already sequenced, with the
+  §3 correction that aggregation compresses the *certificate*, not the O(n²)
+  vote gossip). HotStuff pipelining = Step 5. Light-client finality = ADR-004
+  ladder. Nothing new.
+
+### Rejected (with reasons, per the established pattern)
+
+- **VRF sortition / rotating K-of-N committee** — rejected by name in ADR-002.
+  Governance standing attaches to membership, not to winning a lottery;
+  rotation is the first step toward the tiers/cartel failure the participation
+  model documents three design passes falling into. Our scalability claim is
+  deliberately *all n participating with deterministic ⅔ finality* — committee
+  sampling is how other systems weakened that constraint.
+- **Weighted validators `authority × uptime × reputation`** — voting power is
+  ADR-002 open question 4, deliberately deferred; a node *reputation* score
+  would collide with `MetadataTrustScore` (lot provenance completeness, not
+  behavior — the documented fact-check); there is no stake/fee model anywhere
+  (§2.4) to weight.
+- **Stake slashing** — no balances exist. Ejection on equivocation is a
+  governance act (the adopted ticket), not cryptoeconomics.
+- **Hardware remote attestation (SGX/TDX/SEV) as an admission gate** — swaps
+  the root of trust from federation governance to Intel/AMD, excludes member
+  infrastructure that can't run confidential computing (and every smallholder
+  in ADR-004's horizon), makes binary attestation brittle across rebuilds, and
+  nothing in the 26 requirements asks for it.
+- **Ephemeral keys / SPIFFE-style rotating identities** — contradicts ADR-008's
+  stable key→principal directory (the security boundary) and ADR-011 TOFU
+  pinning; misattribution under a compromised ephemeral key is *worse* than the
+  channel hygiene it buys. Identity-backed mTLS already exists.
