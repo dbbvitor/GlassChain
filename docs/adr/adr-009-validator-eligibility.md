@@ -71,12 +71,20 @@ to validate simply does not enter the roster.
 
 - **Cap:** 300 validators — the technical ceiling, not a political one. No
   governance cap below it.
-- **Epoch:** the active set is fixed for an epoch (days-scale, knob not
-  constant). Per-height set churn is technically supported but rejected as a
-  default: incoming validators must sync before voting, so per-height churn
-  makes liveness depend on permanent catch-up.
+- **Rotation triggers (dual, whichever fires first):** the active set
+  rotates when either (a) the **epoch elapses** (days-scale, knob not
+  constant) — bounds staleness on a quiet chain — or (b) the chain advances a
+  configured number of **heights** since the last rotation — bounds
+  consecutive service in work done rather than wall clock. Both thresholds are
+  chain-verifiable facts. The height threshold is set high enough that a hot
+  network does not rotate per block. Per-height *proposer* rotation is native
+  and separate (below). A third trigger replaces a single member mid-epoch:
+  equivocation suspension (§4) is a per-height set *replacement*, not a
+  rotation, so the no-repeat roster walk is undisturbed.
 - **Proposer rotation is per height** and native to the consensus family
-  (round-robin, equal power) — no validator proposes twice in a row.
+  (round-robin, equal power) — no validator proposes twice in a row. (Full-set
+  churn per height was rejected as the default for the catch-up cost above;
+  proposer rotation costs nothing because the proposer is already synced.)
 - **Set rotation:** each epoch, the active set is the next 300 from a
   round-robin walk over the eligible roster, **re-seeded per epoch from the
   chain** (deterministic, verifiable by any member, not predictable far in
