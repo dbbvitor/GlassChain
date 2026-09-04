@@ -317,9 +317,17 @@ Items 1 and 2 are prerequisites for Step 0 meaning anything: the plan's first
 step is "measure," and this section says the measuring tools need fixing before
 they can.
 
-### Step 0 status (2026-09-03)
+### Step 0 status (2026-09-04) — **the original goal is MET**
 
-**Fan-out growth attributed and fixed.** The instrument's own sweep was one
+> Post-adoption-gate (#82), the harness measures REAL deterministic finality:
+> **p50 2 021 ms @ 100 validators, p50 5 284 ms @ 200** (exact-quorum
+> certificates every round, ~850 ms / ~3.1 s replication, no view changes).
+> The 300 gate is blocked on the documented `blst` backend — the pure-Rust
+> pairing cost (O(quorum) per verifier per phase) exceeds the scaled phase
+> budget at 300 (first vote 34.8 s, precommit re-verification herd > 600 s).
+> Measured table in `consensus-capacity.md`.
+
+**Fan-out growth attributed and fixed (2026-09-03).** The instrument's own sweep was one
 cause (fixed by stride sampling); the dominant cause was every received block
 replaying the full capability history from genesis — O(height) per block per
 peer, growing linearly with the round count. Fixed with an incremental

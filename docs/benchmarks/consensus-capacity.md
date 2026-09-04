@@ -62,6 +62,29 @@
 | Partition recovery (100 join) | **912 ms** to full convergence |
 | PDC dissemination (30 members) | **53.3 ms**, 30/30 delivered |
 
+## BFT finality (2026-09-04, post-adoption-gate #82)
+
+The vote-round driver makes REAL deterministic finality measurable. Three
+`#[ignore]` gates (`bft_finality_gate_{100,200,300}`, run explicitly with
+`ulimit -n 65535`–`200000`), loopback, release, 8 runtime threads:
+
+| Validators | finality p50 | p95 | p99 | replication | quorum/round | first vote |
+|---|---|---|---|---|---|---|
+| 100 | **2 021 ms** | 2 162 | 2 162 | ~850 ms | exact 67 every round | 2.0 s |
+| 200 | **5 284 ms** | 5 744 | 5 744 | ~3.1 s | exact 134 every round | 5.4 s |
+| 300 | **not passing on the pure-Rust backend** — first vote 34.8 s, then the precommit re-verification herd (299 × 202-pairing multi-miller loops) exceeds the scaled phase budget | | | | | |
+
+**The honest finding:** finality is stable and deterministic at 100 and 200
+(exact-quorum certificates every round, no view changes), and the 300 gate is
+blocked on the **documented `blst`-backend follow-up** — ADR-014's pure-Rust
+pairing cost is O(quorum) per verifier per phase; `blst` shrinks it ~10×.
+This is exactly the scaling wall `phase_timeout(n) = 3 s + n/10` encodes, and
+the liveness doc's §4 guidance (round timeout tracks the ⅔n-th order
+statistic) measured against it. No production capacity claim: loopback,
+in-process, synthetic workload.
+
+---
+
 **Observed, honestly — ATTRIBUTED and FIXED (2026-09-03, #62 Step 0):**
 fan-out grew monotonically across rounds (47 → 1 227 ms at 200). The attribution
 instrument (per-tick sweep cost + first-reached, then a stride sample) split the
