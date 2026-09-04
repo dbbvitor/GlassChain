@@ -28,6 +28,7 @@ fn storage() -> Arc<dyn StorageProvider> {
 /// (#45); v1 validation only checks signature presence.
 fn signed(record: &mut CanonicalRecord, signer: &str) {
     record.signatures.push(RecordSignature {
+        algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
         signer: signer.to_owned(),
         signature_bytes: b"sig".to_vec(),
     });

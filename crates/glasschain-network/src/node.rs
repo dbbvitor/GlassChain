@@ -3697,6 +3697,7 @@ mod tests {
                 hash: capability_hash("pdc", 1),
                 activation_height: 2,
                 signatures: vec![RecordSignature {
+                    algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
                     signer: "org-gov".into(),
                     signature_bytes: vec![0x42],
                 }],
@@ -3925,6 +3926,7 @@ mod tests {
                 hash: capability_hash("endorsement", 1),
                 activation_height: height,
                 signatures: vec![RecordSignature {
+                    algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
                     signer: "governance".into(),
                     signature_bytes: vec![0x42],
                 }],
@@ -3954,6 +3956,7 @@ mod tests {
                         collection: None,
                     },
                     signers: vec![EndorserIdentity {
+                        algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
                         claimed_principal: glasschain_core::Principal::new("network-governance"),
                         public_key: identity.public_key_bytes().to_vec(),
                         signature: identity.sign_bytes(&payload),

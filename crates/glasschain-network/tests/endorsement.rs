@@ -94,6 +94,7 @@ fn endorsed(
         signers: signers
             .iter()
             .map(|(identity, principal)| EndorserIdentity {
+                algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
                 claimed_principal: Principal::new(*principal),
                 public_key: identity.public_key_bytes().to_vec(),
                 signature: identity.sign_bytes(&payload),
@@ -152,6 +153,7 @@ fn activation_tx(height: u64) -> Transaction {
             hash: capability_hash("endorsement", 1),
             activation_height: height,
             signatures: vec![RecordSignature {
+                algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
                 signer: "governance".into(),
                 signature_bytes: vec![0x42],
             }],
@@ -209,6 +211,7 @@ fn custody_tx() -> Transaction {
     );
     let mut record = CanonicalRecord::new(0, "delivery_receipt", payload, "org-a");
     record.signatures.push(RecordSignature {
+        algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
         signer: "org-a".into(),
         signature_bytes: vec![0x42],
     });
@@ -235,6 +238,7 @@ fn recall_tx() -> Transaction {
     );
     let mut record = CanonicalRecord::new(0, "recall", payload, "org-a");
     record.signatures.push(RecordSignature {
+        algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
         signer: "org-a".into(),
         signature_bytes: vec![0x42],
     });
@@ -284,6 +288,7 @@ async fn setup(writes: Vec<PersistentWrite>) -> Harness {
                 hash: capability_hash("pdc", 1),
                 activation_height: 2,
                 signatures: vec![RecordSignature {
+                    algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
                     signer: "governance".into(),
                     signature_bytes: vec![0x42],
                 }],
@@ -780,6 +785,7 @@ async fn capability_activation_requires_governance_endorsement_once_active() {
             hash: capability_hash("bft_consensus", 1),
             activation_height: 10,
             signatures: vec![RecordSignature {
+                algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
                 signer: "governance".into(),
                 signature_bytes: vec![0x42],
             }],
@@ -801,6 +807,7 @@ async fn capability_activation_requires_governance_endorsement_once_active() {
             hash: capability_hash("bft_consensus", 1),
             activation_height: 10,
             signatures: vec![RecordSignature {
+                algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
                 signer: "governance".into(),
                 signature_bytes: vec![0x42],
             }],
@@ -855,6 +862,7 @@ async fn state_commitment_record_requires_issuer_and_counterparty_endorsement() 
     );
     let mut record = CanonicalRecord::new(0, "state_commitment", payload, "org-maker");
     record.signatures.push(RecordSignature {
+        algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
         signer: "org-maker".into(),
         signature_bytes: vec![0x42],
     });
@@ -882,10 +890,12 @@ async fn state_commitment_record_requires_issuer_and_counterparty_endorsement() 
     // The structural (count-only) signature check still applies at schema
     // validation; authorization itself rides the endorsement carriers below.
     record.signatures.push(RecordSignature {
+        algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
         signer: "org-a".into(),
         signature_bytes: vec![0x42],
     });
     record.signatures.push(RecordSignature {
+        algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
         signer: "org-b".into(),
         signature_bytes: vec![0x43],
     });

@@ -144,6 +144,7 @@ impl DealContext {
         issuer: &str,
     ) {
         record.signatures.push(RecordSignature {
+            algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
             signer: issuer.to_owned(),
             signature_bytes: vec![0x42],
         });
@@ -184,6 +185,7 @@ impl DealContext {
         for record in catalog_records() {
             let mut signed = record;
             signed.signatures.push(RecordSignature {
+                algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
                 signer: MAKER.to_owned(),
                 signature_bytes: vec![0x42],
             });
