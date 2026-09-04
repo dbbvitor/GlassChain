@@ -1,6 +1,11 @@
 use crate::error::NetworkError;
 use crate::peer::{PeerReader, PeerWriter};
 use crate::protocol::{Message, PROTOCOL_VERSION};
+#[cfg(feature = "bft")]
+use crate::rounds::{
+    BftRound, VoteReceipts, MAX_ROUNDS, PHASE_TIMEOUT, VALIDATOR_REGISTRY_CHANNEL,
+    VALIDATOR_REGISTRY_CONTRACT,
+};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use glasschain_contracts::ContractEngine;
 use glasschain_core::crypto::sha256;
@@ -15,6 +20,8 @@ use glasschain_core::{
     QuorumCertificate, StorageProvider, Transaction, TransactionKind, WriteOp, WriteVisibility,
     CAPABILITY_V1, ENDORSEMENT_CAPABILITY_ID,
 };
+#[cfg(feature = "bft")]
+use glasschain_core::{BftConsensusProvider, EquivocationProof, VotePhase};
 use glasschain_identity::CertChainVerifier;
 use glasschain_identity::{Channel, Identity};
 use glasschain_indexer::{
@@ -72,6 +79,15 @@ pub enum NodeEvent {
     PeerConnected(String),
     /// A peer disconnected.
     PeerDisconnected(String),
+    /// A validator equivocated: two valid BLS votes over different hashes at
+    /// the same `(height, round, phase)` (#77, ADR-009 §4). The proof is
+    /// self-verifying; exclusion is a governance act, never automatic.
+    EquivocationDetected {
+        /// Height of the conflicting votes.
+        height: u64,
+        /// The equivocating validator's BLS public key.
+        public_key: Vec<u8>,
+    },
     /// A smart contract was auto-executed.
     ContractExecuted { contract_id: String, quantity: u64 },
     /// A watcher-triggered autonomous transaction was generated.
@@ -189,6 +205,19 @@ struct NodeState {
     /// never re-derived from genesis per admission (#62 Step-0 attribution:
     /// full-chain replays per received block were the dominant, growing cost).
     capability_history: Option<CapabilityHistory>,
+    /// Active BFT round state (ADR-002 adoption gate): the candidate under
+    /// vote, the votes collected per phase, and the hash this node has locked
+    /// (precommitted) at this height — the Tendermint locking rule.
+    bft_round: Option<BftRound>,
+    /// Equivocation proofs detected at vote receipt (#77).
+    equivocations: Vec<EquivocationProof>,
+    /// The derived validator set, cached by the registry-content hash. The
+    /// set is on-chain state (Q34, ADR-009/ADR-010): world-state keys under
+    /// `governance/validator-registry`, replayed like every projection.
+    bft_validator_cache: Option<(u64, BftConsensusProvider)>,
+    /// Votes from peers are forwarded here by the message state machine; the
+    /// round driver drains them against a timeout.
+    bft_vote_tx: Option<tokio::sync::mpsc::UnboundedSender<glasschain_core::BftVote>>,
     /// TOFU peer registry: verified peer identities keyed by stable listen address.
     peer_registry: PeerRegistry,
     /// Optional CA certificate verifier; when set, peer certs must be org-issued.
@@ -493,6 +522,10 @@ impl Node {
                 known_peers: HashSet::new(),
                 peer_senders: HashMap::new(),
                 dropped_outbound: HashMap::new(),
+                bft_round: None,
+                equivocations: Vec::new(),
+                bft_validator_cache: None,
+                bft_vote_tx: None,
                 capability_history: None,
                 peer_registry: PeerRegistry::new(),
                 cert_verifier: None,
@@ -552,13 +585,12 @@ impl Node {
                 }
             }
             if valid && !chain.is_empty() {
-                let genesis_ok = chain[0].is_valid()
-                    && chain[0].has_valid_pow(difficulty)
-                    && chain[0].previous_hash == "0";
+                let genesis_ok = chain[0].is_valid() && chain[0].previous_hash == "0";
                 let chain_ok = genesis_ok
-                    && chain
-                        .windows(2)
-                        .all(|w| w[1].chains_to(&w[0]).is_ok() && w[1].has_valid_pow(difficulty));
+                    && chain.windows(2).all(|w| {
+                        w[1].chains_to(&w[0]).is_ok()
+                            && Ledger::block_consensus_admissible(&w[1], difficulty)
+                    });
                 if chain_ok {
                     l.chain = chain;
                     log::info!("Restored {} blocks from storage", l.chain.len());
@@ -1574,7 +1606,10 @@ impl Node {
                 None
             };
             if let Some(provider) = provider {
-                provider.attest(block)
+                // Vote-round driver (ADR-002 adoption gate): prevote →
+                // precommit phases over the wire produce a real multi-signer
+                // aggregate certificate.
+                self.run_vote_round(block, &provider).await?
             } else {
                 block.mine(difficulty);
                 CommitNotification::for_pow_block(block)
@@ -2070,6 +2105,159 @@ impl Node {
             .effective_set(height))
     }
 
+    /// The BFT vote-round driver (ADR-002 adoption gate, ADR-014): two
+    /// phases — prevote, then precommit — with per-phase timeouts. The
+    /// proposer for `(height, round)` is round-robin over the on-chain
+    /// validator registry; on timeout the round increments (view change).
+    /// Locked validators prevote their locked hash; the leader proposes its
+    /// locked block when it holds one.
+    #[cfg(feature = "bft")]
+    #[allow(clippy::too_many_lines)]
+    async fn run_vote_round(
+        &self,
+        mut block: Block,
+        attached: &Arc<BftConsensusProvider>,
+    ) -> Result<CommitNotification, CoreError> {
+        block.hash = block.calculate_hash();
+        let height = block.index;
+        let mut round = 0u32;
+        loop {
+            // Derive the set from the on-chain registry; fall back to the
+            // attached provider's static set when the registry is empty
+            // (bootstrap).
+            let provider = {
+                let mut s = self.state.lock().await;
+                derive_validator_provider(&mut s).unwrap_or_else(|| (**attached).clone())
+            };
+            let quorum = provider.quorum();
+            let local_index = provider
+                .validators()
+                .iter()
+                .position(|validator| validator.public_key == provider.public_key());
+            let Some(local_index) = local_index else {
+                return Err(CoreError::InvalidTransaction(
+                    "bft: this node's key is not in the derived validator set".into(),
+                ));
+            };
+            let is_leader = crate::rounds::proposer_index(&provider, height, round) == local_index;
+
+            // Register the round + the vote collector for this attempt.
+            let (vote_tx, mut vote_rx) = tokio::sync::mpsc::unbounded_channel();
+            {
+                let mut s = self.state.lock().await;
+                let locked = s
+                    .bft_round
+                    .as_ref()
+                    .filter(|r| r.height == height)
+                    .and_then(|r| r.locked.clone());
+                s.bft_round = Some(crate::rounds::BftRound {
+                    height,
+                    round,
+                    locked,
+                    proposal: is_leader.then(|| block.clone()),
+                });
+                s.bft_vote_tx = Some(vote_tx);
+            }
+
+            if !is_leader {
+                // This node does not drive the round; the committed block
+                // arrives through the peer path.
+                self.state.lock().await.bft_vote_tx = None;
+                return Err(CoreError::InvalidTransaction(
+                    "bft: not the round leader — waiting for the committed block".into(),
+                ));
+            }
+
+            // ── Phase 1: prevote ────────────────────────────────────────────
+            self.broadcast(Message::Proposal {
+                block: block.clone(),
+                round,
+            })
+            .await;
+            let mut prevotes =
+                vec![provider.sign_vote(height, round, VotePhase::Prevote, &block.hash)];
+            while prevotes.len() < quorum {
+                match tokio::time::timeout(PHASE_TIMEOUT, vote_rx.recv()).await {
+                    Ok(Some(vote))
+                        if vote.height == height
+                            && vote.round == round
+                            && vote.phase == VotePhase::Prevote =>
+                    {
+                        prevotes.push(vote);
+                    }
+                    Ok(Some(_)) => {}
+                    _ => break,
+                }
+            }
+            log::debug!(
+                "bft round {round} at height {height}: {}/{} prevotes",
+                prevotes.len(),
+                quorum
+            );
+            if prevotes.len() < quorum {
+                round += 1;
+                if round >= MAX_ROUNDS {
+                    self.state.lock().await.bft_vote_tx = None;
+                    return Err(CoreError::InvalidTransaction(
+                        "bft: quorum not reached within the round budget".into(),
+                    ));
+                }
+                continue;
+            }
+            let (prevote_bitmap, prevote_aggregate) = provider.aggregate_votes(&prevotes)?;
+            let prevote_certificate = QuorumCertificate {
+                block_index: height,
+                block_hash: block.hash.clone(),
+                signers_bitmap: prevote_bitmap,
+                aggregate_signature: prevote_aggregate,
+                algorithm: glasschain_core::wire::SignatureAlgorithm::Bls12381,
+            };
+
+            // ── Phase 2: precommit (justified by the prevote quorum) ───────
+            self.broadcast(Message::Precommit {
+                block: block.clone(),
+                round,
+                prevote_certificate,
+            })
+            .await;
+            let mut precommits =
+                vec![provider.sign_vote(height, round, VotePhase::Precommit, &block.hash)];
+            while precommits.len() < quorum {
+                match tokio::time::timeout(PHASE_TIMEOUT, vote_rx.recv()).await {
+                    Ok(Some(vote))
+                        if vote.height == height
+                            && vote.round == round
+                            && vote.phase == VotePhase::Precommit =>
+                    {
+                        precommits.push(vote);
+                    }
+                    Ok(Some(_)) => {}
+                    _ => break,
+                }
+            }
+            self.state.lock().await.bft_vote_tx = None;
+            if precommits.len() < quorum {
+                round += 1;
+                if round >= MAX_ROUNDS {
+                    return Err(CoreError::InvalidTransaction(
+                        "bft: precommit quorum not reached within the round budget".into(),
+                    ));
+                }
+                continue;
+            }
+            let (signers_bitmap, aggregate_signature) = provider.aggregate_votes(&precommits)?;
+            let certificate = QuorumCertificate {
+                block_index: height,
+                block_hash: block.hash.clone(),
+                signers_bitmap,
+                aggregate_signature,
+                algorithm: glasschain_core::wire::SignatureAlgorithm::Bls12381,
+            };
+            block.certificate = Some(certificate.clone());
+            return Ok(CommitNotification { block, certificate });
+        }
+    }
+
     /// Cumulative outbound drops per peer address (read-only visibility for
     /// operators and tests; #62 §5.6 item 2).
     pub async fn dropped_outbound(&self, addr: &str) -> u64 {
@@ -2330,6 +2518,224 @@ struct PeerContext {
     storage: Arc<dyn StorageProvider>,
 }
 
+// ── BFT round message handlers (ADR-002 adoption gate, ADR-014) ─────────────
+
+/// Validator side of phase 1: verify the leader's candidate, prevote it (or
+/// abstain when locked elsewhere — the timeout drives the view change).
+#[cfg(feature = "bft")]
+async fn handle_proposal(
+    ctx: &PeerContext,
+    write_tx: &Sender<Message>,
+    block: Block,
+    round: u32,
+) -> MessageEffect {
+    let mut s = ctx.state.lock().await;
+    // Validators learn `(height, round)` from the Proposal itself; a lock at
+    // the same height is preserved across rounds (Tendermint locking rule).
+    let mut round_state = match s.bft_round.take() {
+        Some(existing) if existing.height == block.index => {
+            let mut fresh = crate::rounds::BftRound::new(block.index);
+            fresh.locked = existing.locked;
+            fresh
+        }
+        Some(otherwise) => otherwise,
+        None => crate::rounds::BftRound::new(block.index),
+    };
+    round_state.round = round;
+    // Locking rule: a validator locked on another hash abstains; the round
+    // timeout advances the view.
+    let locked_elsewhere = round_state
+        .locked
+        .as_ref()
+        .is_some_and(|locked| locked != &block.hash);
+    let mut valid_candidate = !locked_elsewhere;
+    if valid_candidate {
+        let chains_ok = {
+            let ledger = ctx.ledger.lock().await;
+            ledger
+                .chain
+                .last()
+                .is_some_and(|previous| block.chains_to(previous).is_ok())
+        };
+        // Capability rules on a scratch history (the candidate is not yet
+        // committed).
+        valid_candidate = chains_ok && {
+            let mut history = s.capability_history.clone().unwrap_or_default();
+            history.validate_block(&block).is_ok()
+        };
+    }
+    let vote = valid_candidate
+        .then(|| derive_validator_provider(&mut s))
+        .flatten()
+        .map(|provider| provider.sign_vote(block.index, round, VotePhase::Prevote, &block.hash));
+    if let Some(vote) = vote {
+        round_state.proposal = Some(block);
+        s.bft_round = Some(round_state);
+        drop(s);
+        if write_tx.send(Message::Vote(vote)).await.is_err() {
+            log::warn!("Failed to deliver prevote to the round leader");
+        }
+    } else {
+        s.bft_round = Some(round_state);
+        drop(s);
+    }
+    MessageEffect::default()
+}
+
+/// Leader side: verify the vote against the derived set, record equivocation
+/// evidence (#77), and forward it to the round driver's collector.
+#[cfg(feature = "bft")]
+async fn handle_vote(ctx: &PeerContext, vote: glasschain_core::BftVote) -> MessageEffect {
+    let mut detected: Option<EquivocationProof> = None;
+    {
+        let mut s = ctx.state.lock().await;
+        let Some(provider) = derive_validator_provider(&mut s) else {
+            return MessageEffect::default();
+        };
+        if provider.verify_vote(&vote).is_err() {
+            log::warn!("Rejecting BFT vote: verification failed");
+            return MessageEffect::default();
+        }
+        let mut receipts = VoteReceipts::default();
+        // Receipts live for the node's lifetime — re-seed from prior
+        // detections so repeat equivocation stays observable.
+        for proof in &s.equivocations {
+            let replay = glasschain_core::BftVote {
+                height: proof.height,
+                round: proof.round,
+                phase: proof.phase,
+                block_hash: proof.second_block_hash.clone(),
+                public_key: proof.public_key.clone(),
+                signature: proof.second_signature.clone(),
+                algorithm: glasschain_core::wire::SignatureAlgorithm::Bls12381,
+            };
+            let _ = receipts.record(&replay);
+        }
+        if let Some(proof) = receipts.record(&vote) {
+            if proof.verify().is_ok() {
+                log::warn!(
+                    "Equivocation detected at height {} (round {}): proof recorded",
+                    proof.height,
+                    proof.round
+                );
+                detected = Some(proof.clone());
+                s.equivocations.push(proof);
+            }
+        }
+        if let Some(vote_tx) = &s.bft_vote_tx {
+            let _ = vote_tx.send(vote);
+        }
+    }
+    if let Some(proof) = detected {
+        let _ = ctx.event_tx.send(NodeEvent::EquivocationDetected {
+            height: proof.height,
+            public_key: proof.public_key,
+        });
+    }
+    MessageEffect::default()
+}
+
+/// Validator side of phase 2: the leader's prevote quorum justifies locking
+/// the hash and precommitting it.
+#[cfg(feature = "bft")]
+async fn handle_precommit(
+    ctx: &PeerContext,
+    write_tx: &Sender<Message>,
+    block: Block,
+    round: u32,
+    prevote_certificate: QuorumCertificate,
+) -> MessageEffect {
+    let mut s = ctx.state.lock().await;
+    let Some(mut round_state) = s.bft_round.take() else {
+        drop(s);
+        return MessageEffect::default();
+    };
+    if round_state.height != block.index || round_state.round != round {
+        s.bft_round = Some(round_state);
+        drop(s);
+        return MessageEffect::default();
+    }
+    let Some(provider) = derive_validator_provider(&mut s) else {
+        s.bft_round = Some(round_state);
+        drop(s);
+        return MessageEffect::default();
+    };
+    if provider
+        .verify_certificate(&prevote_certificate, &block)
+        .is_err()
+    {
+        log::warn!("Rejecting precommit phase: invalid prevote certificate");
+        s.bft_round = Some(round_state);
+        drop(s);
+        return MessageEffect::default();
+    }
+    // Lock on the prevote quorum (Tendermint locking rule).
+    round_state.locked = Some(block.hash.clone());
+    let vote = provider.sign_vote(block.index, round, VotePhase::Precommit, &block.hash);
+    s.bft_round = Some(round_state);
+    drop(s);
+    if write_tx.send(Message::Vote(vote)).await.is_err() {
+        log::warn!("Failed to deliver precommit vote to the round leader");
+    }
+    MessageEffect::default()
+}
+
+/// Derive the validator provider from the on-chain registry (Q34): the set is
+/// world state under `governance/validator-registry/<name>`, replayed like
+/// every projection, cached by content hash. The node's own signing key comes
+/// from the attached provider.
+#[cfg(feature = "bft")]
+fn derive_validator_provider(s: &mut NodeState) -> Option<BftConsensusProvider> {
+    let prefix = format!("ws:{VALIDATOR_REGISTRY_CHANNEL}:{VALIDATOR_REGISTRY_CONTRACT}:");
+    let mut entries: Vec<(String, Vec<u8>, Vec<u8>)> = s
+        .world_state
+        .iter()
+        .filter_map(|(key, value)| {
+            let name = key.strip_prefix(&prefix)?.to_owned();
+            let descriptor: serde_json::Value = serde_json::from_slice(value).ok()?;
+            let public_key = descriptor
+                .get("public_key")?
+                .as_str()
+                .and_then(glasschain_core::wire::base64_decode)?;
+            let pop = descriptor
+                .get("pop")?
+                .as_str()
+                .and_then(glasschain_core::wire::base64_decode)?;
+            Some((name, public_key, pop))
+        })
+        .collect();
+    entries.sort();
+    let attached = s.consensus.as_ref()?;
+    let signing_key = *attached.signing_key();
+    let content_hash = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        entries.hash(&mut hasher);
+        hasher.finish()
+    };
+    if let Some((cached_hash, cached)) = &s.bft_validator_cache {
+        if *cached_hash == content_hash {
+            return Some(cached.clone());
+        }
+    }
+    let validators: Vec<glasschain_core::ValidatorInfo> = entries
+        .into_iter()
+        .map(|(name, public_key, pop)| glasschain_core::ValidatorInfo {
+            name,
+            public_key,
+            pop,
+        })
+        .collect();
+    if validators.is_empty() {
+        return None;
+    }
+    let provider = BftConsensusProvider::new(validators, signing_key).ok()?;
+    s.bft_validator_cache = Some((content_hash, provider.clone()));
+    Some(provider)
+}
+
+/// Handle a single peer connection (inbound or outbound).
 /// Handle a single peer connection (inbound or outbound).
 ///
 /// Reader and writer halves are passed in directly (already split from a TLS
@@ -2842,6 +3248,17 @@ async fn process_message(
 
             let (should_append, too_far_ahead) = {
                 let mut s = ctx.state.lock().await;
+                let bft_consensus_active = {
+                    let next_height = {
+                        let l = ctx.ledger.lock().await;
+                        l.chain.len() as u64
+                    };
+                    s.capability_history.as_ref().is_some_and(|history| {
+                        history
+                            .effective_set(next_height)
+                            .is_active(BFT_CONSENSUS_CAPABILITY_ID)
+                    })
+                };
                 if s.capability_history.is_none() {
                     let l = ctx.ledger.lock().await;
                     match CapabilityHistory::build_from_blocks(&l.chain) {
@@ -2859,10 +3276,23 @@ async fn process_message(
                         // The clone is discarded; the commit choke point
                         // advances the shared cache.
                         let mut history = s.capability_history.clone().unwrap_or_default();
-                        let valid = block.chains_to(prev).is_ok()
-                            && block.has_valid_pow(diff)
-                            && history.validate_block(&block).is_ok();
-                        (valid, false)
+                        let chains = block.chains_to(prev).is_ok();
+                        if !chains {
+                            return (false, false);
+                        }
+                        let capability_valid = history.validate_block(&block).is_ok();
+                        // Consensus admission: BFT blocks (certificate-bearing,
+                        // ADR-014) verify against the derived validator set;
+                        // PoW stays the rule while the capability is dormant.
+                        let consensus_valid = match (&block.certificate, bft_consensus_active) {
+                            (Some(certificate), true) if !certificate.is_degenerate() => {
+                                derive_validator_provider(&mut s).is_some_and(|provider| {
+                                    provider.verify_certificate(certificate, &block).is_ok()
+                                })
+                            }
+                            _ => block.has_valid_pow(diff),
+                        };
+                        (capability_valid && consensus_valid, false)
                     })
                 } else {
                     (false, block.index > expected)
@@ -3178,6 +3608,24 @@ async fn process_message(
             }
             MessageEffect::default()
         }
+        #[cfg(feature = "bft")]
+        Message::Proposal { block, round } => handle_proposal(ctx, write_tx, block, round).await,
+        #[cfg(feature = "bft")]
+        Message::Vote(vote) => handle_vote(ctx, vote).await,
+        #[cfg(feature = "bft")]
+        Message::Precommit {
+            block,
+            round,
+            prevote_certificate,
+        } => handle_precommit(ctx, write_tx, block, round, prevote_certificate).await,
+        #[cfg(not(feature = "bft"))]
+        Message::Proposal { .. } | Message::Vote(_) | Message::Precommit { .. } => {
+            // A node built without the `bft` feature cannot join rounds;
+            // the capability advertisement keeps it read-only (ADR-010).
+            log::debug!("Ignoring BFT round message (bft feature disabled)");
+            MessageEffect::default()
+        }
+
         Message::Goodbye { reason } => {
             log::info!("Peer {addr} says goodbye: {reason}");
             MessageEffect::default()

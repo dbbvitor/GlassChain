@@ -1,3 +1,4 @@
+use crate::consensus::QuorumCertificate;
 use crate::crypto::sha256;
 use crate::error::CoreError;
 use crate::transaction::Transaction;
@@ -29,6 +30,13 @@ pub struct Block {
     pub nonce: u64,
     /// SHA-256 hash of the block's canonical content (including `nonce`).
     pub hash: String,
+    /// The quorum certificate attesting this block, attached by the BFT round
+    /// driver (ADR-014). Deliberately excluded from `calculate_hash` (the
+    /// certificate attests the hash, not vice versa) and absent from `PoW`
+    /// blocks. Persisted with the block so syncing nodes can verify finality
+    /// (this closes the certificate-persistence ADR-010 gate).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<QuorumCertificate>,
 }
 
 impl Block {
@@ -111,6 +119,7 @@ impl Block {
             previous_hash,
             nonce: 0,
             hash: String::new(),
+            certificate: None,
         };
         block.hash = block.calculate_hash();
         block

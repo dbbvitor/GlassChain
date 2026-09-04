@@ -1,4 +1,4 @@
-use glasschain_core::{Block, CapabilityAdvertisement, Transaction};
+use glasschain_core::{Block, CapabilityAdvertisement, QuorumCertificate, Transaction};
 use serde::{Deserialize, Serialize};
 
 /// Maximum wire-frame size accepted (16 MiB).
@@ -55,6 +55,32 @@ pub enum Message {
 
     /// Announce a newly mined block.
     Block(Block),
+
+    /// BFT round driver (ADR-002 adoption gate, ADR-014): the round leader
+    /// proposes a candidate block for `(height, round)`. Validators verify and
+    /// answer with [`Message::Vote`].
+    Proposal {
+        /// The candidate block (pre-certificate).
+        block: Block,
+        /// The round this proposal belongs to (increments on timeout — view
+        /// change).
+        round: u32,
+    },
+
+    /// A validator's phase-tagged BLS vote over a candidate hash, sent to the
+    /// round leader. Prevotes justify precommits; a precommit quorum commits.
+    Vote(glasschain_core::BftVote),
+
+    /// The leader re-broadcasts the candidate with the valid prevote quorum
+    /// attached: seeing it, validators lock the hash and send precommit votes.
+    Precommit {
+        /// The candidate block (pre-certificate).
+        block: Block,
+        /// Round (must match the votes that built `prevote_certificate`).
+        round: u32,
+        /// The prevote quorum certificate.
+        prevote_certificate: QuorumCertificate,
+    },
 
     /// A private data collection payload, sent **point-to-point** between
     /// collection members only (ADR-003, ticket #46) — never broadcast. The

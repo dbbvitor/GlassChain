@@ -1,5 +1,4 @@
 pub mod asset;
-#[cfg(feature = "bft")]
 pub mod bft;
 pub mod block;
 pub mod canonical;
@@ -18,6 +17,7 @@ pub mod write_set;
 pub use asset::{MetadataTrustScore, TraceableAsset, TRUST_SCORE_STANDARD_THRESHOLD};
 #[cfg(feature = "bft")]
 pub use bft::{BftConsensusProvider, ValidatorInfo};
+pub use bft::{BftVote, EquivocationProof, VotePhase};
 pub use block::Block;
 pub use canonical::{
     migrate_legacy_asset, validate_record, validate_record_with, CanonicalRecord,

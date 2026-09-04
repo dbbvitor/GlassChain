@@ -3,6 +3,7 @@ pub mod libp2p_swarm;
 pub mod node;
 pub mod peer;
 pub mod protocol;
+pub mod rounds;
 
 pub use error::NetworkError;
 pub use libp2p_swarm::{
