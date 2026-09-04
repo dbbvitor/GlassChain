@@ -47,6 +47,12 @@ currently has no economics model to draw on (Stage 4).
 
 ### 2. Eligibility: an objective, published bar (ADR-002 Q5 — closed)
 
+Placement rule: the epoch rotation additionally enforces the
+[liveness](liveness.md) diversity constraint — the seeded walk skips a
+candidate whose seating would put any failure domain over 25% (or any
+jurisdiction over 40%) of the active set. The skip is deterministic and
+published with the rotation order.
+
 An organization is **eligible** for a validator slot when it meets every item
 of a published, independently checkable bar. Each criterion must be verifiable
 by any member from the record alone — no discretionary judgment:
