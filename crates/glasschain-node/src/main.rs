@@ -669,6 +669,11 @@ async fn main() {
                 NodeEvent::PeerConnected(addr) => {
                     log::info!("[event] Peer connected: {addr}");
                 }
+                NodeEvent::EquivocationDetected { height, .. } => {
+                    log::warn!(
+                        "[event] EQUIVOCATION detected at height {height} - proof recorded for governance (ADR-009 section 4)"
+                    );
+                }
                 NodeEvent::PeerDisconnected(addr) => {
                     log::info!("[event] Peer disconnected: {addr}");
                 }

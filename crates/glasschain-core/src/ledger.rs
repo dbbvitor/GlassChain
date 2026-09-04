@@ -46,6 +46,7 @@ impl Ledger {
             previous_hash: "0".to_owned(),
             nonce: 0,
             hash: String::new(),
+            certificate: None,
         };
         genesis.hash = genesis.calculate_hash();
         genesis.mine(difficulty);
@@ -208,14 +209,30 @@ impl Ledger {
     /// Returns `Err(CoreError::InvalidBlock)` if any block fails its internal
     /// hash check, does not chain correctly to its predecessor, or does not
     /// satisfy the configured Proof-of-Work difficulty target.
+    /// Consensus admission for a block inside this ledger: `PoW` difficulty
+    /// **or** a non-degenerate BFT certificate whose structure matches the
+    /// block (ADR-014). Deep certificate verification is the node's job
+    /// (it owns the derived validator set); the ledger checks shape only.
+    #[must_use]
+    pub fn block_consensus_admissible(block: &Block, difficulty: usize) -> bool {
+        block.has_valid_pow(difficulty)
+            || block.certificate.as_ref().is_some_and(|certificate| {
+                !certificate.is_degenerate() && certificate.validate(block).is_ok()
+            })
+    }
+
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidBlock`] when any block fails chaining,
+    /// consensus admission, or capability validation.
     pub fn validate_chain(&self) -> Result<(), CoreError> {
         for i in 1..self.chain.len() {
             let current = &self.chain[i];
             let previous = &self.chain[i - 1];
             current.chains_to(previous)?;
-            if !current.has_valid_pow(self.difficulty) {
+            if !Self::block_consensus_admissible(current, self.difficulty) {
                 return Err(CoreError::InvalidBlock(format!(
-                    "block {} does not satisfy PoW difficulty {}",
+                    "block {} does not satisfy PoW difficulty {} and carries no valid certificate",
                     current.index, self.difficulty
                 )));
             }
@@ -262,7 +279,7 @@ impl Ledger {
             if candidate[i].chains_to(&candidate[i - 1]).is_err() {
                 return false;
             }
-            if !candidate[i].has_valid_pow(self.difficulty) {
+            if !Self::block_consensus_admissible(&candidate[i], self.difficulty) {
                 return false;
             }
             // Commit gate for peer blocks: canonical records and capability

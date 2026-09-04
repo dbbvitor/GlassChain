@@ -40,6 +40,19 @@ pub mod base64_bytes {
     }
 }
 
+/// Decode a standard base64 string (shared helper for wire-side consumers).
+///
+/// # Errors
+///
+/// Returns `None` when the string is not valid base64.
+#[must_use]
+pub fn base64_decode(encoded: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()
+}
+
 /// The signature algorithm that produced a key/signature pair.
 ///
 /// Post-quantum plan action 2: every signature carrier names its algorithm;

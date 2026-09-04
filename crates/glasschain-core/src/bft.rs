@@ -1,10 +1,13 @@
 use crate::consensus::{CommitNotification, QuorumCertificate};
 use crate::error::CoreError;
+use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "bft")]
+use bls_signatures::{PrivateKey, PublicKey, Serialize as BlsSerialize, Signature};
+
 use crate::providers::ConsensusProvider;
 use crate::transaction::Transaction;
 use crate::Block;
-use bls_signatures::{PrivateKey, PublicKey, Serialize as BlsSerialize, Signature};
-
 /// One validator in the BFT validator set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatorInfo {
@@ -35,6 +38,8 @@ impl ValidatorInfo {
 /// plus the local proposer's BLS signing key. The validator set is static
 /// configuration until the ADR-009 rotation machinery lands with the BFT
 /// adoption gate (ADR-010).
+#[cfg(feature = "bft")]
+#[derive(Clone)]
 pub struct BftConsensusProvider {
     /// Validators in canonical index order — the order the certificate bitmap
     /// addresses.
@@ -43,6 +48,7 @@ pub struct BftConsensusProvider {
     signing_key: PrivateKey,
 }
 
+#[cfg(feature = "bft")]
 impl BftConsensusProvider {
     /// Build a provider over `validators`, signing with `signing_key`.
     ///
@@ -98,6 +104,21 @@ impl BftConsensusProvider {
         self.signing_key.public_key().as_bytes()
     }
 
+    /// The local proposer's BLS signing key — the round driver rebuilds the
+    /// provider when the on-chain validator registry changes (Q34) while the
+    /// node's own key stays fixed.
+    #[must_use]
+    pub const fn signing_key(&self) -> &PrivateKey {
+        &self.signing_key
+    }
+
+    /// The canonical validator order (name, key bytes) — the bitmap's index
+    /// space.
+    #[must_use]
+    pub fn validators(&self) -> &[ValidatorInfo] {
+        &self.validators
+    }
+
     /// The validator set size.
     #[must_use]
     pub const fn validator_count(&self) -> usize {
@@ -130,7 +151,7 @@ impl BftConsensusProvider {
     #[must_use]
     pub fn attest(&self, mut block: Block) -> CommitNotification {
         block.hash = block.calculate_hash();
-        let signature = self.signing_key.sign(block.hash.as_bytes());
+        let signature = self.signing_key.sign(BftVote::vote_message(&block.hash));
         let mut signers_bitmap = vec![0u8; self.validators.len().div_ceil(8)];
         if let Some(index) = self.local_index() {
             signers_bitmap[index / 8] |= 1 << (index % 8);
@@ -143,6 +164,64 @@ impl BftConsensusProvider {
             algorithm: crate::wire::SignatureAlgorithm::Bls12381,
         };
         CommitNotification { block, certificate }
+    }
+
+    /// Sign a vote for the current round driver (phase-tagged, set-checked on
+    /// receipt by [`Self::verify_vote`]).
+    #[must_use]
+    pub fn sign_vote(
+        &self,
+        height: u64,
+        round: u32,
+        phase: VotePhase,
+        block_hash: &str,
+    ) -> BftVote {
+        BftVote::sign(height, round, phase, block_hash, &self.signing_key)
+    }
+
+    /// Verify a vote against this validator set: self-verification plus
+    /// membership — the voter's key must belong to a set validator. Returns
+    /// the voter's bitmap index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidBlock`] when the vote does not verify or
+    /// the voter is not in the set.
+    pub fn verify_vote(&self, vote: &BftVote) -> Result<usize, CoreError> {
+        vote.verify()?;
+        self.validators
+            .iter()
+            .position(|validator| validator.public_key == vote.public_key)
+            .ok_or_else(|| {
+                CoreError::InvalidBlock("bft: vote from a validator outside the set".into())
+            })
+    }
+
+    /// Verify every vote, check membership, and aggregate: returns the signer
+    /// bitmap over the set's canonical order plus the aggregate signature —
+    /// the material a [`QuorumCertificate`] is built from. Duplicate voters
+    /// are collapsed; every signature is still verified.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidBlock`] when any vote fails verification.
+    pub fn aggregate_votes(&self, votes: &[BftVote]) -> Result<(Vec<u8>, Vec<u8>), CoreError> {
+        let mut signers_bitmap = vec![0u8; self.validators.len().div_ceil(8)];
+        let mut signatures: Vec<Signature> = Vec::with_capacity(votes.len());
+        for vote in votes {
+            let index = self.verify_vote(vote)?;
+            if signers_bitmap[index / 8] & (1 << (index % 8)) == 0 {
+                signers_bitmap[index / 8] |= 1 << (index % 8);
+                signatures.push(
+                    Signature::from_bytes(vote.signature.as_slice()).map_err(|e| {
+                        CoreError::InvalidBlock(format!("bft: invalid vote signature: {e}"))
+                    })?,
+                );
+            }
+        }
+        let aggregate = bls_signatures::aggregate(&signatures)
+            .map_err(|e| CoreError::InvalidBlock(format!("bft: vote aggregation failed: {e}")))?;
+        Ok((signers_bitmap, aggregate.as_bytes()))
     }
 
     /// Verify a quorum certificate: the bitmap must name a quorum of known
@@ -204,7 +283,7 @@ impl BftConsensusProvider {
             Signature::from_bytes(certificate.aggregate_signature.as_slice()).map_err(|e| {
                 CoreError::InvalidBlock(format!("bft: invalid BLS aggregate signature: {e}"))
             })?;
-        let block_hash = bls_signatures::hash(block.hash.as_bytes());
+        let block_hash = bls_signatures::hash(BftVote::vote_message(&block.hash).as_slice());
         if !verify_same_message_multisig(&aggregate, &public_keys, &block_hash) {
             return Err(CoreError::InvalidBlock(format!(
                 "bft: aggregate signature does not verify over block {} ({} signers)",
@@ -224,6 +303,7 @@ impl BftConsensusProvider {
 /// aggregate verify (it enforces message uniqueness as its rogue-key
 /// countermeasure); the same-message form is what a quorum certificate needs,
 /// and proof-of-possession replaces the uniqueness requirement.
+#[cfg(feature = "bft")]
 fn verify_same_message_multisig(
     aggregate: &Signature,
     public_keys: &[[u8; 48]],
@@ -247,6 +327,7 @@ fn verify_same_message_multisig(
     multi_miller_loop(&refs).final_exponentiation() == Gt::identity()
 }
 
+#[cfg(feature = "bft")]
 impl ConsensusProvider for BftConsensusProvider {
     fn propose_block(
         &self,
@@ -277,7 +358,192 @@ impl ConsensusProvider for BftConsensusProvider {
     }
 }
 
-#[cfg(test)]
+/// The two phases of a BFT round (ADR-002 adoption-gate build): a validator
+/// prevotes a candidate hash, and — once a valid prevote quorum exists —
+/// precommits it. Commit happens on a precommit quorum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum VotePhase {
+    #[default]
+    Prevote,
+    Precommit,
+}
+
+impl VotePhase {
+    /// Routing metadata: which phase the vote belongs to. Phase is enforced
+    /// by message flow (a prevote quorum justifies precommits), not by the
+    /// signed message — vote signatures commit to the candidate hash only, so
+    /// the round's aggregate verifies as an ADR-014 certificate.
+    #[must_use]
+    pub const fn tag(self) -> u8 {
+        match self {
+            Self::Prevote => 0,
+            Self::Precommit => 1,
+        }
+    }
+}
+
+/// One validator's BLS vote over a candidate block hash at `(height, round)`.
+/// The signature message is domain-separated per phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BftVote {
+    /// Height being voted on.
+    pub height: u64,
+    /// Round within the height (increments on timeout — view change).
+    pub round: u32,
+    /// The phase this vote belongs to.
+    pub phase: VotePhase,
+    /// The candidate block hash being voted for.
+    pub block_hash: String,
+    /// The voter's BLS public key (G1, 48 bytes).
+    #[serde(with = "crate::wire::base64_bytes")]
+    pub public_key: Vec<u8>,
+    /// BLS signature over the phase-tagged vote message, base64 on the wire.
+    #[serde(with = "crate::wire::base64_bytes")]
+    pub signature: Vec<u8>,
+    /// The vote-signature algorithm (post-quantum plan action 2).
+    #[serde(
+        default,
+        skip_serializing_if = "crate::wire::SignatureAlgorithm::is_ed25519"
+    )]
+    pub algorithm: crate::wire::SignatureAlgorithm,
+}
+
+#[cfg(feature = "bft")]
+impl BftVote {
+    /// The exact message a vote signature commits to: the candidate hash,
+    /// domain-separated from every other signature purpose in the system.
+    /// Height/round/phase are routing metadata; the aggregate over these
+    /// signatures is exactly an ADR-014 certificate over the block hash.
+    ///
+    /// # Panics
+    ///
+    /// Never for real hashes: the length cast is guarded and JSON hashes are
+    /// short.
+    #[must_use]
+    pub fn vote_message(block_hash: &str) -> Vec<u8> {
+        let mut msg = b"glasschain-bft-vote:".to_vec();
+        let hash = block_hash.as_bytes();
+        #[allow(clippy::cast_possible_truncation)]
+        let len32 = u32::try_from(hash.len()).expect("hash length fits u32");
+        msg.extend_from_slice(&len32.to_be_bytes());
+        msg.extend_from_slice(hash);
+        msg
+    }
+
+    /// Sign a vote with `signing_key`.
+    #[must_use]
+    pub fn sign(
+        height: u64,
+        round: u32,
+        phase: VotePhase,
+        block_hash: &str,
+        signing_key: &PrivateKey,
+    ) -> Self {
+        let message = Self::vote_message(block_hash);
+        Self {
+            height,
+            round,
+            phase,
+            block_hash: block_hash.to_owned(),
+            public_key: signing_key.public_key().as_bytes(),
+            signature: signing_key.sign(message).as_bytes(),
+            algorithm: crate::wire::SignatureAlgorithm::Bls12381,
+        }
+    }
+
+    /// Cryptographic self-verification: the signature must verify over this
+    /// vote's own phase/height/round/hash under `public_key`. Validator-set
+    /// membership is the caller's check (the set is height-dependent).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidBlock`] for malformed keys/signatures or a
+    /// signature that does not verify.
+    pub fn verify(&self) -> Result<(), CoreError> {
+        if self.algorithm != crate::wire::SignatureAlgorithm::Bls12381 {
+            return Err(CoreError::InvalidBlock(format!(
+                "bft: vote algorithm must be Bls12381, got {:?}",
+                self.algorithm
+            )));
+        }
+        let public = PublicKey::from_bytes(self.public_key.as_slice()).map_err(|e| {
+            CoreError::InvalidBlock(format!("bft: vote has an invalid BLS public key: {e}"))
+        })?;
+        let signature = Signature::from_bytes(self.signature.as_slice()).map_err(|e| {
+            CoreError::InvalidBlock(format!("bft: vote has an invalid BLS signature: {e}"))
+        })?;
+        let message = Self::vote_message(&self.block_hash);
+        if !public.verify(signature, message) {
+            return Err(CoreError::InvalidBlock(format!(
+                "bft: vote signature does not verify (height {}, round {}, phase {:?})",
+                self.height, self.round, self.phase
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Self-verifying evidence of validator equivocation (ADR-009 §4, #77).
+///
+/// One validator signed two different candidate hashes in the same
+/// `(height, round, phase)`. Both signatures verify individually; no
+/// reputation, no weighting, no automatic ejection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EquivocationProof {
+    pub height: u64,
+    pub round: u32,
+    pub phase: VotePhase,
+    /// The equivocating validator's BLS public key.
+    #[serde(with = "crate::wire::base64_bytes")]
+    pub public_key: Vec<u8>,
+    /// First conflicting vote signature.
+    #[serde(with = "crate::wire::base64_bytes")]
+    pub first_signature: Vec<u8>,
+    pub first_block_hash: String,
+    /// Second conflicting vote signature.
+    #[serde(with = "crate::wire::base64_bytes")]
+    pub second_signature: Vec<u8>,
+    pub second_block_hash: String,
+}
+
+#[cfg(feature = "bft")]
+impl EquivocationProof {
+    /// Self-verification: both signatures verify over their own hashes under
+    /// `public_key`, and the hashes differ. Validator-set membership is the
+    /// caller's check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidBlock`] when the proof does not verify.
+    pub fn verify(&self) -> Result<(), CoreError> {
+        if self.first_block_hash == self.second_block_hash {
+            return Err(CoreError::InvalidBlock(
+                "equivocation proof: both votes name the same hash — not equivocation".into(),
+            ));
+        }
+        let public = PublicKey::from_bytes(self.public_key.as_slice()).map_err(|e| {
+            CoreError::InvalidBlock(format!("equivocation proof: invalid BLS public key: {e}"))
+        })?;
+        for (hash, sig) in [
+            (&self.first_block_hash, &self.first_signature),
+            (&self.second_block_hash, &self.second_signature),
+        ] {
+            let signature = Signature::from_bytes(sig.as_slice()).map_err(|e| {
+                CoreError::InvalidBlock(format!("equivocation proof: invalid signature: {e}"))
+            })?;
+            let message = BftVote::vote_message(hash);
+            if !public.verify(signature, message) {
+                return Err(CoreError::InvalidBlock(
+                    "equivocation proof: a signature does not verify under the validator key"
+                        .into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "bft"))]
 mod tests {
     use super::*;
     use crate::Ledger;
@@ -316,7 +582,7 @@ mod tests {
     ) -> QuorumCertificate {
         let signatures: Vec<Signature> = keys
             .iter()
-            .map(|key| key.sign(block.hash.as_bytes()))
+            .map(|key| key.sign(BftVote::vote_message(&block.hash)))
             .collect();
         let mut signers_bitmap = vec![0u8; keys.len().div_ceil(8)];
         for &index in signers {
@@ -398,12 +664,36 @@ mod tests {
         // A decode-valid aggregate over the WRONG message: flips land in the
         // subgroup check at decode ("Group decode error") — this exercises
         // the pairing failure instead.
-        let wrong = keys[0].sign("a different message entirely");
+        let wrong = keys[0].sign(BftVote::vote_message("a different block hash"));
         certificate.aggregate_signature = wrong.as_bytes();
         let error = provider
             .verify_certificate(&certificate, &block)
             .expect_err("a tampered aggregate must be rejected");
         assert!(error.to_string().contains("does not verify"), "{error}");
+    }
+
+    #[test]
+    fn test_vote_round_aggregation_matches_certificate_verification() {
+        // Mirrors the network round driver: prevote + precommit votes through
+        // aggregate_votes must produce a certificate verify_certificate accepts.
+        let mut ledger = Ledger::new(1);
+        let genesis = ledger.mine_pending_transactions().expect("genesis").clone();
+        let (provider, _) = provider(1);
+        let mut block = Block::with_write_set(1, vec![], genesis.hash, Vec::new());
+        block.hash = block.calculate_hash();
+
+        let precommit = provider.sign_vote(1, 0, VotePhase::Precommit, &block.hash);
+        assert!(precommit.verify().is_ok());
+
+        let (bitmap, aggregate) = provider.aggregate_votes(&[precommit]).expect("aggregate");
+        let certificate = QuorumCertificate {
+            block_index: 1,
+            block_hash: block.hash.clone(),
+            signers_bitmap: bitmap,
+            aggregate_signature: aggregate,
+            algorithm: crate::wire::SignatureAlgorithm::Bls12381,
+        };
+        assert!(provider.verify_certificate(&certificate, &block).is_ok());
     }
 
     #[test]

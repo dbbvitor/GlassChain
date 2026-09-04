@@ -128,6 +128,15 @@ fn event_to_response(event: &NodeEvent) -> SubscribeToEventsResponse {
             })
             .to_string(),
         },
+        NodeEvent::EquivocationDetected { height, public_key } => SubscribeToEventsResponse {
+            timestamp: now_unix(),
+            event_type: "equivocation_detected".into(),
+            payload_json: serde_json::json!({
+                "height": height,
+                "public_key": public_key
+            })
+            .to_string(),
+        },
         NodeEvent::PeerConnected(addr) => SubscribeToEventsResponse {
             timestamp: now_unix(),
             event_type: "peer_connected".into(),
