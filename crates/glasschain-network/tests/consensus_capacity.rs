@@ -32,6 +32,8 @@ use glasschain_core::{
     TransactionKind,
 };
 use glasschain_identity::{Channel, ChannelConfig};
+use bls_signatures::{PrivateKey, Serialize as _};
+use glasschain_core::{BftConsensusProvider, ValidatorInfo};
 use glasschain_network::{Node, NodeEvent};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -607,4 +609,304 @@ async fn capacity_harness_smoke() {
     assert_eq!(joined, 2, "the partitioned validators join");
     assert!(convergence.is_some(), "recovery converges");
     member_dissemination_phase(&set).await;
+}
+
+// ── BFT finality gate (Step 0's original goal — now unblocked) ──────────────
+
+/// Deterministic BLS keys for the validator set.
+fn bft_keys(count: usize) -> Vec<PrivateKey> {
+    let mut seed = 0u8;
+    (0..count)
+        .map(|_| {
+            seed += 1;
+            PrivateKey::new([seed; 64])
+        })
+        .collect()
+}
+
+fn bft_validators(keys: &[PrivateKey]) -> Vec<ValidatorInfo> {
+    keys.iter()
+        .enumerate()
+        .map(|(i, key)| {
+            let public = key.public_key();
+            ValidatorInfo {
+                name: format!("validator-{i}"),
+                public_key: public.as_bytes(),
+                pop: key
+                    .sign(format!(
+                        "glasschain-bls-pop:{}",
+                        hex::encode(public.as_bytes())
+                    ))
+                    .as_bytes(),
+            }
+        })
+        .collect()
+}
+
+async fn bft_poll_until(desc: &str, secs: u64, mut condition: impl AsyncFnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        if condition().await {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "condition never held: {desc}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+struct BftFinalityMetrics {
+    seq: usize,
+    /// Leader-side finality: `mine()` call duration (block build + vote
+    /// round + local commit).
+    leader_finality_ms: u128,
+    /// Quorum size in the committed certificate.
+    signers: usize,
+    /// Time until every connected replica holds the block.
+    replication_ms: Option<u128>,
+}
+
+fn print_bft_round(m: &BftFinalityMetrics) {
+    println!(
+        "bft round {:>3}: leader finality {:>5} ms | signers {:>3} | replication {:>4?} ms",
+        m.seq, m.leader_finality_ms, m.signers, m.replication_ms
+    );
+}
+
+fn print_bft_summary(label: &str, rounds: &[BftFinalityMetrics]) {
+    let leader: Vec<u128> = rounds.iter().map(|r| r.leader_finality_ms).collect();
+    let signers: Vec<usize> = rounds.iter().map(|r| r.signers).collect();
+    println!(
+        "BFT-SUMMARY[{label}]: rounds={} | finality p50={} p95={} p99={} ms | signers min={}",
+        rounds.len(),
+        percentile(leader.clone(), 50),
+        percentile(leader.clone(), 95),
+        percentile(leader, 99),
+        signers.iter().copied().min().unwrap_or(0),
+    );
+}
+
+/// The BFT finality gate: full-mesh validators over a shared static set
+/// (the on-chain registry's bootstrap fallback), `bft_consensus` activated,
+/// and the vote-round driver committing real multi-signer certificates.
+/// Measures leader-side finality latency (the Step 0 number) and replica
+/// replication lag.
+///
+/// NOTE: run with a raised fd limit — the mesh holds ~2·n² sockets:
+/// `ulimit -n 65535 && cargo test ... --ignored --nocapture`.
+#[allow(clippy::too_many_lines)]
+async fn bft_finality_gate(validator_count: usize, txs_per_round: usize, rounds: usize) {
+    let _ = env_logger::try_init();
+    println!(
+        "=== bft finality gate: {validator_count} validators, {txs_per_round} txs/round x {rounds} rounds ==="
+    );
+    eprintln!("env_logger initialized");
+    let setup_start = Instant::now();
+    let keys = bft_keys(validator_count);
+    let validators = bft_validators(&keys);
+
+    // Bind-first, dial-second: listeners bind immediately after their address
+    // is reserved (no TOCTOU window for other dialers to steal the port);
+    // the mesh dials through `connect_peer` afterwards, in waves.
+    let mut nodes: Vec<Node> = Vec::with_capacity(validator_count);
+    let mut addrs: Vec<String> = Vec::with_capacity(validator_count);
+    for i in 0..validator_count {
+        let addr = free_addr();
+        let node = Node::new(format!("validator-{i}"), &addr, 1);
+        let provider = BftConsensusProvider::new(validators.clone(), keys[i]).expect("valid set");
+        node.set_bft_consensus(Arc::new(provider)).await;
+        // Execution provider for canonical-record evaluation.
+        node.set_execution_provider(Arc::new(
+            glasschain_vm::WasmExecutionProvider::new().unwrap(),
+        ))
+        .await;
+        node.start(vec![]).await.expect("bind listener");
+        nodes.push(node);
+        addrs.push(addr);
+    }
+
+    // Full mesh in waves: proposals reach every validator directly (blocks
+    // are broadcast, never re-relayed; votes answer point-to-point).
+    let mut wave: usize = 0;
+    for i in 1..validator_count {
+        for j in 0..i {
+            nodes[i].connect_peer(&addrs[j]);
+            wave += 1;
+        }
+        if wave >= 500 {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            wave = 0;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    println!(
+        "mesh: {} validators fully connected in {:?}",
+        validator_count,
+        setup_start.elapsed()
+    );
+
+    // ── Block 1 (PoW): activate bft_consensus from height 2 ─────────────────
+    nodes[0]
+        .submit_transaction(activation_bft_tx(2))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Height 1's leader: 1 % n.
+    let leader1 = 1 % validator_count;
+    nodes[leader1].mine().await.unwrap();
+    // Height 2: the first vote round — its leader is 2 % n.
+    nodes[leader1]
+        .submit_transaction(canonical_record_tx(0))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut leader2 = 2 % validator_count;
+    let start = Instant::now();
+    for attempt in 0..4u32 {
+        leader2 = (2 + attempt as usize) % validator_count;
+        match nodes[leader2].mine().await {
+            Ok(()) => break,
+            Err(error) if error.to_string().contains("round leader") => continue,
+            Err(error) => panic!("first vote round failed: {error}"),
+        }
+    }
+    println!(
+        "first vote round (height 2, leader {leader2}): {:?}",
+        start.elapsed()
+    );
+
+    // ── Sustained measured rounds ───────────────────────────────────────────
+    let mut all = Vec::new();
+    for seq in 1..=rounds {
+        let height = seq + 2;
+        let mut leader = height % validator_count;
+        for i in 0..txs_per_round {
+            nodes[leader]
+                .submit_transaction(canonical_record_tx((height * 100 + i) as u64))
+                .await
+                .unwrap();
+        }
+        // Wait for the previous block to replicate before driving the next
+        // height: stale-tip nodes compute the wrong round leader.
+        bft_poll_until(
+            // Pure-Rust pairing throughput: every replica verifies the whole
+            // certificate (a 201-term multi-miller loop at n=300) — the
+            // replication lag IS the honest measurement (blst trigger).
+            "replicas converged before the next round",
+            600,
+            || async {
+                for node in &nodes {
+                    if node.ledger_snapshot().await.chain.len() < height {
+                        return false;
+                    }
+                }
+                true
+            },
+        )
+        .await;
+
+        // Drive the round; on a view change (the driver gave up and the
+        // proposer rotated), retry with the next proposer.
+        let mine_start = Instant::now();
+        let mut leader_finality_ms = None;
+        for attempt in 0..4u32 {
+            leader = (height + attempt as usize) % validator_count;
+            match nodes[leader].mine().await {
+                Ok(()) => {
+                    leader_finality_ms = Some(mine_start.elapsed().as_millis());
+                    break;
+                }
+                Err(error) if error.to_string().contains("round leader") => continue,
+                Err(error) => panic!("round failed: {error}"),
+            }
+        }
+        let leader_finality_ms =
+            leader_finality_ms.expect("round did not commit within the view-change budget");
+
+        let tip = nodes[leader].ledger_snapshot().await.chain.len();
+        let cert = nodes[leader]
+            .ledger_snapshot()
+            .await
+            .chain
+            .last()
+            .cloned()
+            .unwrap()
+            .certificate
+            .expect("bft block carries a certificate");
+        let signers = cert
+            .signers_bitmap
+            .iter()
+            .map(|b| b.count_ones())
+            .sum::<u32>() as usize;
+
+        // Replication: time until every validator holds the committed block.
+        let repl_start = Instant::now();
+        bft_poll_until("replicas hold the block", 180, || async {
+            for node in &nodes {
+                if node.ledger_snapshot().await.chain.len() < tip {
+                    return false;
+                }
+            }
+            true
+        })
+        .await;
+        let replication_ms = Some(repl_start.elapsed().as_millis());
+
+        let m = BftFinalityMetrics {
+            seq,
+            leader_finality_ms,
+            signers,
+            replication_ms,
+        };
+        print_bft_round(&m);
+        all.push(m);
+    }
+    print_bft_summary(&format!("{validator_count} validators (BFT)"), &all);
+}
+
+/// A `bft_consensus` capability activation.
+fn activation_bft_tx(height: u64) -> Transaction {
+    Transaction::with_id(
+        format!("cap:bft_consensus:{height}"),
+        TransactionKind::CapabilityActivation(CapabilityActivation {
+            capability_id: "bft_consensus".into(),
+            version: 1,
+            hash: capability_hash("bft_consensus", 1),
+            activation_height: height,
+            signatures: vec![RecordSignature {
+                algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
+                signer: "governance".into(),
+                signature_bytes: vec![0x42],
+            }],
+        }),
+    )
+}
+
+/// A compact canonical record for the BFT workload (same shape as the PoW
+/// gate's compact set).
+fn canonical_record_tx(seq: u64) -> Transaction {
+    signed(lot_record(seq as usize), "org-maker")
+}
+
+#[cfg_attr(madsim, madsim::test)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "bft finality gate: minutes-long, needs a raised fd limit (ulimit -n 65535); run explicitly"]
+async fn bft_finality_gate_100_validators() {
+    bft_finality_gate(100, 10, 10).await;
+}
+
+#[cfg_attr(madsim, madsim::test)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "bft finality gate: heavier mesh (~80k sockets); raise the fd limit first"]
+async fn bft_finality_gate_200_validators() {
+    bft_finality_gate(200, 10, 10).await;
+}
+
+#[cfg_attr(madsim, madsim::test)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "bft finality gate: heaviest mesh (~180k sockets); raise the fd limit first"]
+async fn bft_finality_gate_300_validators() {
+    bft_finality_gate(300, 10, 10).await;
 }
