@@ -18,14 +18,21 @@ hex = "0.4"
 uuid = { version = "1.26", features = ["v4"] }
 thiserror = "2.0"
 log = "0.4"
-ed25519-dalek = { version = "3.0", features = ["alloc", "batch"], optional = true }
+# BLS12-381 aggregate signatures for quorum certificates (ADR-014). Pure-Rust
+# `pairing` backend; the blst C backend stays out of the workspace.
+bls-signatures = { version = "0.15", default-features = false, features = [
+    "pairing",
+], optional = true }
+# Pairing check for the same-message multisig verify (ADR-014): the pure-Rust
+# bls-signatures backend only ships the distinct-message aggregate verify.
+bls12_381 = { version = "0.8", optional = true }
 
 [features]
 default = []
 # Tendermint-class BFT consensus behind the seam (ticket #42). Default-off:
 # Proof-of-Work remains the dev/test driver. Pulls ed25519-dalek for real
 # validator attestations.
-bft = ["dep:ed25519-dalek"]
+bft = ["dep:bls-signatures", "dep:bls12_381"]
 
 [dev-dependencies]
 env_logger = "0.11"

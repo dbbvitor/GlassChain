@@ -137,7 +137,7 @@ cargo run --release -p glasschain-node -- --id node-2 --listen 0.0.0.0:8001 --pe
 
 ```mermaid
 graph LR
-    A["node-1 — 0.0.0.0:8000"] ---|"TLS handshake + Hello (version glasschain/5)"| B["node-2 — 0.0.0.0:8001"]
+    A["node-1 — 0.0.0.0:8000"] ---|"TLS handshake + Hello (version glasschain/6)"| B["node-2 — 0.0.0.0:8001"]
     B -. "dials seed --peer 127.0.0.1:8000" .-> A
 ```
 
@@ -493,10 +493,11 @@ Source: `crates/glasschain-network/src/protocol.rs`.
 ### Version
 
 `PROTOCOL_VERSION` in `crates/glasschain-network/src/protocol.rs` is
-`"glasschain/5"`. `/3` added the private-payload wire message (ADR-003); `/4`
+`"glasschain/6"`. `/3` added the private-payload wire message (ADR-003); `/4`
 added pull-based reconciliation (`RequestPrivatePayload`); `/5` switched
 signature-adjacent byte fields from JSON decimal arrays to base64 and added
-the signature algorithm discriminant (#62 Step 1). **`glasschain/5` is
+the signature algorithm discriminant (#62 Step 1); `/6` restructured the
+quorum certificate into a BLS12-381 aggregate signature (ADR-014). **`glasschain/6` is
 required on both ends** — a Hello with any other version is rejected at the
 handshake and the connection is torn down (a wire-encoding gate, distinct from
 capability gating; `node.rs:2395–2407`).
@@ -526,7 +527,7 @@ capability gating; `node.rs:2395–2407`).
 
 On every connection (`node.rs`, `process_message` Hello branch), in order:
 
-1. **Version gate** — `version != glasschain/5` → disconnect.
+1. **Version gate** — `version != glasschain/6` → disconnect.
 2. **Self-connection detection** — same TLS cert fingerprint → ignored.
 3. **Session fingerprint check** — Hello fingerprint must equal the one
    observed during the TLS handshake, else disconnect.
@@ -735,7 +736,7 @@ cargo bench -p glasschain-workflows   # crates/glasschain-workflows/benches/watc
 | Symptom | Cause | What to do |
 |---|---|---|
 | `Failed to start node: I/O error: Address already in use` (exit 1) | The `--listen` port is taken, or a second node binds the same port | Pick a different port: `--listen 127.0.0.1:8001`. `TcpListener::bind` errors surface through `Node::start`. |
-| `Rejecting peer <id> at <addr>: protocol version '<v>' is incompatible with 'glasschain/5'` | Peer runs a different wire version (e.g. a binary built before `/4`) | Run matching binaries on both ends; rebuild the outdated peer. This is a hard disconnect, not a downgrade. |
+| `Rejecting peer <id> at <addr>: protocol version '<v>' is incompatible with 'glasschain/6'` | Peer runs a different wire version (e.g. a binary built before `/4`) | Run matching binaries on both ends; rebuild the outdated peer. This is a hard disconnect, not a downgrade. |
 | `Rejecting peer <id> at <addr>: advertised TLS fingerprint does not match the observed session certificate` | Certificate changed mid-connection, or MITM | Check both endpoints' `--org`/restart state. The fingerprint is compared against the one observed during the TLS handshake. |
 | `Rejecting peer <id> at <listen>: node_id changed` / `TLS certificate fingerprint changed` / `org changed` | TOFU record for that listen address no longer matches the returning peer (impersonation or re-key) | Verify peer identity out of band. TOFU records are in-memory and address-bound; a peer on a new address is treated as new. |
 | `Failed to open storage at <path>: storage error: …` (exit 1) | Sled cannot open the directory — most often because **another node process already holds the exclusive lock** on the same `--storage-path` | Give each node its own `--storage-path` directory; stop the other process. |

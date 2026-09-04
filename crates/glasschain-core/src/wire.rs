@@ -47,9 +47,12 @@ pub mod base64_bytes {
 /// as ed25519.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SignatureAlgorithm {
-    /// ed25519 (RFC 8032) — the only algorithm the workspace uses today.
+    /// ed25519 (RFC 8032) — transaction signatures, endorsements, identity.
     #[default]
     Ed25519,
+    /// BLS12-381 aggregate signatures (min-pubkey-size: G1 keys, G2 sigs) —
+    /// quorum certificates only (ADR-014).
+    Bls12381,
 }
 
 impl SignatureAlgorithm {

@@ -11,7 +11,7 @@
 //! final at commit — single tip, strict chaining, no fork.
 #![cfg(feature = "bft")]
 
-use ed25519_dalek::SigningKey;
+use bls_signatures::{PrivateKey, Serialize as _};
 use glasschain_core::{
     capability_hash, BftConsensusProvider, CapabilityActivation, QuorumCertificate,
     RecordSignature, Transaction, TransactionKind, ValidatorInfo,
@@ -41,12 +41,19 @@ fn activation_tx(height: u64) -> Transaction {
 
 /// A provider over one validator (a 1-set is its own ⅔+ quorum).
 fn single_validator_provider() -> BftConsensusProvider {
-    let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+    let signing_key = PrivateKey::new([7u8; 64]);
+    let public = signing_key.public_key();
     let validators = vec![ValidatorInfo {
         name: "validator-0".into(),
-        public_key: signing_key.verifying_key().to_bytes().to_vec(),
+        public_key: public.as_bytes(),
+        pop: signing_key
+            .sign(format!(
+                "glasschain-bls-pop:{}",
+                hex::encode(public.as_bytes())
+            ))
+            .as_bytes(),
     }];
-    BftConsensusProvider::new(validators, signing_key)
+    BftConsensusProvider::new(validators, signing_key).expect("valid validator")
 }
 
 type BlockMinedEvent = (u64, String, QuorumCertificate);
@@ -122,7 +129,7 @@ async fn bft_final_at_commit_no_fork() {
     assert_eq!(block2.nonce, 0, "BFT blocks are not PoW-mined");
 
     // Final at commit: the certificate attests exactly the committed block,
-    // and every attestation is a real ed25519 signature over its hash by a
+    // and the aggregate is a real BLS12-381 signature over its hash by a
     // validator in the set (⅔+ distinct).
     certificate
         .validate(&block2)

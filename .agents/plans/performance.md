@@ -438,7 +438,13 @@ quorum, and the only quadratic term on the verification path. Now indexed into a
 `HashSet` once per call. Minor next to steps 1 and 2 (~0.3 ms), but it was five
 lines and it was the term that grew with the ceiling.
 
-### Step 4 — BLS aggregation — promoted, because it serves the scalability story
+### Step 4 — BLS aggregation — ~~promoted~~ **DONE 2026-09-03** ([ADR-014](../../docs/adr/adr-014-bls-aggregated-certificates.md))
+
+> Implemented ahead of the Malachite decision by explicit owner override
+> (recorded in the ADR): plain n-of-n aggregation over `bls-signatures`
+> (pure-Rust pairing backend), PoP rogue-key defense, bitmap + constant-size
+> aggregate certificate, `glasschain/6`, capability-gated dormant. 300-signer
+> certificate < 1 KB. The Malachite re-work risk is accepted.
 
 Collapses the certificate to O(1) and turns 201 light-client verifications into
 one. Under the previous framing this was "does not raise the ceiling, therefore

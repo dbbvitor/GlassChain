@@ -393,7 +393,9 @@ async fn run_round(
                 certificate: quorum,
                 ..
             })) => {
-                break serde_json::to_vec(&quorum.attestations).map_or(0, |v| v.len());
+                // The metric is the certificate itself (the vote-traffic
+                // proxy) — constant-size under ADR-014 aggregation.
+                break serde_json::to_vec(&quorum).map_or(0, |v| v.len());
             }
             Ok(Some(_)) => {}
             _ => break 0,

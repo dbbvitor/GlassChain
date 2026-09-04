@@ -1,116 +1,153 @@
-//! Tendermint-class BFT behind the consensus seam (ticket #42), gated behind the
-//! `bft` feature.
-//!
-//! [`BftConsensusProvider`] is the staged, **default-off** BFT implementation
-//! of [`ConsensusProvider`]. It attests blocks with real ed25519 signatures
-//! over the block hash and **cryptographically verifies** a
-//! [`QuorumCertificate`] against its configured validator set, requiring a ⅔+
-//! distinct-validator quorum (ADR-002: a commit consumer never trusts "the
-//! leader said so").
-//!
-//! Staged scope: `attest` signs with the local key, so a produced certificate
-//! carries exactly one attestation — a 1-validator set is its own quorum.
-//! Gathering attestations from remote validators over the network, wire
-//! transport of certificates, and commit-path certificate verification for
-//! received/synced blocks are the explicit ADR-010 testnet adoption gates, not
-//! part of this delivery.
-
-use crate::block::Block;
-use crate::consensus::{Attestation, CommitNotification, QuorumCertificate};
+use crate::consensus::{CommitNotification, QuorumCertificate};
 use crate::error::CoreError;
 use crate::providers::ConsensusProvider;
 use crate::transaction::Transaction;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use crate::Block;
+use bls_signatures::{PrivateKey, PublicKey, Serialize as BlsSerialize, Signature};
 
 /// One validator in the BFT validator set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatorInfo {
     /// Validator identifier (MSP principal).
     pub name: String,
-    /// Public key bytes. Variable-length so a future signature algorithm
-    /// (post-quantum plan action 2) is a config change, not a type break;
-    /// today every key is 32 ed25519 bytes and verification still enforces
-    /// that length per attestation.
+    /// BLS12-381 public key (G1, 48 bytes) — used only for quorum-certificate
+    /// aggregation; transaction and identity signatures stay ed25519 (ADR-014).
     pub public_key: Vec<u8>,
+    /// Proof of possession: an individual BLS signature over
+    /// `"glasschain-bls-pop:<hex(public_key)>"`, verified at registration.
+    /// Rogue-key defense for plain n-of-n aggregation (ADR-014 decision 4).
+    pub pop: Vec<u8>,
+}
+
+impl ValidatorInfo {
+    /// The distinct message a validator's proof of possession must sign.
+    fn pop_message(&self) -> String {
+        format!(
+            "glasschain-bls-pop:{}",
+            hex::encode(self.public_key.as_slice())
+        )
+    }
 }
 
 /// The Tendermint-class BFT consensus provider.
 ///
 /// Holds the validator set against which quorum certs are produced and verified
-/// plus the local proposer's ed25519 signing key.
+/// plus the local proposer's BLS signing key. The validator set is static
+/// configuration until the ADR-009 rotation machinery lands with the BFT
+/// adoption gate (ADR-010).
 pub struct BftConsensusProvider {
-    /// Validators in index order.
+    /// Validators in canonical index order — the order the certificate bitmap
+    /// addresses.
     validators: Vec<ValidatorInfo>,
-    /// The local proposer's signing key.
-    signing_key: SigningKey,
+    /// The local proposer's BLS signing key.
+    signing_key: PrivateKey,
 }
 
 impl BftConsensusProvider {
     /// Build a provider over `validators`, signing with `signing_key`.
     ///
+    /// Every validator's proof of possession is verified at registration:
+    /// plain n-of-n aggregation is rogue-key-vulnerable without it (ADR-014
+    /// decision 4), and one invalid key corrupts every aggregate it joins.
+    ///
     /// The signing key should belong to one of `validators`; an outsider key
     /// still produces attestations, but [`Self::verify_certificate`] rejects
-    /// them as unknown validators (fail-closed).
-    #[must_use]
-    pub const fn new(validators: Vec<ValidatorInfo>, signing_key: SigningKey) -> Self {
-        Self {
+    /// them as degenerate (fail-closed).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::InvalidBlock`] when a validator's key or proof of
+    /// possession is malformed or does not verify.
+    pub fn new(validators: Vec<ValidatorInfo>, signing_key: PrivateKey) -> Result<Self, CoreError> {
+        for validator in &validators {
+            if validator.public_key.len() != 48 {
+                return Err(CoreError::InvalidBlock(format!(
+                    "bft: validator '{}' has a {}-byte BLS public key (expected 48)",
+                    validator.name,
+                    validator.public_key.len()
+                )));
+            }
+            let public = PublicKey::from_bytes(validator.public_key.as_slice()).map_err(|e| {
+                CoreError::InvalidBlock(format!(
+                    "bft: validator '{}' has an invalid BLS public key: {e}",
+                    validator.name
+                ))
+            })?;
+            let pop = Signature::from_bytes(validator.pop.as_slice()).map_err(|e| {
+                CoreError::InvalidBlock(format!(
+                    "bft: validator '{}' has an invalid proof of possession: {e}",
+                    validator.name
+                ))
+            })?;
+            if !public.verify(pop, validator.pop_message()) {
+                return Err(CoreError::InvalidBlock(format!(
+                    "bft: validator '{}' failed its proof of possession (rogue-key defense)",
+                    validator.name
+                )));
+            }
+        }
+        Ok(Self {
             validators,
             signing_key,
-        }
+        })
     }
 
-    /// Minimum number of distinct validators needed for finality (⅔+, rounded up).
+    /// The local proposer's BLS public key bytes.
+    #[must_use]
+    pub fn public_key(&self) -> Vec<u8> {
+        self.signing_key.public_key().as_bytes()
+    }
+
+    /// The validator set size.
+    #[must_use]
+    pub const fn validator_count(&self) -> usize {
+        self.validators.len()
+    }
+
+    /// ⅔ of the validator set, rounded up — the quorum threshold.
     #[must_use]
     pub const fn quorum(&self) -> usize {
         self.validators.len() * 2 / 3 + 1
     }
 
-    /// The local proposer's raw 32-byte public key.
-    #[must_use]
-    pub fn public_key(&self) -> [u8; 32] {
-        self.signing_key.verifying_key().to_bytes()
+    /// The bitmap index of the local proposer, if it is in the validator set.
+    fn local_index(&self) -> Option<usize> {
+        let local = self.signing_key.public_key().as_bytes();
+        self.validators
+            .iter()
+            .position(|validator| validator.public_key == local)
     }
 
-    /// Produce a block (no `PoW` — finality is the attestation set, not a nonce)
-    /// and its real quorum certificate over `block.hash`.
+    /// Attest `block`: sign its hash with the local BLS key. A one-validator
+    /// set is its own quorum; multi-validator vote gathering over the network
+    /// is the ADR-010 testnet adoption gate — add a round driver there, then
+    /// aggregate the collected signatures into the certificate here.
     ///
     /// # Panics
     ///
-    /// Panics if the system clock is set to a time before the Unix epoch (via
-    /// [`Block::with_write_set`]).
+    /// Never in practice: `calculate_hash` cannot fail for JSON-serializable
+    /// blocks and `PrivateKey::sign` is infallible.
     #[must_use]
-    pub fn attest(&self, block: Block) -> CommitNotification {
-        let mut block = block;
+    pub fn attest(&self, mut block: Block) -> CommitNotification {
         block.hash = block.calculate_hash();
-        let local = self.signing_key.verifying_key().to_bytes();
         let signature = self.signing_key.sign(block.hash.as_bytes());
-        let attestation = Attestation {
-            algorithm: crate::wire::SignatureAlgorithm::Ed25519,
-            validator: self
-                .validators
-                .iter()
-                .find(|validator| validator.public_key.as_slice() == local)
-                .map_or_else(
-                    || hex::encode(&local[..8]),
-                    |validator| validator.name.clone(),
-                ),
-            public_key: local.to_vec(),
-            signature: signature.to_bytes().to_vec(),
-        };
-        // ponytail: single local attestation; a 1-validator set is its own
-        // quorum. Multi-validator vote gathering over the network is the
-        // ADR-010 testnet adoption gate — add a round driver there.
+        let mut signers_bitmap = vec![0u8; self.validators.len().div_ceil(8)];
+        if let Some(index) = self.local_index() {
+            signers_bitmap[index / 8] |= 1 << (index % 8);
+        }
         let certificate = QuorumCertificate {
             block_index: block.index,
             block_hash: block.hash.clone(),
-            attestations: vec![attestation],
+            signers_bitmap,
+            aggregate_signature: signature.as_bytes(),
+            algorithm: crate::wire::SignatureAlgorithm::Bls12381,
         };
         CommitNotification { block, certificate }
     }
 
-    /// Verify that `certificate` is a valid, non-degenerate ⅔+ quorum over
-    /// `block.hash`: every attestation must be a real ed25519 signature over the
-    /// block hash by a distinct validator in the set.
+    /// Verify a quorum certificate: the bitmap must name a quorum of known
+    /// validators and the aggregate must verify against their keys in one
+    /// pairing check (ADR-014).
     ///
     /// # Errors
     ///
@@ -127,70 +164,87 @@ impl BftConsensusProvider {
                 "bft: degenerate (empty) quorum certificate is not final".into(),
             ));
         }
-        // Index the validator set once. Scanning it per attestation is O(n·m) —
-        // at n=300 with a 201-attestation quorum that is ~60k comparisons, and
-        // it is the only quadratic term on the verification path.
-        let known: std::collections::HashSet<&[u8]> = self
-            .validators
-            .iter()
-            .map(|validator| validator.public_key.as_slice())
-            .collect();
 
-        // Parse every attestation up front: an unknown validator or a
-        // malformed key/signature rejects the whole certificate before any
-        // expensive cryptography runs.
-        let mut parsed: Vec<(VerifyingKey, Signature, &[u8; 32], &str)> =
-            Vec::with_capacity(certificate.attestations.len());
-        let mut distinct = std::collections::HashSet::new();
-        for attestation in &certificate.attestations {
-            let key_bytes: &[u8; 32] = attestation
-                .public_key
-                .as_slice()
-                .try_into()
-                .map_err(|_| CoreError::InvalidBlock("bft: non-32-byte public key".into()))?;
-            if !known.contains(key_bytes.as_slice()) {
-                return Err(CoreError::InvalidBlock(format!(
-                    "bft: attestation from unknown validator '{}'",
-                    attestation.validator
-                )));
-            }
-            let verifier = VerifyingKey::from_bytes(key_bytes).map_err(|_| {
-                CoreError::InvalidBlock("bft: invalid ed25519 verifying key".into())
-            })?;
-            let sig = Signature::from_slice(&attestation.signature)
-                .map_err(|_| CoreError::InvalidBlock("bft: invalid ed25519 signature".into()))?;
-            parsed.push((verifier, sig, key_bytes, attestation.validator.as_str()));
-            distinct.insert(*key_bytes);
-        }
-        if distinct.len() < self.quorum() {
+        // Bitmap: bit i = validators[i]. Bits beyond the set are malformed.
+        let signer_bits: Vec<usize> = certificate
+            .signers_bitmap
+            .iter()
+            .enumerate()
+            .flat_map(|(byte, bits)| (0..8).map(move |bit| (byte * 8 + bit, bits >> bit & 1 == 1)))
+            .filter(|(_, set)| *set)
+            .map(|(index, _)| index)
+            .collect();
+        if signer_bits.len() < self.quorum() {
             return Err(CoreError::InvalidBlock(format!(
-                "bft: quorum {} not reached ({} distinct validators attested)",
+                "bft: quorum {} not reached ({} validators in bitmap)",
                 self.quorum(),
-                distinct.len()
+                signer_bits.len()
             )));
         }
+        if signer_bits
+            .iter()
+            .any(|index| *index >= self.validators.len())
+        {
+            return Err(CoreError::InvalidBlock(
+                "bft: certificate bitmap names validators outside the set".into(),
+            ));
+        }
 
-        // Step 2 (#62): optimistic batch verification — ~2× faster than the
-        // sequential loop at a 201-attestation quorum. The zero-trust catch:
-        // batch reports only "some signature in this set failed", without
-        // naming it — so on any batch failure, fall back to sequential
-        // verification, which attributes the misbehaving validator exactly.
-        let messages: Vec<&[u8]> = parsed.iter().map(|_| block.hash.as_bytes()).collect();
-        let signatures: Vec<Signature> = parsed.iter().map(|(_, sig, _, _)| *sig).collect();
-        let verifying_keys: Vec<VerifyingKey> = parsed.iter().map(|(key, ..)| *key).collect();
-        if ed25519_dalek::verify_batch(&messages, &signatures, &verifying_keys).is_err() {
-            for (verifier, sig, key_bytes, name) in &parsed {
-                verifier.verify(block.hash.as_bytes(), sig).map_err(|_| {
-                    CoreError::InvalidBlock(format!(
-                        "bft: signature from '{}' does not verify block {}",
-                        name, block.index
-                    ))
-                })?;
-                let _ = key_bytes;
-            }
+        let public_keys: Vec<[u8; 48]> = signer_bits
+            .iter()
+            .filter_map(|index| self.validators.get(*index))
+            .map(|validator| {
+                let mut key = [0u8; 48];
+                key.copy_from_slice(validator.public_key.as_slice());
+                key
+            })
+            .collect();
+
+        let aggregate =
+            Signature::from_bytes(certificate.aggregate_signature.as_slice()).map_err(|e| {
+                CoreError::InvalidBlock(format!("bft: invalid BLS aggregate signature: {e}"))
+            })?;
+        let block_hash = bls_signatures::hash(block.hash.as_bytes());
+        if !verify_same_message_multisig(&aggregate, &public_keys, &block_hash) {
+            return Err(CoreError::InvalidBlock(format!(
+                "bft: aggregate signature does not verify over block {} ({} signers)",
+                block.index,
+                signer_bits.len()
+            )));
         }
         Ok(())
     }
+}
+
+/// The IETF `PopScheme` multisig check (ADR-014): every signer's key is
+/// individually proof-of-possessed, so the same-message aggregate verifies as
+/// `e(-G1, agg_sig) * prod_i e(pk_i, hash) == identity`.
+///
+/// `bls-signatures`' pure-Rust backend only ships the *distinct-message*
+/// aggregate verify (it enforces message uniqueness as its rogue-key
+/// countermeasure); the same-message form is what a quorum certificate needs,
+/// and proof-of-possession replaces the uniqueness requirement.
+fn verify_same_message_multisig(
+    aggregate: &Signature,
+    public_keys: &[[u8; 48]],
+    hash: &bls12_381::G2Projective,
+) -> bool {
+    use bls12_381::{multi_miller_loop, G1Affine, G2Affine, G2Prepared, Gt};
+
+    let signature = G2Affine::from(*aggregate);
+    let g1_neg = -G1Affine::generator();
+    let hash_prepared = G2Prepared::from(G2Affine::from(hash));
+
+    let mut terms = vec![(g1_neg, G2Prepared::from(signature))];
+    for key in public_keys {
+        let parsed = G1Affine::from_compressed(key);
+        let Some(pk) = <Option<G1Affine>>::from(parsed) else {
+            return false;
+        };
+        terms.push((pk, hash_prepared.clone()));
+    }
+    let refs: Vec<(&G1Affine, &G2Prepared)> = terms.iter().map(|(a, b)| (a, b)).collect();
+    multi_miller_loop(&refs).final_exponentiation() == Gt::identity()
 }
 
 impl ConsensusProvider for BftConsensusProvider {
@@ -207,19 +261,19 @@ impl ConsensusProvider for BftConsensusProvider {
     }
 
     fn validate_block(&self, block: &Block, previous: &Block) -> Result<(), CoreError> {
-        // The synchronous seam hands `validate_block` no certificate, so a BFT
-        // provider can only do the structural (chain + hash) check here. The
-        // real, cryptographic ⅔+ quorum verification is
-        // [`Self::verify_certificate`], called wherever a certificate is
-        // available (e.g. the node-level finality scenario, verifying members).
-        // Wire transport of certificates and commit-path verification of
-        // received/synced blocks are ADR-010 adoption-gate work; the
-        // certificate travels with the commit notification, not the bare block.
-        block.chains_to(previous)
+        // Structural chaining only: certificate verification runs wherever a
+        // certificate is available (`verify_certificate`), and peer-path BFT
+        // admission is the ADR-010 adoption-gate work.
+        block.chains_to(previous).map_err(|e| {
+            CoreError::InvalidBlock(format!(
+                "bft: candidate block {} does not chain to {}: {e}",
+                block.index, previous.index
+            ))
+        })
     }
 
     fn name(&self) -> &'static str {
-        "tendermint-bft"
+        "bft"
     }
 }
 
@@ -227,24 +281,56 @@ impl ConsensusProvider for BftConsensusProvider {
 mod tests {
     use super::*;
     use crate::Ledger;
-    use ed25519_dalek::SigningKey;
 
-    fn key(seed: usize) -> SigningKey {
-        let byte = u8::try_from(seed).expect("seed fits u8");
-        SigningKey::from_bytes(&[byte; 32])
+    /// `count` validators with deterministic BLS keys and valid proofs of
+    /// possession, plus the matching signing keys.
+    fn provider(count: usize) -> (BftConsensusProvider, Vec<PrivateKey>) {
+        let mut validators = Vec::new();
+        let mut keys = Vec::new();
+        for i in 0..u8::try_from(count).expect("test validator count fits u8") {
+            let secret = PrivateKey::new([i + 1; 64]);
+            let public = secret.public_key();
+            let pop = secret.sign(format!(
+                "glasschain-bls-pop:{}",
+                hex::encode(public.as_bytes())
+            ));
+            validators.push(ValidatorInfo {
+                name: format!("validator-{i}"),
+                public_key: public.as_bytes(),
+                pop: pop.as_bytes(),
+            });
+            keys.push(secret);
+        }
+        (
+            BftConsensusProvider::new(validators, keys[0]).expect("valid validators"),
+            keys,
+        )
     }
 
-    fn provider(count: usize) -> (BftConsensusProvider, Vec<SigningKey>) {
-        let keys: Vec<SigningKey> = (0..count).map(|i| key(i + 1)).collect();
-        let validators = keys
+    /// A certificate signed by every key in `keys` over `block`'s hash, with
+    /// `signers` bitmap positions set.
+    fn aggregated_certificate(
+        block: &Block,
+        keys: &[PrivateKey],
+        signers: &[usize],
+    ) -> QuorumCertificate {
+        let signatures: Vec<Signature> = keys
             .iter()
-            .enumerate()
-            .map(|(i, k)| ValidatorInfo {
-                name: format!("validator-{i}"),
-                public_key: k.verifying_key().to_bytes().to_vec(),
-            })
+            .map(|key| key.sign(block.hash.as_bytes()))
             .collect();
-        (BftConsensusProvider::new(validators, keys[0].clone()), keys)
+        let mut signers_bitmap = vec![0u8; keys.len().div_ceil(8)];
+        for &index in signers {
+            signers_bitmap[index / 8] |= 1 << (index % 8);
+        }
+        QuorumCertificate {
+            block_index: block.index,
+            block_hash: block.hash.clone(),
+            signers_bitmap,
+            aggregate_signature: bls_signatures::aggregate(&signatures)
+                .expect("aggregate")
+                .as_bytes(),
+            algorithm: crate::wire::SignatureAlgorithm::Bls12381,
+        }
     }
 
     #[test]
@@ -265,190 +351,112 @@ mod tests {
     }
 
     #[test]
-    fn test_quorum_threshold() {
-        let (p1, _) = provider(1);
-        assert_eq!(p1.quorum(), 1);
-        let (p3, _) = provider(3);
-        assert_eq!(p3.quorum(), 3);
-        let (p4, _) = provider(4);
-        assert_eq!(p4.quorum(), 3);
-    }
-
-    #[test]
-    fn test_provider_name() {
-        let (provider, _) = provider(1);
-        assert_eq!(provider.name(), "tendermint-bft");
-    }
-
-    #[test]
-    fn test_verify_rejects_unknown_validator() {
-        let (provider, _keys) = provider(3);
-        let mut ledger = Ledger::new(1);
-        let genesis = ledger.mine_pending_transactions().expect("genesis").clone();
-        let block = Block::with_write_set(1, vec![], genesis.hash.clone(), Vec::new());
-        let outsider = key(0xFF);
-        let mut certificate = QuorumCertificate {
-            block_index: block.index,
-            block_hash: block.hash.clone(),
-            attestations: Vec::new(),
-        };
-        for _ in 0..provider.quorum() {
-            certificate.attestations.push(Attestation {
-                algorithm: crate::wire::SignatureAlgorithm::Ed25519,
-                validator: format!("outsider-{}", outsider.verifying_key().to_bytes()[0]),
-                public_key: outsider.verifying_key().to_bytes().to_vec(),
-                signature: outsider.sign(block.hash.as_bytes()).to_bytes().to_vec(),
-            });
-        }
-        let err = provider
-            .verify_certificate(&certificate, &block)
-            .unwrap_err();
-        assert!(err.to_string().contains("unknown validator"), "{err}");
-        assert!(provider.validate_block(&block, &genesis).is_err());
-    }
-
-    #[test]
-    fn test_verify_rejects_wrong_signature() {
-        let (provider, keys) = provider(3);
-        let mut ledger = Ledger::new(1);
-        let genesis = ledger.mine_pending_transactions().expect("genesis").clone();
-        let block = Block::with_write_set(1, vec![], genesis.hash, Vec::new());
-        // Attest with a validator's key but sign the *wrong* bytes.
-        let mut certificate = QuorumCertificate {
-            block_index: block.index,
-            block_hash: block.hash.clone(),
-            attestations: Vec::new(),
-        };
-        for (i, key) in keys.iter().take(provider.quorum()).enumerate() {
-            let bad_bytes = format!("wrong-for-block-{i}");
-            certificate.attestations.push(Attestation {
-                algorithm: crate::wire::SignatureAlgorithm::Ed25519,
-                validator: format!("validator-{i}"),
-                public_key: key.verifying_key().to_bytes().to_vec(),
-                signature: key.sign(bad_bytes.as_bytes()).to_bytes().to_vec(),
-            });
-        }
-        let err = provider
-            .verify_certificate(&certificate, &block)
-            .unwrap_err();
-        assert!(err.to_string().contains("does not verify"), "{err}");
-    }
-
-    #[test]
-    fn test_verify_rejects_under_quorum() {
-        let (provider, keys) = provider(4);
-        let mut ledger = Ledger::new(1);
-        let genesis = ledger.mine_pending_transactions().expect("genesis").clone();
-        let block = Block::with_write_set(1, vec![], genesis.hash, Vec::new());
-        let mut certificate = QuorumCertificate {
-            block_index: block.index,
-            block_hash: block.hash.clone(),
-            attestations: Vec::new(),
-        };
-        // Only two distinct validators attest, but quorum(4) = 3.
-        for key in keys.iter().take(2) {
-            certificate.attestations.push(Attestation {
-                algorithm: crate::wire::SignatureAlgorithm::Ed25519,
-                validator: format!("v-{}", key.verifying_key().to_bytes()[0]),
-                public_key: key.verifying_key().to_bytes().to_vec(),
-                signature: key.sign(block.hash.as_bytes()).to_bytes().to_vec(),
-            });
-        }
-        let err = provider
-            .verify_certificate(&certificate, &block)
-            .unwrap_err();
-        assert!(err.to_string().contains("quorum"), "{err}");
-    }
-
-    #[test]
-    fn test_verify_rejects_duplicate_attestations() {
-        let (provider, keys) = provider(3);
-        let mut ledger = Ledger::new(1);
-        let genesis = ledger.mine_pending_transactions().expect("genesis").clone();
-        let block = Block::with_write_set(1, vec![], genesis.hash, Vec::new());
-        // The same validator attests three times over the correct hash: distinct
-        // count is still 1, below quorum(3) — duplicates never inflate quorum.
-        let key = &keys[0];
-        let attestation = Attestation {
-            algorithm: crate::wire::SignatureAlgorithm::Ed25519,
-            validator: "validator-0".into(),
-            public_key: key.verifying_key().to_bytes().to_vec(),
-            signature: key.sign(block.hash.as_bytes()).to_bytes().to_vec(),
-        };
-        let certificate = QuorumCertificate {
-            block_index: block.index,
-            block_hash: block.hash.clone(),
-            attestations: vec![attestation.clone(), attestation.clone(), attestation],
-        };
-        let err = provider
-            .verify_certificate(&certificate, &block)
-            .unwrap_err();
-        assert!(err.to_string().contains("quorum"), "{err}");
-    }
-
-    #[test]
-    fn test_batch_verify_fallback_names_the_bad_signer() {
-        // Step 2 (#62): the optimistic batch fails when any signature is
-        // corrupted; the sequential fallback must attribute THAT validator,
-        // not just report "some signature failed".
-        let mut ledger = Ledger::new(1);
-        let genesis = ledger.mine_pending_transactions().expect("genesis").clone();
-        let (provider, keys) = provider(5);
-        let notification = provider
-            .propose_block(1, vec![], &genesis)
-            .expect("propose");
-
-        // Build a valid certificate, then corrupt one attestation's signature.
-        let mut certificate = notification.certificate.clone();
-        certificate.attestations.clear();
-        for key in &keys {
-            use ed25519_dalek::Signer as _;
-            let signature = key.sign(notification.block.hash.as_bytes());
-            certificate.attestations.push(Attestation {
-                validator: format!("validator-{}", certificate.attestations.len()),
-                public_key: key.verifying_key().to_bytes().to_vec(),
-                signature: signature.to_bytes().to_vec(),
-                algorithm: crate::wire::SignatureAlgorithm::Ed25519,
-            });
-        }
-        assert!(provider
-            .verify_certificate(&certificate, &notification.block)
-            .is_ok());
-        let guilty = 2;
-        certificate.attestations[guilty].signature[0] ^= 0xFF;
-
-        let error = provider
-            .verify_certificate(&certificate, &notification.block)
-            .expect_err("a corrupted attestation must be attributed");
-        assert!(
-            error.to_string().contains(&format!("validator-{guilty}")),
-            "the fallback must name the bad signer: {error}"
-        );
-    }
-
-    #[test]
-    fn test_batch_verify_accepts_a_full_quorum() {
+    fn test_aggregated_quorum_verifies_in_one_pairing() {
         let mut ledger = Ledger::new(1);
         let genesis = ledger.mine_pending_transactions().expect("genesis").clone();
         let count = 10;
         let (provider, keys) = provider(count);
-        let notification = provider
-            .propose_block(1, vec![], &genesis)
-            .expect("propose");
-        let mut certificate = notification.certificate.clone();
-        certificate.attestations.clear();
-        for key in &keys {
-            use ed25519_dalek::Signer as _;
-            let signature = key.sign(notification.block.hash.as_bytes());
-            certificate.attestations.push(Attestation {
-                validator: format!("validator-{}", certificate.attestations.len()),
-                public_key: key.verifying_key().to_bytes().to_vec(),
-                signature: signature.to_bytes().to_vec(),
-                algorithm: crate::wire::SignatureAlgorithm::Ed25519,
-            });
-        }
-        assert!(provider
-            .verify_certificate(&certificate, &notification.block)
-            .is_ok());
+        let block = Block::with_write_set(1, vec![], genesis.hash, Vec::new());
+        let mut block = block;
+        block.hash = block.calculate_hash();
+
+        // All 10 sign; the certificate carries one aggregate.
+        let certificate = aggregated_certificate(&block, &keys, &(0..count).collect::<Vec<_>>());
+        assert!(provider.verify_certificate(&certificate, &block).is_ok());
+
+        // 2-of-10 is below the ⅔ quorum.
+        let below = aggregated_certificate(&block, &keys, &[0, 1]);
+        let error = provider
+            .verify_certificate(&below, &block)
+            .expect_err("below-quorum certificates must be rejected");
+        assert!(error.to_string().contains("quorum"), "{error}");
+    }
+
+    #[test]
+    fn test_bitmap_outside_the_set_is_rejected() {
+        let mut ledger = Ledger::new(1);
+        let genesis = ledger.mine_pending_transactions().expect("genesis").clone();
+        let (provider, keys) = provider(3);
+        let mut block = Block::with_write_set(1, vec![], genesis.hash, Vec::new());
+        block.hash = block.calculate_hash();
+        let mut certificate = aggregated_certificate(&block, &keys, &[0, 1, 2]);
+        certificate.signers_bitmap.push(0b0000_0001);
+        let error = provider
+            .verify_certificate(&certificate, &block)
+            .expect_err("bits beyond the set must be rejected");
+        assert!(error.to_string().contains("outside the set"), "{error}");
+    }
+
+    #[test]
+    fn test_tampered_aggregate_is_rejected() {
+        let mut ledger = Ledger::new(1);
+        let genesis = ledger.mine_pending_transactions().expect("genesis").clone();
+        let (provider, keys) = provider(4);
+        let mut block = Block::with_write_set(1, vec![], genesis.hash, Vec::new());
+        block.hash = block.calculate_hash();
+        let mut certificate = aggregated_certificate(&block, &keys, &[0, 1, 2, 3]);
+        // A decode-valid aggregate over the WRONG message: flips land in the
+        // subgroup check at decode ("Group decode error") — this exercises
+        // the pairing failure instead.
+        let wrong = keys[0].sign("a different message entirely");
+        certificate.aggregate_signature = wrong.as_bytes();
+        let error = provider
+            .verify_certificate(&certificate, &block)
+            .expect_err("a tampered aggregate must be rejected");
+        assert!(error.to_string().contains("does not verify"), "{error}");
+    }
+
+    #[test]
+    fn test_registration_rejects_invalid_proof_of_possession() {
+        // The rogue-key defense (ADR-014 decision 4): a validator whose PoP
+        // does not verify is rejected at registration, before it can join any
+        // aggregate.
+        let secret = PrivateKey::new([9; 64]);
+        let public = secret.public_key();
+        let impostors = vec![ValidatorInfo {
+            name: "impostor".into(),
+            public_key: public.as_bytes(),
+            // A PoP over the WRONG message.
+            pop: secret.sign("glasschain-bls-pop:other").as_bytes(),
+        }];
+        let Err(error) = BftConsensusProvider::new(impostors, secret) else {
+            panic!("an invalid PoP must be rejected at registration");
+        };
+        assert!(error.to_string().contains("proof of possession"), "{error}");
+    }
+
+    #[test]
+    fn test_outside_proposer_fails_closed() {
+        let mut ledger = Ledger::new(1);
+        let genesis = ledger.mine_pending_transactions().expect("genesis").clone();
+        let (provider, _) = provider(2);
+        let outsider = PrivateKey::new([200; 64]);
+        let outsider_provider = {
+            let validators = vec![ValidatorInfo {
+                name: "validator-0".into(),
+                public_key: outsider.public_key().as_bytes(),
+                pop: outsider
+                    .sign(format!(
+                        "glasschain-bls-pop:{}",
+                        hex::encode(outsider.public_key().as_bytes())
+                    ))
+                    .as_bytes(),
+            }];
+            BftConsensusProvider::new(validators, outsider).expect("valid validators")
+        };
+        let _ = provider;
+        let notification =
+            outsider_provider.attest(Block::with_write_set(1, vec![], genesis.hash, Vec::new()));
+        // The outsider IS a one-validator set in its own provider; a mixed
+        // set is what fails closed. Verify against the REAL set: the
+        // outsider's certificate carries an empty bitmap there.
+        assert!(!notification.certificate.is_degenerate());
+        let error = provider
+            .verify_certificate(&notification.certificate, &notification.block)
+            .expect_err("an outsider's certificate must not verify in the real set");
+        assert!(
+            error.to_string().contains("outside the set") || error.to_string().contains("quorum"),
+            "{error}"
+        );
     }
 }

@@ -641,9 +641,13 @@ async fn main() {
                     hash,
                     certificate: quorum,
                 } => {
-                    let quorum_attestations = quorum.attestations.len();
+                    let quorum_signers = quorum
+                        .signers_bitmap
+                        .iter()
+                        .map(|b| b.count_ones())
+                        .sum::<u32>();
                     log::info!(
-                        "[event] Block mined: index={index} hash={} quorum_attestations={quorum_attestations}",
+                        "[event] Block mined: index={index} hash={} quorum_signers={quorum_signers}",
                         &hash[..8],
                     );
                 }
@@ -652,9 +656,13 @@ async fn main() {
                     hash,
                     certificate: quorum,
                 } => {
-                    let quorum_attestations = quorum.attestations.len();
+                    let quorum_signers = quorum
+                        .signers_bitmap
+                        .iter()
+                        .map(|b| b.count_ones())
+                        .sum::<u32>();
                     log::info!(
-                        "[event] Block received from peer: index={index} hash={} quorum_attestations={quorum_attestations}",
+                        "[event] Block received from peer: index={index} hash={} quorum_signers={quorum_signers}",
                         &hash[..8],
                     );
                 }
