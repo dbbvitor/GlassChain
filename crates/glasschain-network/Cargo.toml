@@ -54,6 +54,9 @@ tempfile     = "3"
 # cfg-gated to the `bft` feature). Dev-deps compile unconditionally; the crate
 # is already in the workspace graph via glasschain-identity.
 ed25519-dalek = "3.0"
+# BLS keys for the bft_finality scenario (cfg-gated with the bft feature).
+bls-signatures = { version = "0.15", default-features = false, features = ["pairing"] }
+hex = "0.4"
 glasschain-vm = { path = "../glasschain-vm" }
 glasschain-storage = { path = "../glasschain-storage" }
 # default-features = false drops madsim's `rpc` feature, whose optional

@@ -737,14 +737,17 @@ mod tests {
                 certificate: glasschain_core::QuorumCertificate {
                     block_index: 3,
                     block_hash: "abc".into(),
-                    attestations: Vec::new(),
+                    signers_bitmap: Vec::new(),
+                    aggregate_signature: Vec::new(),
+                    algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
                 },
             },
             "block_mined",
             &serde_json::json!({ "block_index": 3, "block_hash": "abc", "certificate": {
                 "block_index": 3,
                 "block_hash": "abc",
-                "attestations": []
+                "signers_bitmap": "",
+                "aggregate_signature": ""
             } }),
         );
         assert_maps(
@@ -754,14 +757,17 @@ mod tests {
                 certificate: glasschain_core::QuorumCertificate {
                     block_index: 4,
                     block_hash: "def".into(),
-                    attestations: Vec::new(),
+                    signers_bitmap: Vec::new(),
+                    aggregate_signature: Vec::new(),
+                    algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
                 },
             },
             "block_received",
             &serde_json::json!({ "block_index": 4, "block_hash": "def", "certificate": {
                 "block_index": 4,
                 "block_hash": "def",
-                "attestations": []
+                "signers_bitmap": "",
+                "aggregate_signature": ""
             } }),
         );
         assert_maps(

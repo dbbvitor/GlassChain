@@ -27,7 +27,7 @@ inert** (the code exists, is tested, but no production binary activates it), and
 |---|---|---|---|
 | 1 | TLS transport encryption + connection-level fingerprint pinning | **Enforced at runtime** | `Node::build_tls`, `process_message` Hello Step 1, `connector_for_peer_cert` (`glasschain-network/src/node.rs`) |
 | 2 | TOFU peer registry (identity pinned on first contact) | **Enforced at runtime**, with accepted limits — address-bound, in-memory, no persistence | `PeerRegistry` / `verify_or_register` (`node.rs`) |
-| 3 | Wire-version gate (`glasschain/5`) | **Enforced at runtime** | `process_message` Hello Step 0 (`node.rs`) |
+| 3 | Wire-version gate (`glasschain/6`) | **Enforced at runtime** | `process_message` Hello Step 0 (`node.rs`) |
 | 4 | Capability gates (`pdc`, `endorsement`, …) | **Enforced at runtime** (once a capability is activated in a committed block) | `CapabilityHistory::effective_set` (`glasschain-core/src/capability.rs`, `node.rs`) |
 | 5 | `CertChainVerifier` — `VerificationLevel::Full` cryptographic chain check | **Implemented but inert** — `NodeState.cert_verifier` is `None` in all four `Node` constructors; `set_cert_verifier` is called only from integration tests | `cert_verifier.rs`; `node.rs` `with_components`/`set_cert_verifier` |
 | 6 | Certificate-verified PDC org gate (reject self-asserted `Hello` org) | **Implemented but inert — fails open** outside tests: the gate is `cert_verifier.is_some()`, so a stock node accepts the self-asserted org | `process_message` PrivatePayload handler (`node.rs`) |
@@ -555,7 +555,7 @@ tagged `msg`/`data`, 4-byte big-endian length framing, `MAX_MESSAGE_SIZE` =
   against the org Root CA when a verifier runs — ticket #47 design; see §1.4
   for runtime reality), and `listen_addr`.
 - **Wire-version progression** (read from `protocol.rs`, exact):
-  `PROTOCOL_VERSION = "glasschain/5"`. The `/2` bump marked the BFT consensus
+  `PROTOCOL_VERSION = "glasschain/6"`. The `/2` bump marked the BFT consensus
   seam; `/3` added the `PrivatePayload` message and the `Hello` `org` field
   (ticket #46, ADR-003); `/4` added pull-based reconciliation via
   `RequestPrivatePayload` (ticket #47) — a `/3` peer "can neither request
@@ -746,7 +746,7 @@ The status table's claims, with the exact places to re-verify them:
 | Payload org gate fails open | `node.rs` `process_message`, `PrivatePayload` branch: `verification_required = s.cert_verifier.is_some()` |
 | Endorsement provider test-only | grep `set_endorsement_provider` across `crates/` (tests + node unit tests only) |
 | No production `set_collections` | grep `set_collections` across `crates/glasschain-node`, `crates/glasschain-cli` (no matches) |
-| `PROTOCOL_VERSION` | `protocol.rs`: `"glasschain/5"` |
+| `PROTOCOL_VERSION` | `protocol.rs`: `"glasschain/6"` |
 | Retention default 72 h | `channel.rs` `default_retention_secs()` |
 | Next-height payload gates | `node.rs` `submit_private_payload` and `PrivatePayload` handler, both `effective_set(chain.len())` |
 | Committed, not declared, policy | `glasschain-core/src/endorsement.rs` `PolicyUpdate`/`PolicyHistory`; `channel.rs` doc on `endorsement_policy` |

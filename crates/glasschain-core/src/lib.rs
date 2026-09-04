@@ -30,7 +30,7 @@ pub use capability::{
     BFT_CONSENSUS_CAPABILITY_ID, CAPABILITY_V1, ENDORSEMENT_CAPABILITY_ID, GENESIS_CAPABILITIES,
     PDC_CAPABILITY_ID, STATE_COMMITMENT_CAPABILITY_ID,
 };
-pub use consensus::{Attestation, CommitNotification, QuorumCertificate};
+pub use consensus::{CommitNotification, QuorumCertificate};
 pub use endorsement::{
     evaluate_transaction_endorsements, operation_default, EndorsementEvaluation,
     EndorsementRequest, EndorserIdentity, PolicyExpression, PolicyHistory, PolicyUpdate, Principal,

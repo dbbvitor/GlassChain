@@ -108,4 +108,6 @@ pub enum Message {
 /// `/5` switched signature-adjacent byte fields from JSON decimal arrays to
 /// base64 and added the signature algorithm discriminant (#62 Step 1,
 /// post-quantum plan action 2) — a `/4` peer cannot parse the new encoding.
-pub const PROTOCOL_VERSION: &str = "glasschain/5";
+/// `/6` restructured the quorum certificate into a BLS12-381 aggregate
+/// signature with a signer bitmap (ADR-014) — a `/5` peer cannot parse it.
+pub const PROTOCOL_VERSION: &str = "glasschain/6";
