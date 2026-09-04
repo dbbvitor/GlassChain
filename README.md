@@ -384,8 +384,9 @@ against the shipped code, and explicit about what is designed but not yet wired.
 | [Privacy and identity](docs/privacy-and-identity.md) | MSP, certificate verification, endorsement policy, private data collections |
 | [Workflows and contracts](docs/workflows-and-contracts.md) | The contract/workflow split, the WASM host ABI, flows, watcher automation |
 | [Operations](docs/operations.md) | Build, flags, REPL, gRPC, storage, wire protocol, operator security warnings |
+| [Liveness engineering](docs/liveness.md) | Diversity constraints, SLA expectations, participation monitoring for the 300-validator roster |
 
-[`docs/adr/`](docs/adr/) holds the nine accepted architecture decision records.
+[`docs/adr/`](docs/adr/) holds the accepted architecture decision records.
 Read the one covering your area before designing a change.
 
 ---

@@ -505,7 +505,14 @@ round, drained every block.
 harness shows pending-pool depth failing to drain within one round, or block
 propagation dominating p99 finality, under a realistic workload.
 
-### Step 7 — Liveness engineering, not protocol work
+### Step 7 — Liveness engineering, not protocol work — **DONE 2026-09-03**
+
+> Shipped as [docs/liveness.md](../../docs/liveness.md): the 25% failure-domain
+> placement constraint (enforced in the ADR-009 epoch rotation), 40% jurisdiction
+> floor, the 99.0% per-org uptime commitment measured from certificate bitmaps,
+> the participation-monitoring metric table, and round-timeout guidance
+> (⅔n-th order statistic, claimable only post-adoption-gate). No jailing, no
+> reputation weighting, no availability claim.
 
 The bounds that actually bite at 300 among institutional validators are
 **correlated failure** (shared clouds and ISPs — quorum availability tracks the
