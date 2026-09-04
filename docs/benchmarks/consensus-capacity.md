@@ -62,13 +62,29 @@
 | Partition recovery (100 join) | **912 ms** to full convergence |
 | PDC dissemination (30 members) | **53.3 ms**, 30/30 delivered |
 
-**Observed, honestly:** fan-out now grows monotonically *across* rounds
-(47 → 1 227 ms at 200 validators). Within every round 50% ≤ 95% ≤ 100% — the
-instrument is coherent — but the cross-round growth is not yet attributed: the
-sweep is still O(connected) ledger locks per 20 ms tick, and per-peer write
-queues may be absorbing backlog as rounds accumulate. The recovery-convergence
-figure (573/912 ms) remains the cleaner end-to-end number. Attributing the
-growth is follow-up Step 0 work.
+**Observed, honestly — ATTRIBUTED and FIXED (2026-09-03, #62 Step 0):**
+fan-out grew monotonically across rounds (47 → 1 227 ms at 200). The attribution
+instrument (per-tick sweep cost + first-reached, then a stride sample) split the
+causes:
+
+1. **Instrument (minor):** the full O(connected) sweep grew per round and
+   contaminated the thresholds (669 ms of 1751 ms at round 10). Fixed by
+   stride-sampling (~connected/40 nodes).
+2. **Real cause (dominant):** every received block ran
+   `CapabilityHistory::build_from_blocks` — a full replay of the chain — while
+   holding the peer's ledger lock, so each peer did O(height) work per block
+   and the 200-peer commit herd's cost grew linearly with the round count.
+   Fixed with an incremental capability cache on `NodeState`: advanced
+   block-by-block at the commit choke point, rebuilt from the chain on
+   start/sync/replacement, validated on a clone at admission. The same fix
+   removes the per-submission replays.
+
+Post-fix at 200 validators: round 1 fan-out 52 ms → round 10 **459 ms**
+(was 70 → 1 751 ms); first-reached stays 25–99 ms throughout (was growing to
+839 ms). At 300: median **344 ms**, recovery 911 ms, PDC 53 ms. A mild residual
+growth remains (attributed to other O(height) admissions such as `chains_to`
+timestamp checks and task-scheduling contention on the shared runtime) —
+bounded and small; revisit only if the harness grows much longer.
 
 ### 200 validators (2026-09-01 original run — instrument broken, superseded)
 

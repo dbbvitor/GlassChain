@@ -190,6 +190,25 @@ struct ValidatorSet {
     connected: usize,
 }
 
+/// One propagation measurement plus the attribution instrumentation
+/// (Step 0, #62): `sweep_ms`/`ticks` expose the cost of the measurement
+/// itself, `first_reached` separates the fastest peer from the thresholds.
+#[derive(Default, Clone, Copy)]
+struct PropagationSample {
+    first_reached: Option<u128>,
+    p50: Option<u128>,
+    p95: Option<u128>,
+    p100: Option<u128>,
+    sweep_ms: u128,
+    ticks: u32,
+}
+
+impl PropagationSample {
+    const fn p100(&self) -> Option<u128> {
+        self.p100
+    }
+}
+
 impl ValidatorSet {
     /// Time until 50%/95%/100% of the validators hold at least `height`
     /// blocks (integer percent keeps the math off float casts).
@@ -200,35 +219,50 @@ impl ValidatorSet {
     /// lock contention with ongoing commit work and the later thresholds
     /// measured an already-converged network — incoherent as a propagation
     /// measurement.
-    async fn propagation_ms(&self, height: usize) -> (Option<u128>, Option<u128>, Option<u128>) {
+    async fn propagation_ms(&self, height: usize) -> PropagationSample {
         let start = Instant::now();
         // Fan-out is measured over the CONNECTED validators; the partitioned
         // group converges during recovery, not per-block.
-        let want50 = (50 * self.connected).div_ceil(100);
-        let want95 = (95 * self.connected).div_ceil(100);
-        let want100 = self.connected;
-        let mut reached_at: (Option<u128>, Option<u128>, Option<u128>) = (None, None, None);
+        let sampled_count = (self.connected / (self.connected / 40).max(1)).min(self.connected);
+        let want50 = (50 * sampled_count).div_ceil(100);
+        let want95 = (95 * sampled_count).div_ceil(100);
+        let want100 = sampled_count;
+        let mut sample = PropagationSample::default();
         loop {
+            // Attribution instrumentation (Step 0, #62): the full sweep over
+            // `connected` nodes was measured growing per round and dominating
+            // the thresholds (669 ms of 1751 ms at round 10, contending with
+            // the 200-peer commit herd). A stride sample keeps the estimate
+            // at O(sample) cost: the sweep is the instrument's overhead, not
+            // part of the network being measured.
+            let stride = (self.connected / 40).max(1);
+            let sweep_start = Instant::now();
             let mut reached = 0;
-            for node in &self.validators[..self.connected] {
+            for idx in (0..self.connected).step_by(stride) {
+                let node = &self.validators[idx];
                 // Length read under the lock — ledger_snapshot would clone the
                 // whole chain per poll, dominating the measurement.
                 if node.shared_ledger().lock().await.chain.len() >= height {
                     reached += 1;
                 }
             }
+            sample.sweep_ms += sweep_start.elapsed().as_millis();
+            sample.ticks += 1;
             let elapsed = start.elapsed().as_millis();
-            if reached >= want50 && reached_at.0.is_none() {
-                reached_at.0 = Some(elapsed);
+            if sample.first_reached.is_none() && reached >= 1 {
+                sample.first_reached = Some(elapsed);
             }
-            if reached >= want95 && reached_at.1.is_none() {
-                reached_at.1 = Some(elapsed);
+            if reached >= want50 && sample.p50.is_none() {
+                sample.p50 = Some(elapsed);
             }
-            if reached >= want100 && reached_at.2.is_none() {
-                reached_at.2 = Some(elapsed);
+            if reached >= want95 && sample.p95.is_none() {
+                sample.p95 = Some(elapsed);
             }
-            if reached_at.2.is_some() || start.elapsed() > Duration::from_secs(90) {
-                return reached_at;
+            if reached >= want100 && sample.p100.is_none() {
+                sample.p100 = Some(elapsed);
+            }
+            if sample.p100.is_some() || start.elapsed() > Duration::from_secs(90) {
+                return sample;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -367,7 +401,12 @@ async fn run_round(
     };
 
     let height = set.leader.ledger_snapshot().await.chain.len();
-    let (propagation_50, propagation_95, propagation_100) = set.propagation_ms(height).await;
+    let sample = set.propagation_ms(height).await;
+    let (propagation_50, propagation_95, propagation_100) = (sample.p50, sample.p95, sample.p100);
+    println!(
+        "attribution: first-reached {:>4?} ms | sweep {} ms over {} ticks",
+        sample.first_reached, sample.sweep_ms, sample.ticks
+    );
 
     let last = set
         .leader
@@ -498,7 +537,7 @@ async fn capacity_gate(validator_count: usize, txs_per_round: usize, rounds: usi
     let height = set.leader.ledger_snapshot().await.chain.len();
     set.propagation_ms(height)
         .await
-        .2
+        .p100()
         .expect("activation propagates to the connected validators");
 
     // ── Sustained compact workload ──────────────────────────────────────

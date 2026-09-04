@@ -18,7 +18,7 @@ hex = "0.4"
 uuid = { version = "1.26", features = ["v4"] }
 thiserror = "2.0"
 log = "0.4"
-ed25519-dalek = { version = "3.0", features = ["alloc"], optional = true }
+ed25519-dalek = { version = "3.0", features = ["alloc", "batch"], optional = true }
 
 [features]
 default = []
