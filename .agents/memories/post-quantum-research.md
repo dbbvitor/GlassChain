@@ -3,6 +3,8 @@
 **Learned:** 2026-09-02
 
 Date-read note: every URL below was read on **2026-09-02** unless otherwise noted.
+**Updated 2026-09-05** — added §7 (RFC 3161/4998/6283 archival evidence) and Follow-up 3.
+The earlier conclusions stand except where §7 / Follow-up 3 explicitly supersede them.
 This file is the durable record for GlassChain's post-quantum readiness assessment; it is
 fact-only, with each claim tied to a primary source. Anything not verifiable is flagged.
 
@@ -58,12 +60,13 @@ fact-only, with each claim tied to a primary source. Anything not verifiable is 
   **default features**, so PQ is effectively preferred by default for aws-lc-rs users.
 - Under `ring`: **no post-quantum key exchange exists**. None in `crypto::ring::kx_group`,
   none offered.
-- GlassChain relevance (repo evidence): `Cargo.lock` pins rustls **0.23.43** (also
-  aws-lc-rs 1.18.0 via default features, ring 0.17.14);
-  `crates/glasschain-network/Cargo.toml` selects `rustls = { version = "0.23", features =
-  ["ring"] }`. The project therefore runs the `ring` provider → **no PQ KX available to
-  GlassChain today even though the pinned version supports it under aws-lc-rs**. (Identical
-  choice mirrored in `glasschain-identity` for rustls-webpki.)
+- GlassChain relevance (updated 2026-09-05): `Cargo.lock` includes rustls
+  **0.23.43**, aws-lc-rs 1.18.0 via defaults and ring 0.17.14. The network crate's
+  `features = ["ring"]` does not exclude aws-lc. Runtime provider installation and
+  explicit configuration determine negotiation; inspect `build_tls` and identity
+  paths, then assert the group in a handshake test. Webpki certificate-signature
+  verification is separate from TLS key exchange. The earlier manifest-only
+  conclusion about every connection's KX was not justified.
 
 ---
 
@@ -303,6 +306,105 @@ documentos-principais; text extracted) and DOC-ICP-01.01 v6.0.
 - FIPS 203 Table 3: ML-KEM-768 encapsulation key **1,184**, ciphertext **1,088**, decapsulation
   key 2,400, shared secret 32.
 
+## 7. Long-term archival evidence — RFC 3161 / 4998 / 6283 (read 2026-09-05)
+
+Sources read directly from rfc-editor.org on **2026-09-05**.
+
+**RFC 3161 — Internet X.509 PKI Time-Stamp Protocol (TSP).** Proposed Standard,
+Adams/Cain/Pinkas/Zuccherato, 2001-08 (updated by RFC 5816).
+https://www.rfc-editor.org/rfc/rfc3161
+- Purpose: a Time Stamping Authority (TSA) proves a datum "existed before a
+  particular time" (§1); a building block for non-repudiation services.
+- The TSA "SHALL only time-stamp a hash representation of the datum" (a data
+  imprint, one-way + collision-resistant, identified by an OID) and must not
+  examine the imprint beyond its length (§2.1 items 6–8).
+- The TSA signs each token with a key reserved exclusively for time-stamping;
+  the cert EKU id-kp-timeStamping MUST be critical (§2.3).
+- §4 security item 3: a TSA signing key "will have a finite lifetime. Thus, any
+  token signed by the TSA SHOULD be time-stamped again ... at a later date to
+  renew the trust that exists in the TSA's signature."
+- Appendix A: Signature Time-stamp attribute (id-aa-timeStampToken) — the
+  messageImprint is a hash of the signature field, proving a signature existed
+  before a time (e.g., before a certificate revocation).
+
+**RFC 4998 — Evidence Record Syntax (ERS).** Proposed Standard,
+Gondrom/Brandner/Pordesch, 2007-08. https://www.rfc-editor.org/rfc/rfc4998
+- Purpose: "long-term non-repudiation of existence of data"; explicitly
+  motivated by digitally signed data archived 30+ years where algorithms/certs
+  "become weak or ... invalid," "increas[ing] the likelihood that forgeries can
+  be created" (§1.1).
+- EvidenceRecord: version, digestAlgorithms, cryptoInfos (OPTIONAL: "Trust
+  Anchors, certificates, revocation information, or the current definition of
+  the suitability of cryptographic algorithms"), archiveTimeStampSequence (§3.1).
+- ArchiveTimeStamp = optional reduced Merkle hash tree + a timestamp over the
+  root hash (§4.1–4.2). A timestamp is requested only for the tree root; the
+  tree can be reduced to per-object inclusion proofs (§1.2, §4.2).
+- Renewal: ArchiveTimeStampChain = Timestamp Renewal (re-timestamp the prior
+  timestamp); ArchiveTimeStampSequence = Hash-Tree Renewal (re-hash + re-timestamp
+  data and all prior chains) (§5). Only the most recent ArchiveTimestamp must
+  remain valid (§5).
+- §7 security: algorithms "must be secure at the time of generation";
+  recommends "at least two redundant Evidence Records ... using different hash
+  algorithms and different TSAs."
+- Retroactivity caveat (§1.1, §7): if an algorithm loses security *before* it
+  is publicly known, evidence may lose probative force; renewal must occur
+  *before* the event. ERS does not retroactively fix forged or weakened evidence.
+
+**RFC 6283 — Extensible Markup Language Evidence Record Syntax (XMLERS).**
+Proposed Standard, Jerman Blazic/Saljic/Gondrom, 2011-07.
+https://www.rfc-editor.org/rfc/rfc6283
+- XML encoding of the same ERS model (same EvidenceRecord / ArchiveTimeStamp /
+  Chain / Sequence concepts; RFC 4998 reference is informative only — a
+  standalone syntax, §1.1).
+- Adds CanonicalizationMethod: digest values are computed over canonicalized
+  binary representations of XML elements (§1.3, §4.1.2) — "canonical bytes" are
+  a first-class input, not a GlassChain invention.
+- Encryption section (§5): an EvidenceRecord protects the bitstream and does
+  not hide metadata; EncryptionInformation exists only to unambiguously
+  re-encrypt data so evidence over encrypted data can still prove the
+  unencrypted data. It is NOT a confidentiality/metadata-hiding mechanism.
+- §9.2 redundancy: recommends ≥2 redundant Evidence Records with different hash
+  algorithms and TSAs; notes validity can "end without any options for
+  retroactive action."
+
+**Mapping to the "sign Merkle roots of legacy signatures with ML-DSA / SLH-DSA"
+proposal:** ERS already signs the *root hash* of a Merkle tree over a group of
+objects (here: legacy signatures) with a timestamp; renewing the root signature
+(Timestamp / Hash-Tree renewal) is the standard long-term answer to
+non-repudiation of archived classical signatures. The recommendation is a
+research/design option for **off-chain** archival evidence — not an in-ledger
+change and not a consensus requirement.
+
+## Follow-up 3 (2026-09-05): correcting prior overstatements — verified vs inferred
+
+Re-read of the 2026-09-02 notes against primary sources, separating measured
+fact from inference the earlier plan overstated:
+
+- **"Forgery is not retroactive"** overstates the protection of both artifacts
+  and ledgers. Later forgeries do not automatically alter copies held by honest
+  nodes, but can undermine signature-based historical evidence and present
+  apparently valid alternative histories to a new/recovering verifier. Hash
+  links alone do not choose an authentic history. Preserve trusted checkpoints,
+  historical validator/credential evidence and timely renewal; RFC 4998/6283
+  address long-term evidence degradation, not an unconditional blockchain guarantee.
+- **2035** is NIST IR 8547's *proposed* (draft) disallow date for its own FIPS
+  ≥128-bit classical schemes; it is not a guarantee a quantum computer exists
+  by then, and not a legal deadline for GlassChain or Brazil. Do not use
+  "pre-2035 safe" claims. (Consistent with Unverifiable item 2: only the ipd
+  was found.)
+- **"We are compliant today"** (plan Verdict) overreaches: an algorithm being
+  listed in the ICP-Brasil catalogue (DOC-ICP-01.01) is not an assertion of
+  compliance. Compliance is a property of specific requirements under a
+  certificate policy, not of catalogue membership.
+- **"SLH-DSA is off the table for anything touching legal identity"** (plan §7)
+  overreaches: SLH-DSA's absence from the ICP-Brasil catalogue means it cannot
+  be used *for ICP-Brasil-certified identity*, not that the algorithm is
+  illegal or unusable elsewhere (e.g., as an archival evidence timestamp).
+- **"HSM for all runtime identity"** (plan §8) overreaches: DOC-ICP-04 Tabela 4
+  mandates hardware only for A3/A4/SE-H/T3/T4/AE-H/OM-BR; SE-S/AE-S permit
+  software repositório. The hardware duty binds only once node identity is
+  bound to ICP-Brasil credentials — not today.
+
 ## Unverifiable items (explicit)
 
 1. FIPS 206 / FN-DSA: no CSRC record, no accessible draft PDF or DOI (all 404 on
@@ -312,3 +414,7 @@ documentos-principais; text extracted) and DOC-ICP-01.01 v6.0.
 3. ITI consultation listing contents (JS-rendered) and the site search could not be read
    directly; "no PQ consultation/roadmap found" is based on visible page content, not an
    exhaustive search.
+4. RFC 4998 and RFC 6283 are IETF Proposed Standards (stable, published); their adoption
+   in Brazil (e.g., any ITI/ICP-Brasil recognition of RFC 3161/4998/6283 or ERS) was
+   **not** researched or verified — that is a policy question, not a technical one, and
+   belongs with the plan's archival-evidence design option rather than asserted here.

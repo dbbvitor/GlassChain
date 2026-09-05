@@ -773,6 +773,14 @@ waiting flow re-surfaces it with its stored checkpoint timestamp, so staleness
 survives (`resume.rs` proves this). A dashboard on `stuck_flows` only knows
 about flows driven since the current process started.
 
+The referenced purchase/recall tickets have shipped, but restart discovery has
+not. D6 in the [source-comment debt plan](../.agents/plans/deferred-code-debt.md)
+tracks a checkpoint scan that restores triage **without** a new event or duplicate
+side effects, before unattended recall operation. The
+[learning-loop mapping](../.agents/plans/requirements-alignment.md) uses existing
+events/rules/flows and off-chain outcome evaluation; it does not imply a shipped
+ML training engine or let a model bypass endorsement and recall authority.
+
 ### 18. Known limitation: no durable wake queue
 
 A future node-hosted flow runtime needs a **durable wake queue**: because a

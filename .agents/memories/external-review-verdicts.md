@@ -4,6 +4,10 @@
 **Source:** an external review report ("Distributed Inventory System" notebook)
 assessed against the working tree at `fed76c7` and against primary sources.
 
+**Current reading:** entries below are dated assessments, not current-state
+specifications. The final 2026-09-05 HotStuff/PQC/learning-loop entry supersedes
+blanket earlier conclusions about compliance, source usefulness and scaling.
+
 ## Finding
 
 The report's four architectural sections are **broadly aligned with our accepted
@@ -148,3 +152,141 @@ known, mutually-distrusting rival orgs.
   stable key→principal directory (the security boundary) and ADR-011 TOFU
   pinning; misattribution under a compromised ephemeral key is *worse* than the
   channel hygiene it buys. Identity-backed mTLS already exists.
+
+---
+
+## 2026-09-05 — third "Distributed Inventory System" notebook report
+
+Assessed against `main` @ `f7b434e`. **Verdict: it is the 2026-09-02 report
+again**, re-generated from the same notebook, with the same headline priority —
+which was already stale when first assessed and is now stale twice over.
+
+| Report claim | Verdict |
+|---|---|
+| "Main priority: completing the end-to-end integration of the PDC distribution layer" | **Stale, second time.** Shipped in #46/#47 *before* the first report was written. Ruled stale on 2026-09-02; unchanged since |
+| "...alongside the zero-trust identity verification pipelines" | **Stale.** #57/#58/#59 all closed — verifier wired at startup (ADR-011), fail-closed CRLs (ADR-013), MSP provider attached under `--org` |
+| Narwhal/Bullshark DAG separation of dissemination from ordering | **Unchanged verdict:** correct but orthogonal. Mempool layer behind `ConsensusProvider`, performance Step 6, gated on a measured trigger |
+| "Transition towards leaderless or optimistic fast-path consensus" | **Unchanged verdict:** in-family latency optimization (Step 5), not a family change. ADR-002 stands |
+| `zk-X509` for on-chain certificate-chain verification | **Unchanged verdict:** real work, inapplicable. Solves a public-chain metadata leak we do not have |
+| Off-chain PII / on-chain attestation separation, PDCs committing only hashes | **Unchanged verdict:** satisfied by design (ADR-003). Nothing certificate-shaped is ever committed |
+| Off-chain analytics isolated from the consensus runtime | **Unchanged verdict:** correct, and shipped (#39) |
+
+### Implication — the useful finding is about the *source*, not the content
+
+This report contains **zero new information** relative to the 2026-09-02
+assessment, and its stated "main priority" has been shipped for over twenty
+commits. The notebook is regenerating from a corpus that does not include our
+repository state, so it will keep proposing work that is done.
+
+**Treat further reports from this source as a literature check, not a status
+report.** Its value is confirming that our ADRs match the published state of the
+art — which it does, consistently. Its priorities are worthless without first
+checking closed tickets, and the standing rule from 2026-09-02 stands unchanged:
+**when an external report names a priority, check the closed tickets first.**
+
+### What this review *did* find — by reading our own code, not the report
+
+Both findings came from auditing the repo against its own plans, and neither
+appears in any external report:
+
+1. **Performance Step 2 shipped and was deleted three commits later** by
+   ADR-014, taking a documented zero-trust property (per-signer attribution on
+   certificate verification) with it. Nothing recorded the trade. Now ZT-2 in
+   [`../plans/zero-trust.md`](../plans/zero-trust.md) §3.
+2. **Two plans are blocked on the same unasked question.** Post-quantum action 1
+   (`aws-lc-rs`) and the 300-validator finality gate (`blst`) both need a C
+   cryptographic backend, and ADR-014's own revisit condition for `blst`
+   ("revisit only with a measured need") is now met by the measured 300-validator
+   failure. Neither plan saw it because each treated the C toolchain as a local
+   cost. Now [`../plans/zero-trust.md`](../plans/zero-trust.md) §6.
+
+The pattern worth carrying: reconcile plans against each other periodically,
+not just against the code. The prior assessment did not inspect the notebook's
+private corpus; assertions about why its priorities were stale were inference,
+not verified knowledge of that source.
+
+---
+
+## 2026-09-05 — HotStuff / PQ archival evidence / learning-loop report
+
+**Scope:** the new report supplied in chat; no access to its underlying notebook
+or unspecified DLT-LFL/BC-FL papers is assumed. It contains useful new proposals
+as well as incorrect statements about the implementation. Assess them separately
+rather than accepting its two-option follow-up framing.
+
+| Claim or proposal | Verdict and resulting plan |
+|---|---|
+| GlassChain uses HotStuff-style consensus with speculative execution | **Incorrect as shipped.** `network/src/rounds.rs` describes Tendermint-shaped proposal/prevote/precommit and locking; no client-visible speculative execution API. Corrected `docs/consensus.md`; retain fast-path research in performance Step 5, not a speculative test suite for nonexistent code. |
+| HotStuff-1 one-phase confirmation cuts latency | **Relevant research, not a drop-in optimization.** Its abstract describes early speculative client confirmations and a prefix-speculation dilemma. Distinguish tentative replies from finality; any design must prove fault/fallback behaviour and prevent pre-finality business side effects. |
+| WAN overlays/madsim before cloud deployment | **Adopt benchmark work.** `tcp_partition.rs` already tears down established TLS sessions over real TCP; delay/jitter/bandwidth matrices are new work. Extend that proxy first. The one source TODO remains optional madsim-tokio migration, not absent fault testing. |
+| DAG or Snow-family alternatives for contention | **Split the ideas.** Narwhal-like dissemination is a measured Step 6 candidate; it cannot eliminate application hot-key contention. DAG ordering and probabilistic Snow consensus are outside ADR-002, not an unreviewed overlay to add. |
+| zk-X509 needed for private enterprise identity | **Not justified for this deployment.** We do not commit certificate chains to the public ledger. Fix certificate/principal binding, transport possession and lifecycle controls first; ZK proofs would not remove issuer trust, revocation freshness or endpoint authorization requirements. |
+| PQ-signed Merkle roots over legacy signatures | **Add scoped archival-evidence research, not automatic adoption.** RFC 4998 already defines batched hash-tree timestamps and renewal. Bind original signed bytes, signature/algorithm context, validation evidence and inclusion proofs; choose trusted time and renewal policy. A signature over a claimed time is not itself trusted timestamping. |
+| Current endorsements are ECDSA/RSA | **Incorrect for native carriers.** MSP endorsements use Ed25519; staged consensus uses BLS. Imported enterprise PKI formats are a separate interoperability boundary. An archive must preserve actual bytes/algorithms rather than relabel them. |
+| DLT-LFL mandates federated learning | **Unsupported.** No primary citation or applicable regulatory mandate supplied. Map Sense/Decide/Adapt to existing events/rules/flows; add offline outcome evaluation for Learn. §6.5 remains a deferred SHOULD with task, dataset, benefit and privacy gates. |
+| Keep model parameters off-chain, optionally IPFS | **Keep the off-chain boundary, not a dependency mandate.** Gradients and model parameters can disclose data; hashes may be linkable. Prefer authorized existing storage/export, and require access, retention and poisoning controls before any FL adapter. |
+| GUI speculative latency and view-change metrics | **Partly adopt.** Show admission, verified finality, round changes/timeouts and recovery separately. Speculative latency is unavailable until such an interface exists; never label early admission as final. |
+| High-frequency flattening memory benchmarks | **Adopt.** `AnalyticalFlattener.records` is a growing vector; bounded event-bus buffers do not bound projections. It ingests AssetRegistration only, and node commit processing invokes it. Measure retained rows/RSS, lag, query/replay costs and impact on finality with representative input. |
+
+### Source-comment reconciliation
+
+The previous response understated the debt by calling every marker clean.
+**Six ponytail + one TODO** are now individually planned in
+[deferred-code-debt.md](../plans/deferred-code-debt.md), with source locations,
+triggers, next steps and acceptance checks. Two observations matter:
+
+- `TransientStore::get` denies expired reads after restart, but the in-memory
+  index cannot discover old keys for deletion. This is a retention gap, not a
+  harmless cache detail (D5).
+- `FlowTriage` names the already-closed purchase/recall tickets as its future
+  trigger. Checkpoints survive, but unattended discovery still does not (D6).
+  Source history references do not prove an operational recovery requirement met.
+
+Also correct the earlier scaling assertion: a survey of validator counts cannot
+prove that protocol optimization cannot surpass 300. It may improve the feasible
+operating point; demonstrate 300 first, then test beyond it under the same trust
+and quorum model. Fixed-fraction quorum delay is not universally proportional
+to the maximum-of-n Pareto formula previously quoted.
+
+### Additional safety observations while checking the report
+
+Not source-comment markers and not runtime fixes in this pass:
+`BftVote::vote_message` signs a hash but not round/phase metadata;
+`handle_vote` recreates the receipt tracker per message; `Message::Chain`
+reaches structural rather than full historical BLS validation. These contradict
+the prior blanket claim that vote attribution and every verification path are
+complete. The [zero-trust plan §8](../plans/zero-trust.md) records focused
+regressions and the design questions before fast paths or production claims.
+
+### Sources re-read for this report
+
+- [HotStuff-1 v3](https://arxiv.org/abs/2408.04728v3), abstract read 2026-09-05:
+  early speculative confirmations, prefix dilemma and view slotting; not proof
+  that our driver implements it.
+- [Narwhal and Tusk v4](https://arxiv.org/abs/2105.11827v4), abstract read
+  2026-09-05: dissemination/ordering separation, WAN evaluation and latency
+  costs under faults. Its numbers are not GlassChain capacity claims.
+- [RFC 4998](https://www.rfc-editor.org/rfc/rfc4998.html), §§1.1–1.3, 4–5, 7,
+  read 2026-09-05: archive evidence, Merkle batch timestamps, validation material,
+  signature/hash-tree renewal **before** algorithms/evidence become unreliable.
+- [NIST FIPS 204](https://csrc.nist.gov/pubs/fips/204/final) and
+  [FIPS 205](https://csrc.nist.gov/pubs/fips/205/final), publication pages read
+  2026-09-05: standardized ML-DSA and SLH-DSA, respectively. Algorithm standards
+  do not establish ICP-Brasil credential acceptance or legal sufficiency of an
+  archival service. Detailed qualifications live in the PQ plan/research memory.
+
+No new architecture was approved by this report. Priority: source-debt/security
+and actual-driver measurement first; archival-evidence design can proceed
+independently; FL and speculative consensus implementation remain gated.
+
+### Owner follow-up — browser demo replaces desktop (2026-09-05)
+
+The owner changed the visual demo to a web app and asked to consider WebGPU.
+The [demo plan](../plans/gui-demo-benchmark.md) and existing tracking issue now
+supersede gpui rather than adding a second GUI. WebGPU is a rendering API,
+with limited browser availability and secure-context/device requirements
+([MDN](https://developer.mozilla.org/en-US/docs/Web/API/WebGPU_API), read
+2026-09-05), not a consensus or frontend application framework. A same-origin
+Rust demo bridge, accessible baseline and measured GPU fallback are planned;
+none is shipped. This is an explicit product-direction decision, not an
+architecture change inferred from the earlier literature report.

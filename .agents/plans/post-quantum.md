@@ -1,330 +1,237 @@
 # Plan — Post-quantum exposure and crypto agility
 
-**Status:** assessment complete; one action ready, one decision deferred, one ruled out
-**Date:** 2026-09-02
-**Relates to:** [ADR-003](../../docs/adr/adr-003-privacy-model.md) (PDC confidentiality),
-[ADR-008](../../docs/adr/adr-008-endorsement-policy-model.md) (MSP identity),
-[ADR-002](../../docs/adr/adr-002-consensus-finality.md) (attestation signatures)
+**Status:** current 2026-09-05. One action ready (transport, with a verification test);
+signature agility shipped, migration deferred; archival-evidence research option open.
+No new dependency, issue, or commit required by this plan.
+**Relates to:** [ADR-003](../../docs/adr/adr-003-privacy-model.md),
+[ADR-008](../../docs/adr/adr-008-endorsement-policy-model.md),
+[ADR-002](../../docs/adr/adr-002-consensus-finality.md),
+[ADR-014](../../docs/adr/adr-014-bls-aggregated-certificates.md),
+D5 ([`deferred-code-debt.md`](deferred-code-debt.md))
 **Evidence:** [`../memories/post-quantum-research.md`](../memories/post-quantum-research.md)
-— primary sources, read 2026-09-02
+(§1–§7 + Follow-ups 1–3); RFC 3161/4998/6283 and FIPS 203/204/205 re-read 2026-09-05.
 
 ---
 
 ## Verdict
 
-**Yes, we are vulnerable — but only one of the three exposures has a deadline, and
-the fix for it is a dependency feature flag we are already paying for.**
+Three assets fail differently; conflating them turns this into a rewrite nobody needed:
 
-The three assets fail differently, and conflating them is how this topic turns
-into a rewrite that nobody needed:
-
-| Asset | Quantum exposure | Deadline | Action |
+| Asset | Exposure | Clock | Posture |
 |---|---|---|---|
-| **Peer transport confidentiality** | Shor breaks X25519; recorded traffic is decryptable retroactively | **Now** — harvest-now-decrypt-later | Switch rustls to `aws-lc-rs` (§2) |
-| **Signatures** (ed25519, RSA at the ICP boundary) | Shor breaks both, but forgery is not retroactive | 2035 (NIST IR 8547 ipd) | Type-level agility now, algorithms later (§3) |
-| **Hashing** (SHA-256) | Grover, heavily discounted | None | **None.** Do not touch (§4) |
+| **Transport confidentiality** | Shor breaks X25519; recorded traffic decrypts retroactively | Harvest-now-decrypt-later — **now** | Runtime provider → `aws-lc-rs` rustls, negotiate hybrid `X25519MLKEM768`, prove it in a test (§2) |
+| **Signatures** (Ed25519 app, BLS QCs, imported enterprise PKI) | Shor threatens these classical public-key schemes | No guaranteed date — below | Discriminants shipped; migration needs a risk/requirement trigger (§3) |
+| **Hashing** (SHA-256) | Grover, heavily discounted; collision search Category 2 | None | **No action** (§4) |
 
-**The thing that changed while we were not looking: ICP-Brasil has already moved.**
-DOC-ICP-01.01 v6.0 (Instrução Normativa ITI nº 35, 30.01.2026) added ML-DSA and
-ML-KEM to the ICP-Brasil algorithm catalogue. Read this precisely: it
-*acrescenta suporte* — adds support. Classical RSA-2048, Ed25519 and Curve25519
-remain listed for end-user keys, so **we are compliant today and nothing is
-burning.** But the direction of travel in our own jurisdiction is now a published
-normative fact rather than a guess, and our plans should stop treating
-post-quantum as somebody else's future problem.
+Corrections to the previous edition (Follow-up 3 supersedes):
+
+- **Not "compliant today."** Catalogue membership (DOC-ICP-01.01 v6.0 added ML-DSA/ML-KEM
+  as *support*) is not compliance; compliance is a property of specific requirements
+  under a certificate policy.
+- **2035 is a draft proposal, not a prediction** (IR 8547 ipd dates NIST's own FIPS; not
+  a quantum-computer guarantee, not a legal deadline). No "pre-2035 safe" claims.
+- **Algorithms and on-chain hashes give technical integrity, not compliance or proof
+  weight** (§4, §7).
 
 ---
 
 ## 1. What we actually run
 
-Measured against the tree, 2026-09-02:
+Verified against the tree, 2026-09-05:
 
-- **Peer TLS:** `rustls 0.23` with `features = ["ring"]`
-  (`crates/glasschain-network/Cargo.toml:33`). `glasschain-identity` deliberately
-  selects `ring` for `rustls-webpki` too, with a comment saying it does so to
-  share one backend with the network crate.
-- **Consensus signatures:** `ed25519-dalek 3.0`, feature-gated behind `bft`.
-- **Hashing:** `sha2 0.11`, SHA-256 throughout.
-- **Certificates:** `rcgen 0.14`, self-issued ed25519 org roots.
-- **libp2p:** Noise `XX` over X25519 — but the module doc states this is not the
-  active node transport yet.
+- **Peer TLS:** rustls 0.23 (locked 0.23.43), `features = ["ring"]` with defaults on —
+  **`aws-lc-rs` 1.18.0 / `aws-lc-sys` 0.44.0 are already compiled and locked**. The
+  provider is chosen at **runtime, in code**: `Node::build_tls` attempts to install
+  the ring default (and ignores installation failure); `AcceptAnyCert` also names
+  ring signature algorithms. Configs use the installed process default. **No test
+  pins which provider or KX group any path negotiates — verify, do not assume.**
+- **Cert verification:** `glasschain-identity` — `rustls-webpki` with the `ring` feature
+  for signature algorithms (P-256/P-384/ed25519); unaffected by the KX change; PQ
+  *certificate* signatures are separate, deferred.
+- **Signatures:** ed25519 (`ed25519-dalek` 3.0) for identities, endorsements, canonical
+  records; **BFT** (`bft` feature, default-off): BLS12-381 for votes and quorum
+  certificates only (ADR-014). **Hashing:** SHA-256. **Certs:** rcgen 0.14, self-issued
+  ed25519 org roots. **libp2p:** Noise `XX`/X25519, pinned 0.56.0 — not the active
+  transport.
 
-## 2. The one real exposure: transport confidentiality
+## 2. First priority: transport confidentiality
 
-This is the only asset where waiting costs something irreversible. An adversary
-recording peer traffic today decrypts it the day a cryptographically-relevant
-quantum computer exists. PDC payloads move point-to-point over this transport
-(ADR-003), so the content is exactly the commercially-sensitive material the
-privacy model exists to protect.
+Recorded classical peer traffic, including PDC payloads (ADR-003), may become
+readable to a sufficiently capable quantum adversary. Prioritize hybrid key
+exchange for data whose confidentiality must outlast the migration window.
+Archive evidence also needs action before its trust mechanisms fail (§7).
 
-**The irritating part: we pinned a rustls that supports the fix and then selected
-the provider that cannot do it.**
+**Fix shape: runtime provider selection, not a new dependency.** Hybrid
+`X25519MLKEM768` ships only in rustls' `aws-lc-rs` provider; `ring` has no post-quantum
+group (research §1). `aws-lc-rs` is already in the lock, so this is a **provider
+switch**: `build_tls`'s `install_default` + the three ring references in `node.rs` +
+the two in tests, with consistent feature lines (identity's webpki `ring` signature
+algorithms unchanged). **Verification, not assumption, is the change:** a two-node test
+asserts the negotiated group is `X25519MLKEM768` (non-supporting peers fall back to
+X25519 — no wire break) plus the four gates on Ubuntu, macOS, Windows. **Do not
+hand-roll a KEM, add a PQ crate, or design a custom hybrid handshake.**
 
-- Hybrid `X25519MLKEM768` is in rustls' *default* key-exchange groups under the
-  **`aws-lc-rs`** provider, from 0.23.22 (2025-01-30), and the
-  `prefer-post-quantum` feature has been on by default since 0.23.27
-  (2025-05-05).
-- Under **`ring`** there is **no post-quantum key exchange at all** — the
-  provider exposes only SECP256R1, SECP384R1 and X25519.
-- Our `Cargo.lock` resolves rustls to a version with the capability. The feature
-  selection is what excludes it.
+**Cost, uncoupled from a blanket C debate:** aws-lc-sys builds via `cmake`; ring and
+wasmtime already carry C/C++ builds in this graph, so the "audited C backends?"
+question (shared with `blst`, issue #85) is **not a blanket new blockade** — per
+backend, on measured need. The real risk is the CI build.
 
-So the change is: swap the provider feature in `glasschain-network` and
-`glasschain-identity` together (they are coupled on purpose), and re-point the
-four `rustls::crypto::ring::default_provider()` call sites in `node.rs` (lines
-145, 159, 164, 654) plus the two in `tests/`. Hybrid key exchange then negotiates
-by default, and a peer that does not support it falls back to X25519 — no wire
-break, no interop cliff.
+**libp2p:** no action — classical Noise/X25519 has no shipping PQ option (upstream
+`mlkem-hfs` PR open). Do not promote libp2p to the active transport without revisiting.
 
-**Do not** hand-roll a KEM, add a PQ crate directly, or design a custom hybrid
-handshake. The dependency does this correctly and we would not.
+## 3. Signatures: agility shipped, migration not done
 
-Cost to check before committing: `aws-lc-rs` builds a vendored C/assembly library
-via `cmake`, whereas `ring` is a lighter build. That is the real trade, and it is
-a CI-time question, not a security one. It must be verified on all three CI
-platforms (Ubuntu, macOS, Windows) before this is called done.
+**Agility is shipped; the migration is not.** Since 2026-09-03 every signature carrier
+carries `core::wire::SignatureAlgorithm` — ed25519 default (omitted on the wire; legacy
+JSON still parses), unknown discriminant a deserialization error, never silent ed25519
+(test-verified): `RecordSignature`, `EndorserIdentity`, `BftVote`/`QuorumCertificate`
+(currently `Bls12381`), `ValidatorInfo.public_key: Vec<u8>`. A future migration
+still requires implementation, key/certificate profiles, size limits, rollout and
+historical verification—not just a wire-version bump. **The shipped schemes remain ed25519
+(application) and BLS12-381 (quorum certificates) — no post-quantum scheme is in use
+anywhere.**
 
-**libp2p:** no action. Noise-over-X25519 has no shipping PQ option (a hybrid
-`mlkem-hfs` PR is open and unmerged upstream), and our libp2p path is explicitly
-not the active transport. The correct handling is a note that says *do not
-promote libp2p to the active transport without revisiting this*, not a fix.
+**ML-DSA adoption stays deferred.** Sizes (FIPS 204 Table 2): pk 1 312 B / sig 2 420 B
+(ML-DSA-44) ≈ 41×/38× ed25519 — a 201-attestation quorum would be ~487 KB vs ~13 KB
+(§5). Trigger: a **named requirement** (an ICP-Brasil policy level mandating ML-DSA —
+not catalogue membership — or a customer/product requirement), not a date.
 
-## 3. Signatures: buy agility now, buy algorithms later
+**The forgery claim, corrected:** forgery capability does not automatically alter
+copies already held by honest participants, but can undermine classical evidence
+and fabricate apparently valid historical signatures/certificates. Hash links alone
+do not authenticate an alternative history to a new or recovering verifier.
+Trusted checkpoints, historical validator-set validation and renewable archive
+evidence matter; neither replication nor a calendar date makes signatures safe.
 
-**Signature forgery is not retroactive.** A quantum adversary in 2035 who can
-forge ed25519 cannot rewrite a chain that is hash-linked and replicated across
-hundreds of validators — they can only forge *new* signatures going forward. That
-is a live-system problem with a decade of warning, not a stored-data problem.
-NIST IR 8547 (initial public draft) disallows EdDSA, ECDSA and RSA at ≥128-bit
-security **after 2035**, with no prior deprecation step.
+## 4. Hashing: no action — and no implied guarantees
 
-The residual risk is narrower and worth naming: **long-lived non-repudiation.** A
-record signed under ICP-Brasil in 2026 and challenged in a court in 2040 needs its
-signature to still mean something. The established answer to that is trusted
-timestamping and re-signing of archives, not switching the consensus signature
-algorithm today.
+NIST IR 8105: hash functions "should be usable in a quantum era"; the full Grover
+speedup needs serial execution (Zalka; NIST PQC FAQ), parallelism buys ≈√M
+(Bernstein), and Grover does not apply to *collision* resistance. NIST IR 8547 puts
+SHA-256 collision search at Category 2. **SHA-256 stays.** And an on-chain hash is
+technical evidence, not legal proof — no algorithm or hash choice is a compliance
+guarantee by itself.
 
-### What to do now: stop hardwiring the algorithm into the types
+## 5. BLS and the performance plan
 
-This is the cheap, high-value item, and it is not cryptography — it is a type
-change. Today nothing in the wire format identifies which algorithm produced a
-signature:
-
-- `Attestation.public_key` / `.signature` (`core/src/consensus.rs:19`) — bare byte
-  vectors; ed25519 is implied by a doc comment.
-- `RecordSignature.signature_bytes` (`core/src/canonical.rs:35`) — same.
-- `EndorserIdentity.public_key` (`core/src/endorsement.rs:248`) — same.
-- **`ValidatorInfo.public_key` is `[u8; 32]`** (`core/src/bft.rs:31`) — a
-  fixed-size array that *cannot physically hold* an ML-DSA-44 public key (1312
-  bytes). This one is a type-level lock-in, not just a missing label.
-
-Without a discriminant, any future algorithm migration is a hard wire break plus
-a chain-history reinterpretation problem. With one, it is a version bump.
-
-**Piggyback it on Step 1 of the performance plan.** That step already changes the
-wire encoding (JSON is the standing structural tax) and already requires an ADR
-for a binary codec. Adding an algorithm discriminant during a break we are taking
-anyway costs almost nothing; adding it later costs a second break.
-
-Sizing note for whoever does the performance work: ML-DSA-44 signatures are 2420
-bytes against ed25519's 64. At a 201-attestation quorum that is ~487 KB of
-certificate versus ~13 KB. **This interacts badly with the performance plan's
-Step 4 (BLS)** — see §5.
-
-### What to defer
-
-Actually adopting ML-DSA. Trigger: ICP-Brasil making it mandatory rather than
-merely supported, or a customer requirement. Not before. Adopting a signature
-scheme with a 38× size penalty ahead of any requirement, in a system whose stated
-sell factor is latency and scalability, would be trading our differentiator for a
-threat that has a 2035 date on it.
-
-## 4. Hashing: no action, and resist the urge
-
-The "Grover halves SHA-256 to 128 bits" line is a conservative upper bound that
-the literature does not take at face value:
-
-- NIST IR 8105 says hash functions "should be usable in a quantum era" and that
-  doubling output size "may be overly conservative."
-- The NIST PQC FAQ notes the full quadratic speedup requires Grover run *in
-  series* (Zalka); parallel machines diminish it, and variants "will provide no
-  advantage" for attacks that must complete in years or decades.
-- Bernstein's cost analysis: a parallel size-M quantum machine gains only ~√M —
-  no better than M classical machines, before communication costs.
-- For **collision** resistance — the property a hash-linked chain actually
-  depends on — Grover does not apply directly at all.
-
-NIST IR 8547 places SHA-256 collision search at Category 2. SHA-256 stays.
-
-## 5. The uncomfortable interaction with the performance plan
-
-**The performance plan's Step 4 promotes BLS aggregation, and BLS is
-pairing-based, which means Shor breaks it too.** There is no post-quantum
-aggregate signature scheme with comparable size and verification properties
-available today.
-
-This does not cancel Step 4 — the light-client ladder argument that promoted it
-stands, and the 2035 horizon gives it a full useful life. But it does mean:
-
-- **Do not market BLS aggregation as future-proofing.** It is a 2026–2035
-  optimization.
-- The algorithm discriminant from §3 becomes *more* important, not less, because
-  a BLS adoption is a second signature scheme in the wire format before any
-  post-quantum one is.
+BLS aggregation is **shipped** (ADR-014) for quorum certificates. It is
+pairing-based and vulnerable to Shor's algorithm; no guaranteed useful lifetime
+through 2035 follows. Discriminants help distinguish formats but do not implement
+a migration. Do not assume PQ signatures can retain BLS's size/verification costs.
 
 ## 6. What this is not
 
-- **Not a reason to add a ZK identity stack.** Already ruled out separately.
-- **Not a reason to reopen ADR-002.** The consensus family is orthogonal to the
-  signature algorithm.
-- **Not a "quantum-resistant blockchain" positioning exercise.** We would be
-  claiming a property our transport does not have while our signatures and our
-  planned aggregation are both classical.
-- **Not urgent for signatures.** Anyone proposing an ML-DSA migration this year
-  should be asked which requirement it serves.
+Not a reason to add a ZK identity stack, reopen ADR-002, or make a "quantum-resistant
+blockchain" positioning claim (transport, BLS, and ed25519 are all classical until each
+is migrated). Not a justification for a pre-emptive ML-DSA migration this year — ask
+which requirement it serves.
 
-## 7. Algorithm selection — and why it is nearly forced
+## 7. Long-term archival evidence — RFC 4998/3161 Merkle research (optional)
 
-### We do not get to pick. ICP-Brasil picked.
+The established answer to long-lived non-repudiation of *classical* signatures is
+ERS-style off-chain archival evidence (RFC 4998 makes the "sign a Merkle root over
+legacy signatures" idea standard), not changing ledger signatures. **Research/design
+option, not adoption**: off-chain, no new dependency, no issue until profile/legal
+review says otherwise.
 
-DOC-ICP-01.01 v6.0 names **ML-DSA (44/65/87)** and **ML-KEM (512/768/1024)** and
-nothing else post-quantum. **SLH-DSA is absent from the catalogue.** That matters
-because SLH-DSA is otherwise the conservative choice — hash-based, 32-byte public
-keys, security resting on assumptions we already trust for SHA-256 — and on a
-purely technical comparison it would deserve a serious look for long-lived
-non-repudiation. It is off the table for anything touching legal identity in our
-jurisdiction, so the comparison is moot.
+Elements to validate in that review (read 2026-09-05):
 
-The selection therefore is:
+- **Archived objects and validation material** — preserve the exact signed
+  bytes, signature algorithm/context and original signatures, plus trust anchors,
+  certificates, revocation evidence and historical policy. Bind the objects into
+  the evidence construction; ERS `cryptoInfos` is not itself timestamp-protected,
+  so its contents require independent authentication (RFC 4998 §3.1).
+- **Trusted timestamp** — a TSA signs a hash imprint with a key reserved for
+  time-stamping; `id-kp-timeStamping` EKU MUST be critical (RFC 3161 §2.3); tokens
+  SHOULD be re-stamped before the TSA key's lifetime ends (§4).
+- **Inclusion proof** — reduced Merkle tree over the archived objects, timestamped only
+  at the root, per-object proofs (RFC 4998 §1.2/§4.2).
+- **Renewal before compromise** — hash-tree renewal re-hashes/re-timestamps prior chains
+  (RFC 4998 §5); evidence outliving a *publicly* weakened algorithm may lose probative
+  force — ERS cannot retroactively fix it (§1.1/§7, RFC 6283 §9.2).
+- **ML-DSA vs SLH-DSA — comparison only:** evaluate ML-DSA as the primary
+  candidate given the catalogue recorded in earlier research; compare SLH-DSA's
+  hash-based assumptions and parameter-dependent key/signature sizes for a
+  supplementary archive profile. Neither is selected here. NIST standardization
+  is not ICP profile approval, and absence from an ICP catalogue is not a blanket
+  prohibition on supplementary private evidence. Confirm current profile, TSA,
+  interoperability and legal requirements before choosing.
+- **Retention vs legal hold (debt D5):** archival evidence preserves (legal hold), the
+  opposite interest from D5's privacy-purge duty
+  ([`deferred-code-debt.md`](deferred-code-debt.md)). An evidence scheme does not
+  satisfy D5's deletion controls, and D5's 72h retention is not evidence retention;
+  define each with its own retention and copy semantics.
 
-| Purpose | Algorithm | Sizes (bytes) | Status |
-|---|---|---|---|
-| Transport key exchange | **X25519MLKEM768** (hybrid) | ek 1 184 / ct 1 088 | Ship it (§2) |
-| Signatures, when triggered | **ML-DSA-44** | pk 1 312 / sig 2 420 | Deferred (§3) |
-| Hashing | **SHA-256**, unchanged | — | No action (§4) |
+## 8. HSM and password KDFs
 
-Sizes are FIPS 203 Table 3 and FIPS 204 Table 2. Against ed25519's 32/64, ML-DSA-44
-is **41× the public key and 38× the signature** — the number behind the deferral
-in §3, and the reason `ValidatorInfo.public_key: [u8; 32]` is a hard blocker
-rather than an inconvenience.
+Corrected framing (Follow-up 3):
 
-**Hybrid, not pure.** X25519MLKEM768 keeps the classical exchange alongside the
-KEM, so a flaw in ML-KEM — a young lattice assumption — does not cost us
-confidentiality. It is also what rustls offers by default, which means the lazy
-option and the correct option coincide. Pure ML-KEM groups exist in the provider
-and are deliberately left out of the defaults "out of conservatism"; take that
-advice.
-
-### A caution when reading DOC-ICP-01.01
-
-Resolução CG ICP-Brasil nº 211/2024 replaced the end-user certificate types: the
-current set is **A3, A4, SE-S, SE-H, T3, T4, AE-S, AE-H, A CF-e-SAT, OM-BR**, and
-**A1/A2 and S1–S4 no longer exist**. DOC-ICP-01.01 v6.0's key-size tables
-nevertheless still carry A1/A2/S1–S4 rows. Do not treat the older type names as
-live, and do not cite pre-2024 A1-vs-A3 framing — it is a common and now-wrong
-mental model.
-
-## 8. Argon2 and friends: the wrong layer, and pre-empted by law
-
-**Argon2 is a memory-hard password-hashing function / KDF.** It does not sign, it
-does not perform key exchange, and it is not a NIST post-quantum algorithm. Its
-job is making brute force against a **low-entropy secret** expensive. It is not a
-candidate for anything in §7.
-
-**And there is no low-entropy secret in this workspace.** Verified 2026-09-02:
-zero occurrences of `password`, `passphrase`, `argon`, `scrypt`, `pbkdf2`,
-`bcrypt` or `keystore` anywhere in `crates/`. `Identity::generate`
-(`glasschain-identity/src/identity.rs:42`) pulls 32 bytes from `getrandom::fill`
-and the key never touches disk — `glasschain-identity` has no save/load path at
-all, consistent with `AGENTS.md` ("identity material is generated at runtime").
-There is nothing for a KDF to stretch.
-
-### Where it *would* have belonged, and why it still will not
-
-The legitimate home for Argon2 is an encrypted keystore for a **persisted** node
-signing key — which we will need, because runtime-generated identity means a
-validator's key changes on every restart, untenable for a real federation.
-
-But when that arrives, ICP-Brasil has already answered it, and the answer is not
-a software keystore. DOC-ICP-04 v8.3 Tabela 4 mandates for **A3, A4, SE-H, T3,
-T4, AE-H and OM-BR**: *"Hardware criptográfico, homologado junto à ICP-Brasil ou
-com certificação INMETRO."* Only **SE-S and AE-S** permit *"Repositório protegido
-por senha e/ou identificação biométrica, cifrado por software"* — and those are
-the 1-year certificates, against 5–11 years for the hardware levels.
-
-So the path for a persisted validator identity bound to ICP-Brasil credentials is
-**HSM or homologated token via PKCS#11**, at DOC-ICP-10.02 levels NSH-2/NSH-3 —
-not a passphrase-derived key at all. Argon2's use case is pre-empted before it
-arises.
-
-**Scope this honestly:** none of that binds us *today*. Our node certificates are
-self-issued org roots, not ICP-Brasil certificates, so DOC-ICP-04 does not
-currently apply. The constraint bites when node identity is bound to ICP-Brasil
-credentials — which is the entire premise of the ICP interoperability
-requirement, so it is a *when*, not an *if*. Note also the general duty in
-DOC-ICP-01.01 §6.1.1.4 that private keys be stored *"gravada cifrada, por
-algoritmo simétrico aprovado"*.
-
-**The one narrow case where Argon2 would still be right:** an operator-facing
-software keystore for a development or SE-S-tier identity, where a human
-passphrase genuinely guards the key. If that is ever built, Argon2id is the
-correct choice and there is no argument to have. It is not on any current path.
+- **HSM is not an automatic requirement for every separate runtime key.** DOC-ICP-04
+  v8.3 Tabela 4 mandates hardware for A3/A4/SE-H/T3/T4/AE-H/OM-BR; **SE-S and AE-S
+  permit a software repositório.** The duty binds only once node identity is bound to
+  ICP-Brasil credentials of the hardware types — not today, not per-key.
+- **Argon2 is a password KDF, not post-quantum cryptography** — it stretches a
+  low-entropy secret and is a candidate for nothing in this plan. Its only home is an
+  operator-facing software keystore (SE-S/AE-S tier or dev), where Argon2id would be the
+  right KDF — not on any current path, not required here.
 
 ---
 
 ## Ordered actions
 
-1. **Swap rustls to `aws-lc-rs` in `glasschain-network` and `glasschain-identity`
-   together**, verify the build on all three CI platforms, and confirm the
-   negotiated group in a test. Closes the only harvest-now-decrypt-later
-   exposure. *Ready to start.*
-2. ~~**Add an algorithm discriminant** to `Attestation`, `RecordSignature` and
-   `EndorserIdentity`, and widen `ValidatorInfo.public_key` from `[u8; 32]` to a
-   variable-length representation. **Fold into performance Step 1**, not a
-   separate wire break.~~ **Done 2026-09-03** (`core::wire::SignatureAlgorithm`
-   on all three carriers with Ed25519 omitted on the wire and unknown
-   discriminants rejected by test; `ValidatorInfo.public_key: Vec<u8>`).
-3. **Note in the libp2p module docs** that promoting it to the active transport
-   requires revisiting PQ key exchange, since Noise/X25519 has no shipping option.
-4. **Decide on ML-DSA when ICP-Brasil makes it mandatory**, not before. Re-read
-   DOC-ICP-01.01 at each ITI Instrução Normativa.
+1. **Transport provider switch (ready):** runtime provider → `aws-lc-rs` (`build_tls`
+   `install_default`, three ring references in `node.rs`, two in tests), consistent
+   feature lines, and a negotiated-group test (`X25519MLKEM768`) on the two-node path.
+   Four gates green on Ubuntu, macOS, Windows. No new dependency (aws-lc-rs already
+   locked); the C-backend question shared with issue #85 is per-backend, not a blanket
+   blockade.
+2. ~~Add an algorithm discriminant / widen `ValidatorInfo.public_key`~~ **Done
+   2026-09-03** (§3). The ML-DSA *migration* stays deferred behind the §3 trigger.
+3. **Libp2p module note:** promoting it to the active transport requires revisiting PQ
+   key exchange.
+4. **Archival-evidence research (§7):** identify retention lifetime, relying parties,
+   trusted time source, available PQ-capable TSA/profile and renewal owner; compare
+   ML-DSA/SLH-DSA batching off-chain. Keep originals and proof material in authorized
+   storage; a public digest is neither encryption nor anonymization. No consensus
+   dependency, changed `SCHEMA_V1`, mandatory external storage service or automatic
+   adoption. Profile/legal review and independent verification gate implementation.
 5. **Nothing for SHA-256.**
 
 ## Validation
 
-- Action 1: a test asserting the negotiated key-exchange group is
-  `X25519MLKEM768` between two GlassChain nodes, plus the four workspace gates
-  green on Ubuntu, macOS and Windows (the `aws-lc-rs` build is the actual risk).
-- Action 2: a round-trip test proving an unknown algorithm discriminant is
-  rejected rather than silently treated as ed25519.
+- Action 1: negotiated-group test on the two-node path + four gates on three CI
+  platforms (aws-lc-sys build is the real risk).
+- Action 2 (shipped): unknown-discriminant rejection round-trip test in `wire.rs`.
+- Before implementing §7, specify negative checks for modified original bytes,
+  substituted signature/context, invalid/missing inclusion proof, untrusted TSA,
+  missing revocation evidence and expired/unrenewed evidence. Verify renewal with
+  an independent verifier and measure batch size, proof bytes, signing cost and
+  archive lag. A TSA outage must not block consensus; evidence remains visibly
+  pending and retries are bounded/idempotent. A late PQ signature cannot repair
+  evidence forged before anchoring or retroactively certify its alleged date.
 
 ## Out of scope
 
-- Implementing ML-DSA or ML-KEM ourselves in any form.
-- Post-quantum signatures in consensus (§3, deferred with a named trigger).
-- Changing the hash function (§4).
-- Post-quantum for libp2p noise (§2 — nothing to adopt upstream).
-- **SLH-DSA** — technically attractive for long-lived non-repudiation, but absent
-  from the ICP-Brasil catalogue (§7).
-- **Argon2 / scrypt / PBKDF2 and any password-derived key material** — wrong
-  layer for this question, and no low-entropy secret exists to protect (§8).
-- **Persistent node identity and its key custody** — a real gap, but it is an
-  HSM/PKCS#11 decision (§8), not a post-quantum one. Track separately.
+- Implementing any post-quantum algorithm ourselves, in any form.
+- Adopting a PQ signature scheme before a §3 trigger or §7 profile/legal review.
+- Changing the hash function (§4); post-quantum for libp2p noise (§2).
+- Argon2/scrypt/PBKDF2 unless an operator-facing software keystore is ever built (§8).
+- Persistent node identity custody — separate from PQ migration. Certificate-bound
+  principals ([identity decision](https://github.com/dbbvitor/GlassChain/issues/87),
+  D4) and durable peer pins are related but do not by themselves deliver key storage.
+- Claiming compliance, "pre-2035 safe", or proof value from algorithm/hash choice.
 
 ## Sources
 
-See [`../memories/post-quantum-research.md`](../memories/post-quantum-research.md)
-for primary sources with URLs and read dates: rustls release notes and docs.rs,
-NIST FIPS 203/204/205 (including the size tables in §7), NIST IR 8105 / IR 8547
-(ipd), NIST PQC FAQ, Bernstein (SHARCS 2009), ITI DOC-ICP-01.01 v6.0,
-DOC-ICP-04 v8.3, DOC-ICP-10.02, Resoluções CG 211/2024 and 212/2025, Instrução
-Normativa ITI nº 35, and the rust-libp2p repository.
+Primary sources with URLs and read dates are in
+[`../memories/post-quantum-research.md`](../memories/post-quantum-research.md) — rustls
+releases 0.23.0–0.23.43 + provider docs; FIPS 203/204/205 + FIPS 206 status; NIST IR
+8547 ipd; NIST IR 8105, PQC FAQ, Bernstein (SHARCS 2009); ITI DOC-ICP-01.01 v6.0 /
+DOC-ICP-04 v8.3 / IN 35/2026; libp2p noise; RFC 3161 / 4998 / 6283; Follow-ups 1–3.
+FIPS 204 Table 2 and FIPS 205 re-checked 2026-09-05.
 
-**Flagged as unverified in that research — do not cite these as settled:**
-
-- FIPS 206 / FN-DSA status (no CSRC record found).
-- A *final* NIST IR 8547 (only the November 2024 initial public draft was found).
-- An exhaustive search of ITI public consultations (listings are JS-rendered).
-- The pre-2024 A1/S1–S4 key-storage wording (iti.gov.br serves only post-211
-  consolidations). This does not affect §8, which rests on the *current*
-  DOC-ICP-04 v8.3 Tabela 4.
+**Still unverified — do not cite as settled:** FIPS 206/FN-DSA status; a final NIST IR
+8547 (only the Nov 2024 ipd found); ITI public consultations (JS-rendered); any
+ITI/ICP-Brasil recognition of RFC 3161/4998 or ERS (policy question for §7); pre-2024
+A1/S1–S4 key-storage wording (does not affect §8, which rests on current DOC-ICP-04
+v8.3 Tabela 4).
