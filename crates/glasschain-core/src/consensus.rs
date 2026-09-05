@@ -129,6 +129,7 @@ impl CommitNotification {
 mod tests {
     use super::*;
     use crate::Ledger;
+    #[cfg(feature = "bft")]
     use bls_signatures::Serialize as _;
 
     #[test]

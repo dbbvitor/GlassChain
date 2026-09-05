@@ -208,15 +208,19 @@ struct NodeState {
     /// Active BFT round state (ADR-002 adoption gate): the candidate under
     /// vote, the votes collected per phase, and the hash this node has locked
     /// (precommitted) at this height — the Tendermint locking rule.
+    #[cfg(feature = "bft")]
     bft_round: Option<BftRound>,
     /// Equivocation proofs detected at vote receipt (#77).
+    #[cfg(feature = "bft")]
     equivocations: Vec<EquivocationProof>,
     /// The derived validator set, cached by the registry-content hash. The
     /// set is on-chain state (Q34, ADR-009/ADR-010): world-state keys under
     /// `governance/validator-registry`, replayed like every projection.
+    #[cfg(feature = "bft")]
     bft_validator_cache: Option<(u64, BftConsensusProvider)>,
     /// Votes from peers are forwarded here by the message state machine; the
     /// round driver drains them against a timeout.
+    #[cfg(feature = "bft")]
     bft_vote_tx: Option<tokio::sync::mpsc::UnboundedSender<glasschain_core::BftVote>>,
     /// TOFU peer registry: verified peer identities keyed by stable listen address.
     peer_registry: PeerRegistry,
@@ -522,9 +526,13 @@ impl Node {
                 known_peers: HashSet::new(),
                 peer_senders: HashMap::new(),
                 dropped_outbound: HashMap::new(),
+                #[cfg(feature = "bft")]
                 bft_round: None,
+                #[cfg(feature = "bft")]
                 equivocations: Vec::new(),
+                #[cfg(feature = "bft")]
                 bft_validator_cache: None,
+                #[cfg(feature = "bft")]
                 bft_vote_tx: None,
                 capability_history: None,
                 peer_registry: PeerRegistry::new(),
@@ -3273,6 +3281,7 @@ async fn process_message(
 
             let (should_append, too_far_ahead) = {
                 let mut s = ctx.state.lock().await;
+                #[cfg(feature = "bft")]
                 let bft_consensus_active = {
                     let next_height = {
                         let l = ctx.ledger.lock().await;
@@ -3306,9 +3315,11 @@ async fn process_message(
                             return (false, false);
                         }
                         let capability_valid = history.validate_block(&block).is_ok();
-                        // Consensus admission: BFT blocks (certificate-bearing,
-                        // ADR-014) verify against the derived validator set;
-                        // PoW stays the rule while the capability is dormant.
+                        // Consensus admission (ADR-014): with the `bft`
+                        // feature, certificate-bearing blocks verify against
+                        // the derived validator set; PoW stays the rule
+                        // otherwise.
+                        #[cfg(feature = "bft")]
                         let consensus_valid = match (&block.certificate, bft_consensus_active) {
                             (Some(certificate), true) if !certificate.is_degenerate() => {
                                 derive_validator_provider(&mut s).is_some_and(|provider| {
@@ -3317,6 +3328,8 @@ async fn process_message(
                             }
                             _ => block.has_valid_pow(diff),
                         };
+                        #[cfg(not(feature = "bft"))]
+                        let consensus_valid = block.has_valid_pow(diff);
                         (capability_valid && consensus_valid, false)
                     })
                 } else {
