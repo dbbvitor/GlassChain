@@ -30,12 +30,13 @@ pub const MAX_ROUNDS: u32 = 4;
 /// `docs/liveness.md` §4 — claimable numbers wait for the testnet).
 pub const PHASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// Phase timeout scaled to the set size. Two O(n) costs must fit inside one
-/// window: the leader's per-vote pairing verification and — dominating at
-/// scale — every validator's re-verification of the prevote aggregate (an
-/// O(quorum)-pairing multi-miller loop, ADR-014). With the pure-Rust backend
-/// that is seconds per validator; `blst` (the documented follow-up) shrinks
-/// it ~10×.
+/// Phase timeout scaled to the set size.
+///
+/// Two O(n) costs must fit inside one window: the leader's per-vote pairing
+/// verification and — dominating at scale — every validator's
+/// re-verification of the prevote aggregate (an O(quorum)-pairing
+/// multi-miller loop, ADR-014). With the pure-Rust backend that is seconds
+/// per validator; `blst` (the documented follow-up) shrinks it ~10×.
 #[must_use]
 pub fn phase_timeout(validator_count: usize) -> std::time::Duration {
     PHASE_TIMEOUT + std::time::Duration::from_secs((validator_count / 10) as u64)

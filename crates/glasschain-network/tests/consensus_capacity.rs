@@ -27,13 +27,13 @@
 //!
 //! Recorded evidence: `docs/benchmarks/consensus-capacity.md`.
 
+use bls_signatures::{PrivateKey, Serialize as _};
 use glasschain_core::{
     capability_hash, CanonicalRecord, CapabilityActivation, RecordSignature, Transaction,
     TransactionKind,
 };
-use glasschain_identity::{Channel, ChannelConfig};
-use bls_signatures::{PrivateKey, Serialize as _};
 use glasschain_core::{BftConsensusProvider, ValidatorInfo};
+use glasschain_identity::{Channel, ChannelConfig};
 use glasschain_network::{Node, NodeEvent};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -712,10 +712,10 @@ async fn bft_finality_gate(validator_count: usize, txs_per_round: usize, rounds:
     // the mesh dials through `connect_peer` afterwards, in waves.
     let mut nodes: Vec<Node> = Vec::with_capacity(validator_count);
     let mut addrs: Vec<String> = Vec::with_capacity(validator_count);
-    for i in 0..validator_count {
+    for (i, key) in keys.iter().enumerate() {
         let addr = free_addr();
         let node = Node::new(format!("validator-{i}"), &addr, 1);
-        let provider = BftConsensusProvider::new(validators.clone(), keys[i]).expect("valid set");
+        let provider = BftConsensusProvider::new(validators.clone(), *key).expect("valid set");
         node.set_bft_consensus(Arc::new(provider)).await;
         // Execution provider for canonical-record evaluation.
         node.set_execution_provider(Arc::new(
@@ -730,9 +730,9 @@ async fn bft_finality_gate(validator_count: usize, txs_per_round: usize, rounds:
     // Full mesh in waves: proposals reach every validator directly (blocks
     // are broadcast, never re-relayed; votes answer point-to-point).
     let mut wave: usize = 0;
-    for i in 1..validator_count {
-        for j in 0..i {
-            nodes[i].connect_peer(&addrs[j]);
+    for i in 1..addrs.len() {
+        for dial in &addrs[..i] {
+            nodes[i].connect_peer(dial);
             wave += 1;
         }
         if wave >= 500 {
@@ -768,7 +768,7 @@ async fn bft_finality_gate(validator_count: usize, txs_per_round: usize, rounds:
         leader2 = (2 + attempt as usize) % validator_count;
         match nodes[leader2].mine().await {
             Ok(()) => break,
-            Err(error) if error.to_string().contains("round leader") => continue,
+            Err(error) if error.to_string().contains("round leader") => {}
             Err(error) => panic!("first vote round failed: {error}"),
         }
     }
@@ -818,7 +818,7 @@ async fn bft_finality_gate(validator_count: usize, txs_per_round: usize, rounds:
                     leader_finality_ms = Some(mine_start.elapsed().as_millis());
                     break;
                 }
-                Err(error) if error.to_string().contains("round leader") => continue,
+                Err(error) if error.to_string().contains("round leader") => {}
                 Err(error) => panic!("round failed: {error}"),
             }
         }
@@ -884,10 +884,12 @@ fn activation_bft_tx(height: u64) -> Transaction {
     )
 }
 
-/// A compact canonical record for the BFT workload (same shape as the PoW
+/// A compact canonical record for the BFT workload (same shape as the `PoW`
 /// gate's compact set).
 fn canonical_record_tx(seq: u64) -> Transaction {
-    signed(lot_record(seq as usize), "org-maker")
+    #[allow(clippy::cast_possible_truncation)]
+    let seq = seq as usize;
+    signed(lot_record(seq), "org-maker")
 }
 
 #[cfg_attr(madsim, madsim::test)]

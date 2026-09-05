@@ -1600,16 +1600,13 @@ impl Node {
                     false
                 }
             };
-            let provider = if bft_active {
-                self.state.lock().await.consensus.clone()
-            } else {
-                None
-            };
-            if let Some(provider) = provider {
-                // Vote-round driver (ADR-002 adoption gate): prevote →
-                // precommit phases over the wire produce a real multi-signer
-                // aggregate certificate.
-                self.run_vote_round(block, &provider).await?
+            // The vote-round driver (ADR-002 adoption gate): prevote →
+            // precommit phases over the wire produce a real multi-signer
+            // aggregate certificate. It reads the attached provider and the
+            // derived validator set from state itself.
+            let bft_driver = bft_active && self.state.lock().await.consensus.is_some();
+            if bft_driver {
+                self.run_vote_round(block).await?
             } else {
                 block.mine(difficulty);
                 CommitNotification::for_pow_block(block)
@@ -2113,11 +2110,7 @@ impl Node {
     /// locked block when it holds one.
     #[cfg(feature = "bft")]
     #[allow(clippy::too_many_lines)]
-    async fn run_vote_round(
-        &self,
-        mut block: Block,
-        attached: &Arc<BftConsensusProvider>,
-    ) -> Result<CommitNotification, CoreError> {
+    async fn run_vote_round(&self, mut block: Block) -> Result<CommitNotification, CoreError> {
         block.hash = block.calculate_hash();
         let height = block.index;
         let mut round = 0u32;
@@ -2185,7 +2178,12 @@ impl Node {
             let mut prevotes =
                 vec![provider.sign_vote(height, round, VotePhase::Prevote, &block.hash)];
             while prevotes.len() < quorum {
-                match tokio::time::timeout(phase_timeout(provider.validator_count()), vote_rx.recv()).await {
+                match tokio::time::timeout(
+                    phase_timeout(provider.validator_count()),
+                    vote_rx.recv(),
+                )
+                .await
+                {
                     Ok(Some(vote))
                         if vote.height == height
                             && vote.round == round
@@ -2232,7 +2230,12 @@ impl Node {
             let mut precommits =
                 vec![provider.sign_vote(height, round, VotePhase::Precommit, &block.hash)];
             while precommits.len() < quorum {
-                match tokio::time::timeout(phase_timeout(provider.validator_count()), vote_rx.recv()).await {
+                match tokio::time::timeout(
+                    phase_timeout(provider.validator_count()),
+                    vote_rx.recv(),
+                )
+                .await
+                {
                     Ok(Some(vote))
                         if vote.height == height
                             && vote.round == round
@@ -2570,19 +2573,17 @@ async fn handle_proposal(
             history.validate_block(&block).is_ok()
         };
     }
-    let vote = match valid_candidate
+    let vote = valid_candidate
         .then(|| derive_validator_provider(&mut s))
         .flatten()
-    {
-        Some(provider) => {
-            log::info!("proposal handler: prevoting height {} round {}", block.index, round);
-            Some(provider.sign_vote(block.index, round, VotePhase::Prevote, &block.hash))
-        }
-        None => {
-            log::info!("proposal handler: no provider");
-            None
-        }
-    };
+        .map(|provider| {
+            log::info!(
+                "proposal handler: prevoting height {} round {}",
+                block.index,
+                round
+            );
+            provider.sign_vote(block.index, round, VotePhase::Prevote, &block.hash)
+        });
     if let Some(vote) = vote {
         round_state.proposal = Some(block);
         s.bft_round = Some(round_state);
@@ -2601,7 +2602,11 @@ async fn handle_proposal(
 /// evidence (#77), and forward it to the round driver's collector.
 #[cfg(feature = "bft")]
 async fn handle_vote(ctx: &PeerContext, vote: glasschain_core::BftVote) -> MessageEffect {
-    log::info!("handle_vote: vote for height {} phase {:?}", vote.height, vote.phase);
+    log::info!(
+        "handle_vote: vote for height {} phase {:?}",
+        vote.height,
+        vote.phase
+    );
     let mut detected: Option<EquivocationProof> = None;
     {
         let mut s = ctx.state.lock().await;
