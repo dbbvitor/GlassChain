@@ -21,7 +21,9 @@
 //! entries under `governance/validator-registry/<name>`, replayed like every
 //! projection; governance manages membership through endorsed writes.
 
-use glasschain_core::{BftConsensusProvider, BftVote, EquivocationProof, VotePhase};
+#[cfg(feature = "bft")]
+use glasschain_core::BftConsensusProvider;
+use glasschain_core::{BftVote, EquivocationProof, VotePhase};
 
 /// Rounds attempted per height before the driver gives up (dev knob).
 pub const MAX_ROUNDS: u32 = 4;
@@ -128,6 +130,7 @@ impl VoteReceipts {
 
 /// Deterministic proposer for `(height, round)`: round-robin over the
 /// validator set's canonical order (ADR-009 — one org one slot, equal power).
+#[cfg(feature = "bft")]
 #[must_use]
 pub fn proposer_index(validators: &BftConsensusProvider, height: u64, round: u32) -> usize {
     // Deterministic round-robin; usize truncation is impossible for heights

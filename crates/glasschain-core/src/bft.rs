@@ -1,12 +1,17 @@
+#[cfg(feature = "bft")]
 use crate::consensus::{CommitNotification, QuorumCertificate};
+#[cfg(feature = "bft")]
 use crate::error::CoreError;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "bft")]
 use bls_signatures::{PrivateKey, PublicKey, Serialize as BlsSerialize, Signature};
 
+#[cfg(feature = "bft")]
 use crate::providers::ConsensusProvider;
+#[cfg(feature = "bft")]
 use crate::transaction::Transaction;
+#[cfg(feature = "bft")]
 use crate::Block;
 /// One validator in the BFT validator set.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +27,7 @@ pub struct ValidatorInfo {
     pub pop: Vec<u8>,
 }
 
+#[cfg(feature = "bft")]
 impl ValidatorInfo {
     /// The distinct message a validator's proof of possession must sign.
     fn pop_message(&self) -> String {
