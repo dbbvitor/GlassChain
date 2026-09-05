@@ -1,187 +1,206 @@
-# Plan — `glasschain-demo`: a visual demo and benchmark harness (gpui)
+# Plan — `glasschain-demo`: browser demo and benchmark web app
 
-**Status:** draft — not started
-**Date:** 2026-09-02
-**Issue:** #61
+**Status:** planned — no frontend, HTTP bridge or demo runner implemented
+**Reviewed:** 2026-09-05 against `f7b434e`
+**Tracking:** [Visual demo and benchmark harness](https://github.com/dbbvitor/GlassChain/issues/61)
+**Decision update:** the owner requested a **web app instead of the gpui desktop
+app** on 2026-09-05. The previous gpui pin, native-window/toolchain spike and
+“no web build” restriction are superseded. Keep this plan's path for existing links.
 
 ## Goal
 
-A desktop application a human can run to *watch* GlassChain work: synthetic
-supply-chain traffic flowing through a live multi-node federation, with
-throughput visible as it happens and a lot traceable from shelf back to origin
-in a few clicks. When this is done, demonstrating GlassChain to a
-non-Rust-reading audience takes one command instead of a REPL walkthrough, and
-the throughput numbers in `docs/benchmarks/` have a visual counterpart driven by
-the same node code.
+Let a human watch synthetic supply-chain transactions move through a real local
+GlassChain federation: custody transfers, endorsements, private-data commitments,
+replenishment, recall and lot lineage. Plot measured throughput and latency beside
+the activity. A browser makes the demonstration easier to open and share without
+installing a native GUI; hosted multi-user access is a separate security scope.
 
-Two audiences, one binary:
+**Demonstration is not production evidence.** The UI must identify the active
+consensus mode, synthetic workload and in-process topology, and link the
+[benchmark record](../../docs/benchmarks/consensus-capacity.md). A local animated
+federation cannot establish the ADR-010 testnet, security or scalability gates.
 
-- **Demonstrate** — a regulator, a pharma ops lead, or a reviewer sees custody
-  transfers, endorsements, private-payload exchange, and a recall propagating
-  across orgs in real time.
-- **Benchmark** — an engineer sees committed tx/s, block interval, block size,
-  quorum-certificate size, and mempool depth as live plots, against the same
-  compact workload `consensus_capacity.rs` already defines.
+## 1. What exists, what does not
 
-## Context
+| Component | Current state | Demo work |
+|---|---|---|
+| `glasschain_network::Node`, Tokio, ledger/lineage/events | Shipped library APIs | Reuse in a non-interactive headless runner; do not launch the REPL from it |
+| `consensus_capacity.rs`, `bft_finality.rs` | Existing PoW propagation and staged BFT harnesses | Reuse/extract appropriate fixtures and metric definitions; avoid a second ledger simulator |
+| gRPC ledger/lineage/event services | Native Tonic services exist | Browsers cannot call native gRPC directly; no gRPC-Web/HTTP demo bridge exists |
+| REST/WebSocket product API | Not shipped | A narrow demo bridge does not complete that programme requirement |
+| Browser frontend, WebGPU rendering, demo packaging | Not implemented | Build after the browser/bridge design spike below |
+| Active privacy/endorsement and staged BFT guarantees | Configuration-dependent, with known gaps | Enforce real available checks, label unresolved guarantees; see [zero-trust](zero-trust.md) and D1–D7 |
 
-- Nodes are `glasschain_network::Node`, driven with Tokio. Everything the GUI
-  needs is already public: `ledger_snapshot()`, the event bus
-  (`glasschain-indexer`), the provenance/lineage queries behind #39, and the
-  flow runners in `glasschain-workflows`.
-- `crates/glasschain-network/tests/consensus_capacity.rs` already builds a star
-  topology and a compact ADR-010 §7 workload, and already measures latency,
-  block size, certificate size, pool depth, and fan-out. **The demo should drive
-  the same workload generator, not invent a second one** — extract it rather
-  than duplicate it.
-- `docs/benchmarks/consensus-capacity.md` is the existing text-form output. The
-  GUI is a second renderer of the same measurements, not a new source of truth.
+## 2. Minimal architecture
 
-## Approach
-
-### Framework: gpui, pinned to crates.io `=0.2.2`
-
-Chosen because it is the framework the user asked for, it is Rust-native, and
-it is GPU-accelerated enough to animate a few hundred moving elements without
-becoming the bottleneck in a throughput demo.
-
-Verified 2026-09-02:
-
-- `gpui` **is** on crates.io — current stable **0.2.2** (2025-10-22, Apache-2.0,
-  edition 2024). The old "git dependency only" advice is out of date.
-- **Pin `=0.2.2` exactly.** It is pre-1.0 and the README promises breaking
-  changes between versions. zed `main` has already split the bootstrap into a
-  separate `gpui_platform` crate which **is not published** — so consuming
-  `main` from git would drag in unpublished companion crates at a pinned rev.
-  Treat git `main` as radioactive.
-- Zed pins Rust **1.97.1**; `gpui` 0.2.2 declares no `rust-version` but is
-  edition 2024, so it needs ≥1.85. **Our workspace pins 1.95 — this is
-  unverified and is step 0 below.**
-- Linux runtime needs `libvulkan1` plus a working Wayland or X11 display;
-  fontconfig/xkbcommon/wayland/Vulkan are `dlopen`'d, so *compiling* needs
-  little beyond a C toolchain.
-- No built-in charting. Plots are hand-drawn on the `canvas` element:
-  `canvas(prepaint: FnOnce(Bounds<Pixels>, &mut Window, &mut App) -> T, paint: FnOnce(Bounds<Pixels>, T, &mut Window, &mut App))`,
-  drawing with `window.paint_path(...)`.
-
-### Isolation: excluded from the workspace
-
-**This is the load-bearing decision.** `cargo check/test/clippy --workspace
---all-targets --all-features --locked` is a mandatory CI gate on Ubuntu, macOS,
-and Windows. A cargo feature does **not** dodge `--all-features`, so gating the
-GUI behind a feature would put blade, cosmic-text, resvg, accesskit, smol, and
-the `windows` crate into every gate on every runner, and would let pre-1.0 gpui
-churn break the whole workspace.
-
-So: `demo/` lives in the repo but is **excluded from the workspace** via
-`[workspace] exclude = ["demo"]` in the root `Cargo.toml`. It gets its own
-`Cargo.lock` and its own CI job. It depends on the workspace crates by path.
-The four mandatory gates stay exactly as fast and as green as they are today.
-
-Rejected alternative — GUI as a 13th workspace member: fails the CI-cost and
-churn test above.
-Rejected alternative — a separate repository: loses path dependencies, so the
-demo would silently rot against `main`.
-
-### Async: Tokio on its own threads, channel into gpui
-
-gpui runs its own **smol** executor and there is **no documented Tokio bridge**.
-Do not try to run the node inside gpui's executor.
-
-Pattern: the federation runs on a normal Tokio runtime on its own threads and
-publishes snapshots/events into a channel. The UI drains that channel inside a
-gpui task:
-
-```rust
-cx.spawn(async move |this, cx| {
-    while let Ok(msg) = rx.recv().await {
-        let _ = this.update(cx, |this, cx| { this.apply(msg); cx.notify(); });
-    }
-}).detach();
+```mermaid
+flowchart TD
+    Browser[Browser controls and traceability tables]
+    Draw[Canvas2D or optional WebGPU visualization]
+    Bridge[Same-origin demo HTTP and event bridge]
+    Runner[Headless Rust runner on Tokio]
+    Nodes[Real in-process GlassChain nodes]
+    Metrics[Authoritative run metrics and bounded snapshots]
+    Browser --> Bridge
+    Browser --> Draw
+    Bridge --> Runner
+    Runner --> Nodes
+    Nodes --> Metrics
+    Metrics --> Bridge
+    Bridge --> Browser
 ```
 
-Send **snapshots at a fixed cadence** (~30 Hz), not one message per transaction
-— at target throughput a per-tx channel would make the UI the bottleneck and the
-benchmark would measure the renderer.
+- **Backend owns the experiment.** Rust generates seeded workloads, holds synthetic
+  keys, drives nodes and computes timings/counters. Start with a small federation
+  and existing programmatic APIs; do not port Tokio/TCP/Wasmtime to browser WASM.
+- **Frontend owns presentation.** Start with HTML/CSS and native JavaScript modules,
+  DOM controls/tables, SVG or Canvas2D charts. No frontend framework is required
+  for the first slice. Add tooling/library dependencies only when the spike
+  demonstrates a concrete benefit; pin them and isolate their lockfile then.
+- **Bridge:** same-origin HTTP commands/queries plus server-sent events (SSE) for
+  bounded, coalesced snapshots. Polling is an acceptable fallback. Choose an
+  existing compatible Rust HTTP stack during the spike, not a hand-written HTTP
+  parser. WebSockets/gRPC-Web are alternatives only if bidirectional streaming or
+  a real external client requires them.
+- **Reconnect semantics:** include run ID and sequence/height; after a gap fetch a
+  fresh authorized snapshot. A dropped UI update must not lose a transaction or
+  reset backend counters. The presentation stream is not an audit log.
+- **Proposed layout, not existing paths:** `demo/` contains a standalone Rust demo
+  package and static web assets, path-dependent on workspace crates, explicitly
+  excluded from the root workspace when implemented. It gets its own lockfile
+  and CI checks; browser tooling does not enter the 12-crate workspace gates.
+  The root Rust gates remain unchanged. No directory/package is scaffolded by
+  this planning PR.
 
-### Synthetic data
+## 3. WebGPU evaluation
 
-A generator over the real canonical schema v1 families — no bypass of
-validation, endorsement, or the PDC boundary. If the demo can produce a record
-the node would reject, the demo is lying.
+**WebGPU is a browser GPU API, not an application framework.** It is a candidate
+for drawing many node/edge/transaction instances and, only if needed, graph layout.
+It does not improve ledger consensus throughput. Browser GPU timings must not be
+reported as transaction finality.
 
-- A plausible pharma federation: manufacturer → distributor → logistics →
-  pharmacy, plus a regulator with default collection visibility.
-- Deterministic from a seed, so a demo run is reproducible and a benchmark run
-  is comparable.
-- Realistic GTINs, lot numbers, and Anvisa registration shapes; currency always
-  integer minor units.
-- Scenario switches: steady-state replenishment, demand spike, a recall
-  cascade, a disputed shipment, and a node partition.
+| Option | Decision for the first implementation |
+|---|---|
+| DOM + SVG/Canvas2D | Baseline and always-usable fallback; accessible controls and semantic tables remain DOM |
+| Native WebGPU + small WGSL renderer | Preferred experiment for dense animations; adopt if measured frame time/CPU gains justify shader/resource code |
+| Rust `wgpu` compiled to WASM | Revisit only if sharing an actual Rust renderer is valuable; none exists today, so it adds a build target without reuse |
+| Full 3D/WebGPU framework | Defer: a 2D network and time-series panel do not yet justify a game/scene engine |
 
-## Steps
+The spike must test `navigator.gpu`, adapter/device acquisition and feature/limit
+support on target browsers; support is not universal. Use HTTPS when hosted;
+localhost development may qualify as a trustworthy context. Handle unavailable
+adapters, rejected device requests, resource limits and `device.lost` by falling
+back without losing controls, run state or traceability. Dispose buffers on stop/
+reset; bound GPU allocations and chart history. Do not require experimental
+browser flags or disabled browser security.
 
-- [ ] **0. Toolchain spike (blocking, ~15 min).** `cargo add gpui@=0.2.2` in a
-      scratch crate on our pinned 1.95 and build `hello_world`. If 1.95 cannot
-      compile edition-2024 gpui, stop and decide: bump the workspace pin, or pin
-      the toolchain for `demo/` only. **Do not start anything below until this
-      is answered.**
-- [ ] 1. `[workspace] exclude = ["demo"]` in the root `Cargo.toml`; scaffold
-      `demo/` with `gpui = "=0.2.2"` and path deps on the workspace crates.
-- [ ] 2. Extract the compact workload generator out of
-      `crates/glasschain-network/tests/consensus_capacity.rs` into something
-      both the test and the demo call. The test must keep passing unchanged.
-- [ ] 3. Headless federation driver: N in-process nodes on Tokio, snapshot
-      publisher at a fixed cadence, scenario switches. **Testable without a
-      display** — this is where the logic tests live.
-- [ ] 4. gpui shell: window, layout, scenario controls, start/stop/seed.
-- [ ] 5. Network view — nodes, peer links, blocks committing, transactions
-      animating along custody edges. Public records and PDC commitments must be
-      visually distinct; showing a private payload the viewing org may not read
-      would misrepresent the privacy model.
-- [ ] 6. Throughput panel on `canvas` — committed tx/s, block interval, block
-      size, QC size, mempool depth. Same metrics as
-      `docs/benchmarks/consensus-capacity.md`.
-- [ ] 7. Traceability view — pick a lot, walk its provenance back to origin via
-      the #39 lineage queries, showing which hops are public and which are
-      commitments the viewer cannot open.
-- [ ] 8. Separate CI job (Linux only to start): `cargo check` + `cargo clippy -D
-      warnings` + headless tests in `demo/`. Never added to the four mandatory
-      workspace gates.
-- [ ] 9. `docs/demo.md` — what it shows, how to run it, what is synthetic, and
-      an explicit statement that its numbers are **not** the ADR-010 adoption-gate
-      benchmark.
+Compare the same snapshot sequence using Canvas2D and WebGPU at the intended
+visible element counts. Record browser/version, device class, frame-time tails,
+CPU/memory and backend/headless impact. Adopt WebGPU only when it improves a named
+rendering budget; retain the simpler renderer if not. Honour reduced-motion and
+pause/background-tab behaviour. No GPU result affects ledger state or authorization.
+
+## 4. Security and privacy boundary
+
+- Initial scope is **local synthetic-only**: bind the demo service to loopback,
+  serve assets/API from one origin, and never expose validator keys to JavaScript,
+  browser storage or GPU buffers. No production node attachment in the first slice.
+- Localhost is not authorization. Validate Host/Origin, bound requests, authorize
+  session/run commands and protect state-changing requests from CSRF/cross-origin
+  drive-by access. Do not ship wildcard credentialed CORS. Establish a per-session
+  capability/token without leaking it into URLs, logs or snapshots.
+- Enforce the selected viewing organization's rights **before** serializing a
+  snapshot/query result. UI hiding is not PDC enforcement. Switching perspective
+  is restricted to the synthetic demo session, not a production impersonation API.
+- Represent identifiers and wide integer values losslessly across JSON/browser
+  boundaries (decimal strings where needed). Currency stays integer minor units;
+  escape displayed payload strings using DOM text APIs, not injected HTML.
+- A future hosted version needs explicit authentication, TLS, tenant/run isolation,
+  quotas and retention before deployment. Neither WebGPU nor a TLS proxy provides
+  these automatically. No analytics telemetry or third-party dataset upload.
+
+## 5. Scenarios and metric semantics
+
+Seed a manufacturer → distributor → logistics → pharmacy federation with synthetic
+regulator identities. Use valid schema/GTIN/lot shapes, **not real patient data**.
+Drive actual transactions and available endorsement/PDC checks, with a visible
+configuration summary. Begin with traceable asset registration and transfer, then
+replenishment, demand spike, recall/dispute and partition/repair.
+
+Reuse [performance.md](performance.md) §§5–6; all values come from the headless
+runner rather than animation timestamps:
+
+- **Admission:** submission → accepted/rejected/pending; not finality.
+- **Finality:** submission → verified quorum commit in staged BFT; display queue
+  residence and consensus duration separately. Label PoW commit latency as PoW.
+- **Round overhead:** prevote/precommit duration, round changes, timeouts and
+  no-quorum/recovery intervals. Do not remove timed-out samples from the story.
+- **Replication/durability:** separate peer arrival from stable-storage
+  acknowledgement; unavailable durability evidence is “unavailable,” not success.
+- **Resources:** offered/committed rate, pending count/bytes/age, peer drops,
+  projection rows/RSS and subscriber lag. Show sample counts with percentiles.
+- **Speculation:** unavailable in the shipped driver, not zero. Tentative/final/
+  aborted states require a separately approved implementation before visualization.
+
+Snapshot publication is bounded/coalesced at a fixed cadence, not one browser
+message per transaction. Render with `requestAnimationFrame` independently of
+experiment timing. Maintain counters on the backend when a tab is paused or
+throttled; display stale/disconnected state. Compare headless and rendered runs
+so shared CPU/GPU contention does not masquerade as a consensus regression.
+
+Retain D2 recall-approval, D5 retention-after-restart and D6 triage-recovery
+limitations from [source-comment debt](deferred-code-debt.md). Demonstrate known
+limits explicitly rather than drawing successful security or recovery guarantees.
+
+## 6. Implementation order and completion gates
+
+- [ ] **0 — Browser/bridge spike.** One static page reads a bounded synthetic
+  snapshot from a local Rust service and starts/stops a run through validated
+  commands. Record the HTTP/tooling choice, session boundary and browser support
+  matrix. Compare Canvas2D with a small WebGPU view; settle renderer scope from
+  evidence, not a framework preference.
+- [ ] **1 — Package and shared fixtures.** Add the excluded demo package/static
+  assets, extract only the workload code both tests and runner use, and preserve
+  existing harness results. Pin any new tooling in the demo, not core crates.
+- [ ] **2 — Headless real-node runner.** Seed/start/stop/reset, bounded resources,
+  cleanup and authoritative metrics; tests run without a browser/GPU.
+- [ ] **3 — Functional web slice.** DOM controls, scenario state and a custody
+  table/graph; authorized public/commitment views are visibly distinct. A user
+  traces a synthetic lot from shelf to origin without reading Rust.
+- [ ] **4 — Metrics and faults.** Same metric contract as performance plan;
+  seeded WAN/partition controls when those harness capabilities exist. Show
+  missing instrumentation as unavailable, not fabricated measurements.
+- [ ] **5 — Optional WebGPU acceleration.** Land only with the spike's measurable
+  benefit, renderer equivalence and fallback/device-loss tests. No core dependency.
+- [ ] **6 — CI and documentation.** Dedicated demo Rust checks plus browser smoke/
+  accessibility tests in fallback mode; optional GPU-capable smoke separately.
+  Add `docs/demo.md` when runnable and a short README entry. Explain synthetic
+  scope and how to reproduce headless versus rendered measurements.
 
 ## Validation
 
-- The four workspace gates must be **byte-for-byte unaffected**: confirm
-  `cargo check --workspace --all-targets --all-features --locked` does not
-  compile a single gpui dependency.
-- `cd demo && cargo clippy --all-targets -- -D warnings` green.
-- Headless tests cover the federation driver and the synthetic generator; UI
-  rendering is not unit-tested (needs a display) and any smoke test that opens a
-  window is `#[ignore]`d.
-- `cargo test -p glasschain-network --test consensus_capacity` still passes
-  after step 2.
+Required acceptance cases: start/stop cleans resources; same seed reproduces the
+workload; invalid commands cannot control another run; unauthorized PDC bytes
+never reach responses; reconnect/gaps recover a snapshot; stalled browser/network
+keeps memory bounded; admission is not counted as finality; headless totals match
+both renderers; GPU unavailable/device loss/reduced motion leaves a usable UI.
+
+Run normal workspace gates unchanged plus the separate demo checks. Standard
+CI cannot assume a physical GPU; render support failures must not disable
+functional/security tests. End-to-end browser tests use a bounded harness that
+starts and tears down its own service rather than an indefinitely running REPL.
 
 ## Out of scope
 
-- **Not** the ADR-010 adoption-gate benchmark. That gate is a real 200/300-validator
-  compact-workload testnet (#48, `consensus_capacity.rs`, `docs/benchmarks/`). The
-  demo visualizes a small in-process federation and must never be cited as
-  evidence for it. Say so in the UI.
-- No web/WASM build, no remote-node attach, no persistence of demo runs.
-- No new consensus, schema, or protocol behaviour. If the demo needs a
-  capability the node lacks, that is a node ticket, not a demo ticket.
-- Not a production observability surface. Real metrics/tracing remain their own
-  unstarted work item in `requirements-alignment.md`.
+Desktop gpui, mandatory GPU access, browser-hosted validators, a full product
+REST/WebSocket API, public multi-tenant hosting, production key management,
+new consensus/schema behaviour, real-data demonstrations and a new benchmark
+source of truth. These need separate requirements, not incidental demo scope.
 
-## Risks
+## References reviewed 2026-09-05
 
-| Risk | Mitigation |
-|---|---|
-| gpui 0.2.2 will not build on Rust 1.95 | Step 0 spike, before anything else |
-| Pre-1.0 API churn breaks the demo | Pinned `=0.2.2`, separate `Cargo.lock`, excluded from workspace gates |
-| Headless CI cannot run GUI tests | Logic lives in the driver (step 3) and is tested without a display; window tests `#[ignore]`d |
-| Demo numbers get quoted as benchmark evidence | Disclaimer in the UI *and* in `docs/demo.md`; keep `docs/benchmarks/` authoritative |
-| Rendering becomes the throughput bottleneck | Fixed-cadence snapshots, not per-transaction messages |
+- [MDN WebGPU API](https://developer.mozilla.org/en-US/docs/Web/API/WebGPU_API):
+  secure context, limited browser availability, adapter/device negotiation and
+  error/device-loss handling.
+- [WebGPU specification](https://gpuweb.github.io/gpuweb/): normative API reference
+  for the implementation spike; no renderer has been built or benchmarked here.

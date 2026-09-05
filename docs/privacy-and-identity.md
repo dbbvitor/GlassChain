@@ -618,9 +618,10 @@ branches) — the boundaries are enforced exactly there:
    nothing (`offline_member_catches_up_via_reconciliation`, outsider case).
 
 With a `cert_verifier` configured, boundary 2 additionally requires the sender
-to be certificate-verified (`identity_verified_payload_delivery`,
-`hello_with_unverified_org_certificate_is_disconnected`) — and per §1.4 that
-additional requirement is off in production.
+to be certificate-verified. The node binary can install it using `--org` plus
+`--trust-store`; without that configuration org verification remains off.
+See the [zero-trust plan](../.agents/plans/zero-trust.md) for the fail-closed
+configuration and credential-possession work.
 
 ## 3.5 Retention and purge
 
@@ -644,6 +645,13 @@ additional requirement is off in production.
   *knowledge* of what it holds — though the chain still drives reconciliation
   for anything committed (§3.2), uncommitted/never-committed payloads are
   simply stranded by the restart.
+
+  **Read rejection is not deletion:** `get()` still checks the stored expiry
+  after restart, but an expired read returns before rebuilding the expiry index.
+  D5 in the [source-comment debt plan](../.agents/plans/deferred-code-debt.md)
+  requires discovery and purge without first reading each key, plus a purge
+  schedule and failure reporting. Replica/backup retention and archival legal
+  holds need separate policies; none follows automatically from the 72h default.
 
 ## 3.6 Membership vs endorsement
 

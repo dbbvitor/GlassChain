@@ -1,102 +1,140 @@
 # Handoff — GlassChain
 
-**Written:** 2026-09-02
-**Branch:** `main` · **Commit:** `fed76c7` · working tree **clean**
+**Reviewed:** 2026-09-05
+**Source baseline:** `main` / `origin/main` at `f7b434e` after fetching origin.
+**Change branch:** `docs/webapp-roadmap-reconciliation` — documentation and plans
+only; no runtime code, dependencies or security controls changed.
 
----
+## Start here
 
-## Mission
+1. Read [AGENTS.md](../AGENTS.md) for repository rules, then the
+   [plan index](plans/README.md) for concluded versus pending work.
+2. Read [zero-trust §8](plans/zero-trust.md) before consensus optimization or
+   claims about authenticated finality/history.
+3. Read [source-comment debt](plans/deferred-code-debt.md) before completing
+   authorization, private retention or unattended workflow deployment.
+4. For the visual product, use the [browser demo plan](plans/gui-demo-benchmark.md).
+   **The owner replaced desktop gpui with a web app.** WebGPU is an optional,
+   measured renderer, not a framework, validator runtime or shipped feature.
 
-Bring GlassChain — a working supply-chain ledger — into alignment with the
-**Hybrid Distributed Inventory System** requirements: a Fabric/Corda/Thor hybrid
-combining permissioned identity and endorsement (Fabric), workflow-first
-modelling and selective disclosure (Corda), and an event/subscription surface
-(Thor). Multi-quarter programme; advance it one well-scoped, verified step at a
-time.
+## Current state — code, decisions and evidence are different
 
-## Read these first, in this order
-
-| # | File | Why |
+| Area | Concluded / available | Still pending |
 |---|---|---|
-| 1 | `AGENTS.md` | **Canonical project rules.** Invariants, conventions, commands. Non-negotiable — this handoff does not restate them. |
-| 2 | `.agents/plans/requirements-alignment.md` | The programme: 26-requirement traceability matrix + 7-stage roadmap |
-| 3 | `.agents/memories/debt-gap-handoff.md` | What #34–#49 actually shipped, plus the architecture facts and review pitfalls they established. **The densest useful file in the repo.** |
-| 4 | `.agents/memories/external-review-verdicts.md` | Which external-review claims are load-bearing, which are stale, and the verified residual gaps |
-| 5 | [`docs/adr/`](../docs/adr/) | Nine accepted ADRs. Read the one covering your area before designing. Moved out of `.agents/plans/` on 2026-09-02 — they are shipped documentation, not agent scratch. |
-| 6 | `.agents/memories/participation-model.md` | Read before touching the membership ladder. Four senses of "validate"; the four wrong answers every design pass reaches for first |
+| Workspace | 12 Rust crates; wire `glasschain/6`; 14 accepted ADRs | No browser package or demo bridge exists |
+| Ledger/execution | Schema v1, capability/policy history, explicit WASM write sets and replay | Production durability acknowledgement and historical security gates |
+| Consensus | PoW dev/test default; BLS proposal/prevote/precommit driver staged behind `bft` and capability | Context-authenticated votes/QCs, reliable evidence receipt state, full historical verification; no audited production BFT or speculative API |
+| Identity/privacy | TLS/TOFU, optional federation verifier, CRLs/intermediates, endorsement provider, PDC delivery/reconciliation | Fail-closed unconfigured paths, key/certificate lifecycle, role/scope decisions and restart-safe physical deletion |
+| Workflows/read path | Checkpointed flow engine, purchase/recall flows, triage API, provenance/flattener/event bus and RPC queries | Unattended triage discovery, durable external integration, bounded projection costs and complete operational metrics |
+| Measurements | Prior local BFT p50 2,021 ms at 100 / 5,284 ms at 200; structural encoding/fan-out fixes | 300 not passing, WAN/fault/long-run memory evidence, independent comparisons; no best-in-class or deployment claim |
+| PQ readiness | Discriminants shipped, provider/archival research recorded | Negotiated hybrid TLS test/selection, migration and optional archive profile; no guaranteed quantum-safe lifetime |
+| Demonstration | Web-app direction and browser/bridge/renderer acceptance gates specified | Entire implementation; Canvas2D baseline, optional WebGPU, no production data or public hosting |
 
-## Verified state — trust this table, not prose elsewhere
+Earlier tickets for verifier wiring, CRLs, endorsement startup, governance defaults
+and TCP fault tests closed. That does not close the deployment gaps above.
+The seven source markers remain: six ponytail comments plus one madsim TODO.
+D7's real-TCP fault-testing outcome is partly met by the proxy; its simulator
+migration is still optional, not silently completed.
 
-Measured against the working tree at `fed76c7` on 2026-09-02.
+## Pending frontiers — what to do next and how to finish
 
-| Thing | Reality |
-|---|---|
-| Workspace | **12 crates**, 93 `.rs` files, ~37.3k lines |
-| `cargo fmt --all --check` | ✅ passes with zero files needing formatting. The old "there is a known formatting backlog" claim is **retired**; `AGENTS.md`'s "format only the files you touched" convention still stands |
-| `cargo check --workspace --all-targets --all-features --locked` | ✅ passes |
-| `cargo test --workspace --all-targets --all-features --locked` | ✅ **546 tests** (537 passed, 9 ignored, 0 failed) across 29 harnesses + 10 doctest harnesses |
-| `cargo clippy ... -- -D warnings` | ✅ **zero diagnostics**. The `.github/clippy-baseline.txt` no-new-warnings gate is **retired and deleted** — clippy is clean, hold it there |
-| Programme tickets | #16–#49 **all closed**. Map #15 destination reached |
-| Canonical schema v1, VM write sets, capabilities, endorsement engine + enforcement, quorum certificate, staged BFT, PDCs on the wire + reconciliation, analytics read path, workflow flows | ✅ **shipped** — see `debt-gap-handoff.md` for the per-ticket commit and detail |
+### A. First engineering slice: staged consensus safety
 
-Run both feature configs when touching consensus: default **and**
-`--all-features` (the `bft` feature gates real code paths).
+**Ready to specify and test; no backend decision blocks it.** Start with the
+four code observations in zero-trust §8, not a faster signature implementation:
 
-## Residual verified gaps
+1. Add failing tests for changed vote height/round/phase/chain context. Specify
+   signed-byte and historical compatibility before changing votes and QCs.
+2. Send conflicting votes through the real network handler: retain bounded
+   ordinary receipts between messages and prove detection without false blame.
+3. Test structurally valid but cryptographically invalid historical QCs through
+   chain sync and restart, under the correct historical validator set.
+4. Test duplicate/stale traffic against an absolute phase deadline and bounded
+   queues. Count distinct eligible voters; do not allow received-message volume
+   to extend a round indefinitely.
 
-Not fog — each confirmed against the code on 2026-09-02, and each now filed.
-Detail and the reason each was left alone in
-`.agents/memories/external-review-verdicts.md`.
+**Completion:** each regression passes through the actual entry path, default
+and all-feature gates pass, compatibility decisions are documented. File narrowly
+scoped implementation tickets from these acceptance cases before code; existing
+closed BFT tickets do not cover their completion. Do not activate production BFT
+or governance penalties merely because local benchmarks pass.
 
-1. **Certificate verification is inert in production** ([#57](https://github.com/dbbvitor/GlassChain/issues/57)). `glasschain-node`
-   builds an `Organization` (root CA in hand) but never calls
-   `Node::set_cert_verifier`, so `cert_verifier` is `None` at runtime. The #47
-   PDC org gate is `verification_required = cert_verifier.is_some()` — so the
-   private-payload path **fails open to the self-asserted `Hello` org** outside
-   tests. Blocked on a real decision, not a missing line: each node self-issues
-   its own org CA, so a single-org verifier would reject every cross-org peer.
-   Needs a federation trust-store / CA-distribution decision first.
-2. **No certificate revocation** ([#58](https://github.com/dbbvitor/GlassChain/issues/58)). No CRL or OCSP anywhere
-   (`cert_verifier.rs`), and chains are single-hop (no intermediates).
-3. **No endorsement provider wired at node startup** ([#59](https://github.com/dbbvitor/GlassChain/issues/59)). The engine is inert
-   outside tests until a node/CLI flag or network default lands.
-4. **`record.signatures` / `CapabilityActivation.signatures` are count-only**
-   ([#60](https://github.com/dbbvitor/GlassChain/issues/60)).
-   The endorsement engine verifies `Transaction.endorsements`, never these. No
-   ticket will fix it incidentally — binding them needs its own decision.
-5. **`madsim_chaos.rs` TCP-level fault injection.** Long-standing `TODO`;
-   partitions are simulated at the application layer. Not filed — test-harness
-   fidelity, not a product gap.
-6. **The peer wire protocol is JSON, and it costs ~5× on the hot path**
-   ([#62](https://github.com/dbbvitor/GlassChain/issues/62)). `serde_json`
-   renders `Vec<u8>` as decimal arrays, so `Attestation`'s 96 bytes of key and
-   signature become ~393. Certificates are **not persisted with blocks yet**, so
-   a `serde_bytes` attribute plus a wire-version bump fixes it now, and gets
-   expensive once the format is in committed history and light-client proofs.
-7. **There is no BFT finality measurement anywhere**
-   ([#62](https://github.com/dbbvitor/GlassChain/issues/62)). The committed
-   capacity gate measures *PoW mine latency* on the dev engine with a degenerate
-   certificate and, in its own words, "no cross-validator vote rounds exist to
-   measure." Do not cite its p50 33–36 ms as BFT latency — a previous revision of
-   the performance plan did exactly that. Producing a real number is the blocking
-   first step of `.agents/plans/performance.md`.
+### B. Deployment trust, privacy and recovery
 
-Also open, not gaps: [#61](https://github.com/dbbvitor/GlassChain/issues/61)
-(`glasschain-demo`, a gpui visual demo and benchmark harness — plan in
-`.agents/plans/gui-demo-benchmark.md`).
+Independent decisions/tests can proceed alongside A:
 
-## Already rejected — do not re-propose
+- [Org-gated fail-open default](https://github.com/dbbvitor/GlassChain/issues/86):
+  fail closed on private paths and establish credential possession/session binding.
+  The old suggested insecure flag is not approved; real test credentials come first.
+- [Certificate-bound MSP principals](https://github.com/dbbvitor/GlassChain/issues/87):
+  D4, with deterministic historical authorization and go-forward lifecycle rules.
+- [Durable TOFU pins](https://github.com/dbbvitor/GlassChain/issues/88): rotation and
+  recovery policy before persistence; distinct from storing node private keys.
+- D1 governance bootstrap and D2 recall authority require owner/domain decisions.
+  Keep safe defaults; specify unilateral regulator versus independent-party policy.
+- D5 deletion-after-restart and D6 triage discovery require acceptance tests before
+  a persistent/unattended pilot; consider one narrow storage scan, two outcomes.
+- [On-chain revocation registry](https://github.com/dbbvitor/GlassChain/issues/74)
+  remains deferred; not a prerequisite to fixing current off-chain lifecycle gaps.
 
-| Proposal | Why it was rejected |
-|---|---|
-| Keep PoW (ADR-002 Option A) | Probabilistic finality; §8.2's "immediate" is literal |
-| Thor-style finality gadget over production (ADR-002 Option D) | Finality lags production by a quorum round |
-| **DAG-BFT (Narwhal/Bullshark/Mysticeti) as a consensus-family swap** | Orthogonal, not a family change: Narwhal is a *mempool* layer designed to compose with partial-sync BFT ordering. No reusable standalone Rust DAG-BFT crate exists (Sui's is monorepo-embedded; standalone Narwhal repos archived). Sits behind `ConsensusProvider` — carried as step 6 of `.agents/plans/performance.md` under a **measured trigger**, not rejected |
-| **HotStuff-1 / SBFT fast paths as a family change** | In-family speculative latency optimizations of the same partially-synchronous quorum BFT. ADR-preserving, and a live candidate (step 5) now that best-in-class latency is a stated goal — sequenced behind measurement and the wire encoding, because a fast path saves one hop while JSON inflates every message on every hop |
-| **Raising the ~300-validator ceiling by protocol optimization** | A category error, settled in [#62](https://github.com/dbbvitor/GlassChain/issues/62) and `docs/consensus.md` §10.2. No production system runs deterministic per-round ⅔ finality with all `n` participating beyond ~209; every larger network changed the participation model, decoupled finality, or weakened it — all three already rejected by ADR-002. **But `n` is the wrong axis to sell on**: compete on latency, throughput, and ladder reach. 300 mutually-distrusting validators is already best-in-class for a permissioned ledger (Fabric orders on crash-fault-only Raft) |
-| **zk-X509 / ZK certificate-chain proofs** | Solves a *public-chain* metadata-leak problem GlassChain does not have — no certificate is ever committed to the chain. Also a single-author unreviewed preprint, testnet-only |
-| Replace Wasmtime with an EVM (`revm`) | Discards tested work to satisfy a SHOULD; re-introduces the §3.2 conflict |
-| Delete or feature-gate out `LibP2pNode` | ADR-003 makes it required substrate for private-data dissemination |
-| Endorsement check inside `glasschain-core`'s commit path | Requires `core → identity` — a dependency cycle |
-| Drive the watcher from Sled write handles over `mpsc` | Breaks the replay invariant; nodes silently diverge after sync. The watcher **must** be fed committed ledger events only |
-| Extending `SCHEMA_V1` with rfq/quote/acceptance/dispute/settlement families | Those chain steps are flow *states*, record-less by design |
+**Completion:** the D1–D6 tests in the debt plan pass and deployment access,
+retention/backup and authority policies are explicit. Code alone does not certify
+LGPD, ANVISA or ICP-Brasil compliance.
+
+### C. Transport and performance: independent measured improvements
+
+Start a two-node **negotiated KX group** test on each TLS construction path;
+aws-lc already exists in the dependency graph, but runtime selection determines
+use. Preserve certificate/TOFU checks. The
+[backend review](https://github.com/dbbvitor/GlassChain/issues/85) evaluates each
+provider's audit, compatibility and CI cost; it is not a universal no-C blocker.
+
+After/alongside safety regressions, follow performance Step 0: WAN fault profiles,
+D3 history/pool admission costs, projection-memory/lag measurements, then the BLS
+verification/backend experiment. **Completion:** comparable before/after evidence
+under unchanged security/quorum assumptions; no assumed 10× gain or 300 pass.
+Fast paths and DAG dissemination stay behind measured triggers. Beyond-300 tests
+are experimental after 300 succeeds, not ruled out by a theorem.
+
+### D. Browser demonstration: safe parallel product slice
+
+[Browser demo](https://github.com/dbbvitor/GlassChain/issues/61) begins with plan
+step 0: one same-origin page + session-protected HTTP/SSE bridge + bounded sample
+snapshot and Canvas2D/WebGPU comparison. Then extract shared workload fixtures,
+build the real-node headless runner and add traceability/metrics views.
+
+**Completion:** synthetic transactions traverse real available checks; no keys or
+unauthorized payloads reach the browser; no-GPU/device-loss/reconnect cases remain
+usable; headless and UI totals agree; run resources are bounded and cleaned up.
+Core validation never depends on a browser/GPU. This can be built without waiting
+for speculative consensus, FL, an archive TSA or a production REST gateway, but
+must label the staged engine and unresolved privacy/recovery guarantees honestly.
+
+### E. Deferred research
+
+PQ archive evidence needs trusted time, preserved validation material, renewal,
+retention and legal/profile review. Learning starts with offline outcomes against
+a rules baseline; FL remains a SHOULD. Neither changes `SCHEMA_V1` or bypasses
+endorsement. Use the relevant plans rather than inventing a new platform now.
+
+## Validation and PR procedure
+
+Local validation completed on this unchanged source baseline, 2026-09-05:
+
+- `cargo fmt --all --check`: passed.
+- `cargo check`, `cargo test`, `cargo clippy -- -D warnings` with
+  `--workspace --all-targets --all-features --locked`: passed in full.
+- The same check/test/clippy commands with default features (`--all-features`
+  omitted): passed. This supersedes the prior 180-second partial-test timeout.
+- Large ignored scale/WAN gates were not re-run; prior numbers remain dated evidence.
+
+For the PR, verify all local links, marker coverage and whitespace; fetch origin
+and confirm no conflicts. `.github/workflows/ci.yml` filters docs-only changes,
+so manually dispatch **CI on the final branch SHA** to exercise all platforms,
+coverage and dependency audit. Inspect CodeQL/code-quality checks too; a local
+pass is not remote green. Remote statuses belong on the PR, not a permanent
+“all CI green” claim here. Do not weaken rules or suppress a failing check.
+
+On resumption, read the PR's live checks and compare its base to `origin/main`.
+If GitHub's external analysis service fails, record its exact run/error and stop
+short of claiming merge readiness. Keep the PR open; merge only on explicit request.

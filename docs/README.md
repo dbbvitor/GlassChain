@@ -18,12 +18,13 @@ history of that failure mode, and correcting it is worth more than a tidy story.
 | [`privacy-and-identity.md`](privacy-and-identity.md) | You are reviewing security, or working on identity. MSP, certificate verification, endorsement policy, private data collections, and an honest inventory of what is inert at runtime. |
 | [`workflows-and-contracts.md`](workflows-and-contracts.md) | You are building business logic. The contract/workflow split, the WASM host ABI, the flow framework, and watcher automation. |
 | [`operations.md`](operations.md) | You want to run it. Build, flags, the REPL, the gRPC surface, storage, the wire protocol, and the security warnings an operator needs first. |
+| [`liveness.md`](liveness.md) | You are planning a validator set. Failure-domain placement, jurisdiction floors, uptime and participation targets; these are operational guidance, not measured fleet guarantees. |
 
 ## Decisions
 
-[`adr/`](adr/) holds the nine accepted architecture decision records. Read the
-one covering your area **before** designing a change — several of them close off
-options that look attractive from a blank page.
+[`adr/`](adr/) holds the fourteen accepted architecture decision records. Read
+the one covering your area **before** designing a change — several of them close
+off options that look attractive from a blank page.
 
 | ADR | Decision |
 |---|---|
@@ -35,16 +36,20 @@ options that look attractive from a blank page.
 | [006](adr/adr-006-canonical-schema-v1.md) | 13 strict record families, registered extension namespaces, capability-controlled activation |
 | [007](adr/adr-007-vm-state-semantics.md) | Explicit persistent writes, committed write sets, scoped public/PDC visibility |
 | [008](adr/adr-008-endorsement-policy-model.md) | Fabric-style signature policies over verified MSP principals, distinct signer counting |
+| [009](adr/adr-009-validator-eligibility.md) | One org, one vote; an objective published eligibility bar; epoch-or-height duty-roster rotation. Closes ADR-002's open questions 4–5 |
 | [010](adr/adr-010-capability-versioning-policy.md) | Network-wide committed capability set gates every consensus-visible behaviour; height-based historical validation |
-
-There is no ADR-009.
+| [011](adr/adr-011-federation-trust-store.md) | Cross-org trust is an operator-configured federation trust store (`--trust-store`); an unverified org is downgraded, not disconnected |
+| [012](adr/adr-012-signature-binding.md) | Capability activations and `state_commitment` records carry fail-closed governance defaults enforced through the endorsement layer |
+| [013](adr/adr-013-certificate-revocation.md) | Revocation is fail-closed CRLs in the trust store, plus intermediate CAs; go-forward only, committed history stays valid |
+| [014](adr/adr-014-bls-aggregated-certificates.md) | One BLS12-381 aggregate signature plus a signer bitmap; compact certificates with proof-of-possession registration |
 
 ## Evidence
 
-- [`benchmarks/consensus-capacity.md`](benchmarks/consensus-capacity.md) — measured
-  results from the `#[ignore]`-gated 200/300-validator compact-workload harness.
-  This is the authoritative performance record; nothing else should be cited as
-  adoption-gate evidence.
+- [`benchmarks/consensus-capacity.md`](benchmarks/consensus-capacity.md) — recorded
+  PoW propagation and staged BFT finality runs. Local synthetic evidence is not
+  a completed WAN testnet or production adoption gate.
+- [Plans](../.agents/plans/README.md) — current roadmap, the complete source-comment
+  debt inventory, and research proposals clearly separated from shipped features.
 
 ## For agents
 

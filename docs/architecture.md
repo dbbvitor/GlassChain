@@ -81,7 +81,7 @@ source lines including `#[cfg(test)]` and `tests/` files, as of `main`
 | `glasschain-identity` | ~2.6k | `Identity` (ed25519 + X.509), `Organization` (Root CA / MSP), `CertChainVerifier` (rustls-webpki), `Channel` (PDC collections), `MspEndorsementProvider` | `identity.rs`, `msp.rs`, `cert_verifier.rs`, `channel.rs`, `msp_policy.rs` |
 | `glasschain-vm` | ~1.8k | Wasmtime-backed `ExecutionProvider` with independent fuel/op-gas budgets | `wasm.rs`, `gas.rs` |
 | `glasschain-indexer` | ~2.3k | `IndexerProvider`/`InMemoryIndexer`, `EventBusProvider`/`InMemoryEventBus`, `ProvenanceIndex` (custody chains), `AnalyticalFlattener` | `indexer.rs`, `event_bus.rs`, `provenance.rs`, `flattener.rs` |
-| `glasschain-network` | ~11.6k | The node: `Node` (lifecycle, mining, commit, PDC, endorsement gates), wire protocol (`Message`, `glasschain/4`), TLS handshake + TOFU registry, peer loops; `LibP2pNode` (implemented, unwired — see §7) | `node.rs`, `protocol.rs`, `peer.rs`, `libp2p_swarm.rs` |
+| `glasschain-network` | ~11.6k | The node: `Node` (lifecycle, mining, commit, PDC, endorsement gates), wire protocol (`Message`, `glasschain/6`), TLS handshake + TOFU registry, peer loops, BFT vote rounds (`rounds.rs`); `LibP2pNode` (implemented, unwired — see §7) | `node.rs`, `protocol.rs`, `peer.rs`, `rounds.rs`, `libp2p_swarm.rs` |
 | `glasschain-rpc` | ~2.2k | Tonic/Prost gRPC: `LedgerService`, `NodeService`, `IdentityService`, MSP auth interceptor | `server.rs`, `auth.rs`, `proto/glasschain/v1/glasschain.proto` |
 | `glasschain-node` | ~1.1k | The only full node binary: REPL + optional gRPC server + WASM executor attachment | `src/main.rs` |
 | `glasschain-sdk` | ~0.6k | High-level Rust client: pure transaction/JSON builders; **no network I/O today** (no `tonic` dep — the client's docs say a `tonic::Channel` would live here in a full implementation) | `client.rs` |
@@ -629,8 +629,13 @@ declaration only — the authoritative policy source is committed
 - [`workflows-and-contracts.md`](workflows-and-contracts.md) — contracts,
   watchers, flow runners.
 - [`operations.md`](operations.md) — running nodes, storage backends, gRPC.
-- ADRs in `docs/adr/`: `adr-001` (execution layer), `adr-002` (consensus
-  finality), `adr-003` (privacy model), `adr-004` (scale topology), `adr-005`
-  (certification/audit), `adr-006` (canonical schema v1), `adr-007`
-  (VM state semantics), `adr-008` (endorsement policy model), `adr-010`
-  (capability versioning). There is no ADR-009.
+- [`liveness.md`](liveness.md) — failure-domain placement, jurisdiction floors,
+  per-org uptime commitments, participation metrics.
+- ADRs in `docs/adr/` — fourteen, all accepted: `adr-001` (execution layer),
+  `adr-002` (consensus finality), `adr-003` (privacy model), `adr-004` (scale
+  topology), `adr-005` (certification/audit), `adr-006` (canonical schema v1),
+  `adr-007` (VM state semantics), `adr-008` (endorsement policy model),
+  `adr-009` (validator eligibility and churn), `adr-010` (capability
+  versioning), `adr-011` (federation trust store), `adr-012` (signature
+  binding), `adr-013` (certificate revocation), `adr-014` (BLS-aggregated
+  certificates). See [`adr/`](adr/) for the one-line index.

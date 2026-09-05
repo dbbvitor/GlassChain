@@ -4,9 +4,9 @@ Guidance for AI coding agents working on **GlassChain**. This file is the single
 source of truth for agent instructions; `CLAUDE.md` and
 `.github/copilot-instructions.md` intentionally defer to it.
 
-Human-facing docs live in [`README.md`](README.md) (overview, CLI usage) and
-[`PLUGIN_KIT.md`](PLUGIN_KIT.md) (trait-by-trait plugin reference). Read those
-before making architectural changes rather than re-deriving the design from source.
+Human-facing docs start at [`README.md`](README.md) (overview and navigation).
+Use [`docs/operations.md`](docs/operations.md) for CLI/protocol/API details and
+[`PLUGIN_KIT.md`](PLUGIN_KIT.md) for provider traits before extending them.
 
 ---
 
@@ -18,8 +18,7 @@ Proof-of-Work consensus, supply-chain transaction types (`SupplyOffer`,
 `PurchaseOrder`, `InventoryUpdate`, `TraceableAssetRegistration`), a contract +
 watcher automation engine, a TLS-encrypted TCP/libp2p P2P layer, and a gRPC API.
 
-- **Type:** Cargo workspace, 12 crates, ~37k lines of Rust across 93 files
-  (tests and benches included).
+- **Type:** Cargo workspace, 12 crates (members listed in `Cargo.toml`).
 - **Toolchain:** Rust **1.95** (pinned in `rust-toolchain.toml`), edition 2021.
 - **Runtime:** Tokio async, `tonic`/`prost` for gRPC, `wasmtime` for contract execution.
 - **CI:** `.github/workflows/ci.yml` runs strict rustfmt and clippy gates, a
@@ -108,7 +107,7 @@ GlassChain/
 ├── Cargo.toml                  # Workspace manifest + workspace-wide lint config
 ├── clippy.toml                 # Clippy thresholds (MSRV 1.95, complexity limits)
 ├── rust-toolchain.toml         # Pins Rust 1.95
-├── README.md                   # Human overview, CLI reference, protocol summary
+├── README.md                   # Human overview, quick start and navigation
 ├── PLUGIN_KIT.md               # Plugin/trait developer guide — read before extending
 └── crates/
     ├── glasschain-core/        # Block, Transaction, Ledger, provider traits, SNCM schema
@@ -206,9 +205,9 @@ hide unrelated warnings with broad `#[allow]` attributes.
 - Unit tests live in `#[cfg(test)] mod tests` blocks inside the module they cover.
   Integration tests live in `crates/glasschain-network/tests/`
   (`node_integration.rs`, `chaos_tests.rs`, `madsim_chaos.rs`, `sncm_compliance.rs`).
-- The full workspace currently has **209 passing tests** plus doctests, with zero
-  failures. The README's warning about `wasmtime` breaking `cargo test` is stale —
-  it builds fine on the pinned 1.95 toolchain.
+- Treat the current test run as evidence; do not copy historical test counts or
+  claim all tests passed from a partial run. Large scale benchmarks are ignored
+  by default and are separate from the ordinary suite.
 - **Add or update tests for every behavior change, even if not asked.** Follow the
   surrounding style: table-ish `assert_eq!` cases, `#[tokio::test]` for async.
 - Network tests bind real localhost ports and use timeouts. If a test hangs,
@@ -322,8 +321,9 @@ See [`.agents/README.md`](.agents/README.md) for file templates.
   they returned: `cargo check --workspace --all-targets --all-features --locked`,
   `cargo test --workspace --all-targets --all-features --locked`, and
   `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`.
-- Update `README.md` when you change CLI flags, REPL commands, the wire protocol,
-  or the gRPC surface. Update `PLUGIN_KIT.md` when you change a provider trait.
+- Update `docs/operations.md` when CLI flags, REPL commands, the wire protocol
+  or gRPC change; keep README quick-start/navigation consistent without duplicating
+  the reference. Update `PLUGIN_KIT.md` when a provider trait changes.
 - `target/` is ~29 GB and gitignored. Never add build output to a commit.
 
 ---
@@ -332,8 +332,8 @@ See [`.agents/README.md`](.agents/README.md) for file templates.
 
 - The pinned toolchain is 1.95; `clippy.toml` sets `msrv = "1.95.0"`. Don't use
   APIs newer than that, and don't bump `rust-toolchain.toml` casually.
-- `README.md` lists 9 crates but the workspace has 11 (`glasschain-sdk` and
-  `glasschain-cli` were added later). `PLUGIN_KIT.md` has the current list.
+- `Cargo.toml` is authoritative for workspace membership. The planned browser
+  demo is not implemented and must not be counted as a shipped crate.
 - The `glasschain-node` REPL and the gRPC server are separate: no `--rpc-addr`
   means no gRPC.
 - Block production is consensus-driven, not manual: the `mine`/`mine-async`
