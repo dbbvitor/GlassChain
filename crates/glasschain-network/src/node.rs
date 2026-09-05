@@ -3,7 +3,7 @@ use crate::peer::{PeerReader, PeerWriter};
 use crate::protocol::{Message, PROTOCOL_VERSION};
 #[cfg(feature = "bft")]
 use crate::rounds::{
-    BftRound, VoteReceipts, MAX_ROUNDS, PHASE_TIMEOUT, VALIDATOR_REGISTRY_CHANNEL,
+    phase_timeout, BftRound, VoteReceipts, MAX_ROUNDS, VALIDATOR_REGISTRY_CHANNEL,
     VALIDATOR_REGISTRY_CONTRACT,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -1600,16 +1600,13 @@ impl Node {
                     false
                 }
             };
-            let provider = if bft_active {
-                self.state.lock().await.consensus.clone()
-            } else {
-                None
-            };
-            if let Some(provider) = provider {
-                // Vote-round driver (ADR-002 adoption gate): prevote →
-                // precommit phases over the wire produce a real multi-signer
-                // aggregate certificate.
-                self.run_vote_round(block, &provider).await?
+            // The vote-round driver (ADR-002 adoption gate): prevote →
+            // precommit phases over the wire produce a real multi-signer
+            // aggregate certificate. It reads the attached provider and the
+            // derived validator set from state itself.
+            let bft_driver = bft_active && self.state.lock().await.consensus.is_some();
+            if bft_driver {
+                self.run_vote_round(block).await?
             } else {
                 block.mine(difficulty);
                 CommitNotification::for_pow_block(block)
@@ -2113,11 +2110,7 @@ impl Node {
     /// locked block when it holds one.
     #[cfg(feature = "bft")]
     #[allow(clippy::too_many_lines)]
-    async fn run_vote_round(
-        &self,
-        mut block: Block,
-        attached: &Arc<BftConsensusProvider>,
-    ) -> Result<CommitNotification, CoreError> {
+    async fn run_vote_round(&self, mut block: Block) -> Result<CommitNotification, CoreError> {
         block.hash = block.calculate_hash();
         let height = block.index;
         let mut round = 0u32;
@@ -2127,7 +2120,9 @@ impl Node {
             // (bootstrap).
             let provider = {
                 let mut s = self.state.lock().await;
-                derive_validator_provider(&mut s).unwrap_or_else(|| (**attached).clone())
+                derive_validator_provider(&mut s).ok_or_else(|| {
+                    CoreError::InvalidTransaction("bft: no validator set available".into())
+                })?
             };
             let quorum = provider.quorum();
             let local_index = provider
@@ -2159,6 +2154,11 @@ impl Node {
                 s.bft_vote_tx = Some(vote_tx);
             }
 
+            log::info!(
+                "bft driver: height {height} round {round}: proposer={} local_index={local_index} set={} (is_leader={is_leader})",
+                crate::rounds::proposer_index(&provider, height, round),
+                provider.validator_count()
+            );
             if !is_leader {
                 // This node does not drive the round; the committed block
                 // arrives through the peer path.
@@ -2174,10 +2174,16 @@ impl Node {
                 round,
             })
             .await;
+            let phase_start = std::time::Instant::now();
             let mut prevotes =
                 vec![provider.sign_vote(height, round, VotePhase::Prevote, &block.hash)];
             while prevotes.len() < quorum {
-                match tokio::time::timeout(PHASE_TIMEOUT, vote_rx.recv()).await {
+                match tokio::time::timeout(
+                    phase_timeout(provider.validator_count()),
+                    vote_rx.recv(),
+                )
+                .await
+                {
                     Ok(Some(vote))
                         if vote.height == height
                             && vote.round == round
@@ -2189,10 +2195,11 @@ impl Node {
                     _ => break,
                 }
             }
-            log::debug!(
-                "bft round {round} at height {height}: {}/{} prevotes",
+            log::info!(
+                "bft round {round} at height {height}: {}/{} prevotes collected in {:?}",
                 prevotes.len(),
-                quorum
+                quorum,
+                phase_start.elapsed()
             );
             if prevotes.len() < quorum {
                 round += 1;
@@ -2223,7 +2230,12 @@ impl Node {
             let mut precommits =
                 vec![provider.sign_vote(height, round, VotePhase::Precommit, &block.hash)];
             while precommits.len() < quorum {
-                match tokio::time::timeout(PHASE_TIMEOUT, vote_rx.recv()).await {
+                match tokio::time::timeout(
+                    phase_timeout(provider.validator_count()),
+                    vote_rx.recv(),
+                )
+                .await
+                {
                     Ok(Some(vote))
                         if vote.height == height
                             && vote.round == round
@@ -2532,14 +2544,11 @@ async fn handle_proposal(
     let mut s = ctx.state.lock().await;
     // Validators learn `(height, round)` from the Proposal itself; a lock at
     // the same height is preserved across rounds (Tendermint locking rule).
+    // Locks are per-height (Tendermint locking rule): a round state from a
+    // different height is dropped, its lock with it.
     let mut round_state = match s.bft_round.take() {
-        Some(existing) if existing.height == block.index => {
-            let mut fresh = crate::rounds::BftRound::new(block.index);
-            fresh.locked = existing.locked;
-            fresh
-        }
-        Some(otherwise) => otherwise,
-        None => crate::rounds::BftRound::new(block.index),
+        Some(existing) if existing.height == block.index => existing,
+        _ => crate::rounds::BftRound::new(block.index),
     };
     round_state.round = round;
     // Locking rule: a validator locked on another hash abstains; the round
@@ -2567,7 +2576,14 @@ async fn handle_proposal(
     let vote = valid_candidate
         .then(|| derive_validator_provider(&mut s))
         .flatten()
-        .map(|provider| provider.sign_vote(block.index, round, VotePhase::Prevote, &block.hash));
+        .map(|provider| {
+            log::info!(
+                "proposal handler: prevoting height {} round {}",
+                block.index,
+                round
+            );
+            provider.sign_vote(block.index, round, VotePhase::Prevote, &block.hash)
+        });
     if let Some(vote) = vote {
         round_state.proposal = Some(block);
         s.bft_round = Some(round_state);
@@ -2586,6 +2602,11 @@ async fn handle_proposal(
 /// evidence (#77), and forward it to the round driver's collector.
 #[cfg(feature = "bft")]
 async fn handle_vote(ctx: &PeerContext, vote: glasschain_core::BftVote) -> MessageEffect {
+    log::info!(
+        "handle_vote: vote for height {} phase {:?}",
+        vote.height,
+        vote.phase
+    );
     let mut detected: Option<EquivocationProof> = None;
     {
         let mut s = ctx.state.lock().await;
@@ -2719,6 +2740,13 @@ fn derive_validator_provider(s: &mut NodeState) -> Option<BftConsensusProvider> 
             return Some(cached.clone());
         }
     }
+    // Bootstrap: an empty registry means the attached provider's static set
+    // is authoritative (ADR-009 §5 genesis configuration) — return it as-is:
+    // it was PoP-verified at `set_bft_consensus`, and rebuilding it would
+    // re-run n pairings per node per membership generation.
+    if entries.is_empty() {
+        return Some((**attached).clone());
+    }
     let validators: Vec<glasschain_core::ValidatorInfo> = entries
         .into_iter()
         .map(|(name, public_key, pop)| glasschain_core::ValidatorInfo {
@@ -2727,9 +2755,6 @@ fn derive_validator_provider(s: &mut NodeState) -> Option<BftConsensusProvider> 
             pop,
         })
         .collect();
-    if validators.is_empty() {
-        return None;
-    }
     let provider = BftConsensusProvider::new(validators, signing_key).ok()?;
     s.bft_validator_cache = Some((content_hash, provider.clone()));
     Some(provider)
