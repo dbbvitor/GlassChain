@@ -2183,8 +2183,14 @@ impl Node {
             })
             .await;
             let phase_start = std::time::Instant::now();
-            let mut prevotes =
-                vec![provider.sign_vote(height, round, VotePhase::Prevote, &block.hash)];
+            let genesis_hash = self.ledger.lock().await.chain[0].hash.clone();
+            let mut prevotes = vec![provider.sign_vote(
+                &genesis_hash,
+                height,
+                round,
+                VotePhase::Prevote,
+                &block.hash,
+            )];
             while prevotes.len() < quorum {
                 match tokio::time::timeout(
                     phase_timeout(provider.validator_count()),
@@ -2235,8 +2241,13 @@ impl Node {
                 prevote_certificate,
             })
             .await;
-            let mut precommits =
-                vec![provider.sign_vote(height, round, VotePhase::Precommit, &block.hash)];
+            let mut precommits = vec![provider.sign_vote(
+                &genesis_hash,
+                height,
+                round,
+                VotePhase::Precommit,
+                &block.hash,
+            )];
             while precommits.len() < quorum {
                 match tokio::time::timeout(
                     phase_timeout(provider.validator_count()),
@@ -2566,9 +2577,11 @@ async fn handle_proposal(
         .as_ref()
         .is_some_and(|locked| locked != &block.hash);
     let mut valid_candidate = !locked_elsewhere;
+    let mut chain_id = String::new();
     if valid_candidate {
         let chains_ok = {
             let ledger = ctx.ledger.lock().await;
+            chain_id = ledger.chain[0].hash.clone();
             ledger
                 .chain
                 .last()
@@ -2590,7 +2603,13 @@ async fn handle_proposal(
                 block.index,
                 round
             );
-            provider.sign_vote(block.index, round, VotePhase::Prevote, &block.hash)
+            provider.sign_vote(
+                &chain_id,
+                block.index,
+                round,
+                VotePhase::Prevote,
+                &block.hash,
+            )
         });
     if let Some(vote) = vote {
         round_state.proposal = Some(block);
@@ -2634,8 +2653,10 @@ async fn handle_vote(ctx: &PeerContext, vote: glasschain_core::BftVote) -> Messa
                 round: proof.round,
                 phase: proof.phase,
                 block_hash: proof.second_block_hash.clone(),
+                chain_id: String::new(),
                 public_key: proof.public_key.clone(),
                 signature: proof.second_signature.clone(),
+                context_signature: Vec::new(),
                 algorithm: glasschain_core::wire::SignatureAlgorithm::Bls12381,
             };
             let _ = receipts.record(&replay);
@@ -2700,7 +2721,14 @@ async fn handle_precommit(
     }
     // Lock on the prevote quorum (Tendermint locking rule).
     round_state.locked = Some(block.hash.clone());
-    let vote = provider.sign_vote(block.index, round, VotePhase::Precommit, &block.hash);
+    let chain_id = ctx.ledger.lock().await.chain[0].hash.clone();
+    let vote = provider.sign_vote(
+        &chain_id,
+        block.index,
+        round,
+        VotePhase::Precommit,
+        &block.hash,
+    );
     s.bft_round = Some(round_state);
     drop(s);
     if write_tx.send(Message::Vote(vote)).await.is_err() {

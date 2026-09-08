@@ -150,7 +150,7 @@ mod tests {
     use bls_signatures::Serialize as _;
 
     fn vote(key: &PrivateKey, height: u64, round: u32, phase: VotePhase, hash: &str) -> BftVote {
-        BftVote::sign(height, round, phase, hash, key)
+        BftVote::sign("test-chain", height, round, phase, hash, key)
     }
 
     #[test]

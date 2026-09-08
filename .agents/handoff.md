@@ -54,10 +54,10 @@ four code observations in zero-trust §8, not a faster signature implementation:
    to extend a round indefinitely.
 
 **Completion:** each regression passes through the actual entry path, default
-and all-feature gates pass, compatibility decisions are documented. File narrowly
-scoped implementation tickets from these acceptance cases before code; existing
-closed BFT tickets do not cover their completion. Do not activate production BFT
-or governance penalties merely because local benchmarks pass.
+and all-feature gates pass, compatibility decisions are documented. Tickets
+filed 2026-09-08: §8.1 → #95 (dual-sign envelope, genesis-hash chain id; legacy
+removal in #99), §8.2 → #96, §8.3 → #97, §8.4 → #98. Do not activate production
+BFT or governance penalties merely because local benchmarks pass.
 
 ### B. Deployment trust, privacy and recovery
 

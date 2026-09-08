@@ -173,16 +173,26 @@ impl BftConsensusProvider {
     }
 
     /// Sign a vote for the current round driver (phase-tagged, set-checked on
-    /// receipt by [`Self::verify_vote`]).
+    /// receipt by [`Self::verify_vote`]). `chain_id` is the genesis block
+    /// hash — deterministic across nodes and already compared on chain
+    /// replacement (#95: votes bind chain/height/round/phase).
     #[must_use]
     pub fn sign_vote(
         &self,
+        chain_id: &str,
         height: u64,
         round: u32,
         phase: VotePhase,
         block_hash: &str,
     ) -> BftVote {
-        BftVote::sign(height, round, phase, block_hash, &self.signing_key)
+        BftVote::sign(
+            chain_id,
+            height,
+            round,
+            phase,
+            block_hash,
+            &self.signing_key,
+        )
     }
 
     /// Verify a vote against this validator set: self-verification plus
@@ -375,10 +385,11 @@ pub enum VotePhase {
 }
 
 impl VotePhase {
-    /// Routing metadata: which phase the vote belongs to. Phase is enforced
-    /// by message flow (a prevote quorum justifies precommits), not by the
-    /// signed message — vote signatures commit to the candidate hash only, so
-    /// the round's aggregate verifies as an ADR-014 certificate.
+    /// Routing metadata: which phase the vote belongs to. Its byte is part of
+    /// the sealed context envelope ([`BftVote::context_message`], #95) and
+    /// phase-appropriate message flow (a prevote quorum justifies precommits)
+    /// is enforced on top; the legacy hash-only signature spans phases
+    /// during the transition window (#99 removes it).
     #[must_use]
     pub const fn tag(self) -> u8 {
         match self {
@@ -390,6 +401,12 @@ impl VotePhase {
 
 /// One validator's BLS vote over a candidate block hash at `(height, round)`.
 /// The signature message is domain-separated per phase.
+///
+/// Two signature eras (#95): votes signed by current code carry the legacy
+/// hash-only `signature` **plus** a `context_signature` over the
+/// chain/height/round/phase envelope. Legacy-only votes (no
+/// `context_signature`) remain verifiable during the transition and are
+/// removed by the follow-up issue (#99).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BftVote {
     /// Height being voted on.
@@ -400,12 +417,24 @@ pub struct BftVote {
     pub phase: VotePhase,
     /// The candidate block hash being voted for.
     pub block_hash: String,
+    /// The chain this vote belongs to: the genesis block hash. Empty in
+    /// legacy-era votes that carry only the hash signature.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub chain_id: String,
     /// The voter's BLS public key (G1, 48 bytes).
     #[serde(with = "crate::wire::base64_bytes")]
     pub public_key: Vec<u8>,
     /// BLS signature over the phase-tagged vote message, base64 on the wire.
     #[serde(with = "crate::wire::base64_bytes")]
     pub signature: Vec<u8>,
+    /// BLS signature over the context envelope
+    /// ([`BftVote::context_message`]); empty for legacy-era votes.
+    #[serde(
+        default,
+        with = "crate::wire::base64_bytes",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub context_signature: Vec<u8>,
     /// The vote-signature algorithm (post-quantum plan action 2).
     #[serde(
         default,
@@ -436,30 +465,75 @@ impl BftVote {
         msg
     }
 
-    /// Sign a vote with `signing_key`.
+    /// The message a vote's context signature commits to (#95):
+    /// `domain || len(chain_id) || chain_id || height (u64 BE) ||
+    /// round (u32 BE) || phase tag (u8) || len(hash) || hash`. A vote signed
+    /// here cannot replay across heights, rounds, phases or networks.
+    ///
+    /// # Panics
+    ///
+    /// Never for real hashes/chain ids: the length casts are guarded.
+    #[must_use]
+    pub fn context_message(
+        chain_id: &str,
+        height: u64,
+        round: u32,
+        phase: VotePhase,
+        block_hash: &str,
+    ) -> Vec<u8> {
+        let mut msg = b"glasschain-bft-vote-ctx:".to_vec();
+        let chain = chain_id.as_bytes();
+        #[allow(clippy::cast_possible_truncation)]
+        let chain_len = u32::try_from(chain.len()).expect("chain id length fits u32");
+        msg.extend_from_slice(&chain_len.to_be_bytes());
+        msg.extend_from_slice(chain);
+        msg.extend_from_slice(&height.to_be_bytes());
+        msg.extend_from_slice(&round.to_be_bytes());
+        msg.push(phase.tag());
+        let hash = block_hash.as_bytes();
+        #[allow(clippy::cast_possible_truncation)]
+        let hash_len = u32::try_from(hash.len()).expect("hash length fits u32");
+        msg.extend_from_slice(&hash_len.to_be_bytes());
+        msg.extend_from_slice(hash);
+        msg
+    }
+
+    /// Sign a vote with `signing_key`: both the legacy hash signature and the
+    /// context envelope signature (#95 dual-sign).
     #[must_use]
     pub fn sign(
+        chain_id: &str,
         height: u64,
         round: u32,
         phase: VotePhase,
         block_hash: &str,
         signing_key: &PrivateKey,
     ) -> Self {
-        let message = Self::vote_message(block_hash);
         Self {
             height,
             round,
             phase,
             block_hash: block_hash.to_owned(),
+            chain_id: chain_id.to_owned(),
             public_key: signing_key.public_key().as_bytes(),
-            signature: signing_key.sign(message).as_bytes(),
+            signature: signing_key.sign(Self::vote_message(block_hash)).as_bytes(),
+            context_signature: signing_key
+                .sign(Self::context_message(
+                    chain_id, height, round, phase, block_hash,
+                ))
+                .as_bytes(),
             algorithm: crate::wire::SignatureAlgorithm::Bls12381,
         }
     }
 
-    /// Cryptographic self-verification: the signature must verify over this
-    /// vote's own phase/height/round/hash under `public_key`. Validator-set
-    /// membership is the caller's check (the set is height-dependent).
+    /// Cryptographic self-verification and validator-set membership are the
+    /// caller's checks beyond this (the set is height-dependent).
+    ///
+    /// When `context_signature` is present it must verify over this vote's
+    /// own `chain_id`/height/round/phase/hash envelope — replaying a vote at
+    /// another height, round, phase or chain fails. Legacy-only votes (no
+    /// envelope signature) verify against the hash message during the
+    /// transition window; their removal is #99.
     ///
     /// # Errors
     ///
@@ -484,6 +558,27 @@ impl BftVote {
                 "bft: vote signature does not verify (height {}, round {}, phase {:?})",
                 self.height, self.round, self.phase
             )));
+        }
+        if !self.context_signature.is_empty() {
+            let context =
+                Signature::from_bytes(self.context_signature.as_slice()).map_err(|e| {
+                    CoreError::InvalidBlock(format!(
+                        "bft: vote has an invalid context signature: {e}"
+                    ))
+                })?;
+            let envelope = Self::context_message(
+                &self.chain_id,
+                self.height,
+                self.round,
+                self.phase,
+                &self.block_hash,
+            );
+            if !public.verify(context, envelope) {
+                return Err(CoreError::InvalidBlock(format!(
+                    "bft: vote context signature does not verify (chain {}, height {}, round {}, phase {:?})",
+                    self.chain_id, self.height, self.round, self.phase
+                )));
+            }
         }
         Ok(())
     }
@@ -688,7 +783,13 @@ mod tests {
         let mut block = Block::with_write_set(1, vec![], genesis.hash, Vec::new());
         block.hash = block.calculate_hash();
 
-        let precommit = provider.sign_vote(1, 0, VotePhase::Precommit, &block.hash);
+        let precommit = provider.sign_vote(
+            &ledger.chain[0].hash,
+            1,
+            0,
+            VotePhase::Precommit,
+            &block.hash,
+        );
         assert!(precommit.verify().is_ok());
 
         let (bitmap, aggregate) = provider.aggregate_votes(&[precommit]).expect("aggregate");
@@ -754,5 +855,119 @@ mod tests {
             error.to_string().contains("outside the set") || error.to_string().contains("quorum"),
             "{error}"
         );
+    }
+
+    /// A vote signed over the given chain id; helper for #95 acceptance.
+    fn context_vote(
+        provider: &BftConsensusProvider,
+        chain_id: &str,
+        height: u64,
+        round: u32,
+        phase: VotePhase,
+        hash: &str,
+    ) -> BftVote {
+        provider.sign_vote(chain_id, height, round, phase, hash)
+    }
+
+    #[test]
+    fn test_context_vote_rejects_tampered_height_round_phase_chain_id() {
+        let (provider, _) = provider(1);
+        let ledger = Ledger::new(1);
+        let chain_id = ledger.chain[0].hash.clone();
+        let vote = context_vote(&provider, &chain_id, 7, 2, VotePhase::Prevote, "hash-x");
+        assert!(vote.verify().is_ok());
+
+        // Tamper each context field while keeping the signatures: the
+        // envelope must fail for every one of them.
+        for tampered in [
+            {
+                let mut v = vote.clone();
+                v.height = 8;
+                v
+            },
+            {
+                let mut v = vote.clone();
+                v.round = 3;
+                v
+            },
+            {
+                let mut v = vote.clone();
+                v.phase = VotePhase::Precommit;
+                v
+            },
+            {
+                // Nursery rust-clippy#8251-class false positive: the clone
+                // is mutated and returned, `vote` is not re-usable here.
+                #[allow(clippy::redundant_clone)]
+                let mut v = vote.clone();
+                v.chain_id = "other-chain".into();
+                v
+            },
+        ] {
+            let error = tampered
+                .verify()
+                .expect_err("tampered context must be rejected");
+            assert!(error.to_string().contains("context signature"), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_legacy_hash_only_vote_still_verifies_during_transition() {
+        // Era compatibility (#95 case 5): a legacy-only vote (no context
+        // signature, empty chain id) verifies for already-committed history.
+        let (_, keys) = provider(1);
+        let mut vote = BftVote::sign("", 7, 2, VotePhase::Prevote, "legacy-hash", &keys[0]);
+        vote.chain_id = String::new();
+        vote.context_signature = Vec::new();
+        assert!(vote.verify().is_ok());
+    }
+
+    #[test]
+    fn test_context_vote_without_chain_id_is_rejected() {
+        // A vote that claims a context signature must bind a chain id: an
+        // empty chain id with a context signature is a cross-network attack
+        // shape and fails closed.
+        let (provider, _) = provider(1);
+        let mut vote = context_vote(&provider, "genesis-hash", 1, 0, VotePhase::Prevote, "hash");
+        vote.chain_id = String::new();
+        let error = vote.verify().expect_err("empty chain id must be rejected");
+        assert!(error.to_string().contains("context signature"), "{error}");
+    }
+
+    #[test]
+    fn test_aggregate_of_context_signed_votes_produces_valid_certificate() {
+        let mut ledger = Ledger::new(1);
+        let genesis = ledger.mine_pending_transactions().expect("genesis").clone();
+        let count = 4;
+        let (provider, keys) = provider(count);
+        let mut block = Block::with_write_set(1, vec![], genesis.hash.clone(), Vec::new());
+        block.hash = block.calculate_hash();
+
+        let votes: Vec<BftVote> = keys
+            .iter()
+            .map(|key| BftVote::sign(&genesis.hash, 1, 0, VotePhase::Precommit, &block.hash, key))
+            .collect();
+        for vote in &votes {
+            assert!(vote.verify().is_ok(), "context-signed votes must verify");
+        }
+        let (bitmap, aggregate) = provider.aggregate_votes(&votes).expect("aggregate");
+        let certificate = QuorumCertificate {
+            block_index: 1,
+            block_hash: block.hash.clone(),
+            signers_bitmap: bitmap,
+            aggregate_signature: aggregate,
+            algorithm: crate::wire::SignatureAlgorithm::Bls12381,
+        };
+        assert!(provider.verify_certificate(&certificate, &block).is_ok());
+
+        // A context-tampered vote fails before aggregation can use it.
+        let mut impostor = votes[0].clone();
+        impostor.round = 1;
+        let mut mixed: Vec<BftVote> = votes[..count - 1].to_vec();
+        mixed.push(impostor);
+        let error = provider
+            .aggregate_votes(&mixed)
+            .expect_err("mismatched-context votes must fail aggregation");
+        assert!(error.to_string().contains("does not verify"), "{error}");
     }
 }

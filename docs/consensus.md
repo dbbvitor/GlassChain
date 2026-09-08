@@ -138,12 +138,23 @@ and quorum certificates are BLS.
    attaches it to the block (`block.certificate = Some(...)`) before
    `commit_mined_block`.
 
-Vote messages are domain-separated per phase (`BftVote::vote_message`, prefix
-`glasschain-bft-vote:`), so an aggregate over any phase verifies as an
-ADR-014 certificate over the block hash — phase is enforced by message flow,
-not by the signed bytes. On phase timeout the round increments and the proposer
-rotates (view change; `rounds::MAX_ROUNDS = 4`), and the per-phase budget
-scales with the set size (`rounds::phase_timeout`).
+Vote messages are dual-signed (`BftVote::sign`, #95): the legacy hash-only
+signature (`BftVote::vote_message`, prefix `glasschain-bft-vote:`) plus a
+**context signature** (`BftVote::context_message`, prefix
+`glasschain-bft-vote-ctx:`) over
+`len(chain_id) || chain_id || height || round || phase tag || len(hash) || hash`,
+where `chain_id` is the deterministic genesis block hash. A vote with a
+context signature cannot replay across heights, rounds, phases or chain
+contexts; `verify` rejects any tampered context field. Legacy-only votes (no
+context signature) remain verifiable during the transition window; their
+removal is tracked in
+[#99](https://github.com/dbbvitor/GlassChain/issues/99). The legacy aggregate
+over any phase still
+verifies as an ADR-014 certificate over the block hash — QCs carry the hash
+signature only, since block chaining already binds the height. On phase
+timeout the round increments and the proposer rotates (view change;
+`rounds::MAX_ROUNDS = 4`), and the per-phase budget scales with the set size
+(`rounds::phase_timeout`).
 
 The quorum math is unchanged and concrete: `quorum() = n*2/3 + 1` (integer
 division), so a one-validator set needs 1 vote, three needs 3, four needs 3.
@@ -180,9 +191,11 @@ the ledger has no validator set, so consensus-admissibility there is structural.
 `VoteReceipts` can detect two different hashes from the same key in one
 `(height, round, phase)` when kept across calls, and proof/event types exist.
 However, `handle_vote` creates a new tracker for each message and re-seeds only
-from already-detected proofs, not ordinary prior votes. Moreover,
-`BftVote::vote_message` signs the hash, **not** height/round/phase; verification
-of two signatures does not authenticate their alleged shared voting context.
+from already-detected proofs, not ordinary prior votes.
+`BftVote::vote_message` alone authenticates only the hash; the **context
+signature** (#95) now binds chain/height/round/phase, and verification of two
+signatures authenticates their shared voting context once both carry the
+envelope.
 
 Context binding, bounded persistent receipt state and a real two-conflicting-vote
 network regression are prerequisites to governance attribution. See
