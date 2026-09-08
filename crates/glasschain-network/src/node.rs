@@ -3,8 +3,7 @@ use crate::peer::{PeerReader, PeerWriter};
 use crate::protocol::{Message, PROTOCOL_VERSION};
 #[cfg(feature = "bft")]
 use crate::rounds::{
-    phase_timeout, BftRound, VoteReceipts, MAX_ROUNDS, VALIDATOR_REGISTRY_CHANNEL,
-    VALIDATOR_REGISTRY_CONTRACT,
+    phase_timeout, BftRound, MAX_ROUNDS, VALIDATOR_REGISTRY_CHANNEL, VALIDATOR_REGISTRY_CONTRACT,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use glasschain_contracts::ContractEngine;
@@ -213,6 +212,13 @@ struct NodeState {
     /// Equivocation proofs detected at vote receipt (#77).
     #[cfg(feature = "bft")]
     equivocations: Vec<EquivocationProof>,
+    /// Live vote-receipt journal (#96): every verified vote is recorded keyed
+    /// by `(height, round, phase, key)`, bounded by `VOTE_RECEIPT_CAP` and
+    /// pruned to the current + previous height. Held for the node's lifetime
+    /// so conflicting votes arriving in separate messages are detectable;
+    /// a restart loses unreported evidence (accepted limitation).
+    #[cfg(feature = "bft")]
+    bft_receipts: crate::rounds::VoteReceipts,
     /// The derived validator set, cached by the registry-content hash. The
     /// set is on-chain state (Q34, ADR-009/ADR-010): world-state keys under
     /// `governance/validator-registry`, replayed like every projection.
@@ -530,6 +536,8 @@ impl Node {
                 bft_round: None,
                 #[cfg(feature = "bft")]
                 equivocations: Vec::new(),
+                #[cfg(feature = "bft")]
+                bft_receipts: crate::rounds::VoteReceipts::default(),
                 #[cfg(feature = "bft")]
                 bft_validator_cache: None,
                 #[cfg(feature = "bft")]
@@ -2644,24 +2652,15 @@ async fn handle_vote(ctx: &PeerContext, vote: glasschain_core::BftVote) -> Messa
             log::warn!("Rejecting BFT vote: verification failed");
             return MessageEffect::default();
         }
-        let mut receipts = VoteReceipts::default();
-        // Receipts live for the node's lifetime — re-seed from prior
-        // detections so repeat equivocation stays observable.
-        for proof in &s.equivocations {
-            let replay = glasschain_core::BftVote {
-                height: proof.height,
-                round: proof.round,
-                phase: proof.phase,
-                block_hash: proof.second_block_hash.clone(),
-                chain_id: String::new(),
-                public_key: proof.public_key.clone(),
-                signature: proof.second_signature.clone(),
-                context_signature: Vec::new(),
-                algorithm: glasschain_core::wire::SignatureAlgorithm::Bls12381,
-            };
-            let _ = receipts.record(&replay);
+        // Bounded live journal (#96): every verified vote is recorded, so a
+        // conflicting vote in a *separate* later message is detected. Prune
+        // to the current + previous height (a height is dead once we are at
+        // least two past it); the journal re-evicts lower heights when the
+        // cap is hit.
+        if vote.height > 1 {
+            s.bft_receipts.retire_below(vote.height - 1);
         }
-        if let Some(proof) = receipts.record(&vote) {
+        if let Some(proof) = s.bft_receipts.record(&vote) {
             if proof.verify().is_ok() {
                 log::warn!(
                     "Equivocation detected at height {} (round {}): proof recorded",
@@ -4637,5 +4636,122 @@ mod tests {
         Node::enforce_chain_endorsements(&node.state, &candidate)
             .await
             .expect("a signed policy update must pass the sync gate");
+    }
+
+    #[cfg(feature = "bft")]
+    fn single_validator_provider() -> glasschain_core::BftConsensusProvider {
+        use bls_signatures::Serialize as _;
+        let secret = bls_signatures::PrivateKey::new([42; 64]);
+        let pop = secret.sign(format!(
+            "glasschain-bls-pop:{}",
+            hex::encode(secret.public_key().as_bytes())
+        ));
+        glasschain_core::BftConsensusProvider::new(
+            vec![glasschain_core::ValidatorInfo {
+                name: "test-validator".into(),
+                public_key: secret.public_key().as_bytes(),
+                pop: pop.as_bytes(),
+            }],
+            secret,
+        )
+        .expect("valid validators")
+    }
+
+    #[cfg(feature = "bft")]
+    fn peer_context(node: &Node) -> PeerContext {
+        let (dial_tx, dial_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(dial_rx);
+        PeerContext {
+            ledger: Arc::clone(&node.ledger),
+            state: Arc::clone(&node.state),
+            node_id: "n-under-test".into(),
+            listen_addr: "127.0.0.1:0".into(),
+            local_tls_cert_fingerprint: "self-fingerprint".into(),
+            event_tx: node.event_tx.clone(),
+            indexer: Arc::clone(&node.indexer),
+            event_bus: Arc::clone(&node.event_bus),
+            provenance: Arc::clone(&node.provenance),
+            flattener: Arc::clone(&node.flattener),
+            dial_tx,
+            storage: Arc::clone(&node.storage),
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "bft")]
+    async fn conflicting_votes_in_separate_messages_are_detected() {
+        // #96 case 1: two conflicting votes from the same key at the same
+        // (height, round, phase), through the real message state machine in
+        // two separate messages → proof recorded and the event emitted.
+        let node = Node::new("n-under-test", "127.0.0.1:0", 2);
+        let provider = single_validator_provider();
+        node.set_bft_consensus(Arc::new(provider.clone())).await;
+        let ctx = peer_context(&node);
+        let mut events = node.event_tx.subscribe();
+        let (write_tx, _write_rx) = tokio::sync::mpsc::channel::<Message>(16);
+        let genesis = node.ledger.lock().await.chain[0].hash.clone();
+
+        let conflicting = [
+            provider.sign_vote(&genesis, 5, 0, VotePhase::Prevote, "hash-a"),
+            provider.sign_vote(&genesis, 5, 0, VotePhase::Prevote, "hash-b"),
+        ];
+        for v in conflicting {
+            let effect = process_message(
+                Message::Vote(v),
+                "127.0.0.1:40000",
+                &ctx,
+                &write_tx,
+                None,
+                "peer-fingerprint",
+                &[],
+            )
+            .await;
+            assert!(!effect.disconnect);
+        }
+        assert_eq!(
+            ctx.state.lock().await.equivocations.len(),
+            1,
+            "the second conflicting vote must produce one proof"
+        );
+        let event = events
+            .recv()
+            .await
+            .expect("a detection event must be broadcast");
+        assert!(matches!(event, NodeEvent::EquivocationDetected { .. }));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "bft")]
+    async fn conflicting_votes_across_rounds_or_heights_are_not_detected() {
+        // #96 case 2: valid non-conflicting votes across different
+        // rounds/heights from the same validator must not falsely implicate.
+        let node = Node::new("n-under-test", "127.0.0.1:0", 2);
+        let provider = single_validator_provider();
+        node.set_bft_consensus(Arc::new(provider.clone())).await;
+        let ctx = peer_context(&node);
+        let (write_tx, _write_rx) = tokio::sync::mpsc::channel::<Message>(16);
+        let genesis = node.ledger.lock().await.chain[0].hash.clone();
+
+        for v in [
+            provider.sign_vote(&genesis, 5, 0, VotePhase::Prevote, "hash-a"),
+            provider.sign_vote(&genesis, 5, 0, VotePhase::Precommit, "hash-a"),
+            provider.sign_vote(&genesis, 6, 0, VotePhase::Prevote, "hash-a"),
+            provider.sign_vote(&genesis, 5, 1, VotePhase::Prevote, "hash-b"),
+        ] {
+            let _ = process_message(
+                Message::Vote(v),
+                "127.0.0.1:40000",
+                &ctx,
+                &write_tx,
+                None,
+                "peer-fingerprint",
+                &[],
+            )
+            .await;
+        }
+        assert!(
+            ctx.state.lock().await.equivocations.is_empty(),
+            "no false positives across phases/rounds/heights"
+        );
     }
 }

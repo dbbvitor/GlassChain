@@ -89,8 +89,21 @@ pub struct DetectedEquivocation {
     pub proof: EquivocationProof,
 }
 
+/// Journal cap (#96): at most this many outstanding
+/// `(height, round, phase, key)` receipts across all contexts.
+///
+/// Live quorum-sized traffic stays far below it; when the cap is reached,
+/// receipts from strictly lower heights are evicted first and a still-full
+/// journal drops the *new* record — an attacker's flooding context, not a
+/// live vote.
+pub const VOTE_RECEIPT_CAP: usize = 8192;
+
 /// Book-keeping for one validator's votes at `(height, round, phase)` —
 /// the receipt side of #77's detection rule.
+///
+/// Held for the node's lifetime in `NodeState` (#96): detection now works
+/// across separate vote messages. Live-only: a restart loses unreported
+/// evidence (accepted limitation).
 #[derive(Default)]
 #[allow(clippy::type_complexity)]
 pub struct VoteReceipts {
@@ -100,7 +113,7 @@ pub struct VoteReceipts {
 impl VoteReceipts {
     /// Record a verified vote; returns an equivocation proof when the same
     /// key already voted for a **different** hash in the same
-    /// `(height, round, phase)`.
+    /// `(height, round, phase)`. Bounded: see [`VOTE_RECEIPT_CAP`].
     #[must_use]
     pub fn record(&mut self, vote: &BftVote) -> Option<EquivocationProof> {
         let key = (vote.height, vote.round, vote.phase, vote.public_key.clone());
@@ -120,11 +133,30 @@ impl VoteReceipts {
             }
             Some(_) => None,
             None => {
+                if self.seen.len() >= VOTE_RECEIPT_CAP && !self.evict_stale(vote.height) {
+                    return None;
+                }
                 self.seen
                     .insert(key, (vote.block_hash.clone(), vote.signature.clone()));
                 None
             }
         }
+    }
+
+    /// Drop receipts for heights below `height` (a height is dead once we are
+    /// voting at least one height past it — current + previous retained).
+    pub fn retire_below(&mut self, height: u64) -> usize {
+        let before = self.seen.len();
+        self.seen.retain(|(h, _, _, _), _| *h >= height);
+        before - self.seen.len()
+    }
+
+    /// Only-lower-heights eviction inside [`VoteReceipts::record`]; returns
+    /// whether anything was freed.
+    fn evict_stale(&mut self, height: u64) -> bool {
+        let before = self.seen.len();
+        self.seen.retain(|(h, _, _, _), _| *h >= height);
+        self.seen.len() < before
     }
 }
 
@@ -208,5 +240,65 @@ mod tests {
             second_block_hash: "hash-a".into(),
         };
         assert!(proof.verify().is_err(), "same hash is not equivocation");
+    }
+
+    #[test]
+    fn test_journal_is_flood_bounded() {
+        // #96 case 3: flooding distinct height contexts cannot grow the
+        // journal without limit. Distinct flood contexts saturate the cap;
+        // eviction drops strictly lower heights first; with nothing lower
+        // left, further flood records are declined — recorded live context
+        // survives. Flood rows carry dummy signatures: `record` never
+        // verifies (the handler verifies before recording), and real BLS
+        // signing would make this test pay seconds per thousand rows.
+        let key = PrivateKey::new([7; 64]);
+        let public_key = key.public_key().as_bytes();
+        let flood_vote = |height: u64| -> BftVote {
+            BftVote {
+                height,
+                round: 0,
+                phase: VotePhase::Prevote,
+                block_hash: "flood-hash".into(),
+                chain_id: String::new(),
+                public_key: public_key.clone(),
+                signature: vec![0; 96],
+                context_signature: Vec::new(),
+                algorithm: glasschain_core::wire::SignatureAlgorithm::Bls12381,
+            }
+        };
+        let mut journal = VoteReceipts::default();
+        for h in 0..(VOTE_RECEIPT_CAP + 100) {
+            let _ = journal.record(&flood_vote(h as u64));
+        }
+        assert!(journal.seen.len() <= VOTE_RECEIPT_CAP, "journal overflowed");
+
+        // Retirement drops exactly the strictly-lower heights in a small
+        // journal, keeping the live (current) context.
+        let mut small = VoteReceipts::default();
+        let _ = small.record(&vote(&key, 5, 0, VotePhase::Prevote, "hash-a"));
+        let _ = small.record(&vote(
+            &PrivateKey::new([8; 64]),
+            5,
+            0,
+            VotePhase::Prevote,
+            "hash-a",
+        ));
+        let _ = small.record(&vote(&key, 6, 0, VotePhase::Prevote, "hash-a"));
+        assert_eq!(small.seen.len(), 3);
+        let detected = small.retire_below(6);
+        assert_eq!(detected, 2);
+        assert_eq!(small.seen.len(), 1);
+
+        // With nothing lower left, a further flood record is declined, not
+        // stored — the journal cannot grow past its bound.
+        let mut saturated = VoteReceipts::default();
+        for h in 0..VOTE_RECEIPT_CAP as u64 {
+            let _ = saturated.record(&flood_vote(h));
+        }
+        assert_eq!(saturated.seen.len(), VOTE_RECEIPT_CAP);
+        let mut declined = flood_vote(0);
+        declined.round = 9;
+        let _ = saturated.record(&declined);
+        assert_eq!(saturated.seen.len(), VOTE_RECEIPT_CAP, "full journal froze");
     }
 }
