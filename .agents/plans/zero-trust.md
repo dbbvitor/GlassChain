@@ -172,6 +172,18 @@ current driver's safety/liveness first; backend speed cannot repair missing
 context binding or verification gates. No automatic exclusion or production
 safety claim follows from the current local benchmark.
 
+**Tickets filed (2026-09-08):** §8.1 →
+[#95](https://github.com/dbbvitor/GlassChain/issues/95) (dual-sign envelope:
+`domain || genesis-hash || height || round || phase || hash`; QCs stay
+hash-only; legacy removal in
+[#99](https://github.com/dbbvitor/GlassChain/issues/99)); §8.2 →
+[#96](https://github.com/dbbvitor/GlassChain/issues/96) (bounded live journal,
+current + previous height, live-only accepted); §8.3 →
+[#97](https://github.com/dbbvitor/GlassChain/issues/97) (full historical QC
+verification default, measured); §8.4 →
+[#98](https://github.com/dbbvitor/GlassChain/issues/98) (absolute deadline from
+phase start, bounded queue, drop stale-first, distinct-voter quorum).
+
 ## Validation and next steps
 
 Plan the §8 regressions first, then D1/D2/D4/D5/D6 and the independently testable
