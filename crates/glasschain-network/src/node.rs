@@ -227,7 +227,7 @@ struct NodeState {
     /// Votes from peers are forwarded here by the message state machine; the
     /// round driver drains them against a timeout.
     #[cfg(feature = "bft")]
-    bft_vote_tx: Option<tokio::sync::mpsc::UnboundedSender<glasschain_core::BftVote>>,
+    bft_vote_tx: Option<tokio::sync::mpsc::Sender<glasschain_core::BftVote>>,
     /// TOFU peer registry: verified peer identities keyed by stable listen address.
     peer_registry: PeerRegistry,
     /// Optional CA certificate verifier; when set, peer certs must be org-issued.
@@ -2170,7 +2170,8 @@ impl Node {
             let is_leader = crate::rounds::proposer_index(&provider, height, round) == local_index;
 
             // Register the round + the vote collector for this attempt.
-            let (vote_tx, mut vote_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (vote_tx, mut vote_rx) =
+                tokio::sync::mpsc::channel(crate::rounds::VOTE_CHANNEL_CAP);
             {
                 let mut s = self.state.lock().await;
                 let locked = s
@@ -2209,31 +2210,21 @@ impl Node {
             .await;
             let phase_start = std::time::Instant::now();
             let genesis_hash = self.ledger.lock().await.chain[0].hash.clone();
-            let mut prevotes = vec![provider.sign_vote(
+            let seed = provider.sign_vote(
                 &genesis_hash,
                 height,
                 round,
                 VotePhase::Prevote,
                 &block.hash,
-            )];
-            while prevotes.len() < quorum {
-                match tokio::time::timeout(
-                    phase_timeout(provider.validator_count()),
-                    vote_rx.recv(),
-                )
-                .await
-                {
-                    Ok(Some(vote))
-                        if vote.height == height
-                            && vote.round == round
-                            && vote.phase == VotePhase::Prevote =>
-                    {
-                        prevotes.push(vote);
-                    }
-                    Ok(Some(_)) => {}
-                    _ => break,
-                }
-            }
+            );
+            let prevotes = collect_phase_votes(
+                &mut vote_rx,
+                seed,
+                quorum,
+                phase_start + phase_timeout(provider.validator_count()),
+                &provider,
+            )
+            .await;
             log::info!(
                 "bft round {round} at height {height}: {}/{} prevotes collected in {:?}",
                 prevotes.len(),
@@ -2266,31 +2257,22 @@ impl Node {
                 prevote_certificate,
             })
             .await;
-            let mut precommits = vec![provider.sign_vote(
+            let phase_start = std::time::Instant::now();
+            let seed = provider.sign_vote(
                 &genesis_hash,
                 height,
                 round,
                 VotePhase::Precommit,
                 &block.hash,
-            )];
-            while precommits.len() < quorum {
-                match tokio::time::timeout(
-                    phase_timeout(provider.validator_count()),
-                    vote_rx.recv(),
-                )
-                .await
-                {
-                    Ok(Some(vote))
-                        if vote.height == height
-                            && vote.round == round
-                            && vote.phase == VotePhase::Precommit =>
-                    {
-                        precommits.push(vote);
-                    }
-                    Ok(Some(_)) => {}
-                    _ => break,
-                }
-            }
+            );
+            let precommits = collect_phase_votes(
+                &mut vote_rx,
+                seed,
+                quorum,
+                phase_start + phase_timeout(provider.validator_count()),
+                &provider,
+            )
+            .await;
             self.state.lock().await.bft_vote_tx = None;
             if precommits.len() < quorum {
                 round += 1;
@@ -2576,6 +2558,69 @@ struct PeerContext {
 
 // ── BFT round message handlers (ADR-002 adoption gate, ADR-014) ─────────────
 
+/// Leader-side phase collector (#98, zero-trust §8.4): drains the vote
+/// channel until `quorum` **distinct eligible** voters are seen or the
+/// absolute `deadline` (measured from phase start) expires — whichever comes
+/// first. Message volume neither extends nor satisfies a round:
+///
+/// - stale routing metadata (wrong height/round/phase) is filtered before
+///   any cryptographic work;
+/// - eligibility runs `provider.verify_vote` (signature + set membership) —
+///   a vote cannot count before it is verified;
+/// - duplicates collapse per validator public key; one distinct key counts
+///   once regardless of message volume;
+/// - the phase deadline is absolute (a `tokio::time::Instant`), never reset
+///   by arriving messages.
+///
+/// The caller owns the channel; phases reuse the same receiver. The state
+/// lock is **not** held here — verification runs on the driver's own
+/// `provider` clone (§8.4 lock-scope note).
+#[cfg(feature = "bft")]
+async fn collect_phase_votes(
+    vote_rx: &mut tokio::sync::mpsc::Receiver<glasschain_core::BftVote>,
+    seed: glasschain_core::BftVote,
+    quorum: usize,
+    deadline: std::time::Instant,
+    provider: &BftConsensusProvider,
+) -> Vec<glasschain_core::BftVote> {
+    let mut collected = Vec::with_capacity(quorum);
+    let mut voters_seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    let (seed_height, seed_round, seed_phase) = (seed.height, seed.round, seed.phase);
+    if provider.verify_vote(&seed).is_ok() {
+        voters_seen.insert(seed.public_key.clone());
+        collected.push(seed);
+    }
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match tokio::time::timeout(deadline - now, vote_rx.recv()).await {
+            Ok(Some(vote)) => {
+                if vote.height != seed_height
+                    || vote.round != seed_round
+                    || vote.phase != seed_phase
+                {
+                    continue;
+                }
+                if provider.verify_vote(&vote).is_err() {
+                    log::warn!("bft: dropping unverifiable vote at height {seed_height}");
+                    continue;
+                }
+                if !voters_seen.insert(vote.public_key.clone()) {
+                    continue;
+                }
+                collected.push(vote);
+                if collected.len() == quorum {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    collected
+}
+
 /// Validator side of phase 1: verify the leader's candidate, prevote it (or
 /// abstain when locked elsewhere — the timeout drives the view change).
 #[cfg(feature = "bft")]
@@ -2689,7 +2734,12 @@ async fn handle_vote(ctx: &PeerContext, vote: glasschain_core::BftVote) -> Messa
             }
         }
         if let Some(vote_tx) = &s.bft_vote_tx {
-            let _ = vote_tx.send(vote);
+            // Bounded channel (#98, §8.4): when full, this arrival is
+            // dropped, not queued — the phase deadline and the
+            // distinct-voter collector make the drop liveness-safe.
+            if vote_tx.try_send(vote).is_err() {
+                log::warn!("bft: vote channel is full; dropping a vote");
+            }
         }
     }
     if let Some(proof) = detected {
@@ -5143,5 +5193,193 @@ mod tests {
             "measure historical QC verification: {blocks} blocks in {elapsed:?} ({:.3?} per block)",
             elapsed / u32::try_from(blocks).expect("fits")
         );
+    }
+
+    #[cfg(feature = "bft")]
+    fn three_validator_provider() -> (BftConsensusProvider, Vec<bls_signatures::PrivateKey>) {
+        use bls_signatures::Serialize as _;
+        let validators = ["validator-a", "validator-b", "validator-c"];
+        let seeds: [u8; 3] = [31, 32, 33];
+        let keys: Vec<bls_signatures::PrivateKey> = seeds
+            .iter()
+            .map(|seed| bls_signatures::PrivateKey::new([*seed; 64]))
+            .collect();
+        let info: Vec<glasschain_core::ValidatorInfo> = validators
+            .iter()
+            .enumerate()
+            .map(|(i, name)| glasschain_core::ValidatorInfo {
+                name: (*name).to_owned(),
+                public_key: keys[i].public_key().as_bytes(),
+                pop: keys[i]
+                    .sign(format!(
+                        "glasschain-bls-pop:{}",
+                        hex::encode(keys[i].public_key().as_bytes())
+                    ))
+                    .as_bytes(),
+            })
+            .collect();
+        (
+            BftConsensusProvider::new(info, keys[0]).expect("valid validators"),
+            keys,
+        )
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "bft")]
+    async fn duplicate_vote_volume_never_satisfies_or_extends_a_phase() {
+        // #98 case 2: quorum counts distinct eligible voters. Each non-leader
+        // key arrives in three identical message copies; stale round noise is
+        // routed away. The collector ends with exactly quorum votes, no
+        // duplicate inflation.
+        let (provider, keys) = three_validator_provider();
+        let genesis = Ledger::new(1).chain.remove(0);
+        let (vote_tx, mut vote_rx) = tokio::sync::mpsc::channel(64);
+        let seed = provider.sign_vote(&genesis.hash, 5, 0, VotePhase::Prevote, "hash-a");
+        for key in &keys[1..] {
+            for _ in 0..3 {
+                // Three identical copies per signer; each key is baked in and
+                // collapses to one counted vote.
+                vote_tx
+                    .send(glasschain_core::BftVote::sign(
+                        &genesis.hash,
+                        5,
+                        0,
+                        VotePhase::Prevote,
+                        "hash-a",
+                        key,
+                    ))
+                    .await
+                    .expect("channel bound covers it");
+            }
+        }
+        // Stale noise from a finished round: routed-filtered, never counted.
+        vote_tx
+            .send(provider.sign_vote(&genesis.hash, 5, 1, VotePhase::Prevote, "hash-a"))
+            .await
+            .unwrap();
+        let collected =
+            collect_phase_votes(&mut vote_rx, seed, 3, deadline_later(), &provider).await;
+        assert_eq!(
+            collected.len(),
+            3,
+            "quorum = three distinct voters, not three copies per voter"
+        );
+        let voters: std::collections::HashSet<Vec<u8>> =
+            collected.iter().map(|v| v.public_key.clone()).collect();
+        assert_eq!(voters.len(), 3, "no duplicate voter in the quorum");
+
+        // Control: only one distinct non-leader key arrives (in three
+        // identical copies); three message copies cannot manufacture a
+        // third voter — the phase must end unquorate at the absolute
+        // deadline.
+        let (second_tx, mut second_rx) = tokio::sync::mpsc::channel(64);
+        let second_seed = provider.sign_vote(&genesis.hash, 5, 0, VotePhase::Prevote, "hash-a");
+        for _ in 0..3 {
+            second_tx
+                .send(glasschain_core::BftVote::sign(
+                    &genesis.hash,
+                    5,
+                    0,
+                    VotePhase::Prevote,
+                    "hash-a",
+                    &keys[1],
+                ))
+                .await
+                .expect("channel bound covers it");
+        }
+        let control_start = std::time::Instant::now();
+        let control_deadline = control_start + std::time::Duration::from_millis(150);
+        let collected =
+            collect_phase_votes(&mut second_rx, second_seed, 3, control_deadline, &provider).await;
+        assert_eq!(collected.len(), 2, "message volume never mints a voter");
+        assert!(control_start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(feature = "bft")]
+    fn deadline_later() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(1)
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "bft")]
+    async fn phase_deadline_is_absolute_under_continuous_stale_traffic() {
+        // #98 case 1: the round cannot be extended by message volume. A
+        // continuous stream of stale (old-height) votes must end with the
+        // absolute deadline, not at last-arrival + timeout.
+        let (provider, keys) = three_validator_provider();
+        let genesis = Ledger::new(1).chain.remove(0);
+        let (vote_tx, mut vote_rx) = tokio::sync::mpsc::channel(64);
+        // One real sign for the stale vote — clones carry the stream. The
+        // spammer uses try_send: beyond the buffer it drops instead of
+        // blocking (it must not deadlock on the collector's exit).
+        let stale = provider.sign_vote(&genesis.hash, 1, 1, VotePhase::Prevote, "hash-a");
+        let spam = tokio::spawn(async move {
+            for _ in 0..100 {
+                let _ = vote_tx.try_send(stale.clone());
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_millis(150);
+        let seed = provider.sign_vote(&genesis.hash, 7, 0, VotePhase::Prevote, "hash-a");
+        let collected = collect_phase_votes(&mut vote_rx, seed, 3, deadline, &provider).await;
+        let elapsed = start.elapsed();
+        spam.await.unwrap();
+        let _ = keys;
+        assert!(
+            collected.len() < 3,
+            "stale traffic must never reach the quorum"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the phase must end at its absolute deadline, got {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "bft")]
+    async fn vote_channel_bound_rejects_flood_after_capacity() {
+        // #98 case 3: the vote channel has a named bound; arrivals beyond it
+        // are dropped at the handler.
+        let (provider, _) = three_validator_provider();
+        let genesis = Ledger::new(1).chain.remove(0);
+        let (vote_tx, vote_rx) = tokio::sync::mpsc::channel(4);
+        let filler = provider.sign_vote(&genesis.hash, 5, 0, VotePhase::Prevote, "hash-a");
+        for _ in 0..4 {
+            vote_tx.try_send(filler.clone()).expect("within bound");
+        }
+        assert!(
+            vote_tx.try_send(filler).is_err(),
+            "beyond the bound the arrival is dropped"
+        );
+        drop(vote_rx);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "bft")]
+    async fn quorum_sized_traffic_is_never_lost_to_the_bound() {
+        // #98 case 5: the bound comfortably exceeds live quorum-sized
+        // traffic — every distinct vote of a full quorum-sized burst is
+        // collected, none dropped.
+        let (provider, keys) = three_validator_provider();
+        let genesis = Ledger::new(1).chain.remove(0);
+        let (vote_tx, mut vote_rx) = tokio::sync::mpsc::channel(crate::rounds::VOTE_CHANNEL_CAP);
+        for key in &keys[1..] {
+            vote_tx
+                .send(glasschain_core::BftVote::sign(
+                    &genesis.hash,
+                    5,
+                    0,
+                    VotePhase::Prevote,
+                    "hash-a",
+                    key,
+                ))
+                .await
+                .expect("the bound comfortably exceeds quorum-sized traffic");
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let seed = provider.sign_vote(&genesis.hash, 5, 0, VotePhase::Prevote, "hash-a");
+        let collected = collect_phase_votes(&mut vote_rx, seed, 3, deadline, &provider).await;
+        assert_eq!(collected.len(), 3, "live quorum-sized traffic is intact");
     }
 }
