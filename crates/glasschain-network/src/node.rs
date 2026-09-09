@@ -607,6 +607,23 @@ impl Node {
                         w[1].chains_to(&w[0]).is_ok()
                             && Ledger::block_consensus_admissible(&w[1], difficulty)
                     });
+                #[cfg(feature = "bft")]
+                // Historical QC verification (#97, §8.3): a restart must not
+                // silently adopt a cryptographically invalid history.
+                // Bootstrap-era heights are not recoverable on restart — the
+                // attached provider is installed later than the restore — so
+                // certificates at those heights fail closed.
+                let chain_ok = if chain_ok {
+                    verify_chain_certificates(&chain, None)
+                        .inspect_err(|e| {
+                            log::warn!(
+                                "Restored chain failed historical certificate verification: {e}"
+                            );
+                        })
+                        .is_ok()
+                } else {
+                    false
+                };
                 if chain_ok {
                     l.chain = chain;
                     log::info!("Restored {} blocks from storage", l.chain.len());
@@ -2795,6 +2812,135 @@ fn derive_validator_provider(s: &mut NodeState) -> Option<BftConsensusProvider> 
     Some(provider)
 }
 
+/// Historical BFT certificate verification at every chain-adoption entry
+/// point (#97, zero-trust §8.3).
+///
+/// Every non-degenerate BFT certificate in a candidate chain must verify
+/// against the validator set that governed that height's votes: the registry
+/// state after the **previous** block (ADR-009 — the validator registry is
+/// on-chain state replayed like every projection). Set changes are
+/// snapshotted from the chain's own write sets; a change committed in block
+/// `h` governs heights `h+1` onward, exactly as the live
+/// `derive_validator_provider` would have seen it at that tip.
+///
+/// Heights before the first in-chain registry change were voted under the
+/// bootstrap static set (ADR-009 §5 genesis configuration), which does not
+/// live on the chain. With a `bootstrap` set supplied those heights verify
+/// against it; without one a non-degenerate certificate at such a height
+/// fails closed. PoW-era blocks without a BFT certificate are unchanged
+/// (structural admission still applies); inactive signature algorithms are
+/// rejected by [`glasschain_core::QuorumCertificate::validate`].
+///
+/// # Errors
+///
+/// Returns [`CoreError::InvalidBlock`] when a certificate is
+/// cryptographically invalid, verifies under the wrong historical set, names
+/// an inactive algorithm, or has no recoverable snapshot/bootstrap set.
+#[cfg(feature = "bft")]
+fn verify_chain_certificates(
+    chain: &[Block],
+    bootstrap: Option<&BftConsensusProvider>,
+) -> Result<(), CoreError> {
+    if chain.is_empty() {
+        return Ok(());
+    }
+
+    let registry_prefix = format!("ws:{VALIDATOR_REGISTRY_CHANNEL}:{VALIDATOR_REGISTRY_CONTRACT}:");
+    // Verification-only provider: its signing key takes no part in
+    // certificate verification.
+    let verifier_key = bls_signatures::PrivateKey::new([0; 64]);
+
+    // name -> (public_key, pop) plus one provider per change point, ordered
+    // by the block index from which the set takes effect (change index + 1).
+    let mut registry: std::collections::BTreeMap<String, glasschain_core::ValidatorInfo> =
+        std::collections::BTreeMap::new();
+    let mut sets: Vec<(u64, BftConsensusProvider)> = Vec::new();
+
+    for block in chain {
+        // The set governing this height's votes is the snapshot effective at
+        // `block.index` (built when the chain tip was block.index - 1):
+        // lookup BEFORE this block's own writes are applied.
+        let effective_set = match sets.iter().rev().find(|(from, _)| *from <= block.index) {
+            Some((_, provider)) => Some(provider),
+            None => bootstrap,
+        };
+        if let Some(certificate) = &block.certificate {
+            if !certificate.is_degenerate() {
+                let Some(provider) = effective_set else {
+                    return Err(CoreError::InvalidBlock(format!(
+                        "bft: block {} carries a BFT certificate but no validator set is \
+                         recoverable for its height",
+                        block.index
+                    )));
+                };
+                provider.verify_certificate(certificate, block)?;
+            }
+        }
+
+        // Registry writes in this block take effect from the next height on.
+        let mut changed = false;
+        for write in &block.write_set {
+            let state_key = write.state_key();
+            let Some(name) = state_key.strip_prefix(&registry_prefix) else {
+                continue;
+            };
+            match &write.op {
+                glasschain_core::WriteOp::Set(value) => {
+                    let descriptor: serde_json::Value =
+                        serde_json::from_slice(value).map_err(|e| {
+                            CoreError::InvalidBlock(format!(
+                                "bft: corrupt validator-registry descriptor for '{name}': {e}"
+                            ))
+                        })?;
+                    let public_key = descriptor
+                        .get("public_key")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(glasschain_core::wire::base64_decode)
+                        .ok_or_else(|| {
+                            CoreError::InvalidBlock(format!(
+                                "bft: validator-registry descriptor for '{name}' has no public key"
+                            ))
+                        })?;
+                    let pop = descriptor
+                        .get("pop")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(glasschain_core::wire::base64_decode)
+                        .ok_or_else(|| {
+                            CoreError::InvalidBlock(format!(
+                                "bft: validator-registry descriptor for '{name}' has no proof \
+                                 of possession"
+                            ))
+                        })?;
+                    registry.insert(
+                        name.to_owned(),
+                        glasschain_core::ValidatorInfo {
+                            name: name.to_owned(),
+                            public_key,
+                            pop,
+                        },
+                    );
+                }
+                glasschain_core::WriteOp::Delete => {
+                    registry.remove(name);
+                }
+            }
+            changed = true;
+        }
+        if changed {
+            let validators: Vec<glasschain_core::ValidatorInfo> =
+                registry.values().cloned().collect();
+            let snapshot = BftConsensusProvider::new(validators, verifier_key).map_err(|e| {
+                CoreError::InvalidBlock(format!(
+                    "bft: historical validator set at height {} is invalid: {e}",
+                    block.index + 1
+                ))
+            })?;
+            sets.push((block.index + 1, snapshot));
+        }
+    }
+    Ok(())
+}
+
 /// Handle a single peer connection (inbound or outbound).
 /// Handle a single peer connection (inbound or outbound).
 ///
@@ -3437,6 +3583,18 @@ async fn process_message(
             // must hold on the candidate itself before any block is adopted
             // (ADR-008 §4 — no commit path bypasses evaluation).
             if let Err(e) = Node::enforce_chain_endorsements(&ctx.state, &candidate).await {
+                log::warn!("Rejected chain replacement from {addr}: {e}");
+                return MessageEffect::default();
+            }
+            // Historical QC verification (#97, §8.3): a structurally plausible
+            // but cryptographically invalid (or wrong-historical-set)
+            // certificate must never be adopted via sync. Height-0-era
+            // bootstrap blocks verify against the attached provider's static
+            // genesis set (ADR-009 §5).
+            #[cfg(feature = "bft")]
+            let bootstrap = ctx.state.lock().await.consensus.clone();
+            #[cfg(feature = "bft")]
+            if let Err(e) = verify_chain_certificates(&candidate, bootstrap.as_deref()) {
                 log::warn!("Rejected chain replacement from {addr}: {e}");
                 return MessageEffect::default();
             }
@@ -4752,6 +4910,238 @@ mod tests {
         assert!(
             ctx.state.lock().await.equivocations.is_empty(),
             "no false positives across phases/rounds/heights"
+        );
+    }
+
+    #[cfg(feature = "bft")]
+    fn test_validator(
+        name: &str,
+        seed: u8,
+    ) -> (glasschain_core::ValidatorInfo, bls_signatures::PrivateKey) {
+        use bls_signatures::Serialize as _;
+        let secret = bls_signatures::PrivateKey::new([seed; 64]);
+        let pop = secret.sign(format!(
+            "glasschain-bls-pop:{}",
+            hex::encode(secret.public_key().as_bytes())
+        ));
+        (
+            glasschain_core::ValidatorInfo {
+                name: name.to_owned(),
+                public_key: secret.public_key().as_bytes(),
+                pop: pop.as_bytes(),
+            },
+            secret,
+        )
+    }
+
+    #[cfg(feature = "bft")]
+    fn registry_descriptor(info: &glasschain_core::ValidatorInfo) -> Vec<u8> {
+        serde_json::json!({
+            "public_key": BASE64_STANDARD.encode(&info.public_key),
+            "pop": BASE64_STANDARD.encode(&info.pop),
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[cfg(feature = "bft")]
+    fn registry_write(info: &glasschain_core::ValidatorInfo) -> glasschain_core::PersistentWrite {
+        glasschain_core::PersistentWrite {
+            channel: VALIDATOR_REGISTRY_CHANNEL.to_owned(),
+            contract: VALIDATOR_REGISTRY_CONTRACT.to_owned(),
+            key: info.name.clone(),
+            op: glasschain_core::WriteOp::Set(registry_descriptor(info)),
+            visibility: glasschain_core::WriteVisibility::Public,
+        }
+    }
+
+    #[cfg(feature = "bft")]
+    fn q_certificate(
+        block: &Block,
+        keys: &[bls_signatures::PrivateKey],
+    ) -> glasschain_core::QuorumCertificate {
+        use bls_signatures::{aggregate, Serialize as _};
+        let signatures: Vec<bls_signatures::Signature> = keys
+            .iter()
+            .map(|key| key.sign(glasschain_core::BftVote::vote_message(&block.hash)))
+            .collect();
+        let mut signers_bitmap = vec![0u8; keys.len().div_ceil(8)];
+        for i in 0..keys.len() {
+            signers_bitmap[i / 8] |= 1 << (i % 8);
+        }
+        glasschain_core::QuorumCertificate {
+            block_index: block.index,
+            block_hash: block.hash.clone(),
+            signers_bitmap,
+            aggregate_signature: aggregate(&signatures).expect("aggregate").as_bytes(),
+            algorithm: glasschain_core::wire::SignatureAlgorithm::Bls12381,
+        }
+    }
+
+    /// A candidate chain: genesis, an on-chain validator-registry write at
+    /// height 1 (set `{a}` effective from block 2), and blocks carrying real
+    /// certificates signed by `signers`.
+    #[cfg(feature = "bft")]
+    fn historical_chain(
+        genesis: &Block,
+        signers_per_block: &[Vec<bls_signatures::PrivateKey>],
+    ) -> Vec<Block> {
+        let (validator, _) = test_validator("validator-a", 11);
+        let mut b1 = Block::with_write_set(
+            1,
+            vec![],
+            genesis.hash.clone(),
+            vec![registry_write(&validator)],
+        );
+        b1.mine(1);
+        let mut chain = vec![genesis.clone(), b1];
+        for (i, signers) in signers_per_block.iter().enumerate() {
+            let mut block = Block::with_write_set(
+                u64::try_from(i + 2).expect("test chain height fits u64"),
+                vec![],
+                chain.last().expect("previous").hash.clone(),
+                Vec::new(),
+            );
+            block.mine(1);
+            if !signers.is_empty() {
+                block.certificate = Some(q_certificate(&block, signers));
+            }
+            chain.push(block);
+        }
+        chain
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "bft")]
+    async fn sync_adopts_chains_with_valid_historical_certificates() {
+        let node = Node::new("sync-target", "127.0.0.1:0", 1);
+        let ctx = peer_context(&node);
+        let (write_tx, write_rx) = tokio::sync::mpsc::channel::<Message>(16);
+        let _ = write_rx;
+        let genesis = Ledger::new(1).chain.remove(0);
+        let (_, validator_key) = test_validator("validator-a", 11);
+        // Block 2 carries a real certificate signed by the height-2 set
+        // recorded on-chain at height 1 — the historical-chain helper
+        // attaches it.
+        let chain = historical_chain(&genesis, &[vec![validator_key]]);
+        let adopted = process_message(
+            Message::Chain(chain),
+            "127.0.0.1:40001",
+            &ctx,
+            &write_tx,
+            None,
+            "peer-fingerprint",
+            &[],
+        )
+        .await;
+        assert!(!adopted.disconnect);
+        assert_eq!(node.ledger.lock().await.chain.len(), 3, "chain adopted");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "bft")]
+    async fn sync_rejects_chain_with_invalid_historical_certificate() {
+        let node = Node::new("sync-target", "127.0.0.1:0", 1);
+        let ctx = peer_context(&node);
+        let genesis = Ledger::new(1).chain.remove(0);
+
+        // Certificates at every historical height signed by an outsider key.
+        let outsider = vec![bls_signatures::PrivateKey::new([222; 64])];
+        let chain = historical_chain(&genesis, &[outsider.clone(), outsider]);
+        process_message(
+            Message::Chain(chain),
+            "127.0.0.1:40002",
+            &ctx,
+            &(tokio::sync::mpsc::channel::<Message>(16)).0,
+            None,
+            "peer-fingerprint",
+            &[],
+        )
+        .await;
+        assert_eq!(
+            node.ledger.lock().await.chain.len(),
+            1,
+            "invalid-cert chain must not be adopted"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "bft")]
+    async fn restart_rejects_chain_with_invalid_historical_certificate() {
+        let genesis = Ledger::new(1).chain.remove(0);
+        let outsider = vec![bls_signatures::PrivateKey::new([233; 64])];
+        let chain = historical_chain(&genesis, &[outsider]);
+        let storage: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
+        for block in &chain {
+            storage.put_block(block).unwrap();
+        }
+        let node = Node::new_with_storage("restarted", "127.0.0.1:0", 1, storage.clone());
+        assert_eq!(
+            node.ledger.lock().await.chain.len(),
+            1,
+            "a corrupted certificate must fall back to a fresh ledger"
+        );
+
+        // Control: a fully valid chain survives the same restart.
+        let good = historical_chain(&genesis, &[vec![]]);
+        let good_storage: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
+        for block in &good {
+            good_storage.put_block(block).unwrap();
+        }
+        let good_node = Node::new_with_storage("restarted-ok", "127.0.0.1:0", 1, good_storage);
+        assert_eq!(
+            good_node.ledger.lock().await.chain.len(),
+            3,
+            "valid history is restored intact"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "bft")]
+    fn historical_verifier_rejects_inactive_signature_algorithm() {
+        let genesis = Ledger::new(1).chain.remove(0);
+        let mut b1 = Block::with_write_set(1, vec![], genesis.hash.clone(), Vec::new());
+        b1.mine(1);
+        // Structurally plausible certificate naming an inactive algorithm.
+        let certificate = glasschain_core::QuorumCertificate {
+            block_index: b1.index,
+            block_hash: b1.hash.clone(),
+            signers_bitmap: vec![1],
+            aggregate_signature: vec![0; 96],
+            algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
+        };
+        b1.certificate = Some(certificate);
+        let (fake, _) = test_validator("bootstrap", 21);
+        let bootstrap =
+            BftConsensusProvider::new(vec![fake], bls_signatures::PrivateKey::new([0; 64]))
+                .expect("valid validators");
+        let error = verify_chain_certificates(&[genesis, b1], Some(&bootstrap))
+            .expect_err("an inactive algorithm must be rejected");
+        assert!(error.to_string().contains("Bls12381"), "{error}");
+    }
+
+    /// Cost measurement for #97 ("full historical verification is the
+    /// default, measured"). Ignored by default; run with
+    /// `cargo test -p glasschain-network --lib --all-features -- --ignored
+    /// historical_verification_cost --nocapture`.
+    #[test]
+    #[cfg(feature = "bft")]
+    #[ignore = "cost measurement, not a pass/fail gate"]
+    fn historical_verification_cost() {
+        let genesis = Ledger::new(1).chain.remove(0);
+        let (_, validator_key) = test_validator("validator-a", 11);
+        let blocks = 200;
+        let signer_blocks: Vec<Vec<bls_signatures::PrivateKey>> =
+            (0..blocks).map(|_| vec![validator_key]).collect();
+        let chain = historical_chain(&genesis, &signer_blocks);
+        let start = std::time::Instant::now();
+        verify_chain_certificates(&chain, None).expect("the chain must verify");
+        let elapsed = start.elapsed();
+        // println! is allowed inside #[test] (clippy.toml); the logger is
+        // not initialized in test binaries.
+        println!(
+            "measure historical QC verification: {blocks} blocks in {elapsed:?} ({:.3?} per block)",
+            elapsed / u32::try_from(blocks).expect("fits")
         );
     }
 }

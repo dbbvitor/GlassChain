@@ -183,9 +183,18 @@ paths now.** It fails closed:
 It is called by the peer `Message::Block` admission path (node.rs:3323-3330)
 and by `handle_precommit` (node.rs:2692), and is exercised by the bft.rs unit
 tests, `bft_finality.rs`, and the four-validator wire scenario
-`crates/glasschain-network/tests/bft_vote_rounds.rs`. The one path that does
-**not** cryptographically verify certificates is chain **sync** (§5, gate 2):
-the ledger has no validator set, so consensus-admissibility there is structural.
+`crates/glasschain-network/tests/bft_vote_rounds.rs`. Chain **sync** and
+**restart** are verified too (#97, zero-trust §8.3):
+`verify_chain_certificates` replays each candidate chain's validator-registry
+write sets and checks every non-degenerate BFT certificate against the set
+that governed its height — the registry state after the previous block.
+Heights before the first in-chain registry change verify against the
+bootstrap static set where one is attached (sync) and fail closed on
+restart, where it is not yet recoverable. A structurally plausible but
+cryptographically invalid QC, a QC for the wrong historical validator set,
+or an inactive-algorithm certificate rejects the whole candidate. The full
+verification cost is measured (see the `historical_verification_cost`
+ignored test).
 
 **Equivocation support is partial, not established end-to-end** (#77).
 `VoteReceipts` can detect two different hashes from the same key in one
