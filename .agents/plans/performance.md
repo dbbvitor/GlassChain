@@ -139,7 +139,7 @@ seeded fault profiles over real wall-clock TCP from full deterministic madsim
 execution. The optional madsim-tokio migration remains behind compatibility and
 additional-coverage evidence, not a prerequisite to these WAN measurements.
 
-### High-frequency flattening and read-path memory — adopt
+### High-frequency flattening and read-path memory — baseline measured
 
 `AnalyticalFlattener` retains a growing `Vec<FlatAssetRecord>` and currently
 ingests **AssetRegistration**, not every canonical event. The event bus's
@@ -147,20 +147,23 @@ bounded broadcast/ring buffer does not bound the flattener, provenance index or
 caller-side query allocations. Ingestion also runs inside
 `Node::after_block_commit`; “off-chain” does not mean zero cost to the node.
 
-Use existing asset fixtures with a fixed seed and increasing histories (for
-example 1k/10k/100k registrations, stopping at an explicit memory budget).
-Include canonical-record-only traffic as a control so a no-op flattening path
-cannot masquerade as high throughput. Run bursts, long steady input, lagging
-subscribers, repeated lineage/CSV queries and rebuild/replay.
+**Baseline (2026-09-09, `cargo test -p glasschain-indexer --release --test
+read_path_memory -- --ignored --nocapture`, release, Linux RSS):** ~3 KiB per
+registration retained across the three projections (indexer payload JSON
+dominates; the flat-record struct is 424 B and the serialized payload ~485 B).
+Linear growth: 1 000 rows ≈ 3 MiB, 10 000 ≈ 30 MiB, 100 000 ≈ 299 MiB — under
+the 512 MiB scenario budget. Ingestion is sub-ms per block at these scales
+(712 ms total for 100 k); a full rebuild of a fresh flattener over the same
+chain took 368 ms at 100 k. Linear-scan queries (`records_by_gtin`, …) are
+O(rows): 5.2 ms at 100 k — fine today, a measured trigger for indexes later,
+not before. **Remaining measured gaps:** lagging-subscriber lag/drop counts,
+bursts vs steady input with concurrent finality load, and peak-RSS at the
+node level (this harness measures the projections in isolation).
 
-Record retained rows, bytes/row, peak and steady RSS, allocation/CPU cost where
-available, ingestion p50/p95/p99, query latency, consumer lag/drop counts, replay
-time, and node finality with/without the load. Separate expected retained history
-from a leak; count replay duplicates and verify output correctness. Sampling and
-GUI rendering overhead get an on/off comparison. If budgets fail, try bounded
-batch export/pagination and a rebuildable projection before a new database or
-service. A slow analytics consumer must not block consensus, and loss recovery
-must replay committed history rather than silently omit events.
+Remaining fix path unchanged: if budgets fail at deployment scale, bounded
+batch export/pagination and a rebuildable projection come before a new
+database or service. A slow analytics consumer must not block consensus, and
+loss recovery must replay committed history rather than silently omit events.
 
 ## 6. Ordered path (stable Step 0–7 names)
 
