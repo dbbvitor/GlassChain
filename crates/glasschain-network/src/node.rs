@@ -157,7 +157,7 @@ impl ServerCertVerifier for AcceptAnyCert {
             message,
             cert,
             dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            &Node::tls_provider().signature_verification_algorithms,
         )
     }
 
@@ -171,12 +171,12 @@ impl ServerCertVerifier for AcceptAnyCert {
             message,
             cert,
             dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+            &Node::tls_provider().signature_verification_algorithms,
         )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::ring::default_provider()
+        Node::tls_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
@@ -772,8 +772,10 @@ impl Node {
 
     /// Generate a TLS certificate and build the node's TLS context.
     fn build_tls(identity: Option<Arc<Identity>>) -> NodeTls {
-        // Ensure the ring crypto provider is installed (required by rustls 0.23).
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        // Install the selected crypto provider as the process default
+        // (required by rustls 0.23); every builder below also passes it
+        // explicitly, so runtime selection is per-path, not ambient.
+        let _ = Self::tls_provider().install_default();
 
         let (cert_der, key_der) = identity.map_or_else(
             || {
@@ -807,10 +809,13 @@ impl Node {
 
         let cert_fingerprint = sha256(cert_der.as_ref());
 
-        let server_cfg = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der.clone()], key_der)
-            .expect("server TLS config");
+        let server_cfg =
+            rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(Self::tls_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .expect("the selected crypto provider supports the default protocol versions")
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der.clone()], key_der)
+                .expect("server TLS config");
 
         let insecure = Self::insecure_tls_allowed();
         let connector = if insecure {
@@ -818,11 +823,9 @@ impl Node {
                 "Network TLS certificate verification is disabled (dev mode). \
                  Use trusted roots in production."
             );
-            let cfg = rustls::ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
-                .with_no_client_auth();
-            Some(Arc::new(TlsConnector::from(Arc::new(cfg))))
+            Some(Arc::new(TlsConnector::from(Arc::new(
+                Self::insecure_client_config(),
+            ))))
         } else {
             // In normal mode `tls.connector` is never used: each outbound
             // connection builds a fresh per-peer connector via
@@ -845,15 +848,53 @@ impl Node {
             || std::env::var("GLASSCHAIN_INSECURE_TLS").is_ok_and(|v| v == "1")
     }
 
+    /// The runtime-selected crypto provider for the peer transport
+    /// (zero-trust ZT-3, post-quantum plan action).
+    ///
+    /// Default: `ring` (unchanged audit surface). With the `pq-tls`
+    /// feature: `aws-lc-rs`, offering the negotiated `X25519MLKEM768`
+    /// hybrid first and classical `X25519` second — a server that lacks
+    /// the hybrid still negotiates X25519, so the group preference never
+    /// blocks a peer. Certificate verification, fingerprint pinning and
+    /// TOFU behaviour are unchanged on every path.
+    fn tls_provider() -> rustls::crypto::CryptoProvider {
+        #[cfg(feature = "pq-tls")]
+        {
+            let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+            provider.kx_groups = vec![
+                rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
+                rustls::crypto::ring::kx_group::X25519,
+            ];
+            provider
+        }
+        #[cfg(not(feature = "pq-tls"))]
+        rustls::crypto::ring::default_provider()
+    }
+
+    /// The dev-mode client configuration (no certificate verification).
+    /// `GLASSCHAIN_INSECURE_TLS=1` / `insecure-tls` are local-debugging
+    /// escape hatches only.
+    fn insecure_client_config() -> rustls::ClientConfig {
+        rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(Self::tls_provider()))
+            .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+            .expect("the selected crypto provider supports the default protocol versions")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
+            .with_no_client_auth()
+    }
+
     /// Build a client TLS connector that trusts the supplied peer certificate.
     fn connector_for_peer_cert(peer_cert: CertificateDer<'static>) -> Arc<TlsConnector> {
         let mut roots = RootCertStore::empty();
         roots
             .add(peer_cert)
             .expect("add peer certificate to root store");
-        let client_cfg = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let client_cfg =
+            rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(Self::tls_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .expect("the selected crypto provider supports the default protocol versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth();
         Arc::new(TlsConnector::from(Arc::new(client_cfg)))
     }
 
@@ -3908,6 +3949,16 @@ async fn process_message(
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
+/// Map the negotiated key exchange group to a comparable [`rustls::NamedGroup`].
+#[cfg(test)]
+fn glasschain_group(
+    negotiated: Option<&'static dyn rustls::crypto::SupportedKxGroup>,
+) -> rustls::NamedGroup {
+    negotiated
+        .map(rustls::crypto::SupportedKxGroup::name)
+        .expect("a completed handshake negotiated a key exchange group")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5381,5 +5432,89 @@ mod tests {
         let seed = provider.sign_vote(&genesis.hash, 5, 0, VotePhase::Prevote, "hash-a");
         let collected = collect_phase_votes(&mut vote_rx, seed, 3, deadline, &provider).await;
         assert_eq!(collected.len(), 3, "live quorum-sized traffic is intact");
+    }
+
+    /// Two-node handshake through the TLS construction paths (zero-trust ZT-3,
+    /// `pq-tls` plan action): the acceptor built in `build_tls` and both client
+    /// connectors must negotiate the selected group while keeping certificate
+    /// verification unchanged.
+    #[tokio::test]
+    #[cfg(feature = "pq-tls")]
+    async fn negotiated_kx_group_is_hybrid_on_all_construction_paths() {
+        // Path 1: the TOFU connector (per-peer root certificate).
+        let tls = Node::build_tls(None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (server_group_tx, server_group_rx) = tokio::sync::oneshot::channel();
+        let acceptor = Arc::clone(&tls.acceptor);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let server_stream = acceptor.accept(stream).await.expect("server handshake");
+            let group = server_stream
+                .get_ref()
+                .1
+                .negotiated_key_exchange_group()
+                .map(rustls::crypto::SupportedKxGroup::name);
+            let _ = server_group_tx.send(group);
+        });
+        let connector = Node::connector_for_peer_cert(tls.cert_der.clone());
+        let server_name = ServerName::try_from("glasschain-node")
+            .expect("valid server name")
+            .to_owned();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client_stream = connector.connect(server_name.clone(), tcp).await.unwrap();
+        let client_group =
+            glasschain_group(client_stream.get_ref().1.negotiated_key_exchange_group());
+        assert_eq!(
+            client_group,
+            rustls::NamedGroup::X25519MLKEM768,
+            "TOFU path"
+        );
+        assert_eq!(
+            server_group_rx.await.unwrap(),
+            Some(rustls::NamedGroup::X25519MLKEM768),
+            "acceptor path"
+        );
+
+        // Path 2: the insecure dev connector (AcceptAnyCert) — same group
+        // selection, certificate verification still skipped only here.
+        let tls2 = Node::build_tls(None);
+        let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let acceptor2 = Arc::clone(&tls2.acceptor);
+        tokio::spawn(async move {
+            let (stream, _) = listener2.accept().await.unwrap();
+            let _ = acceptor2.accept(stream).await.expect("server handshake");
+        });
+        let connector2 = tokio_rustls::TlsConnector::from(Arc::new(Node::insecure_client_config()));
+        let tcp2 = tokio::net::TcpStream::connect(addr2).await.unwrap();
+        let client2 = connector2.connect(server_name, tcp2).await.unwrap();
+        let group2 = glasschain_group(client2.get_ref().1.negotiated_key_exchange_group());
+        assert_eq!(group2, rustls::NamedGroup::X25519MLKEM768, "insecure path");
+    }
+
+    /// Control on the default build: without `pq-tls` the negotiated group is
+    /// the classical X25519 (ring), proving the feature flag drives the
+    /// runtime selection rather than a constant.
+    #[tokio::test]
+    #[cfg(not(feature = "pq-tls"))]
+    async fn negotiated_kx_group_is_classical_by_default() {
+        let tls = Node::build_tls(None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = Arc::clone(&tls.acceptor);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = acceptor.accept(stream).await.expect("server handshake");
+        });
+        let connector = Node::connector_for_peer_cert(tls.cert_der.clone());
+        let server_name = ServerName::try_from("glasschain-node")
+            .expect("valid server name")
+            .to_owned();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client_stream = connector.connect(server_name, tcp).await.unwrap();
+        let client_group =
+            glasschain_group(client_stream.get_ref().1.negotiated_key_exchange_group());
+        assert_eq!(client_group, rustls::NamedGroup::X25519);
     }
 }
