@@ -181,8 +181,14 @@ must replay committed history rather than silently omit events.
   an individual signer; attribution relies on authenticated votes/evidence, not
   a sequential fallback that no longer exists.
 - [ ] **Step 3 — history-dependent admission (D3).** Old quadratic attestation
-  lookup is obsolete; benchmark the still-live `Ledger::add_transaction` rebuild
-  and ID scans. Optimize shared ownership/invalidation, not just one caller.
+  lookup is obsolete; the `ledger_admission` criterion bench
+  (`cargo bench -p glasschain-core --bench ledger_admission`) records the
+  baseline: admission cost is linear in committed history — ~214 µs/admission
+  at 100 committed records, ~2.3 ms at 1 000, ~21 ms at 10 000 (release,
+  64-admission bursts); duplicate IDs pay the same rebuild; the pending-pool
+  arm is minor at a 1 000-record history. Optimize the shared
+  ownership/invalidation (one rebuildable capability/ID index at the owning
+  layer), not just one caller.
 - [ ] **Step 4 — BLS follow-up, not a new adoption.** Aggregation shipped. QC
   signature is 96 bytes **plus `ceil(n/8)` bitmap and metadata**; the whole
   certificate is not O(1). `verify_same_message_multisig` currently performs
