@@ -49,6 +49,15 @@ pub fn phase_timeout(validator_count: usize) -> std::time::Duration {
 pub const VALIDATOR_REGISTRY_CONTRACT: &str = "validator-registry";
 pub const VALIDATOR_REGISTRY_CHANNEL: &str = "governance";
 
+/// The leader's in-flight vote channel bound (#98, zero-trust §8.4).
+///
+/// Live quorum-sized traffic stays far below it; when full, further arrivals
+/// are dropped at `handle_vote` — the queue retains the oldest messages,
+/// which adversarial flooding would make stale anyway. Liveness degrades
+/// under flooding; safety is kept by the absolute phase deadline and the
+/// distinct-voter quorum count.
+pub const VOTE_CHANNEL_CAP: usize = 1024;
+
 /// In-flight round state for one height.
 #[derive(Debug, Default)]
 pub struct BftRound {
