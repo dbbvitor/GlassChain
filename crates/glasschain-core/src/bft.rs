@@ -388,8 +388,7 @@ impl VotePhase {
     /// Routing metadata: which phase the vote belongs to. Its byte is part of
     /// the sealed context envelope ([`BftVote::context_message`], #95) and
     /// phase-appropriate message flow (a prevote quorum justifies precommits)
-    /// is enforced on top; the legacy hash-only signature spans phases
-    /// during the transition window (#99 removes it).
+    /// is enforced on top of the envelope binding.
     #[must_use]
     pub const fn tag(self) -> u8 {
         match self {
@@ -400,13 +399,13 @@ impl VotePhase {
 }
 
 /// One validator's BLS vote over a candidate block hash at `(height, round)`.
-/// The signature message is domain-separated per phase.
 ///
-/// Two signature eras (#95): votes signed by current code carry the legacy
-/// hash-only `signature` **plus** a `context_signature` over the
-/// chain/height/round/phase envelope. Legacy-only votes (no
-/// `context_signature`) remain verifiable during the transition and are
-/// removed by the follow-up issue (#99).
+/// Every vote carries two signatures (#95): `signature` over the candidate
+/// hash — the aggregate material an ADR-014 certificate is built from — and
+/// `context_signature` over the chain/height/round/phase envelope
+/// ([`BftVote::context_message`]). The legacy hash-only format (no context
+/// signature) is no longer accepted (#99): a vote must bind its consensus
+/// context to be verifiable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BftVote {
     /// Height being voted on.
@@ -417,18 +416,18 @@ pub struct BftVote {
     pub phase: VotePhase,
     /// The candidate block hash being voted for.
     pub block_hash: String,
-    /// The chain this vote belongs to: the genesis block hash. Empty in
-    /// legacy-era votes that carry only the hash signature.
+    /// The chain this vote belongs to: the genesis block hash.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub chain_id: String,
     /// The voter's BLS public key (G1, 48 bytes).
     #[serde(with = "crate::wire::base64_bytes")]
     pub public_key: Vec<u8>,
-    /// BLS signature over the phase-tagged vote message, base64 on the wire.
+    /// BLS signature over the candidate-hash vote message
+    /// ([`BftVote::vote_message`]), base64 on the wire.
     #[serde(with = "crate::wire::base64_bytes")]
     pub signature: Vec<u8>,
     /// BLS signature over the context envelope
-    /// ([`BftVote::context_message`]); empty for legacy-era votes.
+    /// ([`BftVote::context_message`]).
     #[serde(
         default,
         with = "crate::wire::base64_bytes",
@@ -498,8 +497,8 @@ impl BftVote {
         msg
     }
 
-    /// Sign a vote with `signing_key`: both the legacy hash signature and the
-    /// context envelope signature (#95 dual-sign).
+    /// Sign a vote with `signing_key`: the candidate-hash signature (the
+    /// certificate aggregate material) plus the context envelope signature.
     #[must_use]
     pub fn sign(
         chain_id: &str,
@@ -526,25 +525,32 @@ impl BftVote {
         }
     }
 
-    /// Cryptographic self-verification and validator-set membership are the
-    /// caller's checks beyond this (the set is height-dependent).
+    /// Cryptographic self-verification; validator-set membership is the
+    /// caller's check (the set is height-dependent).
     ///
-    /// When `context_signature` is present it must verify over this vote's
-    /// own `chain_id`/height/round/phase/hash envelope — replaying a vote at
-    /// another height, round, phase or chain fails. Legacy-only votes (no
-    /// envelope signature) verify against the hash message during the
-    /// transition window; their removal is #99.
+    /// Both signatures must verify: the candidate-hash signature and the
+    /// context envelope over this vote's own
+    /// `chain_id`/height/round/phase/hash. A vote without a context
+    /// signature (the pre-#95 legacy format) is rejected — replaying it at
+    /// another height, round, phase or chain cannot be ruled out.
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::InvalidBlock`] for malformed keys/signatures or a
-    /// signature that does not verify.
+    /// Returns [`CoreError::InvalidBlock`] for malformed keys/signatures, a
+    /// missing context signature, or a signature that does not verify.
     pub fn verify(&self) -> Result<(), CoreError> {
         if self.algorithm != crate::wire::SignatureAlgorithm::Bls12381 {
             return Err(CoreError::InvalidBlock(format!(
                 "bft: vote algorithm must be Bls12381, got {:?}",
                 self.algorithm
             )));
+        }
+        if self.context_signature.is_empty() {
+            return Err(CoreError::InvalidBlock(
+                "bft: vote has no context signature — the legacy hash-only vote format is no \
+                 longer accepted (#99)"
+                    .into(),
+            ));
         }
         let public = PublicKey::from_bytes(self.public_key.as_slice()).map_err(|e| {
             CoreError::InvalidBlock(format!("bft: vote has an invalid BLS public key: {e}"))
@@ -559,26 +565,21 @@ impl BftVote {
                 self.height, self.round, self.phase
             )));
         }
-        if !self.context_signature.is_empty() {
-            let context =
-                Signature::from_bytes(self.context_signature.as_slice()).map_err(|e| {
-                    CoreError::InvalidBlock(format!(
-                        "bft: vote has an invalid context signature: {e}"
-                    ))
-                })?;
-            let envelope = Self::context_message(
-                &self.chain_id,
-                self.height,
-                self.round,
-                self.phase,
-                &self.block_hash,
-            );
-            if !public.verify(context, envelope) {
-                return Err(CoreError::InvalidBlock(format!(
-                    "bft: vote context signature does not verify (chain {}, height {}, round {}, phase {:?})",
-                    self.chain_id, self.height, self.round, self.phase
-                )));
-            }
+        let context = Signature::from_bytes(self.context_signature.as_slice()).map_err(|e| {
+            CoreError::InvalidBlock(format!("bft: vote has an invalid context signature: {e}"))
+        })?;
+        let envelope = Self::context_message(
+            &self.chain_id,
+            self.height,
+            self.round,
+            self.phase,
+            &self.block_hash,
+        );
+        if !public.verify(context, envelope) {
+            return Err(CoreError::InvalidBlock(format!(
+                "bft: vote context signature does not verify (chain {}, height {}, round {}, phase {:?})",
+                self.chain_id, self.height, self.round, self.phase
+            )));
         }
         Ok(())
     }
@@ -912,14 +913,17 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_hash_only_vote_still_verifies_during_transition() {
-        // Era compatibility (#95 case 5): a legacy-only vote (no context
-        // signature, empty chain id) verifies for already-committed history.
+    fn test_legacy_hash_only_vote_is_rejected_after_transition() {
+        // #99: the legacy hash-only format (no context signature) is no
+        // longer accepted — a vote must bind its consensus context.
         let (_, keys) = provider(1);
         let mut vote = BftVote::sign("", 7, 2, VotePhase::Prevote, "legacy-hash", &keys[0]);
         vote.chain_id = String::new();
         vote.context_signature = Vec::new();
-        assert!(vote.verify().is_ok());
+        let error = vote
+            .verify()
+            .expect_err("legacy-only votes must be rejected");
+        assert!(error.to_string().contains("legacy hash-only"), "{error}");
     }
 
     #[test]

@@ -138,23 +138,18 @@ and quorum certificates are BLS.
    attaches it to the block (`block.certificate = Some(...)`) before
    `commit_mined_block`.
 
-Vote messages are dual-signed (`BftVote::sign`, #95): the legacy hash-only
-signature (`BftVote::vote_message`, prefix `glasschain-bft-vote:`) plus a
-**context signature** (`BftVote::context_message`, prefix
-`glasschain-bft-vote-ctx:`) over
+Vote messages are context-bound (#95, #99): the candidate-hash signature
+(`BftVote::vote_message`, prefix `glasschain-bft-vote:`) — the aggregate
+material an ADR-014 certificate is built from — plus a **context signature**
+(`BftVote::context_message`, prefix `glasschain-bft-vote-ctx:`) over
 `len(chain_id) || chain_id || height || round || phase tag || len(hash) || hash`,
-where `chain_id` is the deterministic genesis block hash. A vote with a
-context signature cannot replay across heights, rounds, phases or chain
-contexts; `verify` rejects any tampered context field. Legacy-only votes (no
-context signature) remain verifiable during the transition window; their
-removal is tracked in
-[#99](https://github.com/dbbvitor/GlassChain/issues/99). The legacy aggregate
-over any phase still
-verifies as an ADR-014 certificate over the block hash — QCs carry the hash
-signature only, since block chaining already binds the height. On phase
-timeout the round increments and the proposer rotates (view change;
-`rounds::MAX_ROUNDS = 4`), and the per-phase budget scales with the set size
-(`rounds::phase_timeout`).
+where `chain_id` is the deterministic genesis block hash. `verify` requires
+**both**: the legacy hash-only format (no context signature) is rejected — a
+vote cannot replay across heights, rounds, phases or chain contexts. QCs
+carry the hash signature only, since block chaining already binds the
+height. On phase timeout the round increments and the proposer rotates
+(view change; `rounds::MAX_ROUNDS = 4`), and the per-phase budget scales
+with the set size (`rounds::phase_timeout`).
 
 The quorum math is unchanged and concrete: `quorum() = n*2/3 + 1` (integer
 division), so a one-validator set needs 1 vote, three needs 3, four needs 3.
