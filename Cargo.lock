@@ -1733,6 +1733,7 @@ dependencies = [
  "base64 0.23.1",
  "bls-signatures",
  "bls12_381",
+ "criterion",
  "env_logger",
  "hex",
  "log",
