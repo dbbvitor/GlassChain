@@ -172,7 +172,7 @@ current driver's safety/liveness first; backend speed cannot repair missing
 context binding or verification gates. No automatic exclusion or production
 safety claim follows from the current local benchmark.
 
-**Tickets filed (2026-09-08):** §8.1 →
+**Tickets filed (2026-09-08) and merged (2026-09-09):** §8.1 →
 [#95](https://github.com/dbbvitor/GlassChain/issues/95) (dual-sign envelope:
 `domain || genesis-hash || height || round || phase || hash`; QCs stay
 hash-only; legacy removal in
@@ -183,6 +183,10 @@ current + previous height, live-only accepted); §8.3 →
 verification default, measured); §8.4 →
 [#98](https://github.com/dbbvitor/GlassChain/issues/98) (absolute deadline from
 phase start, bounded queue, drop stale-first, distinct-voter quorum).
+Implementation merged through PRs #100–#104; #99 removed the legacy
+hash-only vote path immediately (no deployed network carried it). Residual:
+`EquivocationProof::verify` still checks hash-only signatures (its own type,
+pre-dating #95); evidence-path hardening beyond the journal is future work.
 
 ## Validation and next steps
 
