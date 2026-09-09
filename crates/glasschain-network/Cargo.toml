@@ -72,6 +72,13 @@ madsim     = { version = "0.2", default-features = false, features = [
 [features]
 default       = []
 insecure-tls  = []
+# Negotiated post-quantum hybrid key exchange (zero-trust ZT-3, post-quantum
+# plan): selects the aws-lc-rs provider for the peer transport and offers the
+# X25519MLKEM768 hybrid first, classical X25519 second. Certificate
+# verification and TOFU behaviour are unchanged. aws-lc-rs is already in the
+# dependency graph (rustls default features); this feature only flips runtime
+# selection. The #85 backend review remains the audit/licence decision gate.
+pq-tls        = ["rustls/aws_lc_rs"]
 # Tendermint-class BFT behind the consensus seam (ticket #42), default-off.
 # Enables `glasschain-core/bft` so the node can attest blocks with a real
 # quorum certificate instead of dev/test Proof-of-Work.

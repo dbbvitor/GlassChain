@@ -61,15 +61,17 @@ readable to a sufficiently capable quantum adversary. Prioritize hybrid key
 exchange for data whose confidentiality must outlast the migration window.
 Archive evidence also needs action before its trust mechanisms fail (§7).
 
-**Fix shape: runtime provider selection, not a new dependency.** Hybrid
-`X25519MLKEM768` ships only in rustls' `aws-lc-rs` provider; `ring` has no post-quantum
-group (research §1). `aws-lc-rs` is already in the lock, so this is a **provider
-switch**: `build_tls`'s `install_default` + the three ring references in `node.rs` +
-the two in tests, with consistent feature lines (identity's webpki `ring` signature
-algorithms unchanged). **Verification, not assumption, is the change:** a two-node test
-asserts the negotiated group is `X25519MLKEM768` (non-supporting peers fall back to
-X25519 — no wire break) plus the four gates on Ubuntu, macOS, Windows. **Do not
-hand-roll a KEM, add a PQ crate, or design a custom hybrid handshake.**
+**Shipped (2026-09-09):** the `pq-tls` feature on `glasschain-network` selects
+the `aws-lc-rs` provider at runtime and offers the negotiated
+`X25519MLKEM768` hybrid first (classical `X25519` second). Every peer-transport
+construction path — `build_tls`'s server config and insecure dev connector,
+and `connector_for_peer_cert`'s TOFU connector — passes the selected provider
+explicitly; certificate verification, fingerprint pinning and TOFU are
+unchanged. The two-node tests assert the negotiated group is
+`X25519MLKEM768` under `pq-tls` and `X25519` by default, on the acceptor,
+TOFU and insecure paths (§2). Remaining: flipping `pq-tls` on for deployments
+stays gated on the [#85](https://github.com/dbbvitor/GlassChain/issues/85)
+audit/licence review.
 
 **Cost, uncoupled from a blanket C debate:** aws-lc-sys builds via `cmake`; ring and
 wasmtime already carry C/C++ builds in this graph, so the "audited C backends?"
