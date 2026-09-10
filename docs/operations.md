@@ -481,8 +481,9 @@ can fail validation and start fresh — restart with the same flags.
 Private payloads live in a `TransientStore` over the same backend, state keys
 prefixed `transient:<collection>:<commitment>`, with per-collection retention
 (`ChannelConfig.retention_secs`, **default 72 h**). Expired entries are not
-readable and are removed by the purge sweep; the chain keeps the commitment
-forever.
+readable and are removed by the purge sweep — run at node start and every
+300 s, discovering persisted payloads by storage prefix scan so a restart
+still purges — and the chain keeps the commitment forever.
 
 ---
 

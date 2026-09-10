@@ -473,6 +473,11 @@ impl PeerRegistry {
 
 // ── Node ──────────────────────────────────────────────────────────────────────
 
+/// Interval between retention sweeps (D5): expired private payloads are
+/// purged from storage. The first tick fires immediately, so a restart purges
+/// before serving.
+const RETENTION_SWEEP_INTERVAL_SECS: u64 = 300;
+
 /// A `GlassChain` network node.
 ///
 /// Listens for inbound TCP connections from peers, connects to known seed
@@ -1310,6 +1315,28 @@ impl Node {
             &self.flattener,
         )
         .await;
+
+        // Retention sweep (D5): purge expired private payloads at startup and
+        // on a fixed interval. The sweep enumerates storage, so payloads
+        // written before a restart are covered; failures are logged and the
+        // key is retried on the next sweep.
+        let transient = self.state.lock().await.transient.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                RETENTION_SWEEP_INTERVAL_SECS,
+            ));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match transient.purge_expired() {
+                    Ok(0) => {}
+                    Ok(purged) => {
+                        log::info!("retention: purged {purged} expired private payload(s)");
+                    }
+                    Err(e) => log::warn!("retention: purge sweep failed: {e}"),
+                }
+            }
+        });
 
         // Ensure the persisted chain matches the in-memory chain: a fresh
         // node's genesis (and any restored-but-unpersisted blocks) must land
@@ -4710,6 +4737,9 @@ mod tests {
         }
         fn delete_state(&self, key: &str) -> Result<(), CoreError> {
             self.inner.delete_state(key)
+        }
+        fn list_state_keys(&self, prefix: &str) -> Result<Vec<String>, CoreError> {
+            self.inner.list_state_keys(prefix)
         }
         fn name(&self) -> &'static str {
             "fail-state-apply"

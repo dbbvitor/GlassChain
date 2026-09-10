@@ -463,6 +463,7 @@ pub struct Checkpoint {
     pub state: serde_json::Value,        // pre-transition state while pending
     pub pending_event: Option<Event>,    // the event whose actions are pending
     pub next_action: usize,              // actions already executed + acked
+    pub step: String,                    // stable step name at the durable point
     pub updated_at: u64,                 // feeds the triage staleness view
 }
 ```
@@ -470,8 +471,9 @@ pub struct Checkpoint {
 While `pending_event` is `Some`, `state` holds the state **before** the pending
 transition, so a resume re-applies the same event and re-derives the same
 actions deterministically, skipping the first `next_action` of them; the
-`updated_at` comes from the runner's clock at the durable point and survives
-via the triage view.
+`updated_at` comes from the runner's clock at the durable point. The stored
+`step` (empty only for checkpoints written before the field existed) lets
+`FlowTriage::discover` rebuild the view without the concrete state type.
 
 `crates/glasschain-workflows/tests/resume.rs` proves the behaviors end to end:
 a backend outage on the pending-checkpoint write surfaces as
@@ -479,9 +481,9 @@ a backend outage on the pending-checkpoint write surfaces as
 delivery but *before* ack leaves `next_action = 0` and resume re-delivers the
 byte-identical action (ledger dedupe makes the effect exactly-once); a partial
 ack (`next_action = 1` of 2) resumes with only the second action; unmatched
-events and `Resumed` on a waiting flow are no-ops; and a fresh triage registry
-re-surfaces a waiting flow with its **stored** `updated_at`, so staleness
-survives a restart.
+events and `Resumed` on a waiting flow are no-ops; and a fresh triage instance
+discovers a waiting flow from storage alone with its **stored** `updated_at`,
+so staleness survives a restart without driving the flow again.
 
 ### 11. The shipped flows
 
@@ -761,17 +763,14 @@ block) — never off a storage mutation.
 view: the runner records every durable point there, an operator polls
 `stuck_flows(now, stale_after_secs)` for flows that have not advanced past a
 staleness threshold, and completed flows are cleared. Entries are
-`{flow_id, flow_kind, step, updated_at}`, ordered deterministically. Note the
-honest `ponytail:` marker in the source:
-
-> `# ponytail: in-memory registry, lost on restart — flows are re-discovered
-> lazily when driven again. Add a checkpoint scan (storage `list` capability)
-> when triage must survive restarts (#43/#44 need it first).`
-
-So triage is an in-memory registry: restart loses the view, but driving a
-waiting flow re-surfaces it with its stored checkpoint timestamp, so staleness
-survives (`resume.rs` proves this). A dashboard on `stuck_flows` only knows
-about flows driven since the current process started.
+`{flow_id, flow_kind, step, updated_at}`, ordered deterministically. A restarted
+process rebuilds the view from the durable checkpoints with
+`FlowTriage::discover(storage)`: it enumerates the `workflow:checkpoint:`
+prefix and re-surfaces waiting flows with their stored step and timestamp —
+read-only, no new event, no replayed side effects. Completed flows leave no
+checkpoint (finalization deletes it) and stay absent. A dashboard on
+`stuck_flows` therefore knows about flows persisted before the current process
+started.
 
 The referenced purchase/recall tickets have shipped, but restart discovery has
 not. D6 in the [source-comment debt plan](../.agents/plans/deferred-code-debt.md)

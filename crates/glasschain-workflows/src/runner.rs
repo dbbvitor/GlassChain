@@ -302,6 +302,7 @@ impl<S: FlowState> FlowRunner<S> {
             state: serde_json::to_value(state)?,
             pending_event: pending_event.cloned(),
             next_action,
+            step: state.step().to_owned(),
             updated_at: unix_now()?,
         };
         triage.record(flow_id, self.flow_kind, state.step(), checkpoint.updated_at);

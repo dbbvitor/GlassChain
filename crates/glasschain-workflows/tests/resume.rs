@@ -10,7 +10,7 @@ use glasschain_core::{
 };
 use glasschain_workflows::{
     shipment_receipt_flow, Action, Checkpoint, CheckpointStore, Event, FlowOutcome, FlowRunner,
-    FlowState, FlowTriage, ReceiptFlowState, Transition, TransitionResult,
+    FlowState, FlowTriage, ReceiptFlowState, Transition, TransitionResult, CHECKPOINT_PREFIX,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -95,6 +95,9 @@ impl StorageProvider for FailingStorage {
             return Err(CoreError::Storage("simulated outage".to_owned()));
         }
         self.inner.delete_state(key)
+    }
+    fn list_state_keys(&self, prefix: &str) -> Result<Vec<String>, CoreError> {
+        self.inner.list_state_keys(prefix)
     }
     fn name(&self) -> &'static str {
         "failing"
@@ -549,6 +552,7 @@ fn checkpoint_store_round_trips_and_deletes() {
         state: json!({ "LotAnchored": { "lot_ref": "lot-1", "lot_commitment": "c1" } }),
         pending_event: None,
         next_action: 0,
+        step: "lot_anchored".to_owned(),
         updated_at: 7,
     };
     store.save(&checkpoint).unwrap();
@@ -608,4 +612,64 @@ fn double_emit_action(index: u64) -> Action {
             reason: "flow emission".to_owned(),
         }),
     ))
+}
+
+// ── D6: restart-safe triage discovery ────────────────────────────────────────
+
+/// A fresh triage instance discovers waiting flows from persisted
+/// checkpoints without a new event: timestamps are preserved, completed flows
+/// (whose checkpoints were deleted on finalization) stay absent, and
+/// discovery writes nothing.
+#[test]
+fn triage_discovers_waiting_flows_after_restart_without_side_effects() {
+    let storage = storage();
+    let store = CheckpointStore::new(Arc::clone(&storage));
+    let waiting = Checkpoint {
+        flow_id: "flow-restart".to_owned(),
+        flow_kind: "shipment_receipt".to_owned(),
+        state: json!({ "LotAnchored": { "lot_ref": "lot-1", "lot_commitment": "c1" } }),
+        pending_event: None,
+        next_action: 0,
+        step: "lot_anchored".to_owned(),
+        updated_at: 1_234,
+    };
+    store.save(&waiting).unwrap();
+    let completed = Checkpoint {
+        flow_id: "flow-done".to_owned(),
+        flow_kind: "shipment_receipt".to_owned(),
+        state: json!({ "ReceiptEmitted": { "receipt_ref": "r-1" } }),
+        pending_event: None,
+        next_action: 0,
+        step: "receipt_emitted".to_owned(),
+        updated_at: 2_000,
+    };
+    store.save(&completed).unwrap();
+    store.delete("flow-done").unwrap();
+
+    let keys_before = storage.list_state_keys(CHECKPOINT_PREFIX).unwrap();
+
+    // A fresh process: empty triage, discovery from storage only.
+    let triage = FlowTriage::discover(storage.as_ref()).unwrap();
+    let entry = triage
+        .entry("flow-restart")
+        .expect("the waiting flow is discovered");
+    assert_eq!(entry.flow_kind, "shipment_receipt");
+    assert_eq!(entry.step, "lot_anchored");
+    assert_eq!(entry.updated_at, 1_234, "the stored timestamp is preserved");
+    assert!(
+        triage.entry("flow-done").is_none(),
+        "a completed flow has no checkpoint and stays absent"
+    );
+    // The stuck view works off the discovered timestamp without a new event.
+    assert_eq!(
+        triage.stuck_flows(2_000, 500),
+        vec![entry],
+        "the discovered flow surfaces as stuck at its stored age"
+    );
+
+    // Discovery is read-only: the checkpoint keys are unchanged.
+    assert_eq!(
+        storage.list_state_keys(CHECKPOINT_PREFIX).unwrap(),
+        keys_before
+    );
 }

@@ -170,6 +170,14 @@ pub trait StorageProvider: Send + Sync {
     fn get_state(&self, key: &str) -> Result<Option<Vec<u8>>, CoreError>;
     fn delete_state(&self, key: &str) -> Result<(), CoreError>;
 
+    /// List world-state keys starting with `prefix`, sorted.  The narrow
+    /// enumeration seam behind restart-safe transient purge (D5) and flow
+    /// checkpoint discovery (D6); implementations must not materialize
+    /// non-matching keys.  Returns owned keys — fine for these bounded key
+    /// spaces; a batched/streaming variant is the upgrade path if a key
+    /// space ever outgrows an in-memory key list.
+    fn list_state_keys(&self, prefix: &str) -> Result<Vec<String>, CoreError>;
+
     fn name(&self) -> &str;
 }
 ```

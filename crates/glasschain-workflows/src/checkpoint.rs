@@ -36,6 +36,13 @@ pub struct Checkpoint {
     /// the first `next_action` entries of the re-derived action list.
     pub next_action: usize,
 
+    /// Stable human-readable step name at the last durable point
+    /// ([`FlowState::step`](crate::FlowState::step)) — lets a restarted
+    /// triage view discover waiting flows without the concrete state type.
+    /// Empty for checkpoints written before this field existed.
+    #[serde(default)]
+    pub step: String,
+
     /// Unix timestamp (seconds) of the last durable point — feeds the triage
     /// staleness view.
     pub updated_at: u64,

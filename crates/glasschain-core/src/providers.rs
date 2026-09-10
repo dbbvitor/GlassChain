@@ -164,6 +164,24 @@ pub trait StorageProvider: Send + Sync {
     /// Returns `Err` if the underlying storage backend fails to delete the key.
     fn delete_state(&self, key: &str) -> Result<(), CoreError>;
 
+    /// List world-state keys whose name starts with `prefix`, in deterministic
+    /// (sorted) order.
+    ///
+    /// The narrow enumeration seam behind restart-safe physical retention
+    /// (transient private-payload purge) and read-path discovery (flow
+    /// checkpoints). Implementations must not materialize non-matching keys.
+    ///
+    /// # Ceiling
+    ///
+    /// Returns owned keys, suitable for the bounded key spaces it serves
+    /// (transient payloads, workflow checkpoints). A batched/streaming
+    /// variant is the upgrade path if a key space ever outgrows an in-memory
+    /// key list.
+    ///
+    /// # Errors
+    /// Returns `Err` if the underlying storage backend fails to enumerate.
+    fn list_state_keys(&self, prefix: &str) -> Result<Vec<String>, CoreError>;
+
     /// Human-readable identifier for this storage implementation.
     fn name(&self) -> &str;
 }
@@ -487,6 +505,19 @@ pub mod in_memory {
             Ok(())
         }
 
+        fn list_state_keys(&self, prefix: &str) -> Result<Vec<String>, CoreError> {
+            let mut keys: Vec<String> = self
+                .state
+                .read()
+                .expect("lock poisoned")
+                .keys()
+                .filter(|key| key.starts_with(prefix))
+                .cloned()
+                .collect();
+            keys.sort_unstable();
+            Ok(keys)
+        }
+
         fn name(&self) -> &'static str {
             "in-memory"
         }
@@ -550,6 +581,26 @@ pub mod in_memory {
             store.put_state("k", b"v").unwrap();
             store.delete_state("k").unwrap();
             assert!(store.get_state("k").unwrap().is_none());
+        }
+
+        #[test]
+        fn test_list_state_keys_filters_and_sorts() {
+            let store = InMemoryStorageProvider::new();
+            store.put_state("transient:b:z", b"1").unwrap();
+            store.put_state("transient:a:m", b"1").unwrap();
+            store.put_state("workflow:checkpoint:f1", b"1").unwrap();
+            store.put_state("other", b"1").unwrap();
+
+            assert_eq!(
+                store.list_state_keys("transient:").unwrap(),
+                vec!["transient:a:m".to_owned(), "transient:b:z".to_owned()],
+                "only matching keys, sorted"
+            );
+            assert_eq!(
+                store.list_state_keys("workflow:checkpoint:").unwrap(),
+                vec!["workflow:checkpoint:f1".to_owned()]
+            );
+            assert!(store.list_state_keys("missing:").unwrap().is_empty());
         }
 
         #[test]

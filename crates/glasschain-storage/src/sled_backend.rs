@@ -219,6 +219,18 @@ impl StorageProvider for SledStorageProvider {
         Ok(())
     }
 
+    fn list_state_keys(&self, prefix: &str) -> Result<Vec<String>, CoreError> {
+        // `scan_prefix` streams in key order; only matching keys are read.
+        let mut keys = Vec::new();
+        for entry in self.state.scan_prefix(prefix.as_bytes()) {
+            let (key, _) = entry.map_err(|e| CoreError::Storage(e.to_string()))?;
+            let key = String::from_utf8(key.to_vec())
+                .map_err(|e| CoreError::Storage(format!("non-utf8 state key: {e}")))?;
+            keys.push(key);
+        }
+        Ok(keys)
+    }
+
     fn name(&self) -> &'static str {
         "sled"
     }
@@ -360,6 +372,26 @@ mod tests {
         store.put_state("k", b"v1").unwrap();
         store.put_state("k", b"v2").unwrap();
         assert_eq!(store.get_state("k").unwrap(), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn test_list_state_keys_prefix_and_order() {
+        let (store, _dir) = open_temp();
+        store.put_state("transient:b:z", b"1").unwrap();
+        store.put_state("transient:a:m", b"1").unwrap();
+        store.put_state("workflow:checkpoint:f1", b"1").unwrap();
+        store.put_state("other", b"1").unwrap();
+
+        assert_eq!(
+            store.list_state_keys("transient:").unwrap(),
+            vec!["transient:a:m".to_owned(), "transient:b:z".to_owned()],
+            "only matching keys, byte-order sorted"
+        );
+        assert_eq!(
+            store.list_state_keys("workflow:checkpoint:").unwrap(),
+            vec!["workflow:checkpoint:f1".to_owned()]
+        );
+        assert!(store.list_state_keys("missing:").unwrap().is_empty());
     }
 
     #[test]
