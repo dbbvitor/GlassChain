@@ -122,11 +122,13 @@ in [deferred-code-debt.md](deferred-code-debt.md). Zero-trust priorities:
   organizations are required, then bind that policy to record scope. A learning
   model cannot supply the missing legal authority.
 - **D4 certificate-bound principal registration:** the lifecycle work in §5.
-- **D5 retention:** recover expiry discovery and schedule physical deletion after
-  restart. Denying expired reads is not erasure; account for replicas/backups.
-- **D6 triage:** restart-safe discovery before unattended recalls; recovery must
-  not duplicate side effects. Coordinate a small storage scan with D5 only if
-  both require it.
+- **D5 retention — shipped (2026-09-10):** storage-scanning purge discovers
+  persisted payloads without a prior read; the node sweeps at startup and every
+  300 s; delete failures are logged and retried. Replica/backup retention stays
+  a separate deployment policy — denying expired reads is not erasure.
+- **D6 triage — shipped (2026-09-10):** `FlowTriage::discover` rebuilds the view
+  from persisted checkpoints using the same scan, read-only and timestamp-
+  preserving; recovery does not duplicate side effects.
 
 LGPD/ICP/ANVISA claims require applicable profiles, legal basis, access policy,
 retention and evidence review. Public identifiers or digests can remain linkable;

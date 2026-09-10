@@ -16,11 +16,11 @@
 //! The store is deliberately dumb key-value storage over the existing
 //! [`StorageProvider`] seam — membership gating lives at the node boundary.
 //!
-//! # ponytail
-//! The expiry index is in-memory (filled on `put`); a restarted member cannot
-//! enumerate payloads written before the restart, so purge-after-restart
-//! requires a storage `list` capability — add it when a real deployment needs
-//! it rather than pre-building one.
+//! # D5
+//! [`TransientStore::purge_expired`] discovers expired payloads through
+//! [`StorageProvider::list_state_keys`], so a restarted member purges
+//! payloads written before the restart without a prior read; the in-memory
+//! index remains a fast path, not the retention guarantee.
 
 use glasschain_core::{CoreError, StorageProvider};
 use serde::{Deserialize, Serialize};
@@ -51,8 +51,9 @@ fn transient_key(collection: &str, commitment: &str) -> String {
 #[derive(Clone)]
 pub struct TransientStore {
     storage: Arc<dyn StorageProvider>,
-    /// In-memory expiry index `(key → expires_at)`, filled on `put`.
-    /// `ponytail:` lost on restart — see the module docs.
+    /// Fast-path expiry index `(key → expires_at)`, filled on `put`/`get`.
+    /// Purge no longer depends on it: storage enumeration is the durable
+    /// discovery path (D5).
     expiry_index: Arc<Mutex<HashMap<String, u64>>>,
 }
 
@@ -121,30 +122,56 @@ impl TransientStore {
         Ok(Some(envelope.payload))
     }
 
-    /// Purge every expired payload this process knows about; returns the
-    /// number removed. Payloads vanish; the chain's commitments persist.
+    /// Purge every expired payload, discovering them from **storage** rather
+    /// than only the in-memory index — a restarted member can enumerate and
+    /// purge payloads written before the restart (D5).
+    ///
+    /// A per-key delete failure is logged and leaves that key in place, so the
+    /// next sweep retries it; the sweep continues with the remaining keys
+    /// instead of aborting on the first failure. Returns the number removed.
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError`] when the backend fails.
+    /// Returns [`CoreError`] when enumeration or reading an envelope fails.
     pub fn purge_expired(&self) -> Result<usize, CoreError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let expired: Vec<String> = {
-            let index = self.lock();
-            index
-                .iter()
-                .filter(|(_, &expires_at)| now >= expires_at)
-                .map(|(key, _)| key.clone())
-                .collect()
-        };
+        let known: HashMap<String, u64> = self.lock().clone();
+        let mut expired: Vec<String> = known
+            .iter()
+            .filter(|(_, &expires_at)| now >= expires_at)
+            .map(|(key, _)| key.clone())
+            .collect();
+        // Durable discovery: enumerate every persisted payload; entries the
+        // index does not know (written before a restart) have their deadline
+        // read from the stored envelope without a prior `get`.
+        let prefix = format!("{TRANSIENT_PREFIX}:");
+        for key in self.storage.list_state_keys(&prefix)? {
+            if known.contains_key(&key) {
+                continue;
+            }
+            let Some(raw) = self.storage.get_state(&key)? else {
+                continue;
+            };
+            match serde_json::from_slice::<PayloadEnvelope>(&raw) {
+                Ok(envelope) if now >= envelope.expires_at => expired.push(key),
+                Ok(_) => {}
+                Err(e) => log::warn!("transient: unreadable envelope at {key}: {e}"),
+            }
+        }
         let mut purged = 0;
         for key in &expired {
-            self.storage.delete_state(key)?;
-            self.lock().remove(key);
-            purged += 1;
+            match self.storage.delete_state(key) {
+                Ok(()) => {
+                    self.lock().remove(key);
+                    purged += 1;
+                }
+                Err(e) => {
+                    log::warn!("transient: failed to purge {key}: {e}");
+                }
+            }
         }
         Ok(purged)
     }
@@ -220,5 +247,150 @@ mod tests {
         store.put("pricing", &commitment, &payload, 3600).unwrap();
         assert_eq!(store.purge_expired().unwrap(), 0);
         assert_eq!(store.get("pricing", &commitment).unwrap(), Some(payload));
+    }
+
+    /// D5: a restarted member purges payloads persisted **before** the
+    /// restart, discovering them from storage without a prior read; live
+    /// payloads survive and the underlying key is deleted.
+    #[test]
+    fn test_restart_purge_discovers_persisted_payloads_without_reading_them() {
+        let storage: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
+        let store = TransientStore::new(Arc::clone(&storage));
+        let expired_payload = b"expired-before-restart".to_vec();
+        let expired_commitment = glasschain_core::crypto::sha256(&expired_payload);
+        let live_payload = b"live-across-restart".to_vec();
+        let live_commitment = glasschain_core::crypto::sha256(&live_payload);
+        store
+            .put("pricing", &expired_commitment, &expired_payload, 0)
+            .unwrap();
+        store
+            .put("pricing", &live_commitment, &live_payload, 3600)
+            .unwrap();
+
+        // Restart: a fresh store with an empty index over the same storage.
+        let restarted = TransientStore::new(Arc::clone(&storage));
+        assert_eq!(
+            restarted.purge_expired().unwrap(),
+            1,
+            "the pre-restart expired payload is discovered and purged"
+        );
+        assert!(
+            storage
+                .get_state(&transient_key("pricing", &expired_commitment))
+                .unwrap()
+                .is_none(),
+            "the underlying key is deleted without a prior read"
+        );
+        assert!(
+            storage
+                .get_state(&transient_key("pricing", &live_commitment))
+                .unwrap()
+                .is_some(),
+            "a live payload survives the sweep"
+        );
+        assert_eq!(
+            restarted.get("pricing", &live_commitment).unwrap(),
+            Some(live_payload)
+        );
+    }
+
+    /// Storage wrapper whose next `delete_state` fails once — an interrupted
+    /// sweep.
+    struct FlakyDelete {
+        inner: Arc<dyn StorageProvider>,
+        fail_next_delete: std::sync::atomic::AtomicBool,
+    }
+
+    impl StorageProvider for FlakyDelete {
+        fn put_block(&self, block: &glasschain_core::Block) -> Result<(), CoreError> {
+            self.inner.put_block(block)
+        }
+        fn get_block(&self, index: u64) -> Result<Option<glasschain_core::Block>, CoreError> {
+            self.inner.get_block(index)
+        }
+        fn latest_block_index(&self) -> Result<Option<u64>, CoreError> {
+            self.inner.latest_block_index()
+        }
+        fn put_state(&self, key: &str, value: &[u8]) -> Result<(), CoreError> {
+            self.inner.put_state(key, value)
+        }
+        fn get_state(&self, key: &str) -> Result<Option<Vec<u8>>, CoreError> {
+            self.inner.get_state(key)
+        }
+        fn delete_state(&self, key: &str) -> Result<(), CoreError> {
+            if self
+                .fail_next_delete
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(CoreError::Storage("simulated interrupted delete".into()));
+            }
+            self.inner.delete_state(key)
+        }
+        fn list_state_keys(&self, prefix: &str) -> Result<Vec<String>, CoreError> {
+            self.inner.list_state_keys(prefix)
+        }
+        fn name(&self) -> &'static str {
+            "flaky-delete"
+        }
+    }
+
+    #[test]
+    fn test_interrupted_delete_is_retried_on_the_next_sweep() {
+        let inner: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
+        let flaky: Arc<dyn StorageProvider> = Arc::new(FlakyDelete {
+            inner: Arc::clone(&inner),
+            fail_next_delete: std::sync::atomic::AtomicBool::new(true),
+        });
+        let store = TransientStore::new(Arc::clone(&flaky));
+        let payload = b"retry-me".to_vec();
+        let commitment = glasschain_core::crypto::sha256(&payload);
+        store.put("pricing", &commitment, &payload, 0).unwrap();
+
+        // First sweep: the delete fails, nothing is counted as purged and the
+        // key is still there.
+        assert_eq!(store.purge_expired().unwrap(), 0);
+        assert!(inner
+            .get_state(&transient_key("pricing", &commitment))
+            .unwrap()
+            .is_some());
+
+        // Second sweep: the retry succeeds and the key is gone.
+        assert_eq!(store.purge_expired().unwrap(), 1);
+        assert!(inner
+            .get_state(&transient_key("pricing", &commitment))
+            .unwrap()
+            .is_none());
+    }
+
+    /// D5 over the persistent backend: the payload is written, the database
+    /// is **reopened**, the expired payload is purged (discovered by scan,
+    /// not by a prior read) and the underlying sled key is gone.
+    #[test]
+    fn test_restart_purge_over_sled_backend() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let payload = b"sled-expired-before-restart".to_vec();
+        let commitment = glasschain_core::crypto::sha256(&payload);
+        {
+            let storage: Arc<dyn StorageProvider> =
+                Arc::new(crate::SledStorageProvider::open(dir.path()).expect("open"));
+            let store = TransientStore::new(Arc::clone(&storage));
+            store.put("pricing", &commitment, &payload, 0).unwrap();
+        }
+        // Reopen: a restarted member has an empty in-memory index.
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::SledStorageProvider::open(dir.path()).expect("reopen"));
+        let restarted = TransientStore::new(Arc::clone(&storage));
+        assert_eq!(
+            restarted.purge_expired().unwrap(),
+            1,
+            "the reopened store discovers and purges the expired payload"
+        );
+        assert!(
+            storage
+                .get_state(&transient_key("pricing", &commitment))
+                .unwrap()
+                .is_none(),
+            "the underlying sled key is deleted"
+        );
     }
 }

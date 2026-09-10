@@ -34,7 +34,7 @@ inert** (the code exists, is tested, but no production binary activates it), and
 | 7 | Endorsement evaluation (carriers, `PolicyExpression`, operation defaults) | **Implemented but inert** — `NodeState.endorsement` is `None` in every production binary; `set_endorsement_provider` is called only from tests | `glasschain-core/src/endorsement.rs`; `node.rs` |
 | 8 | Policy history replay, same-block policy/write rule | **Implemented; enforced only when a provider is attached and the `endorsement` capability is active** — the gates short-circuit on `endorsement: None` | `PolicyHistory`, `enforce_block_endorsements` (`node.rs`) |
 | 9 | PDC membership gate (admission / transport / storage / replay) | **Implemented and enforced when collections are configured** — but no production binary calls `set_collections`; exercised by integration tests only | `Channel::is_member`, `node.rs`, `tests/pdc_boundary.rs` |
-| 10 | Transient-store retention (default 72 h) + purge | **Implemented and enforced when wired**; expiry index is in-memory and lost on restart | `TransientStore` (`glasschain-storage/src/transient.rs`) |
+| 10 | Transient-store retention (default 72 h) + purge | **Implemented and enforced** — purge discovers persisted payloads from storage, so it survives restarts; the node runs a startup + 300 s sweep | `TransientStore` (`glasschain-storage/src/transient.rs`) |
 | 11 | Pull reconciliation (`RequestPrivatePayload`) | **Implemented; operator-triggered API, no production caller** | `reconcile_private_payloads` (`node.rs`) |
 | 12 | CRL / OCSP / any revocation check | **Not implemented** — no revocation path anywhere; chains are single-hop (no intermediates) | gap: issue #58 |
 | 13 | Trust persistence across restarts (peer registry, CA store) | **Not implemented** — accepted limitation (`AGENTS.md`) | — |
@@ -634,24 +634,20 @@ configuration and credential-possession work.
 - **Retention is a read boundary, not just a background sweep**: `get` refuses
   expired-but-not-yet-purged entries.
 - `purge_expired_private_payloads` (node) → `TransientStore::purge_expired`
-  removes every expired entry the process knows about. Payloads vanish; the
-  chain's hash commitments persist forever — a late auditor can prove
-  existence and consistency but cannot read contents
+  removes every expired entry, discovering persisted payloads by storage
+  prefix scan (`StorageProvider::list_state_keys`) so a restarted member
+  purges payloads written before the restart. Payloads vanish; the chain's
+  hash commitments persist forever — a late auditor can prove existence and
+  consistency but cannot read contents
   (`purge_removes_payloads_commitments_persist`).
-- **The `ponytail:` limitation in `transient.rs`:** the expiry index is
-  in-memory, filled on `put`. A restarted member cannot enumerate payloads
-  written before the restart, so purge-after-restart requires a storage
-  `list` capability that does not exist yet. A restarted node also loses its
-  *knowledge* of what it holds — though the chain still drives reconciliation
-  for anything committed (§3.2), uncommitted/never-committed payloads are
-  simply stranded by the restart.
+- **Retention schedule and failure reporting (D5):** the node runs the sweep
+  at startup and every 300 s (`RETENTION_SWEEP_INTERVAL_SECS`); a per-key
+  delete failure is logged and retried on the next sweep, never aborting the
+  remaining keys.
 
-  **Read rejection is not deletion:** `get()` still checks the stored expiry
-  after restart, but an expired read returns before rebuilding the expiry index.
-  D5 in the [source-comment debt plan](../.agents/plans/deferred-code-debt.md)
-  requires discovery and purge without first reading each key, plus a purge
-  schedule and failure reporting. Replica/backup retention and archival legal
-  holds need separate policies; none follows automatically from the 72h default.
+  **Read rejection is not deletion, and deletion is not certified erasure:**
+  replica/backup retention, storage compaction and archival legal holds need
+  separate policies; none follows automatically from the 72h default.
 
 ## 3.6 Membership vs endorsement
 

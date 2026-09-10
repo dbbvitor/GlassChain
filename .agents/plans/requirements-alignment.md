@@ -93,16 +93,17 @@ extrapolations. 300 is an operating target, not a proven upper bound.
       not the same as every principal/path being certificate-bound.
 - [ ] Resolve governance bootstrap D1, recall authority/scope D2 and certificate
       registration D4 in [deferred-code-debt.md](deferred-code-debt.md).
-- [ ] Enforce restart-safe private-payload deletion D5, including purge scheduling,
-      replica/backup retention and failure handling.
+- [x] Restart-safe private-payload deletion D5 shipped (storage-scanning purge,
+      startup + 300 s sweep, logged/retried delete failures); replica/backup
+      retention remains a deployment policy decision.
 - [ ] Define RBAC and channel-management operations before implementing them.
 - [ ] Preserve current addressed TCP PDC transport; libp2p adoption is separate
       interoperability/PQ work, **not a prerequisite to already-shipped PDCs**.
 
 ### Stage 3 — workflows and governed feedback
 
-- [ ] Restore triage discovery across restart (D6); checkpoint persistence alone
-      cannot surface a stalled recall after a process restart.
+- [x] Triage discovery across restart (D6) shipped
+      (`FlowTriage::discover`); unattended recall orchestration itself remains.
 - [ ] Test recall/quarantine/dispute and replenishment with the intended active
       endorsement policy and authority separation, not just happy-path transitions.
 - [ ] Add a measured Sense/Decide/Adapt/Learn scenario below using existing flows

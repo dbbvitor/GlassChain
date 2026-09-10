@@ -3,7 +3,14 @@
 //! The runner records every durable point here; an operator polls
 //! [`FlowTriage::stuck_flows`] to find flows that have not advanced past a
 //! staleness threshold (e.g. a counterparty that stopped responding).
+//!
+//! A restarted process rebuilds the view with [`FlowTriage::discover`], which
+//! enumerates the persisted checkpoints and re-surfaces waiting flows with
+//! their stored timestamps (D6) — no new event and no side effects.
 
+use crate::checkpoint::{Checkpoint, CHECKPOINT_PREFIX};
+use crate::error::WorkflowError;
+use glasschain_core::StorageProvider;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -23,9 +30,9 @@ pub struct TriageEntry {
 /// In-process registry of flow progress, updated by the runner on every
 /// checkpoint write and cleared on completion.
 ///
-/// # ponytail: in-memory registry, lost on restart — flows are re-discovered
-/// lazily when driven again. Add a checkpoint scan (storage `list` capability)
-/// when triage must survive restarts (#43/#44 need it first).
+/// The registry is in-memory; a restarted process rebuilds it from the
+/// durable checkpoints with [`FlowTriage::discover`] (D6). Completed flows
+/// have no checkpoint left (finalization deletes it), so they stay absent.
 #[derive(Debug, Default)]
 pub struct FlowTriage {
     entries: Mutex<HashMap<String, TriageEntry>>,
@@ -36,6 +43,41 @@ impl FlowTriage {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Discover every persisted flow checkpoint into a fresh view (D6):
+    /// enumerate the `workflow:checkpoint:` prefix and record each waiting or
+    /// stuck flow with its stored step and timestamp. Read-only — discovery
+    /// never replays a transition or emits an action.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkflowError::Storage`] if enumeration or a read fails.
+    /// An unreadable checkpoint is logged and skipped rather than failing the
+    /// whole discovery, matching the purge sweep's error policy.
+    pub fn discover(storage: &dyn StorageProvider) -> Result<Self, WorkflowError> {
+        let triage = Self::new();
+        for key in storage
+            .list_state_keys(CHECKPOINT_PREFIX)
+            .map_err(|e| WorkflowError::Storage(e.to_string()))?
+        {
+            let Some(raw) = storage
+                .get_state(&key)
+                .map_err(|e| WorkflowError::Storage(e.to_string()))?
+            else {
+                continue;
+            };
+            match serde_json::from_slice::<Checkpoint>(&raw) {
+                Ok(checkpoint) => triage.record(
+                    &checkpoint.flow_id,
+                    &checkpoint.flow_kind,
+                    &checkpoint.step,
+                    checkpoint.updated_at,
+                ),
+                Err(e) => log::warn!("triage: unreadable checkpoint at {key}: {e}"),
+            }
+        }
+        Ok(triage)
     }
 
     /// Record (or refresh) a flow's latest durable point.
