@@ -9,6 +9,9 @@
 
 #![cfg(feature = "bft")]
 
+#[path = "common/proxy.rs"]
+mod proxy;
+
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use bls_signatures::{PrivateKey, Serialize as _};
 use glasschain_core::{
@@ -24,9 +27,25 @@ const CHANNEL: &str = "governance";
 const CONTRACT: &str = "validator-registry";
 const VALIDATORS: usize = 4;
 
+/// Allocate a unique loopback port for this test process.
+///
+/// Probing `bind(":0")` and dropping the listener races with sibling tests in
+/// the same binary: the kernel can hand the same just-freed ephemeral port to
+/// two probes before either node binds it (`AddrInUse` on CI). Ports are
+/// reserved from a per-process band below the OS ephemeral range (which
+/// starts at 32768 on Linux, 49152 on macOS/Windows), with a bind probe to
+/// skip ports held by anything else.
 fn free_addr() -> String {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().to_string()
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let band = u16::try_from(std::process::id() % 32).expect("pid mod 32 fits u16");
+    loop {
+        let offset = NEXT.fetch_add(1, Ordering::Relaxed) % 300;
+        let port = 22_000 + band * 300 + offset;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return format!("127.0.0.1:{port}");
+        }
+    }
 }
 
 /// Deterministic BLS validator keys; canonical order is the key index.
@@ -347,4 +366,190 @@ async fn vote_rounds_produce_multi_signer_certificates_on_the_wire() {
 
 const fn provider_quorum() -> usize {
     VALIDATORS * 2 / 3 + 1
+}
+
+/// D7 scenario — WAN-delayed votes still reach quorum (performance plan §5):
+/// every peer sits behind a WAN-shaped proxy (one-way latency + jitter on the
+/// leader's link), and the same on-chain-registry → activation → vote-round
+/// flow as the no-fault test must still commit a multi-signer certificate.
+/// Real TCP wall-clock, labeled separately from deterministic runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
+async fn vote_rounds_reach_quorum_through_wan_delayed_votes() {
+    use proxy::{TcpProxy, WanProfile};
+    let _ = env_logger::try_init();
+    let keys = validator_keys();
+    let validators = validators_with_pops(&keys);
+
+    let mut nodes: Vec<Node> = (0..VALIDATORS)
+        .map(|i| Node::new(format!("validator-{i}"), free_addr(), 1))
+        .collect();
+    // All relays start **unshaped** so the mesh handshake is not shaped
+    // (shaping per TLS record compounds across a handshake and stalls mesh
+    // formation at ≥~120 ms/chunk — the measured D7 finding). The profile is
+    // applied with `set_profile` once the mesh is up, so the scenario tests
+    // WAN-delayed votes on established links.
+    let shaped = WanProfile {
+        latency_ms: 200,
+        jitter_ms: 80,
+        bandwidth_bps: 0,
+    };
+    let mut proxies = Vec::new();
+    for node in &nodes {
+        proxies.push(TcpProxy::spawn_with_profile(node.listen_addr(), WanProfile::none()).await);
+    }
+    for (i, node) in nodes.iter_mut().enumerate() {
+        node.set_advertise_addr(proxies[i].front_addr());
+    }
+
+    for (i, node) in nodes.iter().enumerate() {
+        let provider =
+            BftConsensusProvider::new(validators.clone(), keys[i]).expect("valid validators");
+        node.set_bft_consensus(Arc::new(provider)).await;
+        node.set_execution_provider(Arc::new(RegistryProvider { keys: keys.clone() }))
+            .await;
+    }
+
+    // Full mesh through the proxies.
+    nodes[0].start(vec![]).await.unwrap();
+    for (i, node) in nodes.iter().enumerate().skip(1) {
+        let peers: Vec<String> = (0..VALIDATORS)
+            .filter(|j| *j != i)
+            .map(|j| proxies[j].front_addr().to_owned())
+            .collect();
+        node.start(peers).await.unwrap();
+    }
+    // Mesh up: every validator knows its three peers, then shape the link of
+    // the height-1 leader (node 1) for the vote round.
+    poll_until("all validators see their three peers", 20, || async {
+        let mut all = true;
+        for node in &nodes {
+            if node.known_peers().await.len() < VALIDATORS - 1 {
+                all = false;
+            }
+        }
+        all
+    })
+    .await;
+    proxies[1].set_profile(shaped).await;
+
+    // ── Block 1 (PoW): register the validator set on-chain ─────────────────
+    nodes[0]
+        .submit_transaction(Transaction::new(TransactionKind::ContractCreation(
+            glasschain_core::SmartContractDef {
+                contract_id: CONTRACT.into(),
+                buyer_id: "governance".into(),
+                product_id: "registry".into(),
+                conditions: glasschain_core::PurchaseConditions {
+                    max_price_per_unit: 1,
+                    min_quantity: 1,
+                    max_quantity: 1,
+                    max_lead_time_days: 1,
+                    preferred_seller_id: None,
+                    currency: "BRL".into(),
+                    auto_execute: false,
+                },
+                wasm_code_b64: Some(BASE64_STANDARD.encode(b"fake wasm")),
+            },
+        )))
+        .await
+        .unwrap();
+    for i in 0..VALIDATORS {
+        nodes[0]
+            .submit_transaction(Transaction::with_id(
+                format!("wan-register-{i}"),
+                TransactionKind::ContractExecution(glasschain_core::ContractExecution {
+                    contract_id: CONTRACT.into(),
+                    purchase_order_tx_id: "po-1".into(),
+                    buyer_id: "governance".into(),
+                    seller_id: "seller-1".into(),
+                    product_id: "registry".into(),
+                    quantity: 1,
+                    currency: "BRL".into(),
+                    total_price: 1,
+                }),
+            ))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    nodes[leader_for(1)].mine().await.unwrap();
+    poll_until("all nodes hold the registry block", 12, || async {
+        let mut all = true;
+        for n in &nodes {
+            if chain_len(n).await < 2 {
+                all = false;
+            }
+        }
+        all
+    })
+    .await;
+
+    // ── Block 2 (PoW): activate bft_consensus from height 3 onward ─────────
+    nodes[leader_for(2)]
+        .submit_transaction(activation_tx(3))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    nodes[leader_for(2)].mine().await.unwrap();
+    poll_until("all nodes hold the activation block", 14, || async {
+        let mut all = true;
+        for n in &nodes {
+            if chain_len(n).await < 3 {
+                all = false;
+            }
+        }
+        all
+    })
+    .await;
+
+    // ── Block 3: the vote round through WAN-delayed links ──────────────────
+    let leader3 = leader_for(3);
+    nodes[leader3]
+        .submit_transaction(plain_tx("wan-tx-after-activation"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    nodes[leader3].mine().await.unwrap();
+    poll_until("all nodes hold the WAN-delayed BFT block", 20, || async {
+        let mut all = true;
+        for n in &nodes {
+            if chain_len(n).await < 4 {
+                all = false;
+            }
+        }
+        all
+    })
+    .await;
+
+    // No conflicting finalization: every node's tip is identical.
+    let reference = nodes[0]
+        .ledger_snapshot()
+        .await
+        .chain
+        .last()
+        .cloned()
+        .expect("non-empty chain");
+    let reference_tip = (reference.index, reference.hash);
+    for node in &nodes {
+        let block = node
+            .ledger_snapshot()
+            .await
+            .chain
+            .last()
+            .cloned()
+            .expect("non-empty chain");
+        assert_eq!(
+            (block.index, block.hash),
+            reference_tip,
+            "WAN-delayed rounds must not leave conflicting tips"
+        );
+        let certificate = block.certificate.expect("the block is BFT-attested");
+        let signers = certificate
+            .signers_bitmap
+            .iter()
+            .map(|b| b.count_ones())
+            .sum::<u32>();
+        assert!(signers as usize >= provider_quorum());
+    }
 }
