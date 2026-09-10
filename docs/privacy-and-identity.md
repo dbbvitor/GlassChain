@@ -30,7 +30,7 @@ inert** (the code exists, is tested, but no production binary activates it), and
 | 3 | Wire-version gate (`glasschain/6`) | **Enforced at runtime** | `process_message` Hello Step 0 (`node.rs`) |
 | 4 | Capability gates (`pdc`, `endorsement`, …) | **Enforced at runtime** (once a capability is activated in a committed block) | `CapabilityHistory::effective_set` (`glasschain-core/src/capability.rs`, `node.rs`) |
 | 5 | `CertChainVerifier` — `VerificationLevel::Full` cryptographic chain check | **Implemented but inert** — `NodeState.cert_verifier` is `None` in all four `Node` constructors; `set_cert_verifier` is called only from integration tests | `cert_verifier.rs`; `node.rs` `with_components`/`set_cert_verifier` |
-| 6 | Certificate-verified PDC org gate (reject self-asserted `Hello` org) | **Implemented but inert — fails open** outside tests: the gate is `cert_verifier.is_some()`, so a stock node accepts the self-asserted org | `process_message` PrivatePayload handler (`node.rs`) |
+| 6 | Certificate-verified PDC org gate (reject self-asserted `Hello` org) | **Implemented and fail-closed (#86)**: private send/receive/reconcile require a configured verifier and a certificate-verified member org; a stock node without `--org`/`--trust-store` refuses private paths entirely (public sync unaffected) | `private_peer_trusted`, `payload_targets`, private-payload handlers (`node.rs`) |
 | 7 | Endorsement evaluation (carriers, `PolicyExpression`, operation defaults) | **Implemented but inert** — `NodeState.endorsement` is `None` in every production binary; `set_endorsement_provider` is called only from tests | `glasschain-core/src/endorsement.rs`; `node.rs` |
 | 8 | Policy history replay, same-block policy/write rule | **Implemented; enforced only when a provider is attached and the `endorsement` capability is active** — the gates short-circuit on `endorsement: None` | `PolicyHistory`, `enforce_block_endorsements` (`node.rs`) |
 | 9 | PDC membership gate (admission / transport / storage / replay) | **Implemented and enforced when collections are configured** — but no production binary calls `set_collections`; exercised by integration tests only | `Channel::is_member`, `node.rs`, `tests/pdc_boundary.rs` |
@@ -572,12 +572,12 @@ sequenceDiagram
     participant O as Outsider (non-member)
     participant C as Chain (global)
 
-    Note over W: submit_private_payload(collection, payload)<br/>gates: membership + pdc capability<br/>at NEXT height
+    Note over W: submit_private_payload(collection, payload)<br/>gates: verifier configured + membership<br/>+ pdc capability at NEXT height
     W->>W: store in TransientStore (retention window)
     W->>M: Message::PrivatePayload (collection, commitment, payload)
     W->>O: (no message — not a member target)
     activate M
-    M-->>M: transport gate: pdc active? both orgs members?<br/>sha256(payload)==commitment?
+    M-->>M: transport gate: verifier configured?<br/>verified member orgs? sha256(payload)==commitment?
     Note over M: store in TransientStore
     deactivate M
     W->>C: block with PDC write redacted to commitment
@@ -596,16 +596,21 @@ sequenceDiagram
 Read `tests/pdc_boundary.rs` (and `tests/protocol_security.rs` for the raw-TLS
 branches) — the boundaries are enforced exactly there:
 
-1. **Admission** — `submit_private_payload` rejects a non-member local org and
-   any submission while the `pdc` capability is inactive; `mine_async` drops a
-   candidate **whole** if it contains a PDC-scoped write while `pdc` is
-   inactive (nothing commits, nothing is held — `pdc_writes_require_the_active_capability`).
-2. **Transport** — `Message::PrivatePayload` is accepted only when the local
-   org is a member, the sender's registry org is a member, and the commitment
-   matches the bytes. A payload pushed directly at a non-member over the raw
-   wire is rejected (protocol_security's transport-leakage test); an
-   unauthenticated peer (no successful Hello) is rejected before any of that;
-   a commitment mismatch is never stored (`private_payload_with_commitment_mismatch_is_rejected`).
+1. **Admission** — `submit_private_payload` rejects a non-member local org, a
+   node without a configured certificate verifier (org trust fails closed,
+   #86 — no cleartext is submitted at all), and any submission while the `pdc`
+   capability is inactive; `mine_async` drops a candidate **whole** if it
+   contains a PDC-scoped write while `pdc` is inactive (nothing commits,
+   nothing is held — `pdc_writes_require_the_active_capability`).
+2. **Transport** — `Message::PrivatePayload` is accepted only when this node
+   runs certificate verification, the sender's org was certificate-verified
+   at Hello, both orgs are members, and the commitment matches the bytes.
+   Without a verifier the path fails closed (no self-asserted org is trusted),
+   and sending targets only certificate-verified members. A payload pushed
+   directly at a non-member over the raw wire is rejected
+   (protocol_security's transport-leakage test); an unauthenticated peer (no
+   successful Hello) is rejected before any of that; a commitment mismatch is
+   never stored (`private_payload_with_commitment_mismatch_is_rejected`).
 3. **Storage** — payloads live only in collection members' `TransientStore`,
    keyed by `(collection, sha256(payload))`; a member miner of a *relayed*
    PDC execution commits the public commitment and holds nothing
@@ -617,11 +622,12 @@ branches) — the boundaries are enforced exactly there:
    holder, driven only by on-chain commitments; a non-member reconciles
    nothing (`offline_member_catches_up_via_reconciliation`, outsider case).
 
-With a `cert_verifier` configured, boundary 2 additionally requires the sender
-to be certificate-verified. The node binary can install it using `--org` plus
-`--trust-store`; without that configuration org verification remains off.
-See the [zero-trust plan](../.agents/plans/zero-trust.md) for the fail-closed
-configuration and credential-possession work.
+Org trust on every private path **fails closed (#86)**: a `cert_verifier` must
+be configured (node `--org` plus `--trust-store`), the sender must be
+certificate-verified, and send targets are certificate-verified members only.
+A compiled-but-unattached verifier is not enough, and a copied certificate
+without its private key still needs the credential-possession work tracked in
+the [zero-trust plan](../.agents/plans/zero-trust.md) §5.
 
 ## 3.5 Retention and purge
 

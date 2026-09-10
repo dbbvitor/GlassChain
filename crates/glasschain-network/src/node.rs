@@ -295,18 +295,36 @@ impl NodeState {
             .map(|peer| peer.org.clone())
     }
 
-    /// Write channels of peers whose org is a member of `collection` — the
-    /// point-to-point private-payload targets (ADR-003). Nodes without the
-    /// collection or org never appear here.
+    /// Write channels of peers whose org is a member of `collection` **and**
+    /// whose org was certificate-verified — the point-to-point private-payload
+    /// targets (ADR-003). Fail closed (#86, zero-trust §2): without a
+    /// configured certificate verifier this is always empty, so private
+    /// cleartext is never sent to a peer on a self-asserted org.
     fn payload_targets(&self, collection: &Channel) -> Vec<Sender<Message>> {
         self.peer_senders
             .iter()
             .filter(|(addr, _)| {
                 self.peer_org(addr)
                     .is_some_and(|org| collection.is_member(&org))
+                    && self.private_peer_trusted(addr, &collection.config.name)
             })
             .map(|(_, sender)| sender.clone())
             .collect()
+    }
+
+    /// Whether `addr`'s claimed org may use org-gated private paths for
+    /// `collection`: a certificate verifier is configured, the peer's org was
+    /// certificate-verified at `Hello`, and the org is a collection member.
+    ///
+    /// Fail closed (#86, zero-trust §2): with no verifier configured, or before
+    /// the peer's org is verified, the self-asserted `Hello` org is never
+    /// trusted for private data.
+    fn private_peer_trusted(&self, addr: &str, collection: &str) -> bool {
+        self.cert_verifier.is_some()
+            && self.peer_org(addr).is_some_and(|org| {
+                self.peer_registry.org_verified(addr, &org) == Some(true)
+                    && self.is_collection_member(collection, &org)
+            })
     }
 
     /// Write channels of peers that support the `active` capability set;
@@ -1093,6 +1111,17 @@ impl Node {
         // gets the accurate rejection regardless of chain state).
         {
             let s = self.state.lock().await;
+            // Fail closed (#86, zero-trust §2): org trust requires a
+            // configured certificate verifier. Without one, no private
+            // cleartext leaves (or enters) this node.
+            if s.cert_verifier.is_none() {
+                return Err(CoreError::InvalidTransaction(
+                    "private payloads require a configured certificate verifier; org trust \
+                     fails closed without one (zero-trust #86)"
+                        .into(),
+                )
+                .into());
+            }
             let org = s.local_org(&self.node_id);
             if !s.is_collection_member(collection, &org) {
                 return Err(CoreError::InvalidTransaction(format!(
@@ -1183,6 +1212,16 @@ impl Node {
         // (possibly long) chain scan.
         let transient = {
             let s = self.state.lock().await;
+            // Fail closed (#86): without a verifier no member peer can be
+            // trusted with private data, so issuing requests would only leak
+            // the commitments this node already sees. Refuse the reconcile.
+            if s.cert_verifier.is_none() {
+                log::warn!(
+                    "Reconcile for '{collection}' skipped: private paths fail closed \
+                     without a certificate verifier (#86)"
+                );
+                return Ok(0);
+            }
             if !s.is_collection_member(collection, &s.local_org(&self.node_id)) {
                 return Ok(0);
             }
@@ -3853,20 +3892,26 @@ async fn process_message(
             let sender_verified = sender_org
                 .as_ref()
                 .and_then(|org| s.peer_registry.org_verified(stable_addr, org));
-            // When this node runs certificate verification, a private payload
-            // may only come from a peer whose org was certificate-verified
-            // (ticket #47): the self-asserted Hello org is not trusted here.
-            let verification_required = s.cert_verifier.is_some();
-            let sender_ok = sender_org
-                .as_ref()
-                .is_some_and(|org| s.is_collection_member(&collection, org))
-                && (!verification_required || sender_verified == Some(true));
+            // Fail closed (#86, zero-trust §2): a private payload is accepted
+            // only when this node runs certificate verification, the sender's
+            // org was certificate-verified, and it is a collection member.
+            // Without a verifier the self-asserted Hello org is never trusted.
+            let verifier_configured = s.cert_verifier.is_some();
+            let sender_ok = verifier_configured
+                && sender_org
+                    .as_ref()
+                    .is_some_and(|org| s.is_collection_member(&collection, org))
+                && sender_verified == Some(true);
             let commitment_ok = glasschain_core::crypto::sha256(&payload) == commitment;
             let rejection = match (s.is_collection_member(&collection, &local_org), sender_ok) {
                 (false, _) => Some(format!("local org '{local_org}' is not a member")),
+                (true, false) if !verifier_configured => Some(
+                    "no certificate verifier is configured; private paths fail closed (#86)"
+                        .to_owned(),
+                ),
                 (true, false) => Some(sender_org.map_or_else(
                     || "sender not in the peer registry".to_owned(),
-                    |org| format!("sender org '{org}' is not a member"),
+                    |org| format!("sender org '{org}' is not a verified member"),
                 )),
                 (true, true) if !commitment_ok => Some("commitment mismatch".to_owned()),
                 (true, true) => None,
@@ -3915,20 +3960,21 @@ async fn process_message(
                 log::warn!("Ignoring private-payload request from unauthenticated peer {addr}");
                 return MessageEffect::default();
             };
-            let (transient, requester_member, holder_member) = {
+            let (transient, requester_trusted, holder_member) = {
                 let s = ctx.state.lock().await;
-                let requester_member = s
-                    .peer_org(stable_addr)
-                    .is_some_and(|org| s.is_collection_member(&collection, &org));
+                // Fail closed (#86): the requester must be a
+                // certificate-verified member — a self-asserted org cannot
+                // pull private cleartext, with or without a verifier here.
+                let requester_trusted = s.private_peer_trusted(stable_addr, &collection);
                 let holder_member = s.is_collection_member(&collection, &s.local_org(&ctx.node_id));
                 let transient = s.transient.clone();
                 drop(s);
-                (transient, requester_member, holder_member)
+                (transient, requester_trusted, holder_member)
             };
-            if !requester_member || !holder_member {
+            if !requester_trusted || !holder_member {
                 log::warn!(
                     "Ignoring private-payload request for '{collection}' from {addr}: \
-                     requester or holder is not a member"
+                     requester is not a verified member or holder is not a member"
                 );
                 return MessageEffect::default();
             }

@@ -31,7 +31,7 @@ use glasschain_core::{
     capability_hash, CanonicalRecord, CapabilityActivation, RecordSignature, Transaction,
     TransactionKind,
 };
-use glasschain_identity::{Channel, ChannelConfig};
+use glasschain_identity::{CertChainVerifier, Channel, ChannelConfig, Organization};
 use glasschain_network::{Node, NodeEvent};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -149,19 +149,40 @@ fn signed(record: CanonicalRecord, issuer: &str) -> Transaction {
 /// A validator star: `validator_count` validators of which `connected` dial
 /// the leader; the rest exist but are partitioned (they join at recovery
 /// time). Staggered dial waves keep the leader's accept queue manageable.
+///
+/// Every node carries an org-issued identity and a fail-closed verifier: the
+/// private-dissemination phase runs under the zero-trust gate (#86), which
+/// refuses org-gated paths without verified certificates.
 async fn build_star(validator_count: usize, connected: usize, difficulty: usize) -> ValidatorSet {
+    let mut org = Organization::new("CapacityOrg").unwrap();
+    let verifier = |org: &Organization| {
+        let mut verifier = CertChainVerifier::from_org(org).unwrap();
+        verifier.add_crl_pem(&org.crl_pem().unwrap()).unwrap();
+        verifier
+    };
     let leader_addr = free_addr();
-    let leader = Arc::new(Node::new("leader", &leader_addr, difficulty));
+    let leader_identity = org.issue_identity("leader").unwrap().clone();
+    let leader = Arc::new(Node::new_with_identity(
+        "leader",
+        &leader_addr,
+        difficulty,
+        Arc::new(leader_identity),
+    ));
+    leader.set_cert_verifier(verifier(&org)).await;
     leader.start(vec![]).await.unwrap();
 
     let mut validators = Vec::with_capacity(validator_count);
     let mut wave: Vec<Arc<Node>> = Vec::new();
     for idx in 0..validator_count {
-        let node = Arc::new(Node::new(
-            format!("validator-{idx}"),
+        let name = format!("validator-{idx}");
+        let identity = org.issue_identity(name.clone()).unwrap().clone();
+        let node = Arc::new(Node::new_with_identity(
+            name,
             free_addr(),
             difficulty,
+            Arc::new(identity),
         ));
+        node.set_cert_verifier(verifier(&org)).await;
         if idx < connected {
             node.start(vec![leader_addr.clone()]).await.unwrap();
             wave.push(Arc::clone(&node));

@@ -25,6 +25,16 @@ fn verifier_with_crl(org: &Organization) -> CertChainVerifier {
     verifier
 }
 
+/// A node with an org-issued identity and a fail-closed verifier for `org` —
+/// the minimum configuration for org-gated private paths (#86, zero-trust
+/// §2): a compiled verifier is not enough, it must be attached.
+async fn verified_node(node_id: &str, addr: &str, org: &mut Organization) -> Node {
+    let identity = org.issue_identity(node_id).unwrap().clone();
+    let node = Node::new_with_identity(node_id, addr, 1, Arc::new(identity));
+    node.set_cert_verifier(verifier_with_crl(org)).await;
+    node
+}
+
 fn free_addr() -> String {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -150,8 +160,9 @@ async fn wait_for_sync(node: &Node, peer: &Node) {
 /// chain and pulls the missing payload via reconciliation.
 #[tokio::test]
 async fn offline_member_catches_up_via_reconciliation() {
+    let mut org = Organization::new("PharmaCorp").unwrap();
     let writer_addr = free_addr();
-    let writer = Node::new(WRITER, &writer_addr, 1);
+    let writer = verified_node(WRITER, &writer_addr, &mut org).await;
     writer.start(vec![]).await.unwrap();
     writer.set_collections(vec![pricing_collection(3600)]).await;
     writer
@@ -182,7 +193,7 @@ async fn offline_member_catches_up_via_reconciliation() {
     );
 
     // The member joins after the fact and syncs the chain.
-    let member = Node::new(MEMBER_PEER, free_addr(), 1);
+    let member = verified_node(MEMBER_PEER, &free_addr(), &mut org).await;
     member.start(vec![writer_addr]).await.unwrap();
     member.set_collections(vec![pricing_collection(3600)]).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -306,6 +317,9 @@ async fn identity_verified_payload_delivery() {
 
     let writer_addr = free_addr();
     let writer = Node::new_with_identity(WRITER, &writer_addr, 1, Arc::new(writer_identity));
+    // The writer must verify its members before sending cleartext (#86):
+    // payload targets are certificate-verified members only.
+    writer.set_cert_verifier(verifier_with_crl(&org)).await;
     writer.start(vec![]).await.unwrap();
     writer.set_collections(vec![pricing_collection(3600)]).await;
     writer
@@ -372,6 +386,16 @@ async fn federation_trust_store_enables_cross_org_payload_delivery() {
 
     let writer_addr = free_addr();
     let writer = Node::new_with_identity(WRITER, &writer_addr, 1, Arc::new(writer_identity));
+    // The writer verifies the member's org through its own trust store plus
+    // the member org anchor — sending fails closed without it (#86).
+    let mut writer_verifier = verifier_with_crl(&writer_org);
+    writer_verifier
+        .add_federation_root_pem(MEMBER_PEER, &member_org.root_ca_cert_pem)
+        .unwrap();
+    writer_verifier
+        .add_crl_pem(&member_org.crl_pem().unwrap())
+        .unwrap();
+    writer.set_cert_verifier(writer_verifier).await;
     writer.start(vec![]).await.unwrap();
     writer.set_collections(vec![pricing_collection(3600)]).await;
     writer
@@ -456,8 +480,9 @@ async fn reconcile_fans_out_across_all_member_peers() {
             retention_secs: 3600,
         })
     };
+    let mut org = Organization::new("PharmaCorp").unwrap();
     let writer_addr = free_addr();
-    let writer = Node::new(WRITER, &writer_addr, 1);
+    let writer = verified_node(WRITER, &writer_addr, &mut org).await;
     writer.start(vec![]).await.unwrap();
     writer.set_collections(vec![four_member_collection()]).await;
     writer
@@ -469,7 +494,7 @@ async fn reconcile_fans_out_across_all_member_peers() {
     // Member A is connected when the write commits, so it receives the
     // payload by dissemination; member B joins after and holds nothing.
     let a_addr = free_addr();
-    let member_a = Node::new("org-member-a", &a_addr, 1);
+    let member_a = verified_node("org-member-a", &a_addr, &mut org).await;
     member_a.start(vec![writer_addr.clone()]).await.unwrap();
     member_a
         .set_collections(vec![four_member_collection()])
@@ -494,7 +519,7 @@ async fn reconcile_fans_out_across_all_member_peers() {
     .await;
 
     let b_addr = free_addr();
-    let member_b = Node::new("org-member-b", &b_addr, 1);
+    let member_b = verified_node("org-member-b", &b_addr, &mut org).await;
     member_b.start(vec![writer_addr]).await.unwrap();
     member_b
         .set_collections(vec![four_member_collection()])
@@ -503,7 +528,7 @@ async fn reconcile_fans_out_across_all_member_peers() {
 
     // Member M syncs from A and B and reconciles: with a single arbitrary
     // target this was a coin flip between a holder and a non-holder.
-    let member_m = Node::new("org-member-m", free_addr(), 1);
+    let member_m = verified_node("org-member-m", &free_addr(), &mut org).await;
     member_m
         .set_collections(vec![four_member_collection()])
         .await;
