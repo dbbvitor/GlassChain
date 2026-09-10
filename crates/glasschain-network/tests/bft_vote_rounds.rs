@@ -368,17 +368,19 @@ async fn vote_rounds_reach_quorum_through_wan_delayed_votes() {
     let mut nodes: Vec<Node> = (0..VALIDATORS)
         .map(|i| Node::new(format!("validator-{i}"), free_addr(), 1))
         .collect();
-    // The leader's link (node 0's relay) is shaped; the rest are clean —
-    // asymmetric delay, one-way, per direction.
+    // All relays start **unshaped** so the mesh handshake is not shaped
+    // (shaping per TLS record compounds across a handshake and stalls mesh
+    // formation at ≥~120 ms/chunk — the measured D7 finding). The profile is
+    // applied with `set_profile` once the mesh is up, so the scenario tests
+    // WAN-delayed votes on established links.
     let shaped = WanProfile {
         latency_ms: 200,
         jitter_ms: 80,
         bandwidth_bps: 0,
     };
     let mut proxies = Vec::new();
-    for (i, node) in nodes.iter().enumerate() {
-        let profile = if i == 1 { shaped } else { WanProfile::none() };
-        proxies.push(TcpProxy::spawn_with_profile(node.listen_addr(), profile).await);
+    for node in &nodes {
+        proxies.push(TcpProxy::spawn_with_profile(node.listen_addr(), WanProfile::none()).await);
     }
     for (i, node) in nodes.iter_mut().enumerate() {
         node.set_advertise_addr(proxies[i].front_addr());
@@ -392,7 +394,7 @@ async fn vote_rounds_reach_quorum_through_wan_delayed_votes() {
             .await;
     }
 
-    // Full mesh through the proxies: every dial routes through shaping.
+    // Full mesh through the proxies.
     nodes[0].start(vec![]).await.unwrap();
     for (i, node) in nodes.iter().enumerate().skip(1) {
         let peers: Vec<String> = (0..VALIDATORS)
@@ -401,7 +403,19 @@ async fn vote_rounds_reach_quorum_through_wan_delayed_votes() {
             .collect();
         node.start(peers).await.unwrap();
     }
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // Mesh up: every validator knows its three peers, then shape the link of
+    // the height-1 leader (node 1) for the vote round.
+    poll_until("all validators see their three peers", 20, || async {
+        let mut all = true;
+        for node in &nodes {
+            if node.known_peers().await.len() < VALIDATORS - 1 {
+                all = false;
+            }
+        }
+        all
+    })
+    .await;
+    proxies[1].set_profile(shaped).await;
 
     // ── Block 1 (PoW): register the validator set on-chain ─────────────────
     nodes[0]

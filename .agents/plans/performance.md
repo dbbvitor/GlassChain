@@ -126,7 +126,7 @@ pacing), mid-scenario `set_profile`, and global `partition`/`repair`.
 Shipped scenarios (`real_tcp_wan_*`, 4 validators, wall-clock):
 
 - no-fault baseline through the overlay;
-- asymmetric WAN delay (200 ms ± 80 ms on one link) — convergence, tips agree;
+- asymmetric WAN delay (200 ms ± 80 ms on one link, applied to established links) — convergence, tips agree;
 - partition-while-mining then repair — no conflicting finalization;
   time-without-quorum measured separately and printed;
 - BFT vote round with the leader's link shaped 200 ms ± 80 ms — quorum

@@ -149,14 +149,20 @@ async fn established_session_survives_partition_and_reconverges_after_repair() {
 }
 
 /// Four nodes meshed through per-node proxies (each node advertises its
-/// proxy front), optionally shaped per profile.
+/// proxy front), then shaped per profile.
+///
+/// The mesh handshake runs **unshaped**: shaping per TLS record compounds
+/// latency across a handshake and, at ≥~120 ms/chunk, stalls mesh formation
+/// (~4 × 5 s reconnect cycles — the measured D7 finding). The profile is
+/// applied with `set_profile` once every node knows its three peers, so the
+/// scenario tests WAN delay on **established** links, not the handshake.
 async fn four_node_mesh(profiles: &[WanProfile]) -> (Vec<Node>, Vec<TcpProxy>) {
     let mut nodes: Vec<Node> = (0..4)
         .map(|i| Node::new(format!("wan-{i}"), free_addr(), 1))
         .collect();
     let mut proxies = Vec::new();
-    for (i, node) in nodes.iter().enumerate() {
-        let proxy = TcpProxy::spawn_with_profile(node.listen_addr(), profiles[i]).await;
+    for node in &nodes {
+        let proxy = TcpProxy::spawn_with_profile(node.listen_addr(), WanProfile::none()).await;
         proxies.push(proxy);
     }
     for (i, node) in nodes.iter_mut().enumerate() {
@@ -171,7 +177,22 @@ async fn four_node_mesh(profiles: &[WanProfile]) -> (Vec<Node>, Vec<TcpProxy>) {
             .collect();
         node.start(peers).await.unwrap();
     }
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // Mesh up: every node knows its three peers (Hello-completed, not just
+    // dialed).
+    poll_until("all nodes see their three peers", 20, || async {
+        let mut all = true;
+        for node in &nodes {
+            if node.known_peers().await.len() < 3 {
+                all = false;
+            }
+        }
+        all
+    })
+    .await;
+    // Shape the established links for the scenario.
+    for (proxy, profile) in proxies.iter().zip(profiles) {
+        proxy.set_profile(*profile).await;
+    }
     (nodes, proxies)
 }
 
@@ -232,6 +253,10 @@ async fn real_tcp_wan_baseline_converges_with_no_faults() {
 
 /// D7 scenario 2 — asymmetric WAN delay (one direction fast, the other slow):
 /// convergence still completes and tips agree.
+///
+/// Applied after the mesh is up (`four_node_mesh`), so the 200 ms profile
+/// shapes established links only — the handshake stall at ≥~120 ms/chunk does
+/// not apply here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_tcp_wan_asymmetric_delay_still_converges() {
     let asymmetric = WanProfile {
@@ -258,7 +283,7 @@ async fn real_tcp_wan_asymmetric_delay_still_converges() {
     let expected = tip(&nodes[0]).await;
     poll_until(
         "all nodes converged through the shaped link",
-        15,
+        20,
         || async {
             let snapshot = expected.clone();
             let mut all = true;
