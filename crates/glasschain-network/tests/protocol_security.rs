@@ -583,7 +583,7 @@ async fn goodbye_is_handled_gracefully() {
 
 // ── Private-payload boundary (ADR-003, ticket #46) ────────────────────────────
 
-use glasschain_identity::{Channel, ChannelConfig};
+use glasschain_identity::{CertChainVerifier, Channel, ChannelConfig, Organization};
 
 /// A collection whose member orgs are `org-writer` and `org-member`.
 fn pricing_collection() -> Channel {
@@ -596,13 +596,23 @@ fn pricing_collection() -> Channel {
     })
 }
 
-/// Send a `Hello` advertising `org` (the collection-membership principal).
+/// A fail-closed verifier (ADR-013): the org's CRL rides along with its root.
+fn verifier_with_crl(org: &Organization) -> CertChainVerifier {
+    let mut verifier = CertChainVerifier::from_org(org).unwrap();
+    verifier.add_crl_pem(&org.crl_pem().unwrap()).unwrap();
+    verifier
+}
+
+/// Send a `Hello` advertising `org` (the collection-membership principal) and,
+/// when supplied, the org-issued certificate that must verify against the
+/// receiver's trust store for org-gated paths (#86).
 async fn send_hello_as_org(
     writer: &mut PeerWriter,
     node_id: &str,
     listen_addr: &str,
     fingerprint: &str,
     org: &str,
+    certificate_pem: Option<&str>,
 ) {
     let msg = Message::Hello {
         node_id: node_id.to_owned(),
@@ -617,7 +627,7 @@ async fn send_hello_as_org(
             })
             .collect(),
         org: org.to_owned(),
-        certificate_pem: None,
+        certificate_pem: certificate_pem.map(str::to_owned),
         listen_addr: listen_addr.to_owned(),
     };
     writer.send(&msg).await.unwrap();
@@ -676,6 +686,7 @@ async fn private_payload_to_non_member_is_rejected() {
         "127.0.0.1:1",
         &sha256(CLIENT_CERT_A),
         "org-writer",
+        None,
     )
     .await;
     writer
@@ -720,7 +731,17 @@ async fn private_payload_to_non_member_is_rejected() {
 async fn private_payload_with_commitment_mismatch_is_rejected() {
     init_log_capture();
     let addr = free_addr();
+    // A real org-issued sender certificate and a verifier on the receiver
+    // (#86): the sender passes org verification so the payload reaches the
+    // commitment branch this test targets.
+    let mut org = Organization::new("PharmaCorp").unwrap();
+    let writer_identity = org.issue_identity("org-writer").unwrap().clone();
+    let writer_cert_pem = writer_identity
+        .certificate_pem
+        .clone()
+        .expect("issued identity carries a certificate");
     let member = Node::new("org-member", &addr, 1);
+    member.set_cert_verifier(verifier_with_crl(&org)).await;
     member.start(vec![]).await.unwrap();
     member.set_collections(vec![pricing_collection()]).await;
     let mut events = member.subscribe();
@@ -754,6 +775,7 @@ async fn private_payload_with_commitment_mismatch_is_rejected() {
         "127.0.0.1:2",
         &sha256(CLIENT_CERT_B),
         "org-writer",
+        Some(&writer_cert_pem),
     )
     .await;
     let tampered = Message::PrivatePayload {

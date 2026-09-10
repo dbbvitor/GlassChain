@@ -23,8 +23,9 @@ use glasschain_core::{
     crypto::sha256, CapabilityActivation, PersistentWrite, RecordSignature, Transaction,
     TransactionKind, WriteOp, WriteVisibility,
 };
-use glasschain_identity::{Channel, ChannelConfig};
+use glasschain_identity::{CertChainVerifier, Channel, ChannelConfig, Organization};
 use glasschain_network::Node;
+use std::sync::Arc;
 use std::time::Duration;
 
 const WRITER: &str = "org-writer";
@@ -34,6 +35,13 @@ const COLLECTION: &str = "pricing";
 /// The private payload bytes, written at runtime by the guest (never a data
 /// segment, so the committed contract bytes cannot carry them).
 const PRIVATE_VALUE: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+
+/// A fail-closed verifier (ADR-013): the org's CRL rides along with its root.
+fn verifier_with_crl(org: &Organization) -> CertChainVerifier {
+    let mut verifier = CertChainVerifier::from_org(org).unwrap();
+    verifier.add_crl_pem(&org.crl_pem().unwrap()).unwrap();
+    verifier
+}
 
 fn free_addr() -> String {
     use std::net::TcpListener;
@@ -163,12 +171,21 @@ async fn wait_for_sync(node: &Node, peer: &Node) {
 
 #[tokio::test]
 async fn pdc_member_write_and_commit_with_nonmember_verification() {
-    // ── Three nodes, one collection, two members ────────────────────────
+    // ── One org issues both members' certificates; the outsider has none ──
+    let mut org = Organization::new("PharmaCorp").unwrap();
+    let writer_identity = org.issue_identity(WRITER).unwrap().clone();
+    let member_identity = org.issue_identity(MEMBER_PEER).unwrap().clone();
+    let verifier = verifier_with_crl(&org);
+
     let writer_addr = free_addr();
-    let writer = Node::new(WRITER, &writer_addr, 1);
+    let writer = Node::new_with_identity(WRITER, &writer_addr, 1, Arc::new(writer_identity));
+    writer.set_cert_verifier(verifier_with_crl(&org)).await;
     writer.start(vec![]).await.unwrap();
-    let member_peer = Node::new(MEMBER_PEER, free_addr(), 1);
+    let member_peer =
+        Node::new_with_identity(MEMBER_PEER, free_addr(), 1, Arc::new(member_identity));
+    member_peer.set_cert_verifier(verifier).await;
     member_peer.start(vec![writer_addr.clone()]).await.unwrap();
+    // The outsider keeps a self-asserted org and no certificate.
     let outsider = Node::new(OUTSIDER, free_addr(), 1);
     outsider.start(vec![writer_addr]).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -354,7 +371,10 @@ async fn non_member_miner_never_holds_private_cleartext() {
 
 #[tokio::test]
 async fn private_payload_admission_gates() {
-    let writer = Node::new(WRITER, free_addr(), 1);
+    let mut org = Organization::new("PharmaCorp").unwrap();
+    let writer_identity = org.issue_identity(WRITER).unwrap().clone();
+    let writer = Node::new_with_identity(WRITER, free_addr(), 1, Arc::new(writer_identity));
+    writer.set_cert_verifier(verifier_with_crl(&org)).await;
     writer.start(vec![]).await.unwrap();
     writer.set_collections(vec![pricing_collection()]).await;
 
@@ -380,7 +400,9 @@ async fn private_payload_admission_gates() {
     );
 
     // Membership gate: a non-member org cannot submit at all.
-    let outsider = Node::new(OUTSIDER, free_addr(), 1);
+    let outsider_identity = org.issue_identity(OUTSIDER).unwrap().clone();
+    let outsider = Node::new_with_identity(OUTSIDER, free_addr(), 1, Arc::new(outsider_identity));
+    outsider.set_cert_verifier(verifier_with_crl(&org)).await;
     outsider.start(vec![]).await.unwrap();
     outsider.set_collections(vec![pricing_collection()]).await;
     let err = outsider
@@ -388,4 +410,55 @@ async fn private_payload_admission_gates() {
         .await
         .expect_err("non-member submission must fail");
     assert!(err.to_string().contains("not a member"), "{err}");
+}
+
+/// #86, zero-trust §2: org trust fails closed. A node with no certificate
+/// verifier cannot submit private payloads, and a member without a verifier
+/// rejects a payload sent by a verified member — no cleartext is stored.
+#[tokio::test]
+async fn private_paths_fail_closed_without_a_verifier() {
+    let mut org = Organization::new("PharmaCorp").unwrap();
+    let sender_identity = org.issue_identity(WRITER).unwrap().clone();
+    let receiver_identity = org.issue_identity(MEMBER_PEER).unwrap().clone();
+
+    // The sender verifies its peers; the receiver deliberately does not.
+    let sender_addr = free_addr();
+    let sender = Node::new_with_identity(WRITER, &sender_addr, 1, Arc::new(sender_identity));
+    sender.set_cert_verifier(verifier_with_crl(&org)).await;
+    sender.start(vec![]).await.unwrap();
+    sender.set_collections(vec![pricing_collection()]).await;
+    sender.submit_transaction(activation_tx(2)).await.unwrap();
+    sender.mine().await.unwrap();
+
+    let receiver =
+        Node::new_with_identity(MEMBER_PEER, free_addr(), 1, Arc::new(receiver_identity));
+    // No verifier configured: the receive gate must fail closed.
+    receiver.set_collections(vec![pricing_collection()]).await;
+    receiver.start(vec![sender_addr]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    sender
+        .submit_private_payload(COLLECTION, PRIVATE_VALUE.to_vec())
+        .await
+        .expect("the sender holds its own payload");
+    let commitment = sha256(PRIVATE_VALUE);
+    // The sender can never verify the receiver's org (its verifier is the
+    // shared org root, and the receiver's org IS verified there — but the
+    // receiver has no verifier of its own; delivery may happen at the
+    // transport level and must be rejected on receipt).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        receiver.transient_payload(COLLECTION, &commitment).await,
+        None,
+        "a member without a verifier must not store private cleartext"
+    );
+
+    // A node with no verifier cannot submit either.
+    let bare = Node::new(OUTSIDER, free_addr(), 1);
+    bare.set_collections(vec![pricing_collection()]).await;
+    let err = bare
+        .submit_private_payload(COLLECTION, PRIVATE_VALUE.to_vec())
+        .await
+        .expect_err("submission without a verifier must fail closed");
+    assert!(err.to_string().contains("certificate verifier"), "{err}");
 }

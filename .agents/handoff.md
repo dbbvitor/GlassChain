@@ -64,8 +64,11 @@ BFT or governance penalties merely because local benchmarks pass.
 Independent decisions/tests can proceed alongside A:
 
 - [Org-gated fail-open default](https://github.com/dbbvitor/GlassChain/issues/86):
-  fail closed on private paths and establish credential possession/session binding.
-  The old suggested insecure flag is not approved; real test credentials come first.
+  **fail-closed shipped (2026-09-10)** — private send/receive/reconcile require a
+  configured verifier and certificate-verified member orgs; tests migrated to
+  real credentials. Remaining: credential possession/session binding (a copied
+  certificate without its key still impersonates). The old suggested insecure
+  flag is not approved.
 - [Certificate-bound MSP principals](https://github.com/dbbvitor/GlassChain/issues/87):
   D4, with deterministic historical authorization and go-forward lifecycle rules.
 - [Durable TOFU pins](https://github.com/dbbvitor/GlassChain/issues/88): rotation and

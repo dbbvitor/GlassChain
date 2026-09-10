@@ -28,26 +28,32 @@ mechanisms were “built and correct” was too broad and is withdrawn.
 ## 2. ZT-1 — Fail closed on unverified organizations
 
 [Org-gated fail-open default](https://github.com/dbbvitor/GlassChain/issues/86)
-tracks `node.rs`'s PDC gate:
+tracked `node.rs`'s PDC gate:
 `!verification_required || sender_verified == Some(true)`, where
-`verification_required = s.cert_verifier.is_some()`. A startup warning does not
+`verification_required = s.cert_verifier.is_some()`. A startup warning did not
 prevent a no-verifier deployment trusting an asserted organization.
 
-Plan: require verified membership on private send, receive and reconciliation
-paths. Preserve public-history observation for downgraded peers under ADR-011.
-Audit *all* call sites and configuration combinations; this is not just inverting
-one boolean. Bind the presented organizational credential to the peer/key/session
-with proof of possession, not merely possession of a public certificate string.
+**Shipped (2026-09-10):** every private path fails closed without a configured
+verifier. Receive requires this node's verifier, the sender's
+certificate-verified org, and membership; send targets are
+certificate-verified members only (`payload_targets` → `private_peer_trusted`);
+reconcile refuses without a verifier and serves only verified member
+requesters. Public-history observation for unverified peers stays available
+under ADR-011. Tests migrated to real credentials (org identities, trust
+stores, CRLs): `pdc_boundary`, `pdc_distribution`, `protocol_security`,
+`consensus_capacity`, including
+`private_paths_fail_closed_without_a_verifier`.
 
-The earlier issue proposes `--insecure-unverified-orgs`; this is **not an accepted
-or shipped flag**. First demonstrate that public-only local workflows still work
-and use real test credentials for PDC demos. Any development exception needs an
-explicit bounded threat model and decision; do not introduce another production
-bypass or env-var kill switch to make tests pass.
+**Remaining (issue #86 stays open):** credential possession/session binding —
+verification of a Hello-carried PEM does not prove possession of the org key
+(a copied certificate can still impersonate until channel binding or mTLS
+lands). The earlier proposed `--insecure-unverified-orgs` flag remains
+**not accepted**; do not add a production bypass or env-var kill switch.
 
 Acceptance: absent/invalid verifier and forged org fail closed for private data;
 public sync remains available only under its own validation rules; a copied
 certificate without its private key cannot impersonate an organization.
+**Status: the first two hold; the third awaits the possession work above.**
 
 ## 3. ZT-2 — Aggregate rejection versus attributable evidence
 
