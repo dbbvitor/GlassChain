@@ -117,27 +117,30 @@ stable-storage acknowledgement as separate metrics.
 
 ## 5. Benchmark additions from the external report
 
-### WAN and round-change scenarios — adopt for the actual driver
+### WAN and round-change scenarios — proxy shipped, scenarios started
 
-Extend `tests/tcp_partition.rs`'s established-session proxy rather than replacing
-Tokio first (source debt **D7**). It currently uses `copy_bidirectional` and
-partition/repair, **not** a WAN latency matrix. Add bounded per-direction relay
-queues, a seedable latency/jitter/bandwidth profile and correlated link failures;
-verify advertised addresses/reconnects cannot bypass the overlay. TCP byte-stream
-faults are not a simulation of independent packet reordering/loss.
+`tests/common/proxy.rs` is the shared real-TCP proxy (extended from
+`tests/tcp_partition.rs`, source debt **D7**): bounded-by-socket-buffer
+per-direction relay shaping (seeded one-way latency + jitter, bandwidth
+pacing), mid-scenario `set_profile`, and global `partition`/`repair`.
+Shipped scenarios (`real_tcp_wan_*`, 4 validators, wall-clock):
 
-Test 4/10 validators first, then 100/200/300 under explicit hardware budgets:
+- no-fault baseline through the overlay;
+- asymmetric WAN delay (200 ms ± 80 ms on one link) — convergence, tips agree;
+- partition-while-mining then repair — no conflicting finalization;
+  time-without-quorum measured separately and printed;
+- BFT vote round with the leader's link shaped 200 ms ± 80 ms — quorum
+  commits, no conflicting tips.
 
-- no-fault baseline; asymmetric WAN delays; slow leader/validator CPU and disk;
-- leader loss before/after prevote or precommit; delayed/duplicated/stale votes;
-- equivocation and invalid signatures; partition below/above quorum then repair;
-- saturation and recovery with the same workload, retention and security settings.
+**Measured finding (Step 0 follow-up):** mesh formation through a shaped
+relay at ≥~120 ms per chunk stalls (~4 × 5 s reconnect cycles) while
+60–80 ms one-way converges in ~2 s. Audit the dial/hello handshake budget
+before scaling profiles up; larger profiles otherwise wait.
 
-Assert no conflicting finalization and no premature side effects; measure time
-without quorum separately from recovery once a quorum is reachable. Distinguish
-seeded fault profiles over real wall-clock TCP from full deterministic madsim
-execution. The optional madsim-tokio migration remains behind compatibility and
-additional-coverage evidence, not a prerequisite to these WAN measurements.
+Still open: leader-loss, slow CPU/disk, stale/duplicate-vote floods,
+saturation scenarios and 10/100/200/300 sweeps under explicit hardware
+budgets. Deterministic madsim execution stays optional behind
+compatibility evidence, not a prerequisite to these WAN measurements.
 
 ### High-frequency flattening and read-path memory — baseline measured
 

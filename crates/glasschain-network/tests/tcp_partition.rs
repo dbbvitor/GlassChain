@@ -1,4 +1,4 @@
-//! TCP-level fault injection via an in-process proxy layer (#70).
+//! TCP-level fault injection via an in-process proxy layer (#70, D7).
 //!
 //! Instead of patching the async runtime (the madsim-tokio route, blocked on
 //! fork support for tokio 1.53 — see the issue), nodes run over **real
@@ -17,92 +17,26 @@
 //! (`Node::set_advertise_addr`): reconnects dial the advertised address, so
 //! with a proxy on only one side the built-in 5-second reconnect would bypass
 //! the partition over the direct route.
+//!
+//! The WAN profile scenarios below (`real_tcp_wan_*`) are the D7 latency /
+//! jitter / bandwidth extension: seedable one-way shaping per relay
+//! direction (`tests/common/proxy.rs`), switching profiles mid-scenario,
+//! and time-without-quorum measured separately from recovery. They are
+//! **real TCP wall-clock tests** — generous margins, labeled separately
+//! from deterministic simulated-network runs.
+
+#[path = "common/proxy.rs"]
+mod proxy;
+
+use proxy::{TcpProxy, WanProfile};
 
 use glasschain_core::{InventoryUpdate, Transaction, TransactionKind};
 use glasschain_network::Node;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
 use std::time::Duration;
-use tokio::{
-    io::copy_bidirectional,
-    net::{TcpListener, TcpStream},
-    sync::Mutex,
-    task::JoinHandle,
-};
 
 fn free_addr() -> String {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     l.local_addr().unwrap().to_string()
-}
-
-/// A bidirectional relay between one dialer-side port and one target address.
-/// `partition` aborts the relays (severing the established sockets) and
-/// refuses new connections; `repair` allows them again.
-struct TcpProxy {
-    /// Front port — the address dialers use.
-    front_addr: String,
-    enabled: Arc<AtomicBool>,
-    relays: Arc<Mutex<Vec<JoinHandle<()>>>>,
-}
-
-impl TcpProxy {
-    /// Proxy a freshly bound front port to `target`.
-    async fn spawn(target: &str) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let front_addr = listener.local_addr().unwrap().to_string();
-        let enabled = Arc::new(AtomicBool::new(true));
-        let relays: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::default();
-
-        let acceptor_enabled = Arc::clone(&enabled);
-        let acceptor_relays = Arc::clone(&relays);
-        let target = target.to_owned();
-        tokio::spawn(async move {
-            loop {
-                let Ok((client, _)) = listener.accept().await else {
-                    break;
-                };
-                if !acceptor_enabled.load(Ordering::SeqCst) {
-                    // Partition: refuse the connection outright.
-                    drop(client);
-                    continue;
-                }
-                let Ok(upstream) = TcpStream::connect(&target).await else {
-                    drop(client);
-                    continue;
-                };
-                acceptor_relays.lock().await.push(tokio::spawn(async move {
-                    // Errors (including the abort-induced cancellation below)
-                    // just end the relay; both sockets drop and the TCP stacks
-                    // on both nodes see the disconnect.
-                    let mut client = client;
-                    let mut upstream = upstream;
-                    let _ = copy_bidirectional(&mut client, &mut upstream).await;
-                }));
-            }
-        });
-
-        Self {
-            front_addr,
-            enabled,
-            relays,
-        }
-    }
-
-    /// Sever every established relay and refuse new connections.
-    async fn partition(&self) {
-        self.enabled.store(false, Ordering::SeqCst);
-        let mut relays = self.relays.lock().await;
-        for handle in relays.drain(..) {
-            handle.abort();
-        }
-    }
-
-    /// Allow new connections again.
-    fn repair(&self) {
-        self.enabled.store(true, Ordering::SeqCst);
-    }
 }
 
 fn inv_tx(id: &str, delta: i64) -> Transaction {
@@ -149,11 +83,15 @@ async fn established_session_survives_partition_and_reconverges_after_repair() {
     let proxy_a = TcpProxy::spawn(a.listen_addr()).await;
     let proxy_b = TcpProxy::spawn(b.listen_addr()).await;
 
-    a.set_advertise_addr(&proxy_a.front_addr);
-    b.set_advertise_addr(&proxy_b.front_addr);
+    a.set_advertise_addr(proxy_a.front_addr());
+    b.set_advertise_addr(proxy_b.front_addr());
 
-    a.start(vec![proxy_b.front_addr.clone()]).await.unwrap();
-    b.start(vec![proxy_a.front_addr.clone()]).await.unwrap();
+    a.start(vec![proxy_b.front_addr().to_owned()])
+        .await
+        .unwrap();
+    b.start(vec![proxy_a.front_addr().to_owned()])
+        .await
+        .unwrap();
 
     // Establish: B syncs a block mined on A through the proxy.
     a.submit_transaction(inv_tx("pre-partition", 1))
@@ -189,8 +127,8 @@ async fn established_session_survives_partition_and_reconverges_after_repair() {
     // ── Repair: proxies accept again; peers reconnect and re-verify TOFU ───
     proxy_a.repair();
     proxy_b.repair();
-    a.connect_peer(&proxy_b.front_addr);
-    b.connect_peer(&proxy_a.front_addr);
+    a.connect_peer(proxy_b.front_addr());
+    b.connect_peer(proxy_a.front_addr());
 
     // Re-convergence: the block mined during the partition reaches B.
     poll_until("B re-converged after repair", 8, || async {
@@ -208,4 +146,212 @@ async fn established_session_survives_partition_and_reconverges_after_repair() {
         chain_len(&b).await >= final_height
     })
     .await;
+}
+
+/// Four nodes meshed through per-node proxies (each node advertises its
+/// proxy front), optionally shaped per profile.
+async fn four_node_mesh(profiles: &[WanProfile]) -> (Vec<Node>, Vec<TcpProxy>) {
+    let mut nodes: Vec<Node> = (0..4)
+        .map(|i| Node::new(format!("wan-{i}"), free_addr(), 1))
+        .collect();
+    let mut proxies = Vec::new();
+    for (i, node) in nodes.iter().enumerate() {
+        let proxy = TcpProxy::spawn_with_profile(node.listen_addr(), profiles[i]).await;
+        proxies.push(proxy);
+    }
+    for (i, node) in nodes.iter_mut().enumerate() {
+        let front = proxies[i].front_addr().to_owned();
+        node.set_advertise_addr(&front);
+    }
+    nodes[0].start(vec![]).await.unwrap();
+    for (i, node) in nodes.iter().enumerate().skip(1) {
+        let peers: Vec<String> = (0..4)
+            .filter(|j| *j != i)
+            .map(|j| proxies[j].front_addr().to_owned())
+            .collect();
+        node.start(peers).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    (nodes, proxies)
+}
+
+/// All four nodes agree on the same tip: no conflicting finalization.
+async fn tips_agree(nodes: &[Node]) -> bool {
+    let first = tip(&nodes[0]).await;
+    for node in nodes {
+        if tip(node).await != first {
+            return false;
+        }
+    }
+    true
+}
+
+async fn tip(node: &Node) -> (u64, String) {
+    let chain = node.ledger_snapshot().await.chain;
+    (
+        u64::try_from(chain.len()).expect("test chain fits u64"),
+        chain.last().expect("non-empty").hash.clone(),
+    )
+}
+
+/// Whether `node` has reached `expected`.
+async fn tip_reached(node: &Node, expected: (u64, String)) -> bool {
+    tip(node).await == expected
+}
+
+/// D7 scenario 1 — no-fault baseline through the proxy overlay: blocks mined
+/// on one node propagate to all four and every node agrees on the tip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_tcp_wan_baseline_converges_with_no_faults() {
+    let (nodes, _) = four_node_mesh(&[WanProfile::none(); 4]).await;
+
+    for i in 0..3 {
+        nodes[0]
+            .submit_transaction(inv_tx(&format!("baseline-{i}"), 1))
+            .await
+            .unwrap();
+        nodes[0].mine().await.unwrap();
+    }
+    let expected = tip(&nodes[0]).await;
+    poll_until("all four nodes reached the mined tip", 8, || async {
+        let snapshot = expected.clone();
+        let mut all = true;
+        for n in &nodes {
+            if !tip_reached(n, snapshot.clone()).await {
+                all = false;
+            }
+        }
+        all
+    })
+    .await;
+    assert!(
+        tips_agree(&nodes).await,
+        "no-fault run must not produce conflicting tips"
+    );
+}
+
+/// D7 scenario 2 — asymmetric WAN delay (one direction fast, the other slow):
+/// convergence still completes and tips agree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_tcp_wan_asymmetric_delay_still_converges() {
+    let asymmetric = WanProfile {
+        latency_ms: 200,
+        jitter_ms: 80,
+        bandwidth_bps: 0,
+    };
+    // Only the first node's relay is shaped: asymmetric by construction.
+    let profiles = [
+        asymmetric,
+        WanProfile::none(),
+        WanProfile::none(),
+        WanProfile::none(),
+    ];
+    let (nodes, _) = four_node_mesh(&profiles).await;
+
+    for i in 0..2 {
+        nodes[0]
+            .submit_transaction(inv_tx(&format!("wan-delay-{i}"), 1))
+            .await
+            .unwrap();
+        nodes[0].mine().await.unwrap();
+    }
+    let expected = tip(&nodes[0]).await;
+    poll_until(
+        "all nodes converged through the shaped link",
+        15,
+        || async {
+            let snapshot = expected.clone();
+            let mut all = true;
+            for n in &nodes {
+                if !tip_reached(n, snapshot.clone()).await {
+                    all = false;
+                }
+            }
+            all
+        },
+    )
+    .await;
+    assert!(
+        tips_agree(&nodes).await,
+        "asymmetric delay must not produce conflicting tips"
+    );
+}
+
+/// D7 scenario 3 — partition while blocks are mined, then repair: re-convergence
+/// with no conflicting finalization; time without quorum measured separately
+/// from the recovery window and printed (not asserted).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_tcp_wan_partition_repair_converges_without_conflict() {
+    let (nodes, proxies) = four_node_mesh(&[WanProfile::none(); 4]).await;
+
+    nodes[0]
+        .submit_transaction(inv_tx("pre-partition", 1))
+        .await
+        .unwrap();
+    nodes[0].mine().await.unwrap();
+    let synced = tip(&nodes[0]).await;
+    poll_until("mesh synced the first block", 8, || async {
+        let snapshot = synced.clone();
+        let mut all = true;
+        for n in &nodes {
+            if !tip_reached(n, snapshot.clone()).await {
+                all = false;
+            }
+        }
+        all
+    })
+    .await;
+
+    let quorum_lost_at = std::time::Instant::now();
+    for proxy in &proxies {
+        proxy.partition().await;
+    }
+    for i in 0..2 {
+        nodes[0]
+            .submit_transaction(inv_tx(&format!("during-{i}"), 1))
+            .await
+            .unwrap();
+        nodes[0].mine().await.unwrap();
+    }
+    let ahead = tip(&nodes[0]).await;
+    // Hold the partition past the built-in reconnect window: the proxies are
+    // the only route (advertised addresses), so nothing can bypass them.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    for node in &nodes[1..] {
+        assert_eq!(
+            tip(node).await,
+            synced,
+            "a partitioned node must not receive blocks mined after the severance"
+        );
+    }
+    assert!(ahead > synced, "the mining side advanced while partitioned");
+
+    for proxy in &proxies {
+        proxy.repair();
+    }
+    // Reconnect via the advertised (proxy) addresses.
+    for node in nodes.iter().skip(1) {
+        node.connect_peer(proxies[0].front_addr());
+    }
+    poll_until(
+        "re-convergence after repair (recovery measured from repair)",
+        15,
+        || async {
+            let snapshot = ahead.clone();
+            let mut all = true;
+            for n in &nodes {
+                if !tip_reached(n, snapshot.clone()).await {
+                    all = false;
+                }
+            }
+            all
+        },
+    )
+    .await;
+    let quorum_restored_ms = quorum_lost_at.elapsed();
+    println!("real_tcp_wan time-without-quorum (partition to convergence): {quorum_restored_ms:?}");
+    assert!(
+        tips_agree(&nodes).await,
+        "partition + repair must not leave conflicting finalization"
+    );
 }
