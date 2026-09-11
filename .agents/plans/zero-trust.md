@@ -44,16 +44,23 @@ stores, CRLs): `pdc_boundary`, `pdc_distribution`, `protocol_security`,
 `consensus_capacity`, including
 `private_paths_fail_closed_without_a_verifier`.
 
-**Remaining (issue #86 stays open):** credential possession/session binding —
-verification of a Hello-carried PEM does not prove possession of the org key
-(a copied certificate can still impersonate until channel binding or mTLS
-lands). The earlier proposed `--insecure-unverified-orgs` flag remains
-**not accepted**; do not add a production bypass or env-var kill switch.
+**Possession shipped (2026-09-10, #110):** the Hello carries a base64
+ed25519 signature over `org_possession_message(org, node_id, <TLS exporter>)`
+by the certificate's key (rustls channel binding, RFC 5705). Verification of
+the chain and subject CN is necessary but not sufficient: without a valid
+session-bound proof the peer's org stays unverified. A captured proof cannot
+replay on another session, and a copied certificate without its private key
+cannot produce one. The earlier proposed `--insecure-unverified-orgs` flag
+remains **not accepted**; do not add a production bypass or env-var kill
+switch.
 
 Acceptance: absent/invalid verifier and forged org fail closed for private data;
 public sync remains available only under its own validation rules; a copied
 certificate without its private key cannot impersonate an organization.
-**Status: the first two hold; the third awaits the possession work above.**
+**All three hold** (#86 and #110 shipped); the tests live in
+`pdc_boundary`, `pdc_distribution`, `protocol_security`
+(`copied_certificate_without_private_key_is_rejected`) and
+`glasschain-identity/src/possession.rs`.
 
 ## 3. ZT-2 — Aggregate rejection versus attributable evidence
 

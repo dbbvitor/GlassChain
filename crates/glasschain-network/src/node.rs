@@ -1510,6 +1510,7 @@ impl Node {
                                     return;
                                 }
                             };
+                            let session_binding = tls_session_binding(tls_stream.get_ref().1);
                             let observed_cert_fingerprint = sha256(&peer_cert_buf);
                             let (r, w) = tokio::io::split(tls_stream);
                             let reader = PeerReader::new(r, addr.clone());
@@ -1524,6 +1525,7 @@ impl Node {
                                     node_id: ni,
                                     listen_addr: la,
                                     local_tls_cert_fingerprint,
+                                    session_binding,
                                     event_tx: et,
                                     indexer: ix,
                                     event_bus: eb,
@@ -2639,6 +2641,61 @@ impl Node {
 
 // ── Free functions ────────────────────────────────────────────────────────────
 
+/// Derive the per-session channel binding used by org-possession proofs
+/// (#110). Both peers derive the same bytes from the agreed TLS secrets
+/// (RFC 5705); a proof signed over them is valid only on this connection.
+/// `None` when the connection cannot export keying material — proofs are then
+/// impossible and org-gated paths fail closed.
+fn tls_session_binding<Data>(connection: &rustls::ConnectionCommon<Data>) -> Option<[u8; 32]> {
+    let mut binding = [0u8; 32];
+    connection
+        .export_keying_material(
+            binding.as_mut_slice(),
+            glasschain_identity::SESSION_BINDING_LABEL,
+            None,
+        )
+        .is_ok()
+        .then_some(binding)
+}
+
+/// Build this node's `Hello` for one session, including the session-bound
+/// org-possession proof when an identity and a session binding are available
+/// (#110). Without either, the proof is absent and the org claim stays
+/// unverified on the receiver (org-gated paths fail closed).
+async fn build_local_hello(ctx: &PeerContext) -> Message {
+    let chain_length = ctx.ledger.lock().await.chain.len() as u64;
+    let (org, identity) = {
+        let s = ctx.state.lock().await;
+        (s.local_org(&ctx.node_id), s.identity.clone())
+    };
+    let certificate_pem = identity
+        .as_ref()
+        .and_then(|identity| identity.certificate_pem.clone());
+    let certificate_proof = match (identity.as_ref(), ctx.session_binding) {
+        (Some(identity), Some(binding)) => Some(BASE64_STANDARD.encode(identity.sign_bytes(
+            &glasschain_identity::org_possession_message(&org, &ctx.node_id, &binding),
+        ))),
+        _ => None,
+    };
+    Message::Hello {
+        node_id: ctx.node_id.clone(),
+        tls_cert_fingerprint: ctx.local_tls_cert_fingerprint.clone(),
+        chain_length,
+        version: PROTOCOL_VERSION.to_owned(),
+        capabilities: CAPABILITY_V1
+            .iter()
+            .map(|c| CapabilityAdvertisement {
+                id: c.id.to_owned(),
+                version: c.version,
+            })
+            .collect(),
+        org,
+        certificate_pem,
+        certificate_proof,
+        listen_addr: ctx.listen_addr.clone(),
+    }
+}
+
 /// Stable per-connection context bundling shared state that is invariant
 /// across all messages within a single peer session.
 ///
@@ -2654,6 +2711,12 @@ struct PeerContext {
     /// Used by [`process_message`] to detect self-connections regardless of
     /// how the listen address was formatted (handles wildcard bind addresses).
     local_tls_cert_fingerprint: String,
+    /// This session's TLS exporter output (#110), derived after the handshake
+    /// and identical on both peers. Org-possession proofs are bound to it, so
+    /// a captured proof cannot replay on another session. `None` when the TLS
+    /// stack could not export keying material — proofs are then impossible and
+    /// org-gated paths fail closed.
+    session_binding: Option<[u8; 32]>,
     event_tx: broadcast::Sender<NodeEvent>,
     indexer: Arc<InMemoryIndexer>,
     event_bus: Arc<InMemoryEventBus>,
@@ -3131,31 +3194,7 @@ async fn handle_peer(
     // Connection-scoped: the observed cert fingerprint is passed directly
     // through the call chain — no shared mutable state needed.
 
-    let chain_length = ctx.ledger.lock().await.chain.len() as u64;
-    let (org, certificate_pem) = {
-        let s = ctx.state.lock().await;
-        let certificate_pem = s
-            .identity
-            .as_ref()
-            .and_then(|identity| identity.certificate_pem.clone());
-        (s.local_org(&ctx.node_id), certificate_pem)
-    };
-    let hello = Message::Hello {
-        node_id: ctx.node_id.clone(),
-        tls_cert_fingerprint: ctx.local_tls_cert_fingerprint.clone(),
-        chain_length,
-        version: PROTOCOL_VERSION.to_owned(),
-        capabilities: CAPABILITY_V1
-            .iter()
-            .map(|c| CapabilityAdvertisement {
-                id: c.id.to_owned(),
-                version: c.version,
-            })
-            .collect(),
-        org,
-        certificate_pem,
-        listen_addr: ctx.listen_addr.clone(),
-    };
+    let hello = build_local_hello(&ctx).await;
     if write_tx.try_send(hello).is_err() {
         log::warn!("Failed to queue Hello for {addr}");
         return;
@@ -3298,6 +3337,7 @@ async fn connect_to_peer(
                     return;
                 }
             };
+            let session_binding = tls_session_binding(tls_stream.get_ref().1);
             let (r, w) = tokio::io::split(tls_stream);
             let reader = PeerReader::new(r, peer_addr.clone());
             let writer = PeerWriter::new(w, peer_addr.clone());
@@ -3311,6 +3351,7 @@ async fn connect_to_peer(
                     node_id,
                     listen_addr,
                     local_tls_cert_fingerprint: tls.cert_fingerprint.clone(),
+                    session_binding,
                     event_tx,
                     indexer,
                     event_bus,
@@ -3360,6 +3401,7 @@ async fn process_message(
             capabilities,
             org: peer_org,
             certificate_pem: peer_certificate_pem,
+            certificate_proof: peer_certificate_proof,
         } => {
             log::info!(
                 "Hello from {addr} (id={peer_id}, chain_len={chain_length}, listen={peer_listen_addr})"
@@ -3413,12 +3455,15 @@ async fn process_message(
                 };
             }
 
-            // ── Step 2.5: certificate-verified org (ticket #47) ──────────
+            // ── Step 2.5: certificate-verified org (ticket #47) and
+            // session-bound possession (#110) ────────────────────────────
             // When a verifier is configured, the claimed org counts only if
             // the peer's organization-issued certificate verifies against this
-            // org's Root CA and its subject CN equals the claimed org. The TLS
-            // certificate is transport-only (self-signed), so this check runs
-            // on the Hello-carried certificate.
+            // org's Root CA, its subject CN equals the claimed org, **and** the
+            // peer proves possession of the certificate's private key on this
+            // session. A verified PEM is public knowledge; the possession
+            // proof is signed over this session's TLS exporter output, so a
+            // copied certificate cannot impersonate an organization.
             let org_verified = {
                 let s = ctx.state.lock().await;
                 let has_verifier = s.cert_verifier.is_some();
@@ -3430,7 +3475,19 @@ async fn process_message(
                                 .is_ok_and(|cn| cn == peer_org)
                         })
                     });
-                let rejected = has_verifier && !verified;
+                let possession_ok = verified
+                    && ctx.session_binding.is_some_and(|binding| {
+                        peer_certificate_proof.as_ref().is_some_and(|proof| {
+                            peer_certificate_pem.as_ref().is_some_and(|pem| {
+                                BASE64_STANDARD.decode(proof).is_ok_and(|proof| {
+                                    glasschain_identity::verify_org_possession(
+                                        pem, &peer_org, &peer_id, &binding, &proof,
+                                    )
+                                })
+                            })
+                        })
+                    });
+                let rejected = has_verifier && !possession_ok;
                 drop(s);
                 if rejected {
                     // ADR-011 decision: an unverified organization stays
@@ -3443,7 +3500,7 @@ async fn process_message(
                          paths will not trust it"
                     );
                 }
-                verified
+                possession_ok
             };
 
             // ── Step 2: TOFU peer registry ────────────────────────────
@@ -5002,6 +5059,7 @@ mod tests {
             node_id: "n-under-test".into(),
             listen_addr: "127.0.0.1:0".into(),
             local_tls_cert_fingerprint: "self-fingerprint".into(),
+            session_binding: None,
             event_tx: node.event_tx.clone(),
             indexer: Arc::clone(&node.indexer),
             event_bus: Arc::clone(&node.event_bus),
