@@ -70,4 +70,7 @@ pub use identity::{Identity, SignedTransaction};
 pub use msp::IntermediateCa;
 pub use msp::Organization;
 pub use msp_policy::MspEndorsementProvider;
-pub use possession::{org_possession_message, verify_org_possession, SESSION_BINDING_LABEL};
+pub use possession::{
+    certificate_ed25519_public_key, org_possession_message, tofu_pin_message, verify_ed25519,
+    verify_org_possession, SESSION_BINDING_LABEL,
+};

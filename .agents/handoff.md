@@ -71,8 +71,10 @@ Independent decisions/tests can proceed alongside A:
   not approved.
 - [Certificate-bound MSP principals](https://github.com/dbbvitor/GlassChain/issues/87):
   D4, with deterministic historical authorization and go-forward lifecycle rules.
-- [Durable TOFU pins](https://github.com/dbbvitor/GlassChain/issues/88): rotation and
-  recovery policy before persistence; distinct from storing node private keys.
+- [Durable TOFU pins](https://github.com/dbbvitor/GlassChain/issues/88):
+  **shipped (2026-09-10)** — storage-backed pins, signed rotation by the pinned
+  key, corrupt-pin fail-closed, documented operator recovery. Distinct from
+  storing node private keys (unchanged).
 - D1 governance bootstrap and D2 recall authority require owner/domain decisions.
   Keep safe defaults; specify unilateral regulator versus independent-party policy.
 - D5 deletion-after-restart and D6 triage discovery require acceptance tests before

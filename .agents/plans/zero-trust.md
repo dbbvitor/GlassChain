@@ -96,9 +96,12 @@ not delay unrelated confidentiality improvements.
   plus proof of possession; support remote principals. Specify revocation,
   expiry and deterministic historical authorization before wiring evaluation.
 - [Persist the TOFU registry](https://github.com/dbbvitor/GlassChain/issues/88)
-  remains a separate accepted-limitations decision. Durable pins need legitimate
-  key rotation, corruption handling, recovery and an operator audit trail—not
-  simply a file. Persisted node identity/key custody is related but not identical.
+  — **shipped (2026-09-10).** Pins write through the storage seam
+  (`tofu:peer:<addr>`) and load at startup; a changed fingerprint requires a
+  signed rotation by the pinned identity key; corrupt pins fail closed; each
+  registration/rotation/rejection logs an audit line (node/address, no
+  fingerprints). Recovery for a genuinely lost key is removing the stored
+  pin — documented in `docs/operations.md`. Persisted node identity/key custody is related but not identical.
 - Define trust-store/CRL refresh and established-session reauthorization. A check
   made during Hello cannot promise indefinite membership after expiry/revocation.
   Keep external retrieval off deterministic commit/replay paths and use explicit
@@ -205,8 +208,9 @@ pre-dating #95); evidence-path hardening beyond the journal is future work.
 
 ## Validation and next steps
 
-Plan the §8 regressions first, then D1/D2/D4/D5/D6 and the independently testable
-TLS negotiation work. Use current APIs/test harnesses; preserve default/all-feature
+Plan the §8 regressions first, then the remaining D1/D2/D4 decisions and the
+independently testable TLS negotiation work (D5/D6, #86, #88 and #110 are
+shipped). Use current APIs/test harnesses; preserve default/all-feature
 behaviour until an explicit adoption decision. Every implementation runs the
 workspace gates and adds its named failure-case test. WAN/resource scenarios
 and honest metric labels are specified in the performance and browser demo plans.

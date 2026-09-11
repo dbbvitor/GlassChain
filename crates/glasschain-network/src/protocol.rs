@@ -51,6 +51,14 @@ pub enum Message {
         /// invalid keeps the org unverified and org-gated paths fail closed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         certificate_proof: Option<String>,
+        /// Base64 ed25519 signature by the sender's identity key over
+        /// `tofu_pin_message(node_id, tls_cert_fingerprint)` (#88). A pinned
+        /// peer whose transport certificate is legitimately re-issued signs
+        /// its new fingerprint with the **pinned** key, so a persisted pin
+        /// survives key rotation while still rejecting an impostor. Absent on
+        /// nodes without an identity and on older peers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fingerprint_proof: Option<String>,
         /// The sender's stable TCP listening address (e.g. `"192.168.1.5:8000"`).
         ///
         /// Peers must use this address (rather than the TCP source address, which

@@ -222,8 +222,10 @@ hide unrelated warnings with broad `#[allow]` attributes.
 Treat these as invariants, not suggestions:
 
 - **Peer transport is TLS-encrypted by default.** Peers exchange certificates,
-  verify the fingerprint against the `Hello` message, and pin it in an in-memory
-  TOFU registry. Do not weaken or bypass this path.
+  verify the fingerprint against the `Hello` message, and pin it in a
+  storage-backed TOFU registry that survives restarts. A pinned fingerprint
+  moves only under a signed rotation by the pinned identity key (or explicit
+  operator recovery). Do not weaken or bypass this path.
 - `GLASSCHAIN_INSECURE_TLS=1` (and the `insecure-tls` feature on
   `glasschain-network`) disables verification. It is a **local-debugging escape
   hatch only**. Never make it the default, never widen its reach, and never add
@@ -236,6 +238,8 @@ Treat these as invariants, not suggestions:
   `--trust-store` are given, and logs explicitly when verification is off.
   Unverified organizations stay connected but every org-gated path
   (private-payload send/receive) fails closed — downgrade, not disconnect.
+  Org claims also need a session-bound possession proof (#110): a verified
+  certificate without its private key cannot use the private paths.
 - **Certificate revocation is fail-closed (ADR-013).** `CertChainVerifier`
   requires a current CRL from the issuing CA: missing (`CrlMissing`,
   `RevocationStatusUnknown`), expired (`CrlExpired`), or listing the serial
@@ -245,11 +249,11 @@ Treat these as invariants, not suggestions:
   from the same store and are revocation-checked. Revocation is go-forward
   only — committed history stays valid.
 - **Known, accepted limitations** (documented in README — do not "fix" them
-  silently as part of an unrelated change): TOFU trust is address-bound and
-  in-memory, trust-store distribution between organizations is manual and
-  out-of-band (no shared CA; on-chain registry deferred to #74), and TOFU
-  fingerprints do not persist across restarts (trust-store anchors and CRLs
-  do — they are config).
+  silently as part of an unrelated change): TOFU trust is address-bound,
+  trust-store distribution between organizations is manual and out-of-band
+  (no shared CA; on-chain registry deferred to #74), and a pin whose identity
+  key is genuinely lost needs operator recovery (remove the
+  `tofu:peer:<addr>` state key) — rotation is signed by the pinned key only.
 - Never commit keys, certificates, or `.pem` files. Identity material is generated
   at runtime by `glasschain-identity`.
 - Signing is ed25519 (`ed25519-dalek`), hashing is SHA-256. Don't swap primitives

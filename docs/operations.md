@@ -145,7 +145,7 @@ What happens: node-2 dials node-1; both sides exchange TLS certificates,
 upgrade to TLS, then swap `Hello` messages carrying node ID, TLS-certificate
 fingerprint, chain length, protocol version, capabilities, and organization.
 Each side cross-checks the fingerprint against the one observed during the
-TLS handshake and records the identity in an in-memory TOFU (Trust On First
+TLS handshake and records the identity in a storage-backed TOFU (Trust On First
 Use) registry. A transaction submitted on either node is admitted to its
 local pending pool and broadcast to the other (cross-node replication of
 *pending* state); blocks travel the same way, but only if one endpoint
@@ -561,8 +561,14 @@ ignored (`node.rs:2551–2559`).
   sides exchange self-signed certificates before the handshake.
 - **Certificate-fingerprint verification** — the Hello fingerprint must match
   the certificate presented in the TLS session.
-- **In-memory TOFU registry** — peer identity pinned at first contact per
-  listen address, enforced on reconnect.
+- **Persisted TOFU registry** — peer identity pinned at first contact per
+  listen address and written through the `StorageProvider` state seam
+  (`tofu:peer:<addr>`), so pins survive restarts. A changed transport
+  fingerprint is accepted only with a signed rotation by the pinned identity
+  key (`fingerprint_proof` in `Hello`); a corrupt stored pin fails closed and
+  refuses the address. **Recovery when a peer genuinely lost its key:**
+  remove the `tofu:peer:<addr>` state key and the peer re-pins on next
+  contact. Address-bound trust stays address-bound.
 
 ### The escape hatches — development only, never for deployments
 
@@ -594,13 +600,17 @@ feed `--all-features` builds).
    this node". Enforcement engages only when an embedder attaches a provider
    AND the `endorsement` capability is active at the candidate height
    (ADR-008/ADR-010).
-4. **Trust does not persist across restarts, and is address-bound.** The TOFU
-   registry is in-memory; a restart forgets every peer, and a peer that
-   changes its listen address is treated as brand-new. There is no shared CA
-   between organizations. These are known, accepted limitations.
-5. **The same caveat applies to private payloads** — with no org verifier
-   configured, collection membership is verified against the self-asserted
-   Hello `org`.
+4. **TOFU trust is persisted but address-bound.** Pins survive restarts and
+   move only under a signed rotation by the pinned identity key; a peer that
+   changes its listen address is still treated as brand-new, and a lost
+   identity key needs operator recovery (remove `tofu:peer:<addr>`). There is
+   no shared CA between organizations. Pin persistence also requires a real
+   storage path (`--storage-path`): with in-memory storage the registry is
+   lost like everything else.
+5. **Private payloads require verified orgs with possession.** With no org
+   verifier configured every private path fails closed (#86); with one, the
+   sender must present a certificate-verified member org **and** prove
+   possession of its key on the session (#110).
 
 The transport itself (TLS + per-session fingerprint + TOFU) is the only trust
 boundary fully live in the shipped binaries — treat a deployment as a
@@ -757,7 +767,7 @@ cargo bench -p glasschain-workflows   # crates/glasschain-workflows/benches/watc
 | `VerifyEndorsement` returns `approved: false`, reason `no endorsement provider configured on this node` | No endorsement provider attached (true for every shipped binary — issue #59) | Expected on a stock node. Attach a provider and activate the `endorsement` capability to enable enforcement. |
 | `message too large: N bytes (max 16777216)` | A frame exceeds the 16 MiB `MAX_MESSAGE_SIZE` | Don't send oversized messages; the cap is a protocol constant. |
 | `Transactions never mined`; `pending` keeps growing | **Expected on stock binaries.** The shipped `glasschain-node` never drives mining: `Node::mine()`/`mine_async()` are programmatic and only the integration tests call them (the `mine` REPL commands and `MineBlock` RPC were retired). Transactions sit in the pending pool until a block arrives from a peer | Nothing is broken. Blocks appear only when a connected peer that actually mines broadcasts one; to exercise block production end-to-end use the integration tests in `crates/glasschain-network/tests/`, or embed the `glasschain-network` `Node` and call `Node::mine_async()` yourself |
-| Everything lost after restart | No `--storage-path` (in-memory storage) | Use `--storage-path` for persistence; see Section 7. |
+| Everything lost after restart | No `--storage-path` (in-memory storage) — includes persisted TOFU pins | Use `--storage-path` for persistence; see Section 7. |
 | `QueryAssetHistory` returns an empty list for a known GTIN | Provenance index is built from committed `AssetRegistration` transactions; only custody events ingested from committed blocks are returned | Confirm the asset registration was actually mined (not still `pending`), then re-query. |
 | `WASM execution provider unavailable: …` (warn at startup) | Wasmtime failed to initialise | Rare; the node continues without VM execution (contracts with `wasm_code_b64` won't execute deterministically). |
 

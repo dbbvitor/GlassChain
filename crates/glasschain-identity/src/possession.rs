@@ -49,21 +49,31 @@ pub fn verify_org_possession(
     binding: &[u8],
     proof: &[u8],
 ) -> bool {
-    let Ok(der) = CertificateDer::from_pem_slice(cert_pem.as_bytes()) else {
+    let Some(key) = certificate_ed25519_public_key(cert_pem) else {
         return false;
     };
-    let Ok(cert) = Certificate::from_der(der.as_ref()) else {
-        return false;
-    };
-    let Some(raw) = cert
+    verify_ed25519(&key, &org_possession_message(org, node_id, binding), proof)
+}
+
+/// The raw 32-byte ed25519 public key inside a PEM certificate, if it parses
+/// and carries an ed25519 SPKI. `None` on any parse or shape mismatch.
+#[must_use]
+pub fn certificate_ed25519_public_key(cert_pem: &str) -> Option<[u8; 32]> {
+    let der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).ok()?;
+    let cert = Certificate::from_der(der.as_ref()).ok()?;
+    let raw = cert
         .tbs_certificate()
         .subject_public_key_info()
         .subject_public_key
-        .as_bytes()
-    else {
-        return false;
-    };
-    let Ok(key) = <[u8; 32]>::try_from(raw) else {
+        .as_bytes()?;
+    <[u8; 32]>::try_from(raw).ok()
+}
+
+/// Verify `proof` (a detached 64-byte ed25519 signature) over `message` under
+/// `public_key`. Any malformed input is `false`.
+#[must_use]
+pub fn verify_ed25519(public_key: &[u8], message: &[u8], proof: &[u8]) -> bool {
+    let Ok(key) = <[u8; 32]>::try_from(public_key) else {
         return false;
     };
     let Ok(verifying_key) = VerifyingKey::from_bytes(&key) else {
@@ -73,11 +83,25 @@ pub fn verify_org_possession(
         return false;
     };
     verifying_key
-        .verify(
-            &org_possession_message(org, node_id, binding),
-            &Signature::from_bytes(&signature),
-        )
+        .verify(message, &Signature::from_bytes(&signature))
         .is_ok()
+}
+
+/// The message a **TOFU pin rotation** proof signs (#88):
+/// `domain || len(node_id) || node_id || len(tls_cert_fingerprint) ||
+/// tls_cert_fingerprint`.
+///
+/// A peer's transport certificate may be re-issued (or regenerated on
+/// restart) while its identity key stays the same. The pinned key signs this
+/// message over the **new** transport fingerprint; the pin holder verifies it
+/// under the key pinned at first contact, so only the holder of the original
+/// identity key can re-key an address.
+#[must_use]
+pub fn tofu_pin_message(node_id: &str, tls_cert_fingerprint: &str) -> Vec<u8> {
+    let mut message = b"glasschain-tofu-pin:".to_vec();
+    push_field(&mut message, node_id.as_bytes());
+    push_field(&mut message, tls_cert_fingerprint.as_bytes());
+    message
 }
 
 #[cfg(test)]
