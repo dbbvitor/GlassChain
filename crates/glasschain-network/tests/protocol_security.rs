@@ -120,6 +120,7 @@ async fn send_hello(writer: &mut PeerWriter, node_id: &str, listen_addr: &str, f
         org: "org-test".to_owned(),
         certificate_pem: None,
         certificate_proof: None,
+        fingerprint_proof: None,
         capabilities: glasschain_core::CAPABILITY_V1
             .iter()
             .map(|c| glasschain_core::CapabilityAdvertisement {
@@ -650,6 +651,7 @@ async fn send_hello_as_org(
         org: org.to_owned(),
         certificate_pem: certificate_pem.map(str::to_owned),
         certificate_proof: certificate_proof.map(str::to_owned),
+        fingerprint_proof: None,
         listen_addr: listen_addr.to_owned(),
     };
     writer.send(&msg).await.unwrap();
@@ -860,6 +862,7 @@ async fn hello_with_old_wire_version_is_disconnected() {
         org: "org-old".to_owned(),
         certificate_pem: None,
         certificate_proof: None,
+        fingerprint_proof: None,
         listen_addr: "127.0.0.1:3".to_owned(),
     };
     writer.send(&stale).await.unwrap();
@@ -907,6 +910,7 @@ async fn hello_with_unverified_org_certificate_stays_connected_but_unverified() 
         org: "org-member".to_owned(),
         certificate_pem: Some(cert_pem),
         certificate_proof: None,
+        fingerprint_proof: None,
         listen_addr: "127.0.0.1:4".to_owned(),
     };
     writer.send(&hello).await.unwrap();

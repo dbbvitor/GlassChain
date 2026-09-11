@@ -37,7 +37,7 @@ inert** (the code exists, is tested, but no production binary activates it), and
 | 10 | Transient-store retention (default 72 h) + purge | **Implemented and enforced** — purge discovers persisted payloads from storage, so it survives restarts; the node runs a startup + 300 s sweep | `TransientStore` (`glasschain-storage/src/transient.rs`) |
 | 11 | Pull reconciliation (`RequestPrivatePayload`) | **Implemented; operator-triggered API, no production caller** | `reconcile_private_payloads` (`node.rs`) |
 | 12 | CRL / OCSP / any revocation check | **Not implemented** — no revocation path anywhere; chains are single-hop (no intermediates) | gap: issue #58 |
-| 13 | Trust persistence across restarts (peer registry, CA store) | **Not implemented** — accepted limitation (`AGENTS.md`) | — |
+| 13 | Trust persistence across restarts (peer registry, CA store) | **TOFU pins persist** (state key `tofu:peer:<addr>`, #88); certificate trust is config (`--trust-store`), not persisted state | `PeerRegistry`, `load_tofu_pins` (`node.rs`) |
 | 14 | RBAC / role principals (regulator, auditor, logistics) | **Not implemented** — deferred by ADR-008; principals are org members only | ADR-008 "Out of scope" |
 
 Two load-bearing facts behind rows 5–9, verified against the source:

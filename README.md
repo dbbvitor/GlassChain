@@ -23,7 +23,8 @@ pinned to Rust 1.95 and async on Tokio.
 - **Identity & endorsement** — MSP identities, organization CAs, endorsement
   policies over verified principals, CRL-based revocation (ADR-013).
 - **Federated network** — TLS-encrypted TCP P2P with certificate-fingerprint
-  pinning and an in-memory TOFU peer registry.
+  pinning and a persisted TOFU peer registry (signed rotation; operator
+  recovery by removing the pin).
 - **gRPC API** — Tonic/Prost server (ledger queries, tx submission, asset
   history, event streams), plus Rust transaction-building SDK helpers and a
     `glasschain` CLI. The SDK is not yet a complete network client.
@@ -101,7 +102,9 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
   ADR-010 §7 gates: testnet, API/stability evidence, licensing review and security
   audit. The current local tests do not establish production readiness.
 - **Peer organizations are self-asserted by default.** Verification is opt-in
-  (`--org` + `--trust-store`, fail-closed CRLs); otherwise TOFU fingerprint pinning is the only trust boundary — in-memory, address-bound, no shared CA.
+  (`--org` + `--trust-store`, fail-closed CRLs); otherwise TOFU fingerprint
+  pinning is the only trust boundary — persisted with signed rotation,
+  address-bound, no shared CA.
 - **Not regulatory-certified.** The schema is *aligned* with Anvisa/SNCM
   reporting concepts, but there is no certification, audit, or deployment.
 - **No best-in-class claims** — only internal harness results are published, with explicit caveats.

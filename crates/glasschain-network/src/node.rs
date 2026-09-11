@@ -373,8 +373,48 @@ struct VerifiedPeer {
     /// subject CN under a configured organization Root CA (ticket #47). Bare
     /// TOFU leaves this `false`: the org is self-asserted.
     org_verified: bool,
+    /// The peer's ed25519 identity public key, extracted from its
+    /// identity-backed certificate when present. The **pinned key** that must
+    /// sign a transport-fingerprint rotation (#88). `None` for peers without
+    /// an identity: their pin cannot rotate and needs operator recovery.
+    public_key: Option<Vec<u8>>,
     /// Capabilities the peer advertised in its most recent `Hello`.
     advertised: Vec<CapabilityAdvertisement>,
+}
+
+/// The persisted form of a TOFU pin (#88) — no session state like advertised
+/// capabilities.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StoredPeerPin {
+    node_id: String,
+    cert_fingerprint: String,
+    org: String,
+    org_verified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    public_key: Option<Vec<u8>>,
+}
+
+impl From<&VerifiedPeer> for StoredPeerPin {
+    fn from(peer: &VerifiedPeer) -> Self {
+        Self {
+            node_id: peer.node_id.clone(),
+            cert_fingerprint: peer.cert_fingerprint.clone(),
+            org: peer.org.clone(),
+            org_verified: peer.org_verified,
+            public_key: peer.public_key.clone(),
+        }
+    }
+}
+
+/// The outcome of a TOFU verification: what happened to the pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TofuOutcome {
+    /// First contact — a new pin.
+    New,
+    /// Known peer, identity unchanged.
+    Known,
+    /// The pinned fingerprint was replaced by a signed rotation (#88).
+    Rotated,
 }
 
 impl VerifiedPeer {
@@ -405,6 +445,9 @@ impl VerifiedPeer {
 /// still verified against their original identity.
 struct PeerRegistry {
     peers: HashMap<String, VerifiedPeer>,
+    /// Addresses whose persisted pin could not be read (#88): every Hello
+    /// from them is refused until an operator removes the stored key.
+    poisoned: HashMap<String, String>,
 }
 
 impl PeerRegistry {
@@ -420,14 +463,29 @@ impl PeerRegistry {
     fn new() -> Self {
         Self {
             peers: HashMap::new(),
+            poisoned: HashMap::new(),
         }
+    }
+
+    /// Mark a persisted pin unreadable (#88): every future Hello from that
+    /// address is refused until an operator removes the stored key. Fail
+    /// closed — a corrupt trust record must not silently re-pin.
+    fn poison(&mut self, listen_addr: &str, reason: String) {
+        self.poisoned.insert(listen_addr.to_owned(), reason);
     }
 
     /// Verify and optionally register a peer.
     ///
-    /// * First contact → identity is recorded, returns `Ok(true)`.
-    /// * Known peer, identity matches → returns `Ok(false)`.
-    /// * Known peer, identity **changed** → returns `Err(reason)`.
+    /// * First contact → identity is recorded, returns [`TofuOutcome::New`].
+    /// * Known peer, identity matches → [`TofuOutcome::Known`] (the pin is
+    ///   refreshed when verification data improved).
+    /// * Known peer, fingerprint changed with a valid signed rotation under
+    ///   the pinned identity key → [`TofuOutcome::Rotated`] (#88).
+    /// * Known peer, any other change → `Err(reason)`.
+    /// * A poisoned (unreadable persisted) pin → `Err(reason)`, fail closed.
+    // The parameters are the fields of one Hello's identity claim; a wrapper
+    // struct would only move them elsewhere for the tests that build claims.
+    #[allow(clippy::too_many_arguments)]
     fn verify_or_register(
         &mut self,
         listen_addr: &str,
@@ -435,17 +493,20 @@ impl PeerRegistry {
         cert_fingerprint: &str,
         org: &str,
         org_verified: bool,
-    ) -> Result<bool, String> {
-        if let Some(existing) = self.peers.get(listen_addr) {
+        public_key: Option<Vec<u8>>,
+        fingerprint_proof: Option<&[u8]>,
+    ) -> Result<TofuOutcome, String> {
+        if let Some(reason) = self.poisoned.get(listen_addr) {
+            return Err(format!(
+                "persisted TOFU pin for '{listen_addr}' is unreadable ({reason}); \
+                 remove the stored pin to re-trust this address"
+            ));
+        }
+        if let Some(existing) = self.peers.get_mut(listen_addr) {
             if existing.node_id != node_id {
                 return Err(format!(
                     "node_id changed: expected '{}', got '{node_id}'",
                     existing.node_id,
-                ));
-            }
-            if existing.cert_fingerprint != cert_fingerprint {
-                return Err(format!(
-                    "TLS certificate fingerprint changed for node '{node_id}'"
                 ));
             }
             // Org drift: a returning peer claiming a different organization is
@@ -457,7 +518,49 @@ impl PeerRegistry {
                     existing.org
                 ));
             }
-            Ok(false)
+            if existing.cert_fingerprint != cert_fingerprint {
+                // Transport re-issue (#88): only the pinned identity key may
+                // authorize a new fingerprint, so a persisted pin never
+                // silently forgets the original peer.
+                let Some(pinned_key) = existing.public_key.as_deref() else {
+                    return Err(format!(
+                        "TLS certificate fingerprint changed for node '{node_id}' and no \
+                         pinned identity key is available for a signed rotation; operator \
+                         action required"
+                    ));
+                };
+                let Some(proof) = fingerprint_proof else {
+                    return Err(format!(
+                        "TLS certificate fingerprint changed for node '{node_id}' without a \
+                         signed rotation proof"
+                    ));
+                };
+                if !glasschain_identity::verify_ed25519(
+                    pinned_key,
+                    &glasschain_identity::tofu_pin_message(node_id, cert_fingerprint),
+                    proof,
+                ) {
+                    return Err(format!(
+                        "TLS certificate fingerprint changed for node '{node_id}' with an \
+                         invalid rotation proof (not signed by the pinned key)"
+                    ));
+                }
+                cert_fingerprint.clone_into(&mut existing.cert_fingerprint);
+                existing.org_verified = org_verified;
+                if public_key.is_some() {
+                    existing.public_key = public_key;
+                }
+                return Ok(TofuOutcome::Rotated);
+            }
+            // Same identity: refresh verification data that improved (e.g. the
+            // org became verified, or the identity certificate appeared).
+            if org_verified && !existing.org_verified {
+                existing.org_verified = true;
+            }
+            if existing.public_key.is_none() && public_key.is_some() {
+                existing.public_key = public_key;
+            }
+            Ok(TofuOutcome::Known)
         } else {
             self.peers.insert(
                 listen_addr.to_owned(),
@@ -466,11 +569,28 @@ impl PeerRegistry {
                     cert_fingerprint: cert_fingerprint.to_owned(),
                     org: org.to_owned(),
                     org_verified,
+                    public_key,
                     advertised: Vec::new(),
                 },
             );
-            Ok(true)
+            Ok(TofuOutcome::New)
         }
+    }
+
+    /// Load a persisted pin without a Hello: registration is trusted because
+    /// it was written through [`PeerRegistry::verify_or_register`] (#88).
+    fn load_pin(&mut self, listen_addr: String, pin: StoredPeerPin) {
+        self.peers.insert(
+            listen_addr,
+            VerifiedPeer {
+                node_id: pin.node_id,
+                cert_fingerprint: pin.cert_fingerprint,
+                org: pin.org,
+                org_verified: pin.org_verified,
+                public_key: pin.public_key,
+                advertised: Vec::new(),
+            },
+        );
     }
 
     /// Record the capabilities a peer advertised in its latest `Hello`.
@@ -490,6 +610,70 @@ impl PeerRegistry {
 }
 
 // ── Node ──────────────────────────────────────────────────────────────────────
+
+/// Storage-key prefix for persisted TOFU pins (#88).
+const TOFU_PIN_PREFIX: &str = "tofu:peer:";
+
+/// Persist a pin through the state seam; a write failure is logged and the
+/// pin stays in memory (the next successful write persists it).
+fn persist_tofu_pin(storage: &Arc<dyn StorageProvider>, listen_addr: &str, peer: &VerifiedPeer) {
+    match serde_json::to_vec(&StoredPeerPin::from(peer)) {
+        Ok(bytes) => {
+            let key = format!("{TOFU_PIN_PREFIX}{listen_addr}");
+            if let Err(e) = storage.put_state(&key, &bytes) {
+                log::warn!("TOFU: failed to persist pin for {listen_addr}: {e}");
+            }
+        }
+        Err(e) => log::warn!("TOFU: failed to encode pin for {listen_addr}: {e}"),
+    }
+}
+
+/// Load persisted TOFU pins at startup (#88). A corrupt or unreadable entry
+/// **poisons** that address: the peer is refused until an operator removes the
+/// stored pin — a persisted trust record must never silently re-pin.
+async fn load_tofu_pins(storage: &Arc<dyn StorageProvider>, state: &Arc<Mutex<NodeState>>) {
+    let keys = match storage.list_state_keys(TOFU_PIN_PREFIX) {
+        Ok(keys) => keys,
+        Err(e) => {
+            log::warn!("TOFU: cannot enumerate persisted pins: {e}");
+            return;
+        }
+    };
+    // Parse without the state lock; only the registry mutation needs it.
+    let mut pins: Vec<(String, StoredPeerPin)> = Vec::new();
+    let mut poisoned: Vec<(String, String)> = Vec::new();
+    for key in keys {
+        let Some(addr) = key.strip_prefix(TOFU_PIN_PREFIX).map(str::to_owned) else {
+            continue;
+        };
+        match storage.get_state(&key) {
+            Ok(Some(raw)) => match serde_json::from_slice::<StoredPeerPin>(&raw) {
+                Ok(pin) => pins.push((addr, pin)),
+                Err(e) => {
+                    log::error!("TOFU: unreadable persisted pin at {key}: {e}");
+                    poisoned.push((addr, e.to_string()));
+                }
+            },
+            Ok(None) => {}
+            Err(e) => {
+                log::error!("TOFU: cannot read persisted pin at {key}: {e}");
+                poisoned.push((addr, e.to_string()));
+            }
+        }
+    }
+    let loaded = pins.len();
+    let mut s = state.lock().await;
+    for (addr, pin) in pins {
+        s.peer_registry.load_pin(addr, pin);
+    }
+    for (addr, reason) in poisoned {
+        s.peer_registry.poison(&addr, reason);
+    }
+    drop(s);
+    if loaded > 0 {
+        log::info!("TOFU: loaded {loaded} persisted peer pin(s)");
+    }
+}
 
 /// Interval between retention sweeps (D5): expired private payloads are
 /// purged from storage. The first tick fires immediately, so a restart purges
@@ -1354,6 +1538,10 @@ impl Node {
             &self.flattener,
         )
         .await;
+
+        // Persisted TOFU pins (#88): a restart keeps the trust decisions made
+        // before it, with signed rotation as the only way a fingerprint moves.
+        load_tofu_pins(&self.storage, &self.state).await;
 
         // Retention sweep (D5): purge expired private payloads at startup and
         // on a fixed interval. The sweep enumerates storage, so payloads
@@ -2677,6 +2865,15 @@ async fn build_local_hello(ctx: &PeerContext) -> Message {
         ))),
         _ => None,
     };
+    // Signed pin rotation (#88): the identity key signs this session's
+    // transport fingerprint, so a peer holding the persisted pin can accept a
+    // re-issued certificate without forgetting the original key.
+    let fingerprint_proof = identity.as_ref().map(|identity| {
+        BASE64_STANDARD.encode(identity.sign_bytes(&glasschain_identity::tofu_pin_message(
+            &ctx.node_id,
+            &ctx.local_tls_cert_fingerprint,
+        )))
+    });
     Message::Hello {
         node_id: ctx.node_id.clone(),
         tls_cert_fingerprint: ctx.local_tls_cert_fingerprint.clone(),
@@ -2692,6 +2889,7 @@ async fn build_local_hello(ctx: &PeerContext) -> Message {
         org,
         certificate_pem,
         certificate_proof,
+        fingerprint_proof,
         listen_addr: ctx.listen_addr.clone(),
     }
 }
@@ -3402,6 +3600,7 @@ async fn process_message(
             org: peer_org,
             certificate_pem: peer_certificate_pem,
             certificate_proof: peer_certificate_proof,
+            fingerprint_proof: peer_fingerprint_proof,
         } => {
             log::info!(
                 "Hello from {addr} (id={peer_id}, chain_len={chain_length}, listen={peer_listen_addr})"
@@ -3506,27 +3705,54 @@ async fn process_message(
             // ── Step 2: TOFU peer registry ────────────────────────────
             // First contact  → record identity (node_id + cert fingerprint).
             // Reconnection   → verify identity has not changed.
-            // Identity drift → reject the peer.
+            // Fingerprint change → accept only with a signed rotation by the
+            // pinned identity key (#88); otherwise reject.
             {
                 let mut s = ctx.state.lock().await;
+                // The pinned identity key: from the identity-backed
+                // certificate when present. Peers without one cannot rotate.
+                let pinned_public_key = peer_certificate_pem
+                    .as_deref()
+                    .and_then(glasschain_identity::certificate_ed25519_public_key)
+                    .map(Vec::from);
+                let fingerprint_proof = peer_fingerprint_proof
+                    .as_deref()
+                    .and_then(|proof| BASE64_STANDARD.decode(proof).ok());
                 match s.peer_registry.verify_or_register(
                     &peer_listen_addr,
                     &peer_id,
                     observed_cert_fingerprint,
                     &peer_org,
                     org_verified,
+                    pinned_public_key,
+                    fingerprint_proof.as_deref(),
                 ) {
-                    Ok(is_new) => {
-                        if is_new {
-                            log::info!(
-                                "TOFU: recorded new peer identity for {peer_listen_addr} \
-                                 (node_id={peer_id})"
-                            );
-                        } else {
-                            log::debug!(
-                                "TOFU: verified returning peer {peer_listen_addr} \
-                                 (node_id={peer_id})"
-                            );
+                    Ok(outcome) => {
+                        // Persist the pin (#88) so the decision survives a
+                        // restart. Logs name the node/address only — never
+                        // fingerprints (CodeQL cleartext-logging precedent).
+                        if let Some(peer) = s.peer_registry.peers.get(&peer_listen_addr).cloned() {
+                            persist_tofu_pin(&ctx.storage, &peer_listen_addr, &peer);
+                        }
+                        match outcome {
+                            TofuOutcome::New => {
+                                log::info!(
+                                    "TOFU: recorded new peer identity for {peer_listen_addr} \
+                                     (node_id={peer_id})"
+                                );
+                            }
+                            TofuOutcome::Rotated => {
+                                log::warn!(
+                                    "TOFU: rotated the pinned fingerprint for {peer_listen_addr} \
+                                     (node_id={peer_id}) under a proof by the pinned key"
+                                );
+                            }
+                            TofuOutcome::Known => {
+                                log::debug!(
+                                    "TOFU: verified returning peer {peer_listen_addr} \
+                                     (node_id={peer_id})"
+                                );
+                            }
                         }
                     }
                     Err(reason) => {
@@ -4102,8 +4328,16 @@ mod tests {
     #[test]
     fn tofu_first_contact_records_identity() {
         let mut reg = PeerRegistry::new();
-        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a", false);
-        assert_eq!(result, Ok(true), "first contact should return Ok(true)");
+        let result = reg.verify_or_register(
+            "127.0.0.1:8000",
+            "node-a",
+            "abc123",
+            "org-a",
+            false,
+            None,
+            None,
+        );
+        assert_eq!(result, Ok(TofuOutcome::New));
         assert_eq!(reg.peers.len(), 1);
         let peer = &reg.peers["127.0.0.1:8000"];
         assert_eq!(peer.node_id, "node-a");
@@ -4113,32 +4347,75 @@ mod tests {
     #[test]
     fn tofu_returning_peer_with_same_identity_passes() {
         let mut reg = PeerRegistry::new();
-        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a", false)
-            .unwrap();
-        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a", false);
-        assert_eq!(
-            result,
-            Ok(false),
-            "returning peer with same identity should return Ok(false)"
+        reg.verify_or_register(
+            "127.0.0.1:8000",
+            "node-a",
+            "abc123",
+            "org-a",
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let result = reg.verify_or_register(
+            "127.0.0.1:8000",
+            "node-a",
+            "abc123",
+            "org-a",
+            false,
+            None,
+            None,
         );
+        assert_eq!(result, Ok(TofuOutcome::Known));
     }
 
     #[test]
     fn tofu_rejects_node_id_change() {
         let mut reg = PeerRegistry::new();
-        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a", false)
-            .unwrap();
-        let result =
-            reg.verify_or_register("127.0.0.1:8000", "node-IMPOSTER", "abc123", "org-b", false);
+        reg.verify_or_register(
+            "127.0.0.1:8000",
+            "node-a",
+            "abc123",
+            "org-a",
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let result = reg.verify_or_register(
+            "127.0.0.1:8000",
+            "node-IMPOSTER",
+            "abc123",
+            "org-b",
+            false,
+            None,
+            None,
+        );
         assert!(result.is_err(), "changed node_id should be rejected");
     }
 
     #[test]
-    fn tofu_rejects_cert_fingerprint_change() {
+    fn tofu_rejects_cert_fingerprint_change_without_a_signed_rotation() {
         let mut reg = PeerRegistry::new();
-        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a", false)
-            .unwrap();
-        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "TAMPERED", "org-a", false);
+        reg.verify_or_register(
+            "127.0.0.1:8000",
+            "node-a",
+            "abc123",
+            "org-a",
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let result = reg.verify_or_register(
+            "127.0.0.1:8000",
+            "node-a",
+            "TAMPERED",
+            "org-a",
+            false,
+            None,
+            None,
+        );
         assert!(
             result.is_err(),
             "changed cert fingerprint should be rejected"
@@ -4146,13 +4423,112 @@ mod tests {
     }
 
     #[test]
+    fn tofu_rotation_requires_a_proof_by_the_pinned_key() {
+        let mut reg = PeerRegistry::new();
+        let identity = glasschain_identity::Identity::generate("node-a");
+        let pinned = identity.public_key_bytes().to_vec();
+        reg.verify_or_register(
+            "127.0.0.1:8000",
+            "node-a",
+            "old-fingerprint",
+            "org-a",
+            true,
+            Some(pinned.clone()),
+            None,
+        )
+        .unwrap();
+
+        // A changed fingerprint without a proof is rejected.
+        let refused = reg.verify_or_register(
+            "127.0.0.1:8000",
+            "node-a",
+            "new-fingerprint",
+            "org-a",
+            true,
+            Some(pinned.clone()),
+            None,
+        );
+        assert!(refused.is_err());
+
+        // A proof by the pinned key rotates the pin.
+        let proof = identity.sign_bytes(&glasschain_identity::tofu_pin_message(
+            "node-a",
+            "new-fingerprint",
+        ));
+        let rotated = reg.verify_or_register(
+            "127.0.0.1:8000",
+            "node-a",
+            "new-fingerprint",
+            "org-a",
+            true,
+            Some(pinned),
+            Some(&proof),
+        );
+        assert_eq!(rotated, Ok(TofuOutcome::Rotated));
+        assert_eq!(
+            reg.peers["127.0.0.1:8000"].cert_fingerprint,
+            "new-fingerprint"
+        );
+
+        // A different key's proof is rejected for the next rotation.
+        let impostor = glasschain_identity::Identity::generate("node-a");
+        let forged = impostor.sign_bytes(&glasschain_identity::tofu_pin_message(
+            "node-a",
+            "newer-fingerprint",
+        ));
+        let refused = reg.verify_or_register(
+            "127.0.0.1:8000",
+            "node-a",
+            "newer-fingerprint",
+            "org-a",
+            true,
+            Some(impostor.public_key_bytes().to_vec()),
+            Some(&forged),
+        );
+        assert!(refused.is_err(), "a non-pinned key must not rotate");
+    }
+
+    #[test]
+    fn tofu_poisoned_pin_fails_closed() {
+        let mut reg = PeerRegistry::new();
+        reg.poison("127.0.0.1:8000", "corrupt JSON".to_owned());
+        let result = reg.verify_or_register(
+            "127.0.0.1:8000",
+            "node-a",
+            "abc123",
+            "org-a",
+            true,
+            None,
+            None,
+        );
+        let err = result.expect_err("a poisoned pin must refuse the peer");
+        assert!(err.contains("unreadable"), "{err}");
+    }
+
+    #[test]
     fn tofu_rejects_org_drift() {
         let mut reg = PeerRegistry::new();
-        reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-a", true)
-            .unwrap();
+        reg.verify_or_register(
+            "127.0.0.1:8000",
+            "node-a",
+            "abc123",
+            "org-a",
+            true,
+            None,
+            None,
+        )
+        .unwrap();
         // A returning peer claiming a different organization is rejected:
         // the org gates private-payload delivery (ticket #47).
-        let result = reg.verify_or_register("127.0.0.1:8000", "node-a", "abc123", "org-b", true);
+        let result = reg.verify_or_register(
+            "127.0.0.1:8000",
+            "node-a",
+            "abc123",
+            "org-b",
+            true,
+            None,
+            None,
+        );
         let err = result.expect_err("org drift should be rejected");
         assert!(err.contains("org changed"), "{err}");
     }
@@ -4160,21 +4536,61 @@ mod tests {
     #[test]
     fn tofu_independent_addresses_are_independent() {
         let mut reg = PeerRegistry::new();
-        reg.verify_or_register("127.0.0.1:8000", "node-a", "aaa", "org-a", false)
-            .unwrap();
-        reg.verify_or_register("127.0.0.1:9000", "node-b", "bbb", "org-b", false)
-            .unwrap();
+        reg.verify_or_register(
+            "127.0.0.1:8000",
+            "node-a",
+            "aaa",
+            "org-a",
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        reg.verify_or_register(
+            "127.0.0.1:9000",
+            "node-b",
+            "bbb",
+            "org-b",
+            false,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(reg.peers.len(), 2);
         // Each address keeps its own identity.
         assert!(reg
-            .verify_or_register("127.0.0.1:8000", "node-a", "aaa", "org-a", false)
+            .verify_or_register(
+                "127.0.0.1:8000",
+                "node-a",
+                "aaa",
+                "org-a",
+                false,
+                None,
+                None
+            )
             .is_ok());
         assert!(reg
-            .verify_or_register("127.0.0.1:9000", "node-b", "bbb", "org-b", false)
+            .verify_or_register(
+                "127.0.0.1:9000",
+                "node-b",
+                "bbb",
+                "org-b",
+                false,
+                None,
+                None
+            )
             .is_ok());
         // Cross-contamination is rejected.
         assert!(reg
-            .verify_or_register("127.0.0.1:8000", "node-b", "aaa", "org-b", false)
+            .verify_or_register(
+                "127.0.0.1:8000",
+                "node-b",
+                "aaa",
+                "org-b",
+                false,
+                None,
+                None
+            )
             .is_err());
     }
 
