@@ -1805,7 +1805,13 @@ impl Node {
                     .is_active(ENDORSEMENT_CAPABILITY_ID);
                 if active {
                     let policies = self.state.lock().await.policies.clone();
-                    evaluate_transaction_endorsements(provider.as_ref(), &policies, &tx, &[])?;
+                    evaluate_transaction_endorsements(
+                        provider.as_ref(),
+                        &policies,
+                        &tx,
+                        &[],
+                        next_height,
+                    )?;
                 }
             }
         }
@@ -2209,7 +2215,13 @@ impl Node {
                 .is_active(ENDORSEMENT_CAPABILITY_ID)
             {
                 for tx in &block.transactions {
-                    evaluate_transaction_endorsements(provider.as_ref(), &policies, tx, &[])?;
+                    evaluate_transaction_endorsements(
+                        provider.as_ref(),
+                        &policies,
+                        tx,
+                        &[],
+                        block.index,
+                    )?;
                 }
                 for write in &block.write_set {
                     if !block
@@ -2278,7 +2290,13 @@ impl Node {
         scratch.validate_block(block)?;
         for (tx_index, tx) in block.transactions.iter().enumerate() {
             let writes = per_tx_writes.get(tx_index).map_or(&[][..], Vec::as_slice);
-            evaluate_transaction_endorsements(provider.as_ref(), &policies, tx, writes)?;
+            evaluate_transaction_endorsements(
+                provider.as_ref(),
+                &policies,
+                tx,
+                writes,
+                block.index,
+            )?;
         }
         if per_tx_writes.is_empty() {
             // No write attribution on replay paths: every committed write
@@ -2324,9 +2342,12 @@ impl Node {
             .policies_for(&request.target.channel, &request.target.contract);
         let provider = provider.clone();
         drop(s);
+        // Ad-hoc verification for callers: evaluate at the next height, the
+        // same boundary the submit gate uses.
+        let next_height = self.ledger.lock().await.chain.len() as u64;
         let mut evaluations = Vec::new();
         for policy in policies.applicable(&request.target) {
-            evaluations.push(provider.evaluate(&policy, &request)?);
+            evaluations.push(provider.evaluate(&policy, &request, next_height)?);
         }
         Ok(evaluations)
     }

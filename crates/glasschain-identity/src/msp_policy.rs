@@ -7,10 +7,29 @@
 //! rejected, invalid signatures are skipped, and at most one signature counts
 //! per distinct principal.
 //!
-//! ponytail: the directory stands in for certificate-bound MSP verification;
-//! certificate-backed identity plumbing is Stage 2 (ADR-008 consequences) and
-//! will register identities from issued certificates into the same directory.
+//! # Certificate-bound registration and height-based authorization (#87, D4)
+//!
+//! [`MspEndorsementProvider::register_certificate`] derives the principal from
+//! a certificate verified against the organization anchor (chain, subject CN,
+//! validity, CRL — all at **registration** time) plus a proof of possession of
+//! the certificate's signing key. Each entry records the height it becomes
+//! valid at; [`MspEndorsementProvider::revoke`] records the height it stops
+//! being valid. Evaluation at a height checks those bounds only — no wall
+//! clock and no mutable CRL are consulted after registration, so a committed
+//! endorsement verifies identically on replay (revocation is go-forward).
+//!
+//! The registry is configured out-of-band (like the trust store) and is
+//! assumed identical across validators until a chain-derived registry exists
+//! (adjacent to issue #74). [`MspEndorsementProvider::register`] remains the
+//! trusted local provisioning path (valid from height 0, unverified) for
+//! embedders and tests.
 
+use crate::cert_verifier::{CertChainVerifier, CertVerificationError};
+use crate::possession::{
+    certificate_ed25519_public_key, certificate_organization, msp_registration_message,
+    verify_ed25519,
+};
+use crate::Identity;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use glasschain_core::{
     CoreError, EndorsementEvaluation, EndorsementProvider, EndorsementRequest, PolicyExpression,
@@ -18,13 +37,48 @@ use glasschain_core::{
 };
 use std::collections::{HashMap, HashSet};
 
-use crate::Identity;
+/// Errors from certificate-bound principal registration.
+#[derive(Debug, thiserror::Error)]
+pub enum MspRegistrationError {
+    /// The identity carries no organization-issued certificate.
+    #[error("identity '{0}' has no organization certificate")]
+    MissingCertificate(String),
+    /// The certificate failed chain/validity/revocation verification.
+    #[error("certificate verification failed: {0}")]
+    Certificate(#[from] CertVerificationError),
+    /// The certificate's subject Organization does not match the claimed one.
+    #[error("certificate organization '{subject}' does not match '{org}'")]
+    OrgMismatch {
+        /// The claimed organization.
+        org: String,
+        /// The certificate's subject Organization name.
+        subject: String,
+    },
+    /// The certificate carries no 32-byte ed25519 public key.
+    #[error("certificate carries no ed25519 public key")]
+    NoPublicKey,
+    /// The proof of possession does not verify under the certificate's key.
+    #[error("proof of possession does not verify")]
+    ProofInvalid,
+}
+
+/// One registered key's authorization record. Height bounds are the only
+/// validity inputs at evaluation time (#87).
+#[derive(Debug, Clone)]
+struct RegisteredPrincipal {
+    principal: Principal,
+    /// Height from which the key is authorized for new endorsements.
+    valid_from: u64,
+    /// Height from which the key is no longer authorized (go-forward
+    /// revocation). `None` while the key is live.
+    revoked_at: Option<u64>,
+}
 
 /// Ed25519-verifying endorsement provider over a registered MSP key directory.
 #[derive(Debug, Default)]
 pub struct MspEndorsementProvider {
-    /// Public-key bytes → verified principal.
-    directory: HashMap<Vec<u8>, Principal>,
+    /// Public-key bytes → authorization record.
+    directory: HashMap<Vec<u8>, RegisteredPrincipal>,
 }
 
 impl MspEndorsementProvider {
@@ -36,14 +90,109 @@ impl MspEndorsementProvider {
 
     /// Register an MSP member: `public_key` is the raw 32-byte ed25519 key and
     /// `principal` the verified organization member identity derived from it.
+    ///
+    /// **Trusted local provisioning only** — no certificate is checked. Remote
+    /// principals go through [`Self::register_certificate`].
     pub fn register(&mut self, public_key: Vec<u8>, principal: Principal) {
-        self.directory.insert(public_key, principal);
+        self.directory.insert(
+            public_key,
+            RegisteredPrincipal {
+                principal,
+                valid_from: 0,
+                revoked_at: None,
+            },
+        );
     }
 
     /// Register an [`Identity`] under a principal, binding the identity's
-    /// public key to the principal it signs for.
+    /// public key to the principal it signs for. Trusted local provisioning
+    /// (see [`Self::register`]).
     pub fn register_identity(&mut self, identity: &Identity, principal: Principal) {
         self.register(identity.public_key_bytes().to_vec(), principal);
+    }
+
+    /// Register a remote principal from its organization certificate (#87):
+    /// the certificate must verify against `verifier` (chain, validity, CRL —
+    /// fail closed), its subject **Organization** must equal `org`, and
+    /// `proof` must be a signature by the certificate's key over
+    /// [`msp_registration_message`]. The entry becomes valid at
+    /// `valid_from_height` for new endorsements; committed history at earlier
+    /// heights is unaffected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MspRegistrationError`] for a missing certificate, any
+    /// verification failure, an org mismatch, a certificate without an
+    /// ed25519 key, or an invalid possession proof.
+    pub fn register_certificate(
+        &mut self,
+        cert_pem: &str,
+        proof: &[u8],
+        org: &str,
+        verifier: &CertChainVerifier,
+        valid_from_height: u64,
+    ) -> Result<(), MspRegistrationError> {
+        verifier.verify_cert_pem(cert_pem)?;
+        let subject = certificate_organization(cert_pem).unwrap_or_else(|| "(absent)".to_owned());
+        if subject != org {
+            return Err(MspRegistrationError::OrgMismatch {
+                org: org.to_owned(),
+                subject,
+            });
+        }
+        let public_key =
+            certificate_ed25519_public_key(cert_pem).ok_or(MspRegistrationError::NoPublicKey)?;
+        if !verify_ed25519(
+            &public_key,
+            &msp_registration_message(org, &public_key),
+            proof,
+        ) {
+            return Err(MspRegistrationError::ProofInvalid);
+        }
+        self.directory.insert(
+            public_key.to_vec(),
+            RegisteredPrincipal {
+                principal: Principal::new(org),
+                valid_from: valid_from_height,
+                revoked_at: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// Convenience wrapper for the local node's own identity: signs the
+    /// registration proof with the identity's key and registers the
+    /// certificate-bound principal. The identity must carry a certificate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MspRegistrationError`] as [`Self::register_certificate`].
+    pub fn register_own_identity(
+        &mut self,
+        identity: &Identity,
+        org: &str,
+        verifier: &CertChainVerifier,
+        valid_from_height: u64,
+    ) -> Result<(), MspRegistrationError> {
+        let cert_pem = identity
+            .certificate_pem
+            .as_deref()
+            .ok_or_else(|| MspRegistrationError::MissingCertificate(identity.node_id.clone()))?;
+        let proof =
+            identity.sign_bytes(&msp_registration_message(org, &identity.public_key_bytes()));
+        self.register_certificate(cert_pem, &proof, org, verifier, valid_from_height)
+    }
+
+    /// Revoke a key from `at_height` onward (go-forward, ADR-013): new
+    /// endorsements at or after that height are rejected, while committed
+    /// history before it keeps verifying. Returns `false` for an unknown key.
+    pub fn revoke(&mut self, public_key: &[u8], at_height: u64) -> bool {
+        if let Some(entry) = self.directory.get_mut(public_key) {
+            entry.revoked_at = Some(at_height);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -52,6 +201,7 @@ impl EndorsementProvider for MspEndorsementProvider {
         &self,
         expression: &PolicyExpression,
         request: &EndorsementRequest,
+        height: u64,
     ) -> Result<EndorsementEvaluation, CoreError> {
         // Allow-all shapes are not valid v1 policy metadata (ADR-008 decision
         // 1); validate before counting so no caller can smuggle one in.
@@ -60,17 +210,35 @@ impl EndorsementProvider for MspEndorsementProvider {
         let mut distinct: HashSet<Principal> = HashSet::new();
 
         for signer in &request.signers {
-            let Some(verified) = self.directory.get(&signer.public_key) else {
+            let Some(entry) = self.directory.get(&signer.public_key) else {
                 return Err(CoreError::InvalidTransaction(format!(
                     "endorsement: unknown signing key (hex {}...)",
                     hex::encode(&signer.public_key[..signer.public_key.len().min(4)])
                 )));
             };
-            if verified != &signer.claimed_principal {
+            if entry.principal != signer.claimed_principal {
                 return Err(CoreError::InvalidTransaction(format!(
                     "endorsement: claimed principal '{}' conflicts with verified principal '{}'",
                     signer.claimed_principal.as_str(),
-                    verified.as_str()
+                    entry.principal.as_str()
+                )));
+            }
+            // Height-based authorization (#87): the committed decision, not a
+            // current-time check. A key is valid from its registration height
+            // and stops being valid at its revocation height.
+            if height < entry.valid_from {
+                return Err(CoreError::InvalidTransaction(format!(
+                    "endorsement: principal '{}' is not authorized at height {height} \
+                     (valid from {})",
+                    entry.principal.as_str(),
+                    entry.valid_from
+                )));
+            }
+            if entry.revoked_at.is_some_and(|revoked| height >= revoked) {
+                return Err(CoreError::InvalidTransaction(format!(
+                    "endorsement: principal '{}' was revoked at height {}",
+                    entry.principal.as_str(),
+                    entry.revoked_at.expect("checked by is_some_and")
                 )));
             }
 
@@ -101,7 +269,7 @@ impl EndorsementProvider for MspEndorsementProvider {
                 continue;
             }
 
-            distinct.insert(verified.clone());
+            distinct.insert(entry.principal.clone());
         }
 
         Ok(EndorsementEvaluation {
@@ -123,7 +291,11 @@ impl EndorsementProvider for MspEndorsementProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Organization;
     use glasschain_core::{EndorserIdentity, ScopedTarget};
+
+    /// The height the tests evaluate at (after every registration below).
+    const AT: u64 = 10;
 
     fn request(payload: &[u8], signers: Vec<EndorserIdentity>) -> EndorsementRequest {
         EndorsementRequest {
@@ -164,6 +336,7 @@ mod tests {
             .evaluate(
                 &expression,
                 &request(b"canonical-payload", vec![signer(&org_a, "org-a")]),
+                AT,
             )
             .expect("valid signer");
         assert!(result.satisfied);
@@ -188,6 +361,7 @@ mod tests {
                     b"canonical-payload",
                     vec![signer(&org_a, "org-a"), signer(&org_b, "org-b")],
                 ),
+                AT,
             )
             .expect("valid signers");
         assert!(result.satisfied);
@@ -213,6 +387,7 @@ mod tests {
                     b"canonical-payload",
                     vec![signer(&org_a, "org-a"), signer(&org_a, "org-a")],
                 ),
+                AT,
             )
             .expect("valid signer");
         assert!(!result.satisfied);
@@ -235,6 +410,7 @@ mod tests {
                         signer(&org_b, "org-b"),
                     ],
                 ),
+                AT,
             )
             .expect("valid signers");
         assert!(
@@ -252,6 +428,7 @@ mod tests {
             .evaluate(
                 &expression,
                 &request(b"canonical-payload", vec![signer(&org_a, "org-b")]),
+                AT,
             )
             .expect_err("forged label must be rejected");
         assert!(error.to_string().contains("conflicts"), "{error}");
@@ -266,6 +443,7 @@ mod tests {
             .evaluate(
                 &expression,
                 &request(b"canonical-payload", vec![signer(&unknown, "org-a")]),
+                AT,
             )
             .expect_err("unregistered key must be rejected");
         assert!(error.to_string().contains("unknown signing key"), "{error}");
@@ -279,7 +457,7 @@ mod tests {
             rules: vec![],
         };
         let error = provider
-            .evaluate(&allow_all, &request(b"payload", vec![]))
+            .evaluate(&allow_all, &request(b"payload", vec![]), AT)
             .expect_err("allow-all expressions must be rejected at the seam");
         assert!(error.to_string().contains("rule"), "{error}");
     }
@@ -291,7 +469,7 @@ mod tests {
         let mut bad = signer(&org_a, "org-a");
         bad.signature = vec![0x42; 64]; // not a signature of the payload
         let result = provider
-            .evaluate(&expression, &request(b"canonical-payload", vec![bad]))
+            .evaluate(&expression, &request(b"canonical-payload", vec![bad]), AT)
             .expect("skipped, not fatal");
         assert!(!result.satisfied);
         assert!(result.distinct_principals.is_empty());
@@ -314,6 +492,7 @@ mod tests {
                     b"canonical-payload",
                     vec![signer(&org_a, "org-a"), signer(&org_b, "org-b")],
                 ),
+                AT,
             )
             .expect("valid signers");
         assert!(result.satisfied);
@@ -347,6 +526,7 @@ mod tests {
                             b"canonical-payload",
                             vec![signer(&org_a, "org-a"), signer(&org_b, "org-b")],
                         ),
+                        AT,
                     )
                     .expect("valid signers")
             })
@@ -364,6 +544,7 @@ mod tests {
                     .evaluate(
                         policy,
                         &request(b"canonical-payload", vec![signer(&org_a, "org-a")]),
+                        AT,
                     )
                     .expect("valid signer")
             })
@@ -372,5 +553,113 @@ mod tests {
             results.iter().any(|r| !r.satisfied),
             "the key-level layer must be unsatisfied"
         );
+    }
+
+    // ── #87/D4: certificate-bound registration and height authorization ─────
+
+    fn cert_bound_provider() -> (
+        MspEndorsementProvider,
+        Identity,
+        Organization,
+        CertChainVerifier,
+    ) {
+        let mut org = Organization::new("PharmaCorp").unwrap();
+        let identity = org.issue_identity("node-a").unwrap().clone();
+        let mut verifier = CertChainVerifier::from_org(&org).unwrap();
+        verifier.add_crl_pem(&org.crl_pem().unwrap()).unwrap();
+        (MspEndorsementProvider::new(), identity, org, verifier)
+    }
+
+    #[test]
+    fn test_certificate_bound_registration_and_possession() {
+        let (mut provider, identity, _org, verifier) = cert_bound_provider();
+        provider
+            .register_own_identity(&identity, "PharmaCorp", &verifier, 5)
+            .expect("certificate-bound registration");
+
+        let expression = PolicyExpression::signed_by("PharmaCorp");
+        // Valid at and after the registration height.
+        assert!(
+            provider
+                .evaluate(
+                    &expression,
+                    &request(b"canonical-payload", vec![signer(&identity, "PharmaCorp")]),
+                    5
+                )
+                .expect("valid signer")
+                .satisfied
+        );
+        // Not valid before it (a replay of the key at an earlier height).
+        let error = provider
+            .evaluate(
+                &expression,
+                &request(b"canonical-payload", vec![signer(&identity, "PharmaCorp")]),
+                4,
+            )
+            .expect_err("not yet authorized");
+        assert!(error.to_string().contains("not authorized"), "{error}");
+    }
+
+    #[test]
+    fn test_certificate_registration_rejects_wrong_org_and_bad_proof() {
+        let (mut provider, identity, _org, verifier) = cert_bound_provider();
+        // Wrong org: the certificate's subject must equal the claimed org.
+        let error = provider
+            .register_own_identity(&identity, "OtherCorp", &verifier, 0)
+            .expect_err("wrong org must be rejected");
+        assert!(
+            matches!(error, MspRegistrationError::OrgMismatch { .. }),
+            "{error}"
+        );
+
+        // Proof by a different key does not register the certificate's key.
+        let mut impostor = Organization::new("OtherCorp").unwrap();
+        let impostor = impostor.issue_identity("PharmaCorp").unwrap().clone();
+        let cert_pem = identity.certificate_pem.clone().unwrap();
+        let forged = impostor.sign_bytes(&msp_registration_message(
+            "PharmaCorp",
+            &identity.public_key_bytes(),
+        ));
+        let error = provider
+            .register_certificate(&cert_pem, &forged, "PharmaCorp", &verifier, 0)
+            .expect_err("a proof from another key must be rejected");
+        assert!(
+            matches!(error, MspRegistrationError::ProofInvalid),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_revocation_is_go_forward_only() {
+        let (mut provider, identity, _org, verifier) = cert_bound_provider();
+        provider
+            .register_own_identity(&identity, "PharmaCorp", &verifier, 5)
+            .expect("registration");
+        assert!(provider.revoke(&identity.public_key_bytes(), 20));
+
+        let expression = PolicyExpression::signed_by("PharmaCorp");
+        // Committed history before the revocation height still verifies.
+        assert!(
+            provider
+                .evaluate(
+                    &expression,
+                    &request(b"canonical-payload", vec![signer(&identity, "PharmaCorp")]),
+                    10
+                )
+                .expect("historical authorization stays valid")
+                .satisfied
+        );
+        // New authorization at or after the revocation height is refused.
+        let error = provider
+            .evaluate(
+                &expression,
+                &request(b"canonical-payload", vec![signer(&identity, "PharmaCorp")]),
+                20,
+            )
+            .expect_err("revoked key must be refused for new authorization");
+        assert!(error.to_string().contains("revoked"), "{error}");
+
+        // Unknown keys cannot be revoked.
+        assert!(!provider.revoke(&[9u8; 32], 20));
     }
 }

@@ -26,12 +26,12 @@ inert** (the code exists, is tested, but no production binary activates it), and
 | # | Control | Status | Where it lives |
 |---|---|---|---|
 | 1 | TLS transport encryption + connection-level fingerprint pinning | **Enforced at runtime** | `Node::build_tls`, `process_message` Hello Step 1, `connector_for_peer_cert` (`glasschain-network/src/node.rs`) |
-| 2 | TOFU peer registry (identity pinned on first contact) | **Enforced at runtime**, with accepted limits — address-bound, in-memory, no persistence | `PeerRegistry` / `verify_or_register` (`node.rs`) |
+| 2 | TOFU peer registry (identity pinned on first contact) | **Enforced at runtime**, pins persist across restarts with signed rotation (#88); address-bound (accepted limit) | `PeerRegistry` / `verify_or_register` / `load_tofu_pins` (`node.rs`) |
 | 3 | Wire-version gate (`glasschain/6`) | **Enforced at runtime** | `process_message` Hello Step 0 (`node.rs`) |
 | 4 | Capability gates (`pdc`, `endorsement`, …) | **Enforced at runtime** (once a capability is activated in a committed block) | `CapabilityHistory::effective_set` (`glasschain-core/src/capability.rs`, `node.rs`) |
 | 5 | `CertChainVerifier` — `VerificationLevel::Full` cryptographic chain check | **Implemented but inert** — `NodeState.cert_verifier` is `None` in all four `Node` constructors; `set_cert_verifier` is called only from integration tests | `cert_verifier.rs`; `node.rs` `with_components`/`set_cert_verifier` |
 | 6 | Certificate-verified PDC org gate (reject self-asserted `Hello` org) | **Implemented, fail-closed and possession-bound (#86, #110)**: private paths require a configured verifier, a certificate-verified member org, and a session-bound proof that the peer holds the certificate's key; a stock node without `--org`/`--trust-store` refuses private paths entirely (public sync unaffected) | `private_peer_trusted`, `payload_targets`, `verify_org_possession`, private-payload handlers (`node.rs`, `glasschain-identity/src/possession.rs`) |
-| 7 | Endorsement evaluation (carriers, `PolicyExpression`, operation defaults) | **Implemented but inert** — `NodeState.endorsement` is `None` in every production binary; `set_endorsement_provider` is called only from tests | `glasschain-core/src/endorsement.rs`; `node.rs` |
+| 7 | Endorsement evaluation (carriers, `PolicyExpression`, operation defaults) | **Implemented but inert** — `NodeState.endorsement` is `None` in every production binary; `set_endorsement_provider` is called only from tests. Certificate-bound principal registration with height-based authorization shipped (#87, D4) in the provider; runtime wiring of remote principals remains | `glasschain-core/src/endorsement.rs`; `MspEndorsementProvider` (`glasschain-identity/src/msp_policy.rs`); `node.rs` |
 | 8 | Policy history replay, same-block policy/write rule | **Implemented; enforced only when a provider is attached and the `endorsement` capability is active** — the gates short-circuit on `endorsement: None` | `PolicyHistory`, `enforce_block_endorsements` (`node.rs`) |
 | 9 | PDC membership gate (admission / transport / storage / replay) | **Implemented and enforced when collections are configured** — but no production binary calls `set_collections`; exercised by integration tests only | `Channel::is_member`, `node.rs`, `tests/pdc_boundary.rs` |
 | 10 | Transient-store retention (default 72 h) + purge | **Implemented and enforced** — purge discovers persisted payloads from storage, so it survives restarts; the node runs a startup + 300 s sweep | `TransientStore` (`glasschain-storage/src/transient.rs`) |
@@ -209,12 +209,15 @@ is the critical one, and it is also recorded — in `.agents/memories/` and
    expiry. `AGENTS.md` does not list this as accepted; it is a genuine open
    gap, and §4.3 notes the Brazilian legal pressure on it.
 
-6. **Membership and endorsement are separate but neither is certificate-bound
-   in production.** `MspEndorsementProvider` binds a public key to a
-   `Principal` in an in-memory directory, with a module-level `ponytail:` note
-   that the directory "stands in for certificate-bound MSP verification"
-   (Stage 2 per ADR-008 consequences). The certificate machinery in §1.2 is
-   the planned binding; it is not wired (see row 5 of the status table).
+6. **Membership and endorsement are separate; endorsement registration is
+   certificate-bound but not yet wired.** `MspEndorsementProvider` can derive
+   a principal from a verified certificate (chain, subject Organization,
+   validity, CRL checked once at registration) plus a proof of possession
+   (#87, D4), and authorizes **by height** (valid-from/revoked-at) so
+   committed history replays deterministically — no wall clock or mutable CRL
+   on evaluation. The key→principal directory remains configured out of band
+   (assumed identical across validators) and no production binary registers
+   remote principals yet; a chain-derived registry is adjacent to issue #74.
 
 ## 1.5 TLS transport
 

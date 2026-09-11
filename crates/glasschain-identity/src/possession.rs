@@ -55,6 +55,27 @@ pub fn verify_org_possession(
     verify_ed25519(&key, &org_possession_message(org, node_id, binding), proof)
 }
 
+/// The certificate subject's Organization name (the MSP principal for a
+/// remote member), if present.
+#[must_use]
+pub fn certificate_organization(cert_pem: &str) -> Option<String> {
+    use x509_cert::ext::pkix::name::DirectoryString;
+
+    let der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).ok()?;
+    let cert = Certificate::from_der(der.as_ref()).ok()?;
+    let value = cert
+        .tbs_certificate()
+        .subject()
+        .organization()
+        .ok()
+        .flatten()?;
+    match value {
+        DirectoryString::Utf8String(text) => Some(text),
+        DirectoryString::PrintableString(text) => Some(text.to_string()),
+        _ => None,
+    }
+}
+
 /// The raw 32-byte ed25519 public key inside a PEM certificate, if it parses
 /// and carries an ed25519 SPKI. `None` on any parse or shape mismatch.
 #[must_use]
@@ -101,6 +122,20 @@ pub fn tofu_pin_message(node_id: &str, tls_cert_fingerprint: &str) -> Vec<u8> {
     let mut message = b"glasschain-tofu-pin:".to_vec();
     push_field(&mut message, node_id.as_bytes());
     push_field(&mut message, tls_cert_fingerprint.as_bytes());
+    message
+}
+
+/// The message an **MSP principal registration** proof signs (#87, D4):
+/// `domain || len(org) || org || len(public_key) || public_key`.
+///
+/// Registration derives the principal from the certificate (chain + subject
+/// CN) and requires this proof under the certificate's key, so no caller can
+/// register a key it does not hold.
+#[must_use]
+pub fn msp_registration_message(org: &str, public_key: &[u8]) -> Vec<u8> {
+    let mut message = b"glasschain-msp-registration:".to_vec();
+    push_field(&mut message, org.as_bytes());
+    push_field(&mut message, public_key);
     message
 }
 

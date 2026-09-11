@@ -642,6 +642,7 @@ pub fn evaluate_transaction_endorsements(
     history: &PolicyHistory,
     tx: &Transaction,
     partial_writes: &[PersistentWrite],
+    height: u64,
 ) -> Result<(), CoreError> {
     // The committed write set must stay inside the signed scope.
     for write in partial_writes {
@@ -679,7 +680,7 @@ pub fn evaluate_transaction_endorsements(
                 signers: endorsement.signers.clone(),
             };
             for policy in policies.applicable(&endorsement.target) {
-                if !provider.evaluate(&policy, &request)?.satisfied {
+                if !provider.evaluate(&policy, &request, height)?.satisfied {
                     return Err(CoreError::InvalidTransaction(format!(
                         "endorsement: transaction '{}' failed policy evaluation (required {})",
                         tx.id,
@@ -709,7 +710,7 @@ pub fn evaluate_transaction_endorsements(
             payload: TransactionEndorsement::payload(tx)?,
             signers,
         };
-        if !provider.evaluate(&default, &request)?.satisfied {
+        if !provider.evaluate(&default, &request, height)?.satisfied {
             return Err(CoreError::InvalidTransaction(format!(
                 "endorsement: transaction '{}' failed its operation default (required {})",
                 tx.id,
@@ -930,6 +931,7 @@ mod tests {
             &self,
             expression: &PolicyExpression,
             request: &EndorsementRequest,
+            _height: u64,
         ) -> Result<EndorsementEvaluation, CoreError> {
             expression.validate()?;
             let distinct: HashSet<Principal> = request
@@ -1282,20 +1284,20 @@ mod tests {
 
         let writes = vec![write("supply", "inventory", "threshold")];
         assert!(
-            evaluate_transaction_endorsements(&provider, &history, &tx, &writes).is_ok(),
+            evaluate_transaction_endorsements(&provider, &history, &tx, &writes, 1).is_ok(),
             "channel + key layers satisfied"
         );
 
         // Missing the key-level signer.
         let mut tx_missing = tx.clone();
         tx_missing.endorsements[0].signers = vec![signer("channel-gov")];
-        let error = evaluate_transaction_endorsements(&provider, &history, &tx_missing, &writes)
+        let error = evaluate_transaction_endorsements(&provider, &history, &tx_missing, &writes, 1)
             .expect_err("unsatisfied key policy must reject");
         assert!(error.to_string().contains("failed policy"), "{error}");
 
         // A write outside every declared scope.
         let outside = vec![write("supply", "inventory", "other-key")];
-        let error = evaluate_transaction_endorsements(&provider, &history, &tx, &outside)
+        let error = evaluate_transaction_endorsements(&provider, &history, &tx, &outside, 1)
             .expect_err("out-of-scope write must reject");
         assert!(
             error.to_string().contains("outside every declared"),
@@ -1310,13 +1312,13 @@ mod tests {
         let mut tx = delivery_receipt_tx("receiver-org");
         // sender-org signs twice — the duplicate must not satisfy 2-of-2.
         tx.endorsements[0].signers = vec![signer("sender-org"), signer("sender-org")];
-        let error = evaluate_transaction_endorsements(&provider, &history, &tx, &[])
+        let error = evaluate_transaction_endorsements(&provider, &history, &tx, &[], 1)
             .expect_err("duplicate signatures must not satisfy 2-of-2");
         assert!(error.to_string().contains("operation default"), "{error}");
 
         tx.endorsements[0].signers = vec![signer("sender-org"), signer("receiver-org")];
         assert!(
-            evaluate_transaction_endorsements(&provider, &history, &tx, &[]).is_ok(),
+            evaluate_transaction_endorsements(&provider, &history, &tx, &[], 1).is_ok(),
             "two distinct custodians satisfy the custody default"
         );
     }
@@ -1330,7 +1332,7 @@ mod tests {
             contract: String::new(),
             policies: PolicyHistory::default_policies(),
         }));
-        let error = evaluate_transaction_endorsements(&provider, &history, &bare, &[])
+        let error = evaluate_transaction_endorsements(&provider, &history, &bare, &[], 1)
             .expect_err("an unauthorized policy update must reject");
         assert!(error.to_string().contains("no endorsement"), "{error}");
 
@@ -1338,7 +1340,7 @@ mod tests {
         let mut authorized = policy_update_tx("supply", "", "");
         authorized.endorsements[0].signers = vec![signer("network-governance")];
         assert!(
-            evaluate_transaction_endorsements(&provider, &history, &authorized, &[]).is_ok(),
+            evaluate_transaction_endorsements(&provider, &history, &authorized, &[], 1).is_ok(),
             "the network-governance principal authorizes the update"
         );
     }
@@ -1363,7 +1365,7 @@ mod tests {
 
         // The decorative signatures field does not authorize: no carrier, no
         // governance principal — fail closed.
-        let error = evaluate_transaction_endorsements(&provider, &history, &activation, &[])
+        let error = evaluate_transaction_endorsements(&provider, &history, &activation, &[], 1)
             .expect_err("an unendorsed capability activation must reject");
         assert!(error.to_string().contains("operation default"), "{error}");
 
@@ -1373,7 +1375,7 @@ mod tests {
         authorized.endorsements.push(carrier("", "", &[]));
         authorized.endorsements[0].signers = vec![signer("network-governance")];
         assert!(
-            evaluate_transaction_endorsements(&provider, &history, &authorized, &[]).is_ok(),
+            evaluate_transaction_endorsements(&provider, &history, &authorized, &[], 1).is_ok(),
             "the governance principal authorizes the activation"
         );
     }
@@ -1406,7 +1408,7 @@ mod tests {
         let mut partial = tx.clone();
         partial.endorsements.push(carrier("", "", &[]));
         partial.endorsements[0].signers = vec![signer("issuer-org")];
-        let error = evaluate_transaction_endorsements(&provider, &history, &partial, &[])
+        let error = evaluate_transaction_endorsements(&provider, &history, &partial, &[], 1)
             .expect_err("issuer alone must not satisfy the state-commitment default");
         assert!(error.to_string().contains("operation default"), "{error}");
 
@@ -1419,7 +1421,7 @@ mod tests {
             signer("counter-b"),
         ];
         assert!(
-            evaluate_transaction_endorsements(&provider, &history, &full, &[]).is_ok(),
+            evaluate_transaction_endorsements(&provider, &history, &full, &[], 1).is_ok(),
             "issuer plus every named counterparty satisfies the default"
         );
     }

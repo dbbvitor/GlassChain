@@ -774,6 +774,7 @@ pub trait EndorsementProvider: Send + Sync {
         &self,
         expression: &PolicyExpression,
         request: &EndorsementRequest,
+        height: u64,
     ) -> Result<EndorsementEvaluation, CoreError>;
 
     fn name(&self) -> &str;
@@ -782,13 +783,15 @@ pub trait EndorsementProvider: Send + Sync {
 
 Implementations must derive each signer's principal from the authenticated
 key (never the caller-supplied label), reject a claimed principal that
-conflicts with the verified identity, and count at most one signature per
-distinct principal.
+conflicts with the verified identity, authorize **by height rather than wall
+clock** (a key registered as valid from some height and revoked at a later
+one verifies identically for historical heights on replay — revocation is
+go-forward, ADR-013), and count at most one signature per distinct principal.
 
 ### Built-in implementation
 
 `MspEndorsementProvider` (crate `glasschain-identity`) — ed25519 verification
-over a registered key→principal directory:
+over a registered key→principal directory with height-based authorization:
 
 ```rust
 use glasschain_identity::{Identity, MspEndorsementProvider};
@@ -796,10 +799,21 @@ use glasschain_core::{EndorsementProvider, PolicyExpression, Principal};
 
 let identity = Identity::generate("node-1");
 let mut provider = MspEndorsementProvider::new();
+// Trusted local provisioning (no credential check):
 provider.register_identity(&identity, Principal::new("MyOrg"));
 
 let request = /* EndorsementRequest signed by identity.sign_bytes(&payload) */;
-let result = provider.evaluate(&PolicyExpression::signed_by("MyOrg"), &request)?;
+let result = provider.evaluate(&PolicyExpression::signed_by("MyOrg"), &request, height)?;
+```
+
+Remote principals register from a verified certificate (#87, D4):
+
+```rust
+// Certificate chain + subject Organization + CRL/expiry checked now (fail
+// closed); `valid_from` becomes a committed decision.
+provider.register_own_identity(&identity, "MyOrg", &verifier, valid_from_height)?;
+provider.register_certificate(cert_pem, &proof, "MyOrg", &verifier, valid_from_height)?;
+provider.revoke(&public_key, at_height); // go-forward only
 ```
 
 ### Commit-path enforcement (ADR-008 §4)

@@ -91,8 +91,11 @@ extrapolations. 300 is an operating target, not a proven upper bound.
 - [ ] Complete [zero-trust.md](zero-trust.md)'s fail-closed deployment, historical
       verification and identity lifecycle gates; the verifier being installed is
       not the same as every principal/path being certificate-bound.
-- [ ] Resolve governance bootstrap D1, recall authority/scope D2 and certificate
-      registration D4 in [deferred-code-debt.md](deferred-code-debt.md).
+- [x] Certificate registration D4 shipped (#87): verified-certificate
+      registration with possession proof and height-stamped authorization.
+- [ ] Resolve governance bootstrap D1 and recall authority/scope D2 in
+      [deferred-code-debt.md](deferred-code-debt.md). Remote-principal wiring
+      and a chain-derived MSP registry remain (adjacent to #74).
 - [x] Restart-safe private-payload deletion D5 shipped (storage-scanning purge,
       startup + 300 s sweep, logged/retried delete failures); replica/backup
       retention remains a deployment policy decision.

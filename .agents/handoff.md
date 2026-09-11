@@ -70,7 +70,9 @@ Independent decisions/tests can proceed alongside A:
   the copied-certificate case is covered. The old suggested insecure flag is
   not approved.
 - [Certificate-bound MSP principals](https://github.com/dbbvitor/GlassChain/issues/87):
-  D4, with deterministic historical authorization and go-forward lifecycle rules.
+  **shipped (2026-09-10)** — verified-certificate registration + possession
+  proof, height-stamped authorization (valid-from/revoked-at; no wall clock on
+  replay). Remaining: remote-principal wiring and a chain-derived registry.
 - [Durable TOFU pins](https://github.com/dbbvitor/GlassChain/issues/88):
   **shipped (2026-09-10)** — storage-backed pins, signed rotation by the pinned
   key, corrupt-pin fail-closed, documented operator recovery. Distinct from
