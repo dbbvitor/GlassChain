@@ -92,9 +92,12 @@ not delay unrelated confidentiality improvements.
 ## 5. ZT-4/5 — Principal and key lifecycle
 
 - [Certificate-bound MSP principals](https://github.com/dbbvitor/GlassChain/issues/87)
-  owns source debt D4. Derive principal and signing key from verified credentials
-  plus proof of possession; support remote principals. Specify revocation,
-  expiry and deterministic historical authorization before wiring evaluation.
+  owns source debt D4 — **shipped (2026-09-10).** Registration derives the
+  principal from a verified certificate (chain, subject O, validity, CRL at
+  registration) plus a possession proof; entries are height-stamped
+  (`valid_from`/`revoked_at`) and `evaluate(..., height)` consults only those
+  bounds, so committed history replays deterministically. The directory stays
+  out-of-band provisioning until a chain-derived registry (adjacent to #74).
 - [Persist the TOFU registry](https://github.com/dbbvitor/GlassChain/issues/88)
   — **shipped (2026-09-10).** Pins write through the storage seam
   (`tofu:peer:<addr>`) and load at startup; a changed fingerprint requires a
@@ -137,7 +140,9 @@ in [deferred-code-debt.md](deferred-code-debt.md). Zero-trust priorities:
 - **D2 recall:** resolve whether unilateral regulator action or independent
   organizations are required, then bind that policy to record scope. A learning
   model cannot supply the missing legal authority.
-- **D4 certificate-bound principal registration:** the lifecycle work in §5.
+- **D4 certificate-bound principal registration — shipped (#87):** the
+  lifecycle work in §5; remote-principal *wiring* and chain-derived sets
+  remain.
 - **D5 retention — shipped (2026-09-10):** storage-scanning purge discovers
   persisted payloads without a prior read; the node sweeps at startup and every
   300 s; delete failures are logged and retried. Replica/backup retention stays
@@ -208,8 +213,8 @@ pre-dating #95); evidence-path hardening beyond the journal is future work.
 
 ## Validation and next steps
 
-Plan the §8 regressions first, then the remaining D1/D2/D4 decisions and the
-independently testable TLS negotiation work (D5/D6, #86, #88 and #110 are
+Plan the §8 regressions first, then the remaining D1/D2 decisions and the
+independently testable TLS negotiation work (D4–D6, #86, #88 and #110 are
 shipped). Use current APIs/test harnesses; preserve default/all-feature
 behaviour until an explicit adoption decision. Every implementation runs the
 workspace gates and adds its named failure-case test. WAN/resource scenarios

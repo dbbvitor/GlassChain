@@ -300,26 +300,31 @@ pub trait ExecutionProvider: Send + Sync {
 /// verified credentials (ADR-008). Application authorization via this seam is
 /// separate from consensus finality.
 pub trait EndorsementProvider: Send + Sync {
-    /// Evaluate one [`PolicyExpression`] against the request's signers.
+    /// Evaluate one [`PolicyExpression`] against the request's signers **as
+    /// of `height`**.
     ///
     /// Implementations must:
     /// - derive each signer's principal from the authenticated key, never from
     ///   the caller-supplied label alone;
     /// - reject a claimed principal that conflicts with the verified identity;
+    /// - authorize by height, not wall clock: a key registered as valid from
+    ///   some height and revoked at a later one must verify identically for
+    ///   historical heights on replay (revocation is go-forward, ADR-013);
     /// - count at most one signature per distinct principal — duplicate,
     ///   multi-node, and replayed signatures never increase the count.
     ///
     /// # Errors
     ///
     /// Returns `Err` when a signer cannot be authenticated (unknown key), a
-    /// claimed principal conflicts with the verified identity, or the
-    /// expression is not valid v1 policy metadata (allow-all shapes are
-    /// rejected). Signatures that fail cryptographic verification are skipped,
-    /// not fatal.
+    /// claimed principal conflicts with the verified identity, the key is not
+    /// authorized at `height`, or the expression is not valid v1 policy
+    /// metadata (allow-all shapes are rejected). Signatures that fail
+    /// cryptographic verification are skipped, not fatal.
     fn evaluate(
         &self,
         expression: &PolicyExpression,
         request: &EndorsementRequest,
+        height: u64,
     ) -> Result<EndorsementEvaluation, CoreError>;
 
     /// Human-readable identifier for this endorsement implementation.
