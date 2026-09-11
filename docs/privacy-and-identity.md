@@ -30,7 +30,7 @@ inert** (the code exists, is tested, but no production binary activates it), and
 | 3 | Wire-version gate (`glasschain/6`) | **Enforced at runtime** | `process_message` Hello Step 0 (`node.rs`) |
 | 4 | Capability gates (`pdc`, `endorsement`, …) | **Enforced at runtime** (once a capability is activated in a committed block) | `CapabilityHistory::effective_set` (`glasschain-core/src/capability.rs`, `node.rs`) |
 | 5 | `CertChainVerifier` — `VerificationLevel::Full` cryptographic chain check | **Implemented but inert** — `NodeState.cert_verifier` is `None` in all four `Node` constructors; `set_cert_verifier` is called only from integration tests | `cert_verifier.rs`; `node.rs` `with_components`/`set_cert_verifier` |
-| 6 | Certificate-verified PDC org gate (reject self-asserted `Hello` org) | **Implemented and fail-closed (#86)**: private send/receive/reconcile require a configured verifier and a certificate-verified member org; a stock node without `--org`/`--trust-store` refuses private paths entirely (public sync unaffected) | `private_peer_trusted`, `payload_targets`, private-payload handlers (`node.rs`) |
+| 6 | Certificate-verified PDC org gate (reject self-asserted `Hello` org) | **Implemented, fail-closed and possession-bound (#86, #110)**: private paths require a configured verifier, a certificate-verified member org, and a session-bound proof that the peer holds the certificate's key; a stock node without `--org`/`--trust-store` refuses private paths entirely (public sync unaffected) | `private_peer_trusted`, `payload_targets`, `verify_org_possession`, private-payload handlers (`node.rs`, `glasschain-identity/src/possession.rs`) |
 | 7 | Endorsement evaluation (carriers, `PolicyExpression`, operation defaults) | **Implemented but inert** — `NodeState.endorsement` is `None` in every production binary; `set_endorsement_provider` is called only from tests | `glasschain-core/src/endorsement.rs`; `node.rs` |
 | 8 | Policy history replay, same-block policy/write rule | **Implemented; enforced only when a provider is attached and the `endorsement` capability is active** — the gates short-circuit on `endorsement: None` | `PolicyHistory`, `enforce_block_endorsements` (`node.rs`) |
 | 9 | PDC membership gate (admission / transport / storage / replay) | **Implemented and enforced when collections are configured** — but no production binary calls `set_collections`; exercised by integration tests only | `Channel::is_member`, `node.rs`, `tests/pdc_boundary.rs` |
@@ -577,7 +577,7 @@ sequenceDiagram
     W->>M: Message::PrivatePayload (collection, commitment, payload)
     W->>O: (no message — not a member target)
     activate M
-    M-->>M: transport gate: verifier configured?<br/>verified member orgs? sha256(payload)==commitment?
+    M-->>M: transport gate: verifier configured?<br/>verified member orgs + possession proof?<br/>sha256(payload)==commitment?
     Note over M: store in TransientStore
     deactivate M
     W->>C: block with PDC write redacted to commitment
@@ -604,7 +604,8 @@ branches) — the boundaries are enforced exactly there:
    nothing is held — `pdc_writes_require_the_active_capability`).
 2. **Transport** — `Message::PrivatePayload` is accepted only when this node
    runs certificate verification, the sender's org was certificate-verified
-   at Hello, both orgs are members, and the commitment matches the bytes.
+   **and its session-bound possession proof verified** at Hello (#110), both
+   orgs are members, and the commitment matches the bytes.
    Without a verifier the path fails closed (no self-asserted org is trusted),
    and sending targets only certificate-verified members. A payload pushed
    directly at a non-member over the raw wire is rejected
@@ -625,9 +626,11 @@ branches) — the boundaries are enforced exactly there:
 Org trust on every private path **fails closed (#86)**: a `cert_verifier` must
 be configured (node `--org` plus `--trust-store`), the sender must be
 certificate-verified, and send targets are certificate-verified members only.
-A compiled-but-unattached verifier is not enough, and a copied certificate
-without its private key still needs the credential-possession work tracked in
-the [zero-trust plan](../.agents/plans/zero-trust.md) §5.
+A compiled-but-unattached verifier is not enough. Possession is proven too
+(#110): the Hello carries a signature over this session's TLS exporter output
+by the certificate's key, so a **copied certificate without its private key
+cannot impersonate** an organization (see §3.2 and the
+[zero-trust plan](../.agents/plans/zero-trust.md) §2).
 
 ## 3.5 Retention and purge
 

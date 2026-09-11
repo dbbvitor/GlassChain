@@ -20,6 +20,8 @@
 //! * `RequestPeers` → `Peers` reply, `Peers` dedupe + re-dial, and `Goodbye`
 //!   graceful handling.
 
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine as _;
 use glasschain_core::crypto::sha256;
 use glasschain_core::{Block, InventoryUpdate, Transaction, TransactionKind};
 use glasschain_network::{
@@ -68,7 +70,10 @@ async fn exchange_certs(stream: &mut TcpStream, our_cert: &[u8]) -> Vec<u8> {
 /// Connect a raw TLS client to `node_addr`, complete the pre-TLS certificate
 /// exchange and TLS handshake, and return the framed reader/writer plus the
 /// node's certificate DER (so tests can compute the node's own fingerprint).
-async fn connect_raw(node_addr: &str, our_cert: &[u8]) -> (PeerReader, PeerWriter, Vec<u8>) {
+async fn connect_raw(
+    node_addr: &str,
+    our_cert: &[u8],
+) -> (PeerReader, PeerWriter, Vec<u8>, Option<[u8; 32]>) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let mut stream = TcpStream::connect(node_addr).await.unwrap();
     let node_cert = exchange_certs(&mut stream, our_cert).await;
@@ -83,11 +88,25 @@ async fn connect_raw(node_addr: &str, our_cert: &[u8]) -> (PeerReader, PeerWrite
         .expect("valid server name")
         .to_owned();
     let tls_stream = connector.connect(server_name, stream).await.unwrap();
+    // The org-possession proof is bound to this session's TLS exporter
+    // (#110); the raw client derives the same bytes the node does.
+    let mut binding = [0u8; 32];
+    let session_binding = tls_stream
+        .get_ref()
+        .1
+        .export_keying_material(
+            binding.as_mut_slice(),
+            glasschain_identity::SESSION_BINDING_LABEL,
+            None,
+        )
+        .is_ok()
+        .then_some(binding);
     let (r, w) = tokio::io::split(tls_stream);
     (
         PeerReader::new(r, node_addr.to_owned()),
         PeerWriter::new(w, node_addr.to_owned()),
         node_cert,
+        session_binding,
     )
 }
 
@@ -100,6 +119,7 @@ async fn send_hello(writer: &mut PeerWriter, node_id: &str, listen_addr: &str, f
         version: PROTOCOL_VERSION.to_owned(),
         org: "org-test".to_owned(),
         certificate_pem: None,
+        certificate_proof: None,
         capabilities: glasschain_core::CAPABILITY_V1
             .iter()
             .map(|c| glasschain_core::CapabilityAdvertisement {
@@ -129,7 +149,7 @@ async fn complete_hello(
     node_id: &str,
     listen_addr: &str,
 ) -> (PeerReader, PeerWriter) {
-    let (mut reader, mut writer, _node_cert) = connect_raw(node_addr, our_cert).await;
+    let (mut reader, mut writer, _node_cert, _binding) = connect_raw(node_addr, our_cert).await;
     read_node_hello(&mut reader).await;
     send_hello(&mut writer, node_id, listen_addr, &sha256(our_cert)).await;
     (reader, writer)
@@ -209,7 +229,7 @@ async fn hello_self_connection_is_disconnected() {
     let node = Node::new("self-test-node", &addr, 1);
     node.start(vec![]).await.unwrap();
 
-    let (mut reader, mut writer, node_cert) = connect_raw(&addr, CLIENT_CERT_A).await;
+    let (mut reader, mut writer, node_cert, _binding) = connect_raw(&addr, CLIENT_CERT_A).await;
     read_node_hello(&mut reader).await;
 
     // Advertise the node's own certificate fingerprint → self-connection.
@@ -231,7 +251,7 @@ async fn hello_fingerprint_mismatch_is_disconnected() {
     let node = Node::new("fp-test-node", &addr, 1);
     node.start(vec![]).await.unwrap();
 
-    let (mut reader, mut writer, _node_cert) = connect_raw(&addr, CLIENT_CERT_A).await;
+    let (mut reader, mut writer, _node_cert, _binding) = connect_raw(&addr, CLIENT_CERT_A).await;
     read_node_hello(&mut reader).await;
 
     // Present CLIENT_CERT_A (observed = sha256(A)) but advertise a different
@@ -258,7 +278,7 @@ async fn hello_tofu_rejects_changed_identity_on_same_listen_addr() {
     let listen_addr = "127.0.0.1:31000";
 
     // First contact: register the identity for `listen_addr` (cert A).
-    let (mut reader1, mut writer1, _) = connect_raw(&addr, CLIENT_CERT_A).await;
+    let (mut reader1, mut writer1, _, _binding) = connect_raw(&addr, CLIENT_CERT_A).await;
     read_node_hello(&mut reader1).await;
     send_hello(
         &mut writer1,
@@ -280,7 +300,7 @@ async fn hello_tofu_rejects_changed_identity_on_same_listen_addr() {
 
     // Second contact: same listen address + node_id, but a different cert
     // (changed observed fingerprint) → TOFU registry rejects the peer.
-    let (mut reader2, mut writer2, _) = connect_raw(&addr, CLIENT_CERT_B).await;
+    let (mut reader2, mut writer2, _, _binding) = connect_raw(&addr, CLIENT_CERT_B).await;
     read_node_hello(&mut reader2).await;
     send_hello(
         &mut writer2,
@@ -308,7 +328,7 @@ async fn block_from_unauthenticated_peer_is_ignored() {
     node.start(vec![]).await.unwrap();
 
     // Connect + TLS but never send a Hello → current_stable_addr stays None.
-    let (mut reader, mut writer, _node_cert) = connect_raw(&addr, CLIENT_CERT_A).await;
+    let (mut reader, mut writer, _node_cert, _binding) = connect_raw(&addr, CLIENT_CERT_A).await;
     read_node_hello(&mut reader).await;
 
     // A *valid* block (chained to genesis, correct PoW) so that, if the auth
@@ -421,7 +441,7 @@ async fn transaction_from_unauthenticated_peer_is_ignored() {
     node.start(vec![]).await.unwrap();
     let mut events = node.subscribe();
 
-    let (mut reader, mut writer, _node_cert) = connect_raw(&addr, CLIENT_CERT_A).await;
+    let (mut reader, mut writer, _node_cert, _binding) = connect_raw(&addr, CLIENT_CERT_A).await;
     read_node_hello(&mut reader).await;
 
     let tx = Transaction::new(TransactionKind::InventoryUpdate(InventoryUpdate {
@@ -613,6 +633,7 @@ async fn send_hello_as_org(
     fingerprint: &str,
     org: &str,
     certificate_pem: Option<&str>,
+    certificate_proof: Option<&str>,
 ) {
     let msg = Message::Hello {
         node_id: node_id.to_owned(),
@@ -628,6 +649,7 @@ async fn send_hello_as_org(
             .collect(),
         org: org.to_owned(),
         certificate_pem: certificate_pem.map(str::to_owned),
+        certificate_proof: certificate_proof.map(str::to_owned),
         listen_addr: listen_addr.to_owned(),
     };
     writer.send(&msg).await.unwrap();
@@ -678,7 +700,7 @@ async fn private_payload_to_non_member_is_rejected() {
         .unwrap();
     outsider.mine().await.unwrap();
 
-    let (mut reader, mut writer, _node_cert) = connect_raw(&addr, CLIENT_CERT_A).await;
+    let (mut reader, mut writer, _node_cert, _binding) = connect_raw(&addr, CLIENT_CERT_A).await;
     read_node_hello(&mut reader).await;
     send_hello_as_org(
         &mut writer,
@@ -686,6 +708,7 @@ async fn private_payload_to_non_member_is_rejected() {
         "127.0.0.1:1",
         &sha256(CLIENT_CERT_A),
         "org-writer",
+        None,
         None,
     )
     .await;
@@ -767,8 +790,14 @@ async fn private_payload_with_commitment_mismatch_is_rejected() {
         .unwrap();
     member.mine().await.unwrap();
 
-    let (mut reader, mut writer, _node_cert) = connect_raw(&addr, CLIENT_CERT_B).await;
+    let (mut reader, mut writer, _node_cert, binding) = connect_raw(&addr, CLIENT_CERT_B).await;
     read_node_hello(&mut reader).await;
+    // Session-bound possession proof (#110): the sender holds the key for the
+    // certificate it presents, on this exact connection.
+    let binding = binding.expect("the raw client derived its session binding");
+    let proof = BASE64_STANDARD.encode(writer_identity.sign_bytes(
+        &glasschain_identity::org_possession_message("org-writer", "org-writer", &binding),
+    ));
     send_hello_as_org(
         &mut writer,
         "org-writer",
@@ -776,6 +805,7 @@ async fn private_payload_with_commitment_mismatch_is_rejected() {
         &sha256(CLIENT_CERT_B),
         "org-writer",
         Some(&writer_cert_pem),
+        Some(&proof),
     )
     .await;
     let tampered = Message::PrivatePayload {
@@ -819,7 +849,7 @@ async fn hello_with_old_wire_version_is_disconnected() {
     let node = Node::new("version-node", &addr, 1);
     node.start(vec![]).await.unwrap();
 
-    let (mut reader, mut writer, _node_cert) = connect_raw(&addr, CLIENT_CERT_A).await;
+    let (mut reader, mut writer, _node_cert, _binding) = connect_raw(&addr, CLIENT_CERT_A).await;
     read_node_hello(&mut reader).await;
     let stale = Message::Hello {
         node_id: "old-peer".to_owned(),
@@ -829,6 +859,7 @@ async fn hello_with_old_wire_version_is_disconnected() {
         capabilities: Vec::new(),
         org: "org-old".to_owned(),
         certificate_pem: None,
+        certificate_proof: None,
         listen_addr: "127.0.0.1:3".to_owned(),
     };
     writer.send(&stale).await.unwrap();
@@ -865,7 +896,7 @@ async fn hello_with_unverified_org_certificate_stays_connected_but_unverified() 
         .expect("org CRL");
     member.set_cert_verifier(verifier).await;
 
-    let (mut reader, mut writer, _node_cert) = connect_raw(&addr, CLIENT_CERT_A).await;
+    let (mut reader, mut writer, _node_cert, _binding) = connect_raw(&addr, CLIENT_CERT_A).await;
     read_node_hello(&mut reader).await;
     let hello = Message::Hello {
         node_id: "imposter-node".to_owned(),
@@ -875,6 +906,7 @@ async fn hello_with_unverified_org_certificate_stays_connected_but_unverified() 
         capabilities: Vec::new(),
         org: "org-member".to_owned(),
         certificate_pem: Some(cert_pem),
+        certificate_proof: None,
         listen_addr: "127.0.0.1:4".to_owned(),
     };
     writer.send(&hello).await.unwrap();
@@ -885,5 +917,82 @@ async fn hello_with_unverified_org_certificate_stays_connected_but_unverified() 
     assert!(
         result.is_err(),
         "an unverified org must stay connected (downgrade, not disconnect)"
+    );
+}
+
+/// #110: a valid certificate proves issuance, not possession. A peer that
+/// copies a member's certificate but cannot sign with that certificate's key
+/// has an unverified session org, so its private payload is rejected even
+/// though the PEM verifies against the trust store.
+#[tokio::test]
+async fn copied_certificate_without_private_key_is_rejected() {
+    init_log_capture();
+    let addr = free_addr();
+    let mut org = Organization::new("PharmaCorp").unwrap();
+    let member_identity = org.issue_identity("org-member").unwrap().clone();
+    let writer_identity = org.issue_identity("org-writer").unwrap().clone();
+    let writer_cert_pem = writer_identity
+        .certificate_pem
+        .clone()
+        .expect("issued identity carries a certificate");
+    // The impostor's key has no relationship to the copied certificate.
+    let mut other_org = Organization::new("OtherCorp").unwrap();
+    let impostor_identity = other_org.issue_identity("org-writer").unwrap().clone();
+
+    let member = Node::new_with_identity("org-member", &addr, 1, Arc::new(member_identity));
+    member.set_cert_verifier(verifier_with_crl(&org)).await;
+    member.start(vec![]).await.unwrap();
+    member.set_collections(vec![pricing_collection()]).await;
+    member
+        .submit_transaction(glasschain_core::Transaction::with_id(
+            "cap:pdc:2".to_owned(),
+            glasschain_core::TransactionKind::CapabilityActivation(
+                glasschain_core::CapabilityActivation {
+                    capability_id: "pdc".into(),
+                    version: 1,
+                    hash: glasschain_core::capability_hash("pdc", 1),
+                    activation_height: 2,
+                    signatures: vec![glasschain_core::RecordSignature {
+                        algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
+                        signer: "org-gov".into(),
+                        signature_bytes: vec![0x42],
+                    }],
+                },
+            ),
+        ))
+        .await
+        .unwrap();
+    member.mine().await.unwrap();
+
+    let (mut reader, mut writer, _node_cert, binding) = connect_raw(&addr, CLIENT_CERT_A).await;
+    read_node_hello(&mut reader).await;
+    let binding = binding.expect("the raw client derived its session binding");
+    // The impostor signs the right message with the WRONG key.
+    let forged = BASE64_STANDARD.encode(impostor_identity.sign_bytes(
+        &glasschain_identity::org_possession_message("org-writer", "org-writer", &binding),
+    ));
+    send_hello_as_org(
+        &mut writer,
+        "org-writer",
+        "127.0.0.1:5",
+        &sha256(CLIENT_CERT_A),
+        "org-writer",
+        Some(&writer_cert_pem),
+        Some(&forged),
+    )
+    .await;
+    // A well-formed payload (commitment matches) that only org trust gates.
+    writer
+        .send(&private_payload("pricing", b"stolen-price"))
+        .await
+        .unwrap();
+
+    wait_for_log("not a verified member").await;
+    assert_eq!(
+        member
+            .transient_payload("pricing", &sha256(b"stolen-price"))
+            .await,
+        None,
+        "a copied certificate without its key must not deliver private payloads"
     );
 }

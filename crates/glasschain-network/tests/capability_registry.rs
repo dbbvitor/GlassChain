@@ -87,6 +87,7 @@ async fn send_hello(
         capabilities,
         org: "org-test".to_owned(),
         certificate_pem: None,
+        certificate_proof: None,
         listen_addr: listen_addr.to_owned(),
     };
     writer.send(&msg).await.unwrap();

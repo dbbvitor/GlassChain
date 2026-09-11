@@ -515,7 +515,7 @@ capability gating; `node.rs:2395–2407`).
 
 | Message | Direction / purpose |
 |---|---|
-| `Hello` | Initial handshake: `node_id`, `tls_cert_fingerprint`, `chain_length`, `version`, `capabilities`, `org`, `certificate_pem` (org cert, optional), `listen_addr` (the peer's stable address — used for reconnects and the peer registry). |
+| `Hello` | Initial handshake: `node_id`, `tls_cert_fingerprint`, `chain_length`, `version`, `capabilities`, `org`, `certificate_pem` (org cert, optional), `certificate_proof` (session-bound possession proof, optional, #110), `listen_addr` (the peer's stable address — used for reconnects and the peer registry). |
 | `Transaction` | Broadcast a new transaction. |
 | `Block` | Announce a newly mined block. |
 | `PrivatePayload` | Private-data payload, sent **point-to-point between collection members only** — never broadcast. |
@@ -532,10 +532,17 @@ On every connection (`node.rs`, `process_message` Hello branch), in order:
 2. **Self-connection detection** — same TLS cert fingerprint → ignored.
 3. **Session fingerprint check** — Hello fingerprint must equal the one
    observed during the TLS handshake, else disconnect.
-4. **TOFU registration** — first contact records `listen_addr → (node_id,
+4. **Org verification and possession** (#47, #110) — when a certificate
+   verifier is configured, the claimed org counts only if the peer's
+   certificate verifies against the trust store, its subject CN equals the
+   claimed org, **and** the peer proves possession of that certificate's
+   private key by signing over this session's TLS exporter output. A copied
+   certificate without its key cannot pass; org-gated private paths then fail
+   closed for that peer. Without a verifier, every private path fails closed.
+5. **TOFU registration** — first contact records `listen_addr → (node_id,
    cert fingerprint, org)`; a returning peer whose node ID, fingerprint, or
    org changed is rejected as a potential impersonation.
-5. **Capability recording** — the peer's advertised capabilities are stored.
+6. **Capability recording** — the peer's advertised capabilities are stored.
 
 **Downgrade behaviour:** version mismatch is a hard disconnect — there is no
 wire downgrade. What *does* degrade is capability support: a peer advertising

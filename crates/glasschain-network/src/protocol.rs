@@ -42,6 +42,15 @@ pub enum Message {
         /// the TLS certificate itself stays a transport-only self-signed cert.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         certificate_pem: Option<String>,
+        /// Base64 ed25519 proof of possession of the certificate's private
+        /// key, signed over `org_possession_message(org, node_id,
+        /// <this session's TLS exporter>)` (#110). A verified certificate
+        /// proves issuance, not possession; this proves the peer holds the
+        /// key **on this session**, so a copied PEM cannot impersonate.
+        /// Absent on nodes without an identity and on older peers; absent or
+        /// invalid keeps the org unverified and org-gated paths fail closed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        certificate_proof: Option<String>,
         /// The sender's stable TCP listening address (e.g. `"192.168.1.5:8000"`).
         ///
         /// Peers must use this address (rather than the TCP source address, which

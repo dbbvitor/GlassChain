@@ -57,6 +57,7 @@ pub mod error;
 pub mod identity;
 pub mod msp;
 pub mod msp_policy;
+pub mod possession;
 
 pub use cert_verifier::{CertChainVerifier, CertVerificationError, VerificationLevel};
 pub use channel::{default_retention_secs, Channel, ChannelConfig, DEFAULT_REGULATOR_ORGS};
@@ -69,3 +70,4 @@ pub use identity::{Identity, SignedTransaction};
 pub use msp::IntermediateCa;
 pub use msp::Organization;
 pub use msp_policy::MspEndorsementProvider;
+pub use possession::{org_possession_message, verify_org_possession, SESSION_BINDING_LABEL};
