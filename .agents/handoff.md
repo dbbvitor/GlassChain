@@ -77,10 +77,12 @@ Independent decisions/tests can proceed alongside A:
   **shipped (2026-09-10)** — storage-backed pins, signed rotation by the pinned
   key, corrupt-pin fail-closed, documented operator recovery. Distinct from
   storing node private keys (unchanged).
-- D1 governance bootstrap and D2 recall authority require owner/domain decisions.
-  Keep safe defaults; specify unilateral regulator versus independent-party policy.
-- D5 deletion-after-restart and D6 triage discovery require acceptance tests before
-  a persistent/unattended pilot; consider one narrow storage scan, two outcomes.
+- D1 governance bootstrap and D2 recall authority: **decided and shipped
+  (2026-09-10)** — fail-closed `network-governance` default with documented
+  provisioning; no on-chain recall authority (issuer-signed recalls, public
+  downstream visibility).
+- D5 deletion-after-restart and D6 triage discovery: **shipped (2026-09-10)**
+  (storage-scanning purge with startup+300 s sweep; `FlowTriage::discover`).
 - [On-chain revocation registry](https://github.com/dbbvitor/GlassChain/issues/74)
   remains deferred; not a prerequisite to fixing current off-chain lifecycle gaps.
 

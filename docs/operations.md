@@ -612,6 +612,31 @@ feed `--all-features` builds).
    sender must present a certificate-verified member org **and** prove
    possession of its key on the session (#110).
 
+### Governance bootstrap (D1)
+
+Unconfigured scopes and every `CapabilityActivation` are authorized by the
+fixed `network-governance` principal (fail-closed; no allow-all bootstrap and
+no bypass flag). A deployment bootstraps real governance by:
+
+1. registering its governance key under the principal `network-governance` in
+   the MSP endorsement provider — certificate-bound registration via
+   `MspEndorsementProvider::register_own_identity`, or the directory
+   provisioning API for trusted embedders;
+2. committing an authorized `PolicyUpdate` (signed by that principal) for each
+   channel/contract scope, which applies from the next block and replays
+   deterministically.
+
+A scoped `PolicyUpdate` never relaxes the activation rule: capability
+activations still require `network-governance` at every height.
+
+### Recall records (D2, owner decision)
+
+The chain does **not** arbitrate recall authority: the issuing organization
+registers a recall with its own signature, and `issued_by` is informational
+metadata for operators. Downstream members observe the public `recall` record
+on their synced chain and respond through the quarantine/dispute workflows —
+the chain's job is visibility, not legal authority.
+
 The transport itself (TLS + per-session fingerprint + TOFU) is the only trust
 boundary fully live in the shipped binaries — treat a deployment as a
 federation of peers that agree to trust each other's advertised identities on
