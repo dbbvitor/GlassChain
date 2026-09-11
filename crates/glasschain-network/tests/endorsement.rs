@@ -559,33 +559,40 @@ async fn custody_handoff_requires_sender_and_receiving_custodian_2_of_2() {
 }
 
 #[tokio::test]
-async fn recall_transition_requires_the_multi_party_authority_signature() {
-    // The v1 recall operation default: the issuing custodian (envelope
-    // issuer) and the authorized authority (payload `issued_by`) must both
-    // sign — 2-of-2 multi-party.
+async fn recall_registration_requires_only_the_issuing_org() {
+    // No on-chain recall authority (owner decision): the issuing organization
+    // registers the recall with its own signature; `issued_by` stays
+    // informational metadata and the public record plus downstream
+    // quarantine/dispute flows carry the visibility.
     let Harness {
         node, org_a, org_b, ..
     } = setup(vec![]).await;
     let before = chain_len(&node).await;
 
-    let issuer_only = endorsed(
+    // A signature from another organization cannot register the recall.
+    let wrong_signer = endorsed(
+        recall_tx(),
+        target(SUPPLY, INVENTORY, &[]),
+        &[(&org_b, "org-b")],
+    );
+    let error = node
+        .submit_transaction(wrong_signer)
+        .await
+        .expect_err("only the issuing organization may register the recall");
+    assert!(
+        error.to_string().contains("endorsement")
+            || error.to_string().contains("operation default"),
+        "{error}"
+    );
+    assert_eq!(chain_len(&node).await, before, "nothing committed");
+
+    // The issuer's own signature registers it.
+    let issuer_signed = endorsed(
         recall_tx(),
         target(SUPPLY, INVENTORY, &[]),
         &[(&org_a, "org-a")],
     );
-    let error = node
-        .submit_transaction(issuer_only)
-        .await
-        .expect_err("recall must require the authorized authority");
-    assert!(error.to_string().contains("operation default"), "{error}");
-    assert_eq!(chain_len(&node).await, before, "nothing committed");
-
-    let multi_party = endorsed(
-        recall_tx(),
-        target(SUPPLY, INVENTORY, &[]),
-        &[(&org_a, "org-a"), (&org_b, "org-b")],
-    );
-    node.submit_transaction(multi_party).await.unwrap();
+    node.submit_transaction(issuer_signed).await.unwrap();
     node.mine().await.unwrap();
     assert_eq!(chain_len(&node).await, before + 1);
 }

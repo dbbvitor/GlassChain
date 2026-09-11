@@ -135,11 +135,15 @@ approval of a new primitive, backend, certificate profile or algorithm lifetime.
 All six ponytail markers and the one TODO have dispositions and acceptance tests
 in [deferred-code-debt.md](deferred-code-debt.md). Zero-trust priorities:
 
-- **D1 governance bootstrap:** keep fail-closed defaults; provision principals
-  and verify scoped policy changes without weakening fixed operation defaults.
-- **D2 recall:** resolve whether unilateral regulator action or independent
-  organizations are required, then bind that policy to record scope. A learning
-  model cannot supply the missing legal authority.
+- **D1 governance bootstrap — shipped (2026-09-10):** the fixed fail-closed
+  default stays; the provisioning procedure (register the governance key under
+  `network-governance`, commit an authorized `PolicyUpdate`) is documented and
+  tested, and scoped updates never relax the activation rule.
+- **D2 recall — decided (2026-09-10, owner):** no on-chain recall authority;
+  the issuing organization registers the recall with its own signature and
+  `issued_by` is metadata. Downstream visibility is the shipped public record +
+  quarantine/dispute flows. A learning model still cannot supply legal
+  authority, and the chain no longer pretends to.
 - **D4 certificate-bound principal registration — shipped (#87):** the
   lifecycle work in §5; remote-principal *wiring* and chain-derived sets
   remain.

@@ -517,7 +517,9 @@ impl PolicyHistory {
 ///
 /// Custody handoffs (`delivery_receipt`) require the sender (record issuer)
 /// and the receiving custodian, 2-of-2; `recall` requires the issuing
-/// custodian and the authorized authority (`issued_by`), 2-of-2;
+/// organization's own signature (the chain does not arbitrate recall
+/// authority — a regulated authority is an off-chain matter, and the public
+/// record plus downstream quarantine/dispute flows carry the visibility);
 /// `quality_certification` and `audit_attestation` require the payload
 /// issuer's signature. Quarantine and dispute are workflow transitions, not
 /// record families — their multi-party rule is whatever the committed scoped
@@ -530,9 +532,6 @@ impl PolicyHistory {
 ///
 /// Returns [`CoreError::InvalidTransaction`] when a default-bearing record
 /// family is missing its payload authority field.
-// ponytail: recall's 2-of-2 degenerates to self-approval when the envelope
-// issuer equals the payload authority; per-channel configured multi-party
-// policies for record families land with channel wiring.
 pub fn operation_default(tx: &Transaction) -> Result<Option<PolicyExpression>, CoreError> {
     // Governance default (ADR-012): a capability activation switches
     // network-wide, validation-affecting behaviour, so it requires the
@@ -565,18 +564,17 @@ pub fn operation_default(tx: &Transaction) -> Result<Option<PolicyExpression>, C
             ])))
         }
         "recall" => {
-            let Some(authority) = payload_str("issued_by") else {
+            // No on-chain recall authority (#44, owner decision 2026-09-10):
+            // the issuing organization registers the recall with its own
+            // signature. `issued_by` stays informational metadata for
+            // operators and downstream flows; the chain does not arbitrate
+            // who may order a recall.
+            if payload_str("issued_by").is_none() {
                 return Err(CoreError::InvalidTransaction(
                     "endorsement: recall record is missing 'issued_by'".into(),
                 ));
-            };
-            Ok(Some(PolicyExpression::NOutOf {
-                required: 2,
-                rules: vec![
-                    PolicyExpression::signed_by(record.issuer.clone()),
-                    PolicyExpression::signed_by(authority),
-                ],
-            }))
+            }
+            Ok(Some(PolicyExpression::signed_by(record.issuer.clone())))
         }
         "quality_certification" | "audit_attestation" => {
             let Some(issuer) = payload_str("issuer") else {
@@ -1227,10 +1225,14 @@ mod tests {
         let default = operation_default(&recall)
             .expect("known family validates")
             .expect("recall has a default");
-        let PolicyExpression::NOutOf { required, .. } = &default else {
-            panic!("recall default must be multi-party");
-        };
-        assert_eq!(*required, 2);
+        // No on-chain recall authority (owner decision): the issuing
+        // organization's own signature registers the recall; `issued_by` is
+        // metadata, not a second required principal.
+        assert_eq!(
+            default,
+            PolicyExpression::signed_by("custodian-org"),
+            "recall requires the issuer's signature only"
+        );
 
         // A known family missing its payload field fails closed.
         let broken_recall = Transaction::new(TransactionKind::CanonicalRecord(
@@ -1470,5 +1472,85 @@ mod tests {
             !serialized.contains("endorsements"),
             "empty carriers are skipped so historical hashes stay stable: {serialized}"
         );
+    }
+
+    #[test]
+    fn scoped_update_does_not_relax_the_activation_rule() {
+        let provider = provider(&["network-governance", "channel-gov"]);
+        let mut history = PolicyHistory::default();
+        let genesis = unmined_block(0, "0".into(), vec![]);
+
+        // An authorized scoped update for (supply, inventory) naming
+        // channel-gov as the channel governor.
+        let update = policy_update_tx("supply", "inventory", "threshold");
+        history
+            .validate_block(&unmined_block(1, genesis.hash, vec![update]))
+            .expect("authorized update applies");
+
+        // The scoped update governs its scope from the next block…
+        let scoped = Transaction::new(TransactionKind::InventoryUpdate(crate::InventoryUpdate {
+            product_id: "SKU".into(),
+            owner_id: "buyer-org".into(),
+            quantity_delta: 1,
+            reason: "scoped".into(),
+        }));
+        let mut scoped = scoped;
+        scoped
+            .endorsements
+            .push(carrier("supply", "inventory", &[]));
+        scoped.endorsements[0].signers = vec![signer("channel-gov")];
+        assert!(evaluate_transaction_endorsements(&provider, &history, &scoped, &[], 2).is_ok());
+
+        // …but a capability activation still requires the fixed bootstrap
+        // principal: the scoped governor cannot authorize it.
+        let mut activation = Transaction::new(TransactionKind::CapabilityActivation(
+            crate::CapabilityActivation {
+                capability_id: "endorsement".into(),
+                version: 1,
+                hash: crate::capability_hash("endorsement", 1),
+                activation_height: 3,
+                signatures: vec![],
+            },
+        ));
+        activation.endorsements.push(carrier("", "", &[]));
+        activation.endorsements[0].signers = vec![signer("channel-gov")];
+        let error = evaluate_transaction_endorsements(&provider, &history, &activation, &[], 2)
+            .expect_err("the scoped governor must not authorize an activation");
+        // Either the scope's own policy layer or the activation operation
+        // default rejects it; both are fail-closed.
+        assert!(error.to_string().contains("endorsement"), "{error}");
+
+        // An unconfigured scope still resolves to the fixed bootstrap
+        // principal, not to the scoped update.
+        assert_eq!(
+            history.policies_for("other-channel", ""),
+            PolicyHistory::default_policies()
+        );
+    }
+
+    #[test]
+    fn policy_bootstrap_replay_is_deterministic() {
+        let genesis = unmined_block(0, "0".into(), vec![]);
+        let update = policy_update_tx("supply", "inventory", "threshold");
+        let block = unmined_block(1, genesis.hash.clone(), vec![update]);
+        let blocks = vec![genesis, block];
+
+        let first = PolicyHistory::build_from_blocks(&blocks).expect("valid bootstrap");
+        let second = PolicyHistory::build_from_blocks(&blocks).expect("valid bootstrap");
+
+        // Replay derives identical policies: the scoped override and the
+        // fail-closed default for everything unconfigured.
+        assert_eq!(
+            first.policies_for("supply", "inventory"),
+            second.policies_for("supply", "inventory")
+        );
+        assert_eq!(
+            first.policies_for("unconfigured", ""),
+            PolicyHistory::default_policies()
+        );
+        assert!(matches!(
+            first.policies_for("supply", "inventory").channel_default,
+            PolicyExpression::SignedBy { .. }
+        ));
     }
 }
