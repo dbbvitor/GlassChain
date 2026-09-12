@@ -460,10 +460,10 @@ All confirmed against the source (`.agents/memories/debt-gap-handoff.md`,
    more-specific update overrides a stricter channel-wide one.
 3. **Record families have no channel/contract scope.** Committed policies
    cannot reach `CanonicalRecord` transactions; `operation_default` is the
-   only record-level enforcement. In particular, the recall 2-of-2
-   **degenerates to self-approval** when the envelope issuer equals the payload
-   `issued_by` — the `ponytail:` comment in `endorsement.rs` calls it out;
-   configured multi-party policies for record families await channel wiring.
+   only record-level enforcement. Recall authority was resolved by owner
+   decision (D2, #115): the chain does not arbitrate recall authority; `recall`
+   requires only the issuing organization's signature and `issued_by` is informational
+   metadata for downstream quarantine/dispute workflows.
 4. **Peer-path write binding is aggregate, not per-transaction.** On replay
    paths (peer block, sync) `enforce_*_endorsements` checks only that every
    committed write is covered by *some* carrier in the block — it does not
@@ -748,7 +748,7 @@ The status table's claims, with the exact places to re-verify them:
 | Next-height payload gates | `node.rs` `submit_private_payload` and `PrivatePayload` handler, both `effective_set(chain.len())` |
 | Committed, not declared, policy | `glasschain-core/src/endorsement.rs` `PolicyUpdate`/`PolicyHistory`; `channel.rs` doc on `endorsement_policy` |
 | No CRL/OCSP, single-hop | `cert_verifier.rs` module doc + `verify_signature`; grep for CRL/OCSP is empty |
-| Recall self-approval / operation defaults | `glasschain-core/src/endorsement.rs` `operation_default` + `ponytail:` comment |
+| Recall issuer-only authorization / operation defaults | `glasschain-core/src/endorsement.rs` `operation_default` (#115, D2) |
 | ADR-008 non-weakening unenforced | `PolicyHistory::policies_for` (full replacement) vs ADR-008 §1 |
 | Aggregate (not per-tx) peer-path binding | `enforce_block_endorsements` / `enforce_chain_endorsements` (empty `per_tx_writes` → block-level `covers`) |
 

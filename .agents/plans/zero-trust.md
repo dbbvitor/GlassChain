@@ -1,7 +1,7 @@
 # Plan — Zero-trust deployment and verification gaps
 
-**Status:** active; proposals below are not implemented or an audit certification
-**Reviewed:** 2026-09-05 against `f7b434e`
+**Status:** active; §8.1–§8.4 consensus safety shipped (#95–#99, PR #116); Frontier A remains open specifically for `EquivocationProof` payload format migration
+**Reviewed:** 2026-09-12 against `7143c0c`
 **Related:** [ADRs](../../docs/README.md), [performance](performance.md),
 [post-quantum](post-quantum.md), [source-comment debt](deferred-code-debt.md).
 
@@ -19,7 +19,7 @@ mechanisms were “built and correct” was too broad and is withdrawn.
 |---|---|
 | Peer TLS and TOFU | Default transport; address-bound in-memory fingerprints. Does not alone prove claimed organization membership. |
 | Federation chain verification | Node startup installs a verifier with both `--org` and `--trust-store`; otherwise org claims remain unverified. |
-| CRLs/intermediate CAs | Verification rejects missing/stale/revoked status when the verifier is configured; startup-loaded files are not automatic refresh or reauthorization of established sessions. |
+| CRLs, OCSP and intermediate CAs | Verification rejects missing/stale/revoked status when the verifier is configured; startup CRL files are enforced (ADR-013); OCSP responder query / stapling and dynamic refresh are planned for live session lifecycle. |
 | Endorsement provider | Attached under `--org`, initially registering local identity; enforcement also depends on active capability. Not complete remote certificate-derived principal management. |
 | Governance defaults | ADR-012 uses endorsement carriers for capability activations/state commitments. Advisory record signatures do not become independently verified credentials. |
 | BFT votes/certificates | Default-off staged implementation with verification code; context binding, receipt lifetime and historical verification need the checks in §8. |
@@ -109,6 +109,12 @@ not delay unrelated confidentiality improvements.
   made during Hello cannot promise indefinite membership after expiry/revocation.
   Keep external retrieval off deterministic commit/replay paths and use explicit
   historical evidence for already-committed authorization.
+- **OCSP (Online Certificate Status Protocol) verification and stapling:**
+  While CRLs provide local fail-closed revocation (ADR-013), they require periodic distribution.
+  Add OCSP to the live session lifecycle plan:
+  1. **OCSP stapling** during the TLS handshake for live peer authentication.
+  2. **OCSP responder queries** for dynamic status validation of peer certificates and intermediate CAs, with bounded timeouts, local caching, and fail-closed behavior for private paths.
+  3. **Strict isolation from consensus:** external OCSP network requests must stay strictly off the consensus loop and block execution paths (local cache only; historical validation remains deterministic and height-bound).
 
 ## 6. Cryptographic backend review
 
@@ -132,8 +138,8 @@ approval of a new primitive, backend, certificate profile or algorithm lifetime.
 
 ## 7. Source-comment debt and compliance gates
 
-All six ponytail markers and the one TODO have dispositions and acceptance tests
-in [deferred-code-debt.md](deferred-code-debt.md). Zero-trust priorities:
+All original source markers (six ponytail + one TODO) have dispositions and acceptance tests
+in [deferred-code-debt.md](deferred-code-debt.md); D1–D7 are settled and benchmarked in code. Zero-trust priorities:
 
 - **D1 governance bootstrap — shipped (2026-09-10):** the fixed fail-closed
   default stays; the provisioning procedure (register the governance key under

@@ -1,123 +1,77 @@
 # Handoff — GlassChain
 
-**Reviewed:** 2026-09-05
-**Source baseline:** `main` / `origin/main` at `f7b434e` after fetching origin.
-**Change branch:** `docs/webapp-roadmap-reconciliation` — documentation and plans
-only; no runtime code, dependencies or security controls changed.
+**Reviewed:** 2026-09-12
+**Source baseline:** `main` / `origin/main` at `7143c0c` (PR #116 / `fix/sync-certificate-events-and-doc-drift`).
+**Change branch:** `fix/sync-certificate-events-and-doc-drift` — sync certificate events, doc reconciliation, and living artifact alignment.
 
 ## Start here
 
 1. Read [AGENTS.md](../AGENTS.md) for repository rules, then the
    [plan index](plans/README.md) for concluded versus pending work.
-2. Read [zero-trust §8](plans/zero-trust.md) before consensus optimization or
-   claims about authenticated finality/history.
-3. Read [source-comment debt](plans/deferred-code-debt.md) before completing
-   authorization, private retention or unattended workflow deployment.
-4. For the visual product, use the [browser demo plan](plans/gui-demo-benchmark.md).
-   **The owner replaced desktop gpui with a web app.** WebGPU is an optional,
-   measured renderer, not a framework, validator runtime or shipped feature.
+2. Active priority sequence: **Frontier C (Consensus Capacity / BLST Backend) →
+   Frontier B (RBAC & Operational Tail) → Frontier D (Browser Demo)**.
+   Frontier A remains open specifically for `EquivocationProof` format migration.
+3. Read [zero-trust §8](plans/zero-trust.md) for consensus safety invariants.
+4. Read [source-comment debt](plans/deferred-code-debt.md) for settled D1–D7
+   markers and benchmarks.
+5. For the visual product, use the [browser demo plan](plans/gui-demo-benchmark.md).
+   Web app replaces desktop gpui; Canvas2D baseline, optional WebGPU.
 
 ## Current state — code, decisions and evidence are different
 
 | Area | Concluded / available | Still pending |
 |---|---|---|
-| Workspace | 12 Rust crates; wire `glasschain/6`; 14 accepted ADRs | No browser package or demo bridge exists |
+| Workspace | 12 Rust crates; wire `glasschain/6`; 14 accepted ADRs; D1–D7 settled | No browser package or demo bridge exists |
 | Ledger/execution | Schema v1, capability/policy history, explicit WASM write sets and replay | Production durability acknowledgement and historical security gates |
-| Consensus | PoW dev/test default; BLS proposal/prevote/precommit driver staged behind `bft` and capability | Context-authenticated votes/QCs, reliable evidence receipt state, full historical verification; no audited production BFT or speculative API |
-| Identity/privacy | TLS/TOFU, optional federation verifier, CRLs/intermediates, endorsement provider, PDC delivery/reconciliation | Fail-closed unconfigured paths, key/certificate lifecycle, role/scope decisions and restart-safe physical deletion |
-| Workflows/read path | Checkpointed flow engine, purchase/recall flows, triage API, provenance/flattener/event bus and RPC queries | Unattended triage discovery, durable external integration, bounded projection costs and complete operational metrics |
-| Measurements | Prior local BFT p50 2,021 ms at 100 / 5,284 ms at 200; structural encoding/fan-out fixes | 300 not passing, WAN/fault/long-run memory evidence, independent comparisons; no best-in-class or deployment claim |
-| PQ readiness | Discriminants shipped, provider/archival research recorded | Negotiated hybrid TLS test/selection, migration and optional archive profile; no guaranteed quantum-safe lifetime |
-| Demonstration | Web-app direction and browser/bridge/renderer acceptance gates specified | Entire implementation; Canvas2D baseline, optional WebGPU, no production data or public hosting |
+| Consensus | PoW dev/test default; BLS driver with context-authenticated votes (#95, #99), live receipt journal (#96), full historical QC verification on sync/restart (#97, PR #116), absolute phase deadlines/bounded queues/distinct voters (#98) | Migrate `EquivocationProof` payload format to dual-sign context envelope (Frontier A open); production audit/testnet/APIs (ADR-010) |
+| Identity/privacy | TLS/TOFU with durable pins & signed rotation (#88), opt-in verifier with fail-closed private paths (#86), session-bound possession proofs (#110), CRLs/intermediates (ADR-013), cert-bound MSP principals with height authorization (#87, D4), fail-closed governance fallback (D1), issuer-signed recall (D2), restart-safe purge (D5) & triage discovery (D6) | OCSP verification & stapling, deployment access (operator RBAC/channel-management operations), explicit replica/backup retention policy, deferred on-chain revocation (#74) |
+| Workflows/read path | Checkpointed flow engine, purchase/recall flows, triage API with restart discovery (D6), provenance/flattener/event bus and RPC queries; D3 baseline measured (#106) | Unattended external integration, durable external indexer adapter, bounded projection costs |
+| Measurements | Prior local BFT p50 2,021 ms at 100 / 5,284 ms at 200; D3 admission bench (~21 ms at 10k); read-path memory baseline (#107); D7 WAN proxy profiles (#108) | 300-validator pass (pure-Rust pairing bottleneck; active Frontier C focus); long-run fleet memory |
+| PQ readiness | Discriminants shipped; negotiated X25519MLKEM768 hybrid TLS behind `pq-tls` shipped (#105) | Long-term archive evidence / migration policy; no guaranteed quantum-safe lifetime |
+| Demonstration | Web-app direction and browser/bridge/renderer acceptance gates specified | Entire implementation; Canvas2D baseline, optional WebGPU (Frontier D, queued after C and B) |
 
-Earlier tickets for verifier wiring, CRLs, endorsement startup, governance defaults
-and TCP fault tests closed. That does not close the deployment gaps above.
-The seven source markers remain: six ponytail comments plus one madsim TODO.
-D7's real-TCP fault-testing outcome is partly met by the proxy; its simulator
-migration is still optional, not silently completed.
+The seven source markers (D1–D7) are fully settled (#106–#109, #114–#115):
+D1 governance bootstrap documented; D2 recall issuer-signed; D3 admission cost
+benchmarked; D4 cert-bound principals shipped; D5 restart-safe purge shipped;
+D6 triage discovery shipped; D7 WAN proxy profiles shipped.
 
 ## Pending frontiers — what to do next and how to finish
 
-### A. First engineering slice: staged consensus safety
+### A. Consensus safety residual (kept open)
 
-**Ready to specify and test; no backend decision blocks it.** Start with the
-four code observations in zero-trust §8, not a faster signature implementation:
+**Status:** core safety mechanisms shipped in #95, #96, #97, #98, #99, and PR #116.
+Frontier A remains open specifically to complete:
 
-1. Add failing tests for changed vote height/round/phase/chain context. Specify
-   signed-byte and historical compatibility before changing votes and QCs.
-2. Send conflicting votes through the real network handler: retain bounded
-   ordinary receipts between messages and prove detection without false blame.
-3. Test structurally valid but cryptographically invalid historical QCs through
-   chain sync and restart, under the correct historical validator set.
-4. Test duplicate/stale traffic against an absolute phase deadline and bounded
-   queues. Count distinct eligible voters; do not allow received-message volume
-   to extend a round indefinitely.
+- Migrate `EquivocationProof::verify` payload format from the legacy hash-only
+  signature check to the context-bound dual-sign envelope (`domain || genesis-hash ||
+  height || round || phase || block-hash`) introduced in #95.
 
-**Completion:** each regression passes through the actual entry path, default
-and all-feature gates pass, compatibility decisions are documented. Tickets
-filed 2026-09-08: §8.1 → #95 (dual-sign envelope, genesis-hash chain id; legacy
-removal in #99), §8.2 → #96, §8.3 → #97, §8.4 → #98. Do not activate production
-BFT or governance penalties merely because local benchmarks pass.
+### B. Deployment trust, privacy and recovery (queued after C)
 
-### B. Deployment trust, privacy and recovery
+Code items D1–D6 and #86–#88 shipped with tests. Frontier B remains open on:
 
-Independent decisions/tests can proceed alongside A:
+- OCSP (Online Certificate Status Protocol) verification and stapling for live peer authentication.
+- Deployment access (operator RBAC and channel-management operations specification).
+- Explicit replica/backup physical retention and recovery policy.
+- On-chain revocation registry (#74) remains deferred.
 
-- [Org-gated fail-open default](https://github.com/dbbvitor/GlassChain/issues/86):
-  **shipped (2026-09-10)** — private send/receive/reconcile require a configured
-  verifier, certificate-verified member orgs, and a session-bound possession
-  proof (#110, TLS exporter binding); tests migrated to real credentials and
-  the copied-certificate case is covered. The old suggested insecure flag is
-  not approved.
-- [Certificate-bound MSP principals](https://github.com/dbbvitor/GlassChain/issues/87):
-  **shipped (2026-09-10)** — verified-certificate registration + possession
-  proof, height-stamped authorization (valid-from/revoked-at; no wall clock on
-  replay). Remaining: remote-principal wiring and a chain-derived registry.
-- [Durable TOFU pins](https://github.com/dbbvitor/GlassChain/issues/88):
-  **shipped (2026-09-10)** — storage-backed pins, signed rotation by the pinned
-  key, corrupt-pin fail-closed, documented operator recovery. Distinct from
-  storing node private keys (unchanged).
-- D1 governance bootstrap and D2 recall authority: **decided and shipped
-  (2026-09-10)** — fail-closed `network-governance` default with documented
-  provisioning; no on-chain recall authority (issuer-signed recalls, public
-  downstream visibility).
-- D5 deletion-after-restart and D6 triage discovery: **shipped (2026-09-10)**
-  (storage-scanning purge with startup+300 s sweep; `FlowTriage::discover`).
-- [On-chain revocation registry](https://github.com/dbbvitor/GlassChain/issues/74)
-  remains deferred; not a prerequisite to fixing current off-chain lifecycle gaps.
+### C. Active Priority: Transport and performance (unblock 300 validators)
 
-**Completion:** the D1–D6 tests in the debt plan pass and deployment access,
-retention/backup and authority policies are explicit. Code alone does not certify
-LGPD, ANVISA or ICP-Brasil compliance.
+Hybrid TLS negotiation shipped (#105). Step 0 prerequisites (WAN proxy #108,
+D3 admission bench #106, read-path memory baseline #107) are complete.
+Active focus:
 
-**Status (2026-09-11):** D1–D6 and #86–#88 shipped with tests; frontier B is
-**not fully closed** — deployment access (RBAC/channel-management operations)
-and explicit replica/backup retention remain, and #74 stays deferred.
+- **Step 3 (BLS verification / pairing backend experiment, issue #85):** evaluate
+  `blst` vs pure-Rust `pairing` to unblock the 300-validator finality gate timeout.
+  Validate API portability, Windows/macOS/Linux CI, and aggregate-public-key verification.
+- **Completion:** comparable before/after evidence under unchanged quorum assumptions;
+  300-validator gate passing within budget.
 
-### C. Transport and performance: independent measured improvements
-
-Start a two-node **negotiated KX group** test on each TLS construction path;
-aws-lc already exists in the dependency graph, but runtime selection determines
-use. Preserve certificate/TOFU checks. The
-[backend review](https://github.com/dbbvitor/GlassChain/issues/85) evaluates each
-provider's audit, compatibility and CI cost; it is not a universal no-C blocker.
-
-After/alongside safety regressions, follow performance Step 0: WAN fault profiles,
-D3 history/pool admission costs, projection-memory/lag measurements, then the BLS
-verification/backend experiment. **Completion:** comparable before/after evidence
-under unchanged security/quorum assumptions; no assumed 10× gain or 300 pass.
-Fast paths and DAG dissemination stay behind measured triggers. Beyond-300 tests
-are experimental after 300 succeeds, not ruled out by a theorem.
-
-### D. Browser demonstration: safe parallel product slice
+### D. Browser demonstration (queued after C and B)
 
 [Browser demo](https://github.com/dbbvitor/GlassChain/issues/61) begins with plan
 step 0: one same-origin page + session-protected HTTP/SSE bridge + bounded sample
-snapshot and Canvas2D/WebGPU comparison. Then extract shared workload fixtures,
-build the real-node headless runner and add traceability/metrics views.
-
-**Completion:** synthetic transactions traverse real available checks; no keys or
-unauthorized payloads reach the browser; no-GPU/device-loss/reconnect cases remain
+snapshot and Canvas2D/WebGPU comparison. Queued after Frontiers C and B.
 usable; headless and UI totals agree; run resources are bounded and cleaned up.
 Core validation never depends on a browser/GPU. This can be built without waiting
 for speculative consensus, FL, an archive TSA or a production REST gateway, but

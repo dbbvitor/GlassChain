@@ -28,12 +28,24 @@ _Avoid_: participant, peer (a peer is the network process, not the organization)
 The operator-configured set of peer-organization Root CAs a node accepts as certificate issuers, alongside its own organization's Root CA. An organization outside the store stays connected but is not trusted on organization-gated paths (private payloads). Distribution between organizations is manual and out-of-band; trust anchors are configuration and persist across restarts.
 _Avoid_: shared CA (no single root exists), on-chain registry (a considered but rejected alternative, ADR-011)
 
+**Session-bound possession proof**:
+A cryptographic proof (an ed25519 signature over RFC 5705 TLS exporter context) demonstrating that a peer holds the private key matching its presented MSP certificate, bound to the active TLS session. Guarantees that copied certificates cannot impersonate a member organization.
+_Avoid_: bearer certificate, unverified identity claim
+
+**Durable TOFU pin**:
+A storage-persisted peer public key binding keyed by advertised network address, loaded at node startup. Can be rotated only by presenting a signed rotation message from the currently pinned key. Prevents in-memory trust amnesia and fails closed on pin corruption.
+_Avoid_: in-memory peer registry, blind TOFU
+
 **Validator**:
 A member organization that participates in block finality voting. In v1 every member organization is a validator (full participation); bounding the validator set later is configuration, not redesign — the consensus family supports per-height validator-set changes. Validating is an operational role, not a status: it confers no read access, no authority to authorize a business change, and no fee or settlement advantage. Bounding the set is a liveness requirement (a quorum needs ⅔+ of validators responsive), not an exclusion mechanism.
 _Avoid_: miner (the retired proof-of-work role); tier, rank (validator is a role a member holds, not a class it belongs to)
 
 **Zero trust**:
 The network's consensus posture: no participant is trusted by default. Commercial rivals may operate validators, so finality must not depend on any single operator's honesty.
+
+**Context-authenticated vote**:
+A consensus vote payload cryptographically binding the validator's signature to the full routing context (`domain || genesis-hash || height || round || phase || block-hash`) rather than an isolated block hash. Prevents cross-chain, cross-height, cross-round, and cross-phase vote replay.
+_Avoid_: bare hash vote, hash-only attestation
 
 **Light client**:
 A member organization that submits transactions and queries state through authenticated gRPC without operating a validator, verifying block headers against the validator set's signatures. It takes state validity on trust from the quorum and therefore cannot detect an invalid state transition. At national scale most members are light clients; provenance guarantees are unchanged because every submission is signed by an MSP identity.
@@ -78,6 +90,10 @@ _Avoid_: mutable policy side table
 **Endorsement principal**:
 A verified MSP organization member whose signature can satisfy a policy rule. Distinct principals count separately; duplicate signatures or multiple nodes from one organization do not create extra organizational approvals.
 _Avoid_: caller-supplied organization label
+
+**Height-stamped authorization**:
+Authorization evaluation bounded strictly by block height (`valid_from` and `revoked_at` block indices) rather than mutable wall-clock time or external CRL lookups during historical replay. Ensures deterministic state re-execution across restarts and syncs.
+_Avoid_: wall-clock authorization, dynamic CRL evaluation on historical blocks
 
 **Private data collection (PDC)**:
 A named set of member organizations authorized to hold a class of private payloads. Only a hash commitment is written to the global chain; payloads are disseminated point-to-point to collection members, purge after the collection's retention window, and remain pullable by late peers for the retention period. Regulator organizations are members of every collection by default.

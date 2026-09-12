@@ -63,14 +63,11 @@ gates real code paths.
 - A guest MUST compute private values at runtime — a value in a WASM data
   segment rides the committed ContractCreation tx. The test contracts do this
   via `i32.store` of an obfuscated constant.
-- #47 delivered: `CertChainVerifier` on the payload path, membership enforced
-  on VM writes mined by relayed executions, org-drift detection in
-  `verify_or_register`, and retention/purge in `TransientStore`. **Caveat
-  found 2026-09-02:** the payload-path cert gate is
-  `verification_required = cert_verifier.is_some()`, and no production binary
-  ever calls `set_cert_verifier` — so it fails open to the self-asserted org
-  outside tests. See `external-review-verdicts.md`; do not "fix" it by
-  installing a single-org verifier in `glasschain-node`.
+- #47 delivered `CertChainVerifier` on the payload path. **Update (2026-09-10):**
+  The previous fail-open caveat was resolved by #86 (fail closed on unverified
+  orgs for all private paths) and #110 (session-bound TLS exporter possession proofs).
+  `glasschain-node` installs `CertChainVerifier` when `--org` and `--trust-store`
+  are provided; unverified peers stay connected for public sync only.
 
 #44 review finding worth remembering (fixed in the amend, generalizable):
 - `RecallConfig.lot_ref` was write-only — the anchor transition anchored the
