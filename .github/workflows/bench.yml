@@ -1,0 +1,65 @@
+name: Benchmarks
+
+# Criterion benches run here, parallel to the gates in ci.yml. The test job
+# excludes bench *executions* (their test-mode setup dominates runtime and
+# yields no test coverage), so this workflow is where they run for real:
+# release builds, full criterion measurement.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "clippy.toml"
+      - ".cargo/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "clippy.toml"
+      - ".cargo/**"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    name: Criterion benches
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ github.job }}
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      # -p keeps the build to the bench crates and their dependencies, so
+      # protoc (needed only by glasschain-rpc) is not required here.
+      - name: Run benches
+        run: |
+          cargo bench -p glasschain-core
+          cargo bench -p glasschain-vm
+          cargo bench -p glasschain-workflows

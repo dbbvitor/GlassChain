@@ -30,12 +30,10 @@ fn inventory_tx(owner: &str) -> Transaction {
     }))
 }
 
-/// Allocate an available loopback port.
-fn free_addr() -> String {
-    use std::net::TcpListener;
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().to_string()
-}
+#[path = "common/ports.rs"]
+mod ports;
+
+use ports::free_addr;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

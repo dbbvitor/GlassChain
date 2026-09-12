@@ -80,13 +80,10 @@ fn asset_tx(asset: TraceableAsset, event_type: &str, originator: &str) -> Transa
     ))
 }
 
-fn free_addr() -> String {
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr.to_string()
-}
+#[path = "common/ports.rs"]
+mod ports;
+
+use ports::free_addr;
 
 // ── Unit-level trust score tests ───────────────────────────────────────────
 

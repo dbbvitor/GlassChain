@@ -116,37 +116,32 @@ pub const VOTE_RECEIPT_CAP: usize = 8192;
 #[derive(Default)]
 #[allow(clippy::type_complexity)]
 pub struct VoteReceipts {
-    seen: std::collections::HashMap<(u64, u32, VotePhase, Vec<u8>), (String, Vec<u8>)>,
+    seen: std::collections::HashMap<(u64, u32, VotePhase, Vec<u8>), BftVote>,
 }
 
 impl VoteReceipts {
-    /// Record a verified vote; returns an equivocation proof when the same
-    /// key already voted for a **different** hash in the same
-    /// `(height, round, phase)`. Bounded: see [`VOTE_RECEIPT_CAP`].
+    /// Record a verified vote; returns an equivocation proof carrying both
+    /// dual-signed votes (#95) when the same key already voted for a
+    /// **different** hash in the same `(height, round, phase)`. Bounded: see
+    /// [`VOTE_RECEIPT_CAP`].
     #[must_use]
     pub fn record(&mut self, vote: &BftVote) -> Option<EquivocationProof> {
         let key = (vote.height, vote.round, vote.phase, vote.public_key.clone());
         match self.seen.get(&key) {
-            Some((hash, signature)) if hash != &vote.block_hash => {
-                let (first_hash, first_signature) = (hash.clone(), signature.clone());
-                Some(EquivocationProof {
-                    height: vote.height,
-                    round: vote.round,
-                    phase: vote.phase,
-                    public_key: vote.public_key.clone(),
-                    first_signature,
-                    first_block_hash: first_hash,
-                    second_signature: vote.signature.clone(),
-                    second_block_hash: vote.block_hash.clone(),
-                })
-            }
+            Some(first) if first.block_hash != vote.block_hash => Some(EquivocationProof {
+                height: vote.height,
+                round: vote.round,
+                phase: vote.phase,
+                public_key: vote.public_key.clone(),
+                first_vote: first.clone(),
+                second_vote: vote.clone(),
+            }),
             Some(_) => None,
             None => {
                 if self.seen.len() >= VOTE_RECEIPT_CAP && !self.evict_stale(vote.height) {
                     return None;
                 }
-                self.seen
-                    .insert(key, (vote.block_hash.clone(), vote.signature.clone()));
+                self.seen.insert(key, vote.clone());
                 None
             }
         }
@@ -239,16 +234,70 @@ mod tests {
             round: 0,
             phase: VotePhase::Prevote,
             public_key: key.public_key().as_bytes(),
-            first_signature: key
-                .sign(glasschain_core::BftVote::vote_message("hash-a"))
-                .as_bytes(),
-            first_block_hash: "hash-a".into(),
-            second_signature: key
-                .sign(glasschain_core::BftVote::vote_message("hash-a"))
-                .as_bytes(),
-            second_block_hash: "hash-a".into(),
+            first_vote: vote(&key, 1, 0, VotePhase::Prevote, "hash-a"),
+            second_vote: vote(&key, 1, 0, VotePhase::Prevote, "hash-a"),
         };
         assert!(proof.verify().is_err(), "same hash is not equivocation");
+    }
+
+    #[test]
+    fn test_equivocation_proof_rejects_cross_context_votes() {
+        // Two genuine votes in different consensus contexts — different
+        // heights here — are the protocol working, not equivocation. A proof
+        // assembled from them must fail verification: the dual-sign context
+        // envelope (#95) authenticates the shared (chain, height, round,
+        // phase), not just the hashes (Frontier A conclusion).
+        let key = PrivateKey::new([9; 64]);
+        let proof = glasschain_core::EquivocationProof {
+            height: 5,
+            round: 0,
+            phase: VotePhase::Prevote,
+            public_key: key.public_key().as_bytes(),
+            first_vote: vote(&key, 5, 0, VotePhase::Prevote, "hash-a"),
+            second_vote: vote(&key, 6, 0, VotePhase::Prevote, "hash-b"),
+        };
+        assert!(
+            proof.verify().is_err(),
+            "cross-height votes are not equivocation"
+        );
+    }
+
+    #[test]
+    fn test_equivocation_proof_rejects_cross_chain_votes() {
+        // The envelope binds the chain id: votes reused from a different
+        // network (same validator, same context shape) cannot pass.
+        let key = PrivateKey::new([11; 64]);
+        let proof = glasschain_core::EquivocationProof {
+            height: 5,
+            round: 0,
+            phase: VotePhase::Prevote,
+            public_key: key.public_key().as_bytes(),
+            first_vote: vote(&key, 5, 0, VotePhase::Prevote, "hash-a"),
+            second_vote: BftVote::sign("other-chain", 5, 0, VotePhase::Prevote, "hash-b", &key),
+        };
+        assert!(
+            proof.verify().is_err(),
+            "cross-chain votes are not equivocation"
+        );
+    }
+
+    #[test]
+    fn test_equivocation_proof_rejects_tampered_context_signature() {
+        let key = PrivateKey::new([10; 64]);
+        let mut second = vote(&key, 5, 0, VotePhase::Prevote, "hash-b");
+        second.context_signature = vec![0; 96];
+        let proof = glasschain_core::EquivocationProof {
+            height: 5,
+            round: 0,
+            phase: VotePhase::Prevote,
+            public_key: key.public_key().as_bytes(),
+            first_vote: vote(&key, 5, 0, VotePhase::Prevote, "hash-a"),
+            second_vote: second,
+        };
+        assert!(
+            proof.verify().is_err(),
+            "a tampered context signature must fail"
+        );
     }
 
     #[test]

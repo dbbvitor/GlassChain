@@ -588,8 +588,11 @@ impl BftVote {
 /// Self-verifying evidence of validator equivocation (ADR-009 §4, #77).
 ///
 /// One validator signed two different candidate hashes in the same
-/// `(height, round, phase)`. Both signatures verify individually; no
-/// reputation, no weighting, no automatic ejection.
+/// `(chain, height, round, phase)` context. The proof carries both votes in
+/// full, so verification rides the dual-sign context envelope (#95): each
+/// vote must individually verify, both must agree on the chain and the
+/// proof's `(height, round, phase, public_key)` context, and they must name
+/// different hashes. No reputation, no weighting, no automatic ejection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EquivocationProof {
     pub height: u64,
@@ -598,48 +601,47 @@ pub struct EquivocationProof {
     /// The equivocating validator's BLS public key.
     #[serde(with = "crate::wire::base64_bytes")]
     pub public_key: Vec<u8>,
-    /// First conflicting vote signature.
-    #[serde(with = "crate::wire::base64_bytes")]
-    pub first_signature: Vec<u8>,
-    pub first_block_hash: String,
-    /// Second conflicting vote signature.
-    #[serde(with = "crate::wire::base64_bytes")]
-    pub second_signature: Vec<u8>,
-    pub second_block_hash: String,
+    /// First conflicting vote, dual-signed over its own hash and the
+    /// context envelope ([`BftVote::context_message`], #95).
+    pub first_vote: BftVote,
+    /// Second conflicting vote, dual-signed over its own hash and the same
+    /// context envelope ([`BftVote::context_message`], #95).
+    pub second_vote: BftVote,
 }
 
 #[cfg(feature = "bft")]
 impl EquivocationProof {
-    /// Self-verification: both signatures verify over their own hashes under
-    /// `public_key`, and the hashes differ. Validator-set membership is the
-    /// caller's check.
+    /// Self-verification: both votes verify through their dual-sign context
+    /// envelopes (#95), agree on the chain and the proof's
+    /// `(height, round, phase, public_key)` context, and name different
+    /// hashes. Validator-set membership is the caller's check.
     ///
     /// # Errors
     ///
     /// Returns [`CoreError::InvalidBlock`] when the proof does not verify.
     pub fn verify(&self) -> Result<(), CoreError> {
-        if self.first_block_hash == self.second_block_hash {
+        self.first_vote.verify()?;
+        self.second_vote.verify()?;
+        if self.first_vote.block_hash == self.second_vote.block_hash {
             return Err(CoreError::InvalidBlock(
                 "equivocation proof: both votes name the same hash — not equivocation".into(),
             ));
         }
-        let public = PublicKey::from_bytes(self.public_key.as_slice()).map_err(|e| {
-            CoreError::InvalidBlock(format!("equivocation proof: invalid BLS public key: {e}"))
-        })?;
-        for (hash, sig) in [
-            (&self.first_block_hash, &self.first_signature),
-            (&self.second_block_hash, &self.second_signature),
-        ] {
-            let signature = Signature::from_bytes(sig.as_slice()).map_err(|e| {
-                CoreError::InvalidBlock(format!("equivocation proof: invalid signature: {e}"))
-            })?;
-            let message = BftVote::vote_message(hash);
-            if !public.verify(signature, message) {
-                return Err(CoreError::InvalidBlock(
-                    "equivocation proof: a signature does not verify under the validator key"
-                        .into(),
-                ));
+        for (label, vote) in [("first", &self.first_vote), ("second", &self.second_vote)] {
+            if vote.height != self.height
+                || vote.round != self.round
+                || vote.phase != self.phase
+                || vote.public_key != self.public_key
+            {
+                return Err(CoreError::InvalidBlock(format!(
+                    "equivocation proof: {label} vote disagrees with the proof context"
+                )));
             }
+        }
+        if self.first_vote.chain_id != self.second_vote.chain_id {
+            return Err(CoreError::InvalidBlock(
+                "equivocation proof: the votes are bound to different chains".into(),
+            ));
         }
         Ok(())
     }
