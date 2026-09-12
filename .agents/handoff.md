@@ -3,7 +3,8 @@
 **Reviewed:** 2026-09-12
 **Source baseline:** `main` / `origin/main` at `523cd42` (PR #116 / `fix/sync-certificate-events-and-doc-drift`).
 **Change branch:** `feat/frontier-a-dual-sign-proof-ci` — dual-sign `EquivocationProof` (Frontier A
-conclusion), parallel-safe test ports and CI speed, workflow badges.
+conclusion), parallel-safe test ports and CI speed, workflow badges, Rust
+1.98.1 pin and a dedicated parallel bench workflow.
 
 ## Start here
 
@@ -90,16 +91,20 @@ endorsement. Use the relevant plans rather than inventing a new platform now.
 ## Validation and PR procedure
 
 Local validation completed on this branch, 2026-09-12 (worktree target dir,
-clean build):
+Rust 1.98.1 — the branch also pins the toolchain, so the gates below ran on
+it):
 
 - `cargo fmt --all --check`: passed.
 - `cargo check --workspace --all-targets --all-features --locked`: passed.
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D
-  warnings`: passed, zero diagnostics.
+  warnings`: passed, zero diagnostics (three 1.98 lint fixes: the SDK client
+  constructor is now sync and infallible, and two CLI log borrows dropped).
 - `cargo test --workspace --lib --bins --tests --all-features --locked`:
-  passed — 589 tests across 33 harnesses in 113 s with parallel harnesses (the
+  passed — 589 tests across 33 harnesses with parallel harnesses (the
   new shared port-band allocator removes the serial constraint; bench
-  executions are excluded from the test gate as in CI).
+  executions run in the new Benchmarks workflow instead of the test gate).
+- `cargo bench -p glasschain-core`: passed in release on 1.98.1 (the
+  bench.yml command shape); the vm/workflows benches share the same shape.
 - Large ignored scale/WAN gates were not re-run; prior numbers remain dated evidence.
 
 For the PR, verify all local links, marker coverage and whitespace; fetch origin

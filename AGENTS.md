@@ -19,7 +19,7 @@ Proof-of-Work consensus, supply-chain transaction types (`SupplyOffer`,
 watcher automation engine, a TLS-encrypted TCP/libp2p P2P layer, and a gRPC API.
 
 - **Type:** Cargo workspace, 12 crates (members listed in `Cargo.toml`).
-- **Toolchain:** Rust **1.95** (pinned in `rust-toolchain.toml`), edition 2021.
+- **Toolchain:** Rust **1.98.1** (pinned in `rust-toolchain.toml`), edition 2021.
 - **Runtime:** Tokio async, `tonic`/`prost` for gRPC, `wasmtime` for contract execution.
 - **CI:** `.github/workflows/ci.yml` runs strict rustfmt and clippy gates, a
   check/test matrix on Ubuntu, macOS, and Windows, code coverage, and a RustSec
@@ -115,8 +115,8 @@ GlassChain/
 ├── .github/copilot-instructions.md  # Pointer to AGENTS.md
 ├── .agents/                    # Agent working artifacts (plans, tasks, memories)
 ├── Cargo.toml                  # Workspace manifest + workspace-wide lint config
-├── clippy.toml                 # Clippy thresholds (MSRV 1.95, complexity limits)
-├── rust-toolchain.toml         # Pins Rust 1.95
+├── clippy.toml                 # Clippy thresholds (MSRV 1.98.1, complexity limits)
+├── rust-toolchain.toml         # Pins Rust 1.98.1
 ├── README.md                   # Human overview, quick start and navigation
 ├── PLUGIN_KIT.md               # Plugin/trait developer guide — read before extending
 └── crates/
@@ -346,7 +346,7 @@ See [`.agents/README.md`](.agents/README.md) for file templates.
 
 ## Gotchas
 
-- The pinned toolchain is 1.95; `clippy.toml` sets `msrv = "1.95.0"`. Don't use
+- The pinned toolchain is 1.98.1; `clippy.toml` sets `msrv = "1.98.1"`. Don't use
   APIs newer than that, and don't bump `rust-toolchain.toml` casually.
 - `Cargo.toml` is authoritative for workspace membership. The planned browser
   demo is not implemented and must not be counted as a shipped crate.

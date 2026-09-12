@@ -4,13 +4,14 @@
 
 [![CI](https://github.com/dbbvitor/GlassChain/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/dbbvitor/GlassChain/actions/workflows/ci.yml)
 [![Security audit](https://github.com/dbbvitor/GlassChain/actions/workflows/audit.yml/badge.svg?branch=main)](https://github.com/dbbvitor/GlassChain/actions/workflows/audit.yml)
+[![Benchmarks](https://github.com/dbbvitor/GlassChain/actions/workflows/bench.yml/badge.svg?branch=main)](https://github.com/dbbvitor/GlassChain/actions/workflows/bench.yml)
 [![codecov](https://codecov.io/gh/dbbvitor/GlassChain/branch/main/graph/badge.svg)](https://codecov.io/gh/dbbvitor/GlassChain)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Rust 1.95](https://img.shields.io/badge/rust-1.95-orange.svg)](https://www.rust-lang.org)
+[![Rust 1.98.1](https://img.shields.io/badge/rust-1.98.1-orange.svg)](https://www.rust-lang.org)
 
 GlassChain shares a tamper-evident record of offers, orders, inventory, and
 custody across a federated peer-to-peer network. It is a 12-crate Rust workspace,
-pinned to Rust 1.95 and async on Tokio.
+pinned to Rust 1.98.1 and async on Tokio.
 
 ---
 
@@ -57,7 +58,7 @@ pinned to Rust 1.95 and async on Tokio.
 
 ### Prerequisites
 
-- Rust via [rustup](https://rustup.rs) — `rust-toolchain.toml` pins 1.95.
+- Rust via [rustup](https://rustup.rs) — `rust-toolchain.toml` pins 1.98.1.
 - `protoc` — needed to build `glasschain-rpc` (compiles the `.proto`; not vendored).
 
 ### Build

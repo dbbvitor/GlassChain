@@ -3,7 +3,7 @@
 #
 # Setup, build, test, and CI-gate targets for the GlassChain Rust workspace.
 #
-# The toolchain is pinned to 1.95 in `rust-toolchain.toml`; cargo/rustup pick it
+# The toolchain is pinned to 1.98.1 in `rust-toolchain.toml`; cargo/rustup pick it
 # up automatically, so plain `cargo` commands here use the right toolchain.
 #
 # Targets mirror the gates in .github/workflows/ci.yml, so `make ci` locally
@@ -36,7 +36,7 @@ TEST_FLAGS := --workspace --lib --bins --tests --all-features --locked
 # the libtest harnesses run in parallel safely — same as CI.
 
 # Pinned channel from rust-toolchain.toml.
-TOOLCHAIN := 1.95
+TOOLCHAIN := 1.98.1
 
 .DEFAULT_GOAL := help
 
@@ -103,9 +103,10 @@ fmt-check: ## Verify formatting without modifying files (CI gate)
 clippy: ## Run clippy with warnings as errors (CI gate)
 	cargo clippy $(CARGO_FLAGS) -- -D warnings
 
-bench: ## Run the criterion benchmarks
-	cargo bench -p glasschain-vm
-	cargo bench -p glasschain-workflows
+bench: ## Run the criterion benches (CI runs them in the Benchmarks workflow)
+	        cargo bench -p glasschain-core
+	        cargo bench -p glasschain-vm
+	        cargo bench -p glasschain-workflows
 
 audit: ## Audit dependencies for known vulnerabilities (run `make tools` first)
 	cargo audit --deny warnings --file Cargo.lock

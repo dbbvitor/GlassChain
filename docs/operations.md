@@ -29,7 +29,7 @@ gating, adoption gates), [`benchmarks/consensus-capacity.md`](benchmarks/consens
 
 | Requirement | Notes |
 |---|---|
-| **Rust 1.95** | Pinned in `rust-toolchain.toml`; rustup picks it up automatically. Edition 2021. |
+| **Rust 1.98.1** | Pinned in `rust-toolchain.toml`; rustup picks it up automatically. Edition 2021. |
 | **`protoc`** | **Required to build.** `glasschain-rpc` compiles
   `proto/glasschain/v1/glasschain.proto` at build time (`build.rs` via
   `tonic-prost-build`); `protoc` is **not vendored**. CI installs it
@@ -47,7 +47,7 @@ make setup
 Verify the toolchain and compiler are visible:
 
 ```bash
-rustc --version      # 1.95.x
+rustc --version      # 1.98.x
 protoc --version     # any recent release
 ```
 
@@ -760,9 +760,13 @@ numbers: [`docs/benchmarks/consensus-capacity.md`](benchmarks/consensus-capacity
 ### Criterion benchmarks
 
 ```bash
+cargo bench -p glasschain-core        # crates/glasschain-core/benches/ledger_admission.rs (D3)
 cargo bench -p glasschain-vm          # crates/glasschain-vm/benches/vm_throughput.rs
 cargo bench -p glasschain-workflows   # crates/glasschain-workflows/benches/watcher_throughput.rs
 ```
+
+CI runs these in their own parallel workflow (`.github/workflows/bench.yml`),
+separate from the test gates; `make bench` runs the same three commands.
 
 - `vm_throughput.rs` — per-cost-centre WASM execution throughput (plan target:
   1,000+ autonomous inventory triggers/s).
