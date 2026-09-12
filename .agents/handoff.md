@@ -105,6 +105,13 @@ it):
   executions run in the new Benchmarks workflow instead of the test gate).
 - `cargo bench -p glasschain-core`: passed in release on 1.98.1 (the
   bench.yml command shape); the vm/workflows benches share the same shape.
+- Coverage-specific: `cargo tarpaulin -p glasschain-network --all-features
+  --lib --tests --locked --engine llvm` passed twice after fixing the
+  instrumented-timing flakiness in the BFT vote collector tests — the
+  collector now skips verification for duplicate copies of an already-counted
+  voter (§8.4 flood relief), count-invariant tests use a generous window
+  (the collector still exits at quorum), and the deadline-control asserts
+  its structural bound (never ≥ 3) rather than an exact count.
 - Large ignored scale/WAN gates were not re-run; prior numbers remain dated evidence.
 
 For the PR, verify all local links, marker coverage and whitespace; fetch origin
