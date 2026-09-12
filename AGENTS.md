@@ -52,8 +52,10 @@ cargo build --release
 # Type-check everything, including tests and benches (fast, do this often)
 cargo check --workspace --all-targets --all-features --locked
 
-# Test — the full workspace passes on the pinned 1.95 toolchain
-cargo test --workspace --all-targets --all-features --locked
+# Test — every unit and integration test (benches excluded: their test-mode
+# setup mines a 10k-block history in debug and dominates the run; benches are
+# compile-checked by check/clippy and run for real via `cargo bench`)
+cargo test --workspace --lib --bins --tests --all-features --locked
 
 # Test a single crate / a single test
 cargo test -p glasschain-network
@@ -66,7 +68,7 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo fmt --all --check
 ```
 
-**Always run `cargo test --workspace --all-targets --all-features --locked` and
+**Always run `cargo test --workspace --lib --bins --tests --all-features --locked` and
 `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
 before finishing a task.** The suite is fast (~5s of test time once compiled), and
 finding a failure locally is far cheaper than finding it in CI.
@@ -332,7 +334,7 @@ See [`.agents/README.md`](.agents/README.md) for file templates.
   the working tree for review.
 - Before proposing a change as complete, state which of these you ran and what
   they returned: `cargo check --workspace --all-targets --all-features --locked`,
-  `cargo test --workspace --all-targets --all-features --locked`, and
+  `cargo test --workspace --lib --bins --tests --all-features --locked`, and
   `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`.
 - Update relevant documentation whenever behavior, interfaces, or security controls change:
   - Update `docs/operations.md` when CLI flags, REPL commands, the wire protocol, or gRPC change.

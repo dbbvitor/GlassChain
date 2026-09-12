@@ -3,9 +3,11 @@ name: CI
 on:
   push:
     branches: [main]
-    # Every job below is a code check (format, lint, test, coverage, audit):
-    # skip the whole workflow when only documentation changes. .github/** is
-    # included so CI config changes always self-validate.
+    # Every job here is a code check (format, lint, test, coverage): skip the
+    # whole workflow when only documentation changes. .github/** is included
+    # so CI config changes always self-validate. The dependency audit is a
+    # separate workflow (.github/workflows/audit.yml) so it carries its own
+    # status badge.
     paths:
       - "crates/**"
       - "Cargo.toml"
@@ -88,7 +90,7 @@ jobs:
 
   test:
     name: Test (${{ matrix.os }})
-    needs: [fmt, clippy]
+    needs: [fmt]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -98,11 +100,6 @@ jobs:
     env:
       RUSTFLAGS: -D warnings
       RUSTDOCFLAGS: -D warnings
-      # The network integration tests allocate ephemeral loopback ports and
-      # use real TLS handshakes; serial libtest execution avoids cross-test
-      # port races on slower macOS and Windows runners. Criterion benches do
-      # not consume this setting.
-      RUST_TEST_THREADS: 1
 
     steps:
       - uses: actions/checkout@v7
@@ -124,11 +121,15 @@ jobs:
           shared-key: rust-cache
           cache-on-failure: true
 
-      - name: Check all targets
-        run: cargo check --workspace --all-targets --all-features --locked
-
+      # cargo test compiles every target it runs and clippy (parallel job)
+      # already lints all targets, so a separate cargo check step would only
+      # duplicate work. `--lib --bins --tests` runs every unit and integration
+      # test; criterion bench *executions* are excluded on purpose — their
+      # test-mode setup mines a 10k-block history in debug and dominated the
+      # job (~20+ min per OS). Benches stay compile-checked via clippy
+      # --all-targets and run for real through `make bench` / `cargo bench`.
       - name: Run all tests
-        run: cargo test --workspace --all-targets --all-features --locked
+        run: cargo test --workspace --lib --bins --tests --all-features --locked
 
   coverage:
     name: Code coverage
@@ -159,22 +160,23 @@ jobs:
           cache-on-failure: true
 
       - name: Install cargo-tarpaulin
-        run: cargo install --locked cargo-tarpaulin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
 
       - name: Generate coverage report
         # --engine llvm: wasmtime delivers WASM traps (e.g. `unreachable`, fuel
         # exhaustion) via SIGILL/SIGSEGV caught by its own signal handler; the
         # default ptrace engine intercepts those signals and aborts the run.
-        # RUST_TEST_THREADS=1: tests reserve loopback ports with a
-        # bind→drop→rebind pattern (free_addr helpers); under tarpaulin's
-        # instrumented parallel execution that window widened enough to hit
-        # AddrInUse (sncm_compliance, 2026-09-03). The env var serializes the
-        # libtest harnesses only — criterion benches ignore it (passing
-        # --test-threads through tarpaulin's `--` would break their CLI) — and
-        # normal `cargo test` runs are unaffected.
-        env:
-          RUST_TEST_THREADS: "1"
-        run: cargo tarpaulin --verbose --workspace --all-features --all-targets --locked --timeout 120 --engine llvm --out xml
+        # --lib --bins --tests: same surface as the test job — benches are
+        # excluded (their test-mode setup dominates the run and yields no
+        # library coverage). Tests bind ports through the shared per-process
+        # allocator (glasschain-network/tests/common/ports.rs), so the
+        # parallel libtest harness cannot collide on loopback ports even
+        # under tarpaulin's instrumented execution (the bind→drop→rebind
+        # window that forced RUST_TEST_THREADS=1 here, sncm_compliance
+        # 2026-09-03, is gone).
+        run: cargo tarpaulin --verbose --workspace --all-features --lib --bins --tests --locked --timeout 120 --engine llvm --out xml
 
       - name: Upload coverage to Codecov
         if: ${{ env.CODECOV_TOKEN != '' }}
@@ -183,24 +185,3 @@ jobs:
           files: cobertura.xml
           fail_ci_if_error: true
           token: ${{ env.CODECOV_TOKEN }}
-
-  audit:
-    name: Security audit
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.95
-
-      - name: Install cargo-audit
-        run: cargo install --locked cargo-audit
-
-      - name: Audit Rust dependencies
-        run: cargo audit --deny warnings --file Cargo.lock

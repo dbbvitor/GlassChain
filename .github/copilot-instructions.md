@@ -22,7 +22,9 @@ Run these from the repository root:
 
 1. `cargo fmt --all --check`
 2. `cargo check --workspace --all-targets --all-features --locked`
-3. `cargo test --workspace --all-targets --all-features --locked`
+3. `cargo test --workspace --lib --bins --tests --all-features --locked` (benches
+   excluded: their test-mode setup mines a 10k-block history in debug; they stay
+   compile-checked by step 2 and run for real via `cargo bench`)
 4. `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
 
 Notes that will save you a failed run:

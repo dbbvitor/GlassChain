@@ -25,10 +25,15 @@ SHELL := /bin/sh
 # Flags shared by the CI-gate targets (override: make test CARGO_FLAGS="...").
 CARGO_FLAGS := --workspace --all-targets --all-features --locked
 
-# The network integration tests bind real loopback ports and do real TLS
-# handshakes; serialised libtest execution avoids cross-test port races (CI
-# uses the same setting). Override: make test RUST_TEST_THREADS=4
-RUST_TEST_THREADS ?= 1
+# Test targets drop --all-targets: criterion bench *executions* dominate the
+# run (their test-mode setup mines a 10k-block history in debug) and yield no
+# test coverage; they stay compile-checked via check/clippy and run for real
+# through `make bench`. Mirrors the CI test job.
+TEST_FLAGS := --workspace --lib --bins --tests --all-features --locked
+
+# The network integration tests allocate loopback ports through the shared
+# per-process band allocator (glasschain-network/tests/common/ports.rs), so
+# the libtest harnesses run in parallel safely — same as CI.
 
 # Pinned channel from rust-toolchain.toml.
 TOOLCHAIN := 1.95
@@ -78,11 +83,11 @@ build-release: ## Build the workspace (release)
 check: ## Type-check all targets (fast; run often while iterating)
 	cargo check $(CARGO_FLAGS)
 
-test: ## Run the full workspace test suite (CI gate)
-	RUST_TEST_THREADS=$(RUST_TEST_THREADS) cargo test $(CARGO_FLAGS)
+test: ## Run the full workspace test suite (CI gate; benches excluded, see make bench)
+        cargo test $(TEST_FLAGS)
 
 test-pkg: ## Test a single crate: make test-pkg pkg=glasschain-network
-	RUST_TEST_THREADS=$(RUST_TEST_THREADS) cargo test -p $(pkg)
+        cargo test -p $(pkg) --lib --bins --tests --all-features --locked
 
 test-one: ## Run one test by substring: make test-one test=mine
 	cargo test $(CARGO_FLAGS) -- $(test)
@@ -114,10 +119,10 @@ coverage-xml: ## Generate Cobertura XML coverage (same command CI uses)
 ## ── Aggregate ───────────────────────────────────────────────────────────────
 
 ci: ## Run the CI gates in order: fmt-check -> clippy -> check -> test
-	$(MAKE) fmt-check
-	$(MAKE) clippy
-	$(MAKE) check
-	$(MAKE) test
+	        $(MAKE) fmt-check
+	        $(MAKE) clippy
+	        $(MAKE) check
+	        $(MAKE) test
 
 ## ── Run & docs ──────────────────────────────────────────────────────────────
 
