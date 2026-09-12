@@ -407,9 +407,12 @@ any append:
 
 1. Timestamp sanity (reject blocks more than 2 hours in the future; genesis is
    exempt), then, against the current tip: `Block::chains_to(prev)`,
-   `has_valid_pow(difficulty)`, and `CapabilityHistory::validate_block` — a
-   block must be valid under the capability set active *at its own height*
-   (ADR-010 decision 5).
+   `CapabilityHistory::validate_block` — a block must be valid under the
+   capability set active *at its own height* (ADR-010 decision 5) — and
+   consensus admission: `has_valid_pow(difficulty)`, or, while the
+   `bft_consensus` capability is active at the expected height, a
+   non-degenerate certificate verified against the derived validator set
+   (ADR-014).
 2. **Endorsement gate 3 (peer admission):** `enforce_block_endorsements` again
    — this time without per-transaction write attribution (no re-execution), so
    coverage is checked in aggregate: every committed write must sit inside some
@@ -418,8 +421,8 @@ any append:
    since admission — a stale candidate would fork the local chain), prunes the
    block's transaction ids from the pending pool, and pushes. Then
    `after_block_commit` runs exactly as for a locally mined block, and
-   `NodeEvent::BlockReceived` is emitted with the degenerate PoW certificate
-   (BFT certificates are not transported on this path yet — §7).
+   `NodeEvent::BlockReceived` is emitted with the block's own certificate (or
+   the degenerate PoW certificate when it carries none).
 
 ### Step 7 — Chain sync (the flood-fill path)
 
@@ -534,27 +537,26 @@ README's feature table says this plainly: "libp2p is experimental and
 currently unwired." ADR-003 still lists `LibP2pNode` as the future home of the
 PDC dissemination layer.
 
-### 7.2 Certificate verification is inert in production (fails open) — issue #57
+### 7.2 Certificate verification is opt-in; private paths fail closed without it
 
-`CertChainVerifier` (rustls-webpki chain check against an org Root CA,
-`VerificationLevel::Full` by default) is real and tested, and
-`Node::set_cert_verifier` installs it — but **the only callers are two
-integration tests** (`crates/glasschain-network/tests/pdc_distribution.rs`,
-`protocol_security.rs`). The `glasschain-node` binary builds an `Organization`
-(root CA in hand) to issue its TLS identity and then drops the CA; no
-production path sets `NodeState.cert_verifier`. Consequence, in
-`process_message`: the Hello handshake's org gate (`org_verified`) and the
-private-payload sender gate
-(`let verification_required = s.cert_verifier.is_some(); node.rs`) both
-evaluate to "no verifier → not required", so the **self-asserted `Hello` org is
-accepted** outside tests. This is a deliberate fail-open tied to the missing
-federation trust model — installing a single-org verifier in the binary would
-reject every cross-org peer. See [issue #57](https://github.com/dbbvitor/GlassChain/issues/57).
+`CertChainVerifier` (rustls-webpki chain check against an org Root CA plus
+federation anchors, `VerificationLevel::Full` by default, CRLs fail-closed per
+ADR-013) is real and tested. `glasschain-node` installs it only when both
+`--org` and `--trust-store` are given; cross-org roots are supplied as anchors
+by that store, whose distribution stays manual and out-of-band (no shared CA).
 
-### 7.3 No production binary attaches an `EndorsementProvider` — issue #59
+Since #86 the consequence of running without a verifier is **fail-closed**, not
+fail-open: every org-gated private path (send, receive, reconcile) refuses an
+organization it cannot certificate-verify. Since #110 a sender must also prove
+possession of the certificate's key bound to the TLS session, so a copied
+certificate cannot impersonate an organization. Unverified peers stay
+connected and may sync/verify public history (ADR-011).
 
-The entire ADR-008 enforcement machinery (carriers, `PolicyExpression`,
-`PolicyHistory` replay, `MspEndorsementProvider`, the four gates) is
+### 7.3 Endorsement enforcement still waits on capability activation
+
+The `glasschain-node` binary attaches `MspEndorsementProvider` when it has an
+organizational identity (`--org`), but the entire ADR-008 enforcement machinery
+(carriers, `PolicyExpression`, `PolicyHistory` replay, the four gates) is
 implemented and integration-tested in
 `crates/glasschain-network/tests/endorsement.rs`. But `set_endorsement_provider`
 is called **only in tests**; neither `glasschain-node` nor `glasschain-cli`
@@ -573,11 +575,15 @@ at genesis); a WASM contract that emits a PDC write is dropped whole at mining
 because `mine_async` requires the `pdc` capability at the candidate height.
 Payloads are therefore never disseminated outside tests. As for BFT: even with the `bft` feature compiled, the
 `bft_consensus` capability must additionally be *activated* at the candidate
-height for the BFT attestation to engage. BFT blocks are also not admissible
-on the peer/sync/restart paths today: `Message::Block` admission,
-`try_replace_chain`, and `restore_ledger`/`validate_chain` all require a valid
-PoW nonce (`has_valid_pow`), and certificates are not persisted with blocks —
-all recorded as ADR-010 adoption-gate work (ticket #42, README).
+height for the BFT attestation to engage. BFT blocks are admitted on every
+entry path: live `Message::Block` admission verifies a non-degenerate
+certificate against the derived set while the capability is active; sync and
+restart replay the chain's registry write sets and verify every historical
+certificate under its effective set (`verify_chain_certificates`, #97) —
+bootstrap-era heights verify against the attached static set on sync and fail
+closed on restart. Certificates ride `Block.certificate` and persist with the
+block. Production adoption still waits on the ADR-010 §7 gates (testnet, API,
+licensing, audit).
 
 ### 7.5 Record and capability-activation signatures — resolved by ADR-012 (issue #60)
 
@@ -607,8 +613,8 @@ SDK produce JSON to submit to the gRPC endpoint; they do not dial it.
 
 ### 7.8 Known, accepted limitations (do not "fix" silently)
 
-TOFU trust is address-bound and in-memory, there is no shared CA across
-organizations, and trust does not persist across restarts (README, AGENTS.md).
+TOFU trust is address-bound (pins persist with signed rotation, #88), and
+there is no shared CA across organizations (README, AGENTS.md).
 `exchange_certificate` acknowledges Root CA certificates but stores nothing
 ("populated once identity integration is complete"). `PolicyUpdate` is a full
 replacement, so a more-specific scope can weaken a base layer (ADR-008 §1

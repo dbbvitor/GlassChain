@@ -90,6 +90,10 @@ Independent decisions/tests can proceed alongside A:
 retention/backup and authority policies are explicit. Code alone does not certify
 LGPD, ANVISA or ICP-Brasil compliance.
 
+**Status (2026-09-11):** D1–D6 and #86–#88 shipped with tests; frontier B is
+**not fully closed** — deployment access (RBAC/channel-management operations)
+and explicit replica/backup retention remain, and #74 stays deferred.
+
 ### C. Transport and performance: independent measured improvements
 
 Start a two-node **negotiated KX group** test on each TLS construction path;

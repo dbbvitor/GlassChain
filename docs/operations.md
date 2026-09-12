@@ -582,24 +582,24 @@ feed `--all-features` builds).
 
 ### Honest warnings an operator must know before deploying
 
-1. **Certificate-chain verification is inert in production (issue #57).**
-   `Node::set_cert_verifier` exists and is exercised by tests, but **no shipped
-   binary calls it** — neither `glasschain-node` nor `glasschain` attaches a
-   `CertChainVerifier`. The handshake's org-verification step
-   (`cert_verifier.is_some()`) therefore fails open: a peer's claimed `org` is
-   **self-asserted** in production; identity rests on TOFU fingerprint pinning,
-   not CA-verified identity.
-2. **There is no certificate revocation (issue #58).** No CRL/OCSP anywhere; a
-   compromised certificate stays "valid" until you stop trusting the peer out
-   of band.
-3. **Endorsement enforcement is dormant (issue #59).** No endorsement provider
-   is attached at startup by any binary (`set_endorsement_provider` is called
-   only in tests). All enforcement gates (submit, block, chain-sync, commit)
-   short-circuit when `NodeState.endorsement` is `None`, and the
-   `VerifyEndorsement` RPC errors with "no endorsement provider configured on
-   this node". Enforcement engages only when an embedder attaches a provider
-   AND the `endorsement` capability is active at the candidate height
-   (ADR-008/ADR-010).
+1. **Certificate verification is opt-in, and private paths fail closed without
+   it.** `glasschain-node` attaches `CertChainVerifier` only when both `--org`
+   and `--trust-store` are given; cross-org anchors load from that store
+   (distribution is manual/out-of-band). Without it, every org-gated private
+   path refuses (#86); with it, senders must be certificate-verified members
+   **and** prove possession of the certificate key on the session (#110).
+   Anything not org-gated still rests on TOFU fingerprint pinning.
+2. **Revocation is enforced but manually distributed, and OCSP is absent.**
+   CRLs and intermediate CAs load from `--trust-store` and a missing, expired,
+   or listed serial rejects the certificate (ADR-013, fail-closed). Revocation
+   is go-forward only; the on-chain distribution registry remains deferred
+   (#74).
+3. **Endorsement enforcement requires both a provider and the active
+   capability.** `glasschain-node` attaches an `MspEndorsementProvider` when it
+   has an organizational identity (`--org`); enforcement engages only once the
+   `endorsement` capability is active at the candidate height (ADR-008/010).
+   Without a provider every gate short-circuits, and the `VerifyEndorsement`
+   RPC errors with "no endorsement provider configured on this node".
 4. **TOFU trust is persisted but address-bound.** Pins survive restarts and
    move only under a signed rotation by the pinned identity key; a peer that
    changes its listen address is still treated as brand-new, and a lost
