@@ -27,6 +27,11 @@
 //! }
 //! ```
 
+// Duplicate `pem`/`yasna` versions leak in transitively from libp2p's
+// optional `tls` feature (see the note in glasschain-network); this crate
+// never enables it.
+#![allow(clippy::multiple_crate_versions)]
+
 pub mod auth;
 pub mod server;
 

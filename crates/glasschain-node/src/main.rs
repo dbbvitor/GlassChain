@@ -1,3 +1,8 @@
+// Duplicate `pem`/`yasna` versions leak in transitively from libp2p's
+// optional `tls` feature (see the note in glasschain-network); this crate
+// never enables it.
+#![allow(clippy::multiple_crate_versions)]
+
 use glasschain_core::{
     endorsement::Principal, InventoryUpdate, PurchaseConditions, PurchaseOrder, SmartContractDef,
     SupplyOffer, TraceableAsset, TraceableAssetRegistration, Transaction, TransactionKind,
