@@ -1,6 +1,6 @@
 # Plan — Zero-trust deployment and verification gaps
 
-**Status:** active; §8.1–§8.4 consensus safety shipped (#95–#99, PR #116); Frontier A remains open specifically for `EquivocationProof` payload format migration
+**Status:** active; §8.1–§8.4 consensus safety shipped (#95–#99, PR #116); Frontier A concluded — `EquivocationProof` carries both dual-signed votes and verifies through the #95 context envelope
 **Reviewed:** 2026-09-12 against `7143c0c`
 **Related:** [ADRs](../../docs/README.md), [performance](performance.md),
 [post-quantum](post-quantum.md), [source-comment debt](deferred-code-debt.md).
@@ -217,9 +217,12 @@ verification default, measured); §8.4 →
 [#98](https://github.com/dbbvitor/GlassChain/issues/98) (absolute deadline from
 phase start, bounded queue, drop stale-first, distinct-voter quorum).
 Implementation merged through PRs #100–#104; #99 removed the legacy
-hash-only vote path immediately (no deployed network carried it). Residual:
-`EquivocationProof::verify` still checks hash-only signatures (its own type,
-pre-dating #95); evidence-path hardening beyond the journal is future work.
+hash-only vote path immediately (no deployed network carried it). Frontier A
+concluded: `EquivocationProof` carries both conflicting votes in full and
+`EquivocationProof::verify` rides the same dual-sign context envelope (#95),
+so a proof authenticates the shared `(chain, height, round, phase)` and
+cannot be assembled from votes of different contexts; evidence-path
+hardening beyond the journal is future work.
 
 ## Validation and next steps
 

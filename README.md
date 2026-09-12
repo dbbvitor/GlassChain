@@ -2,6 +2,12 @@
 
 > A federated distributed ledger for transparent supply-chain transactions, written in Rust.
 
+[![CI](https://github.com/dbbvitor/GlassChain/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/dbbvitor/GlassChain/actions/workflows/ci.yml)
+[![Security audit](https://github.com/dbbvitor/GlassChain/actions/workflows/audit.yml/badge.svg?branch=main)](https://github.com/dbbvitor/GlassChain/actions/workflows/audit.yml)
+[![codecov](https://codecov.io/gh/dbbvitor/GlassChain/branch/main/graph/badge.svg)](https://codecov.io/gh/dbbvitor/GlassChain)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust 1.95](https://img.shields.io/badge/rust-1.95-orange.svg)](https://www.rust-lang.org)
+
 GlassChain shares a tamper-evident record of offers, orders, inventory, and
 custody across a federated peer-to-peer network. It is a 12-crate Rust workspace,
 pinned to Rust 1.95 and async on Tokio.
