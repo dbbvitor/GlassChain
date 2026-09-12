@@ -28,48 +28,15 @@ gaps surfaced while checking it — neither of them the ones the report names.
 | "ICP-Brasil X.509 under MP 2.200-2 required for legally binding signatures" | **Real law, cuts the other way.** MP 2.200-2 Art. 10 §2º expressly preserves other means of proving authorship and integrity — *including non-ICP-Brasil certificates* — "desde que admitido pelas partes". Lei 14.063/2020 applies to public-sector interactions (Art. 2º), so a private federated ledger needs no ICP-Brasil chain. **New pharma-relevant datum:** Lei 14.063 Art. 13 mandates a *qualified* signature for controlled-substance e-prescriptions, and Art. 4º §2º mandates revocation mechanisms. |
 | LGPD constraint on immutable ledgers | **Real, and already avoided.** Art. 18 III/VI (correction/erasure) vs immutability is a genuine tension, resolved by Art. 16-I where retention serves a legal duty — and moot when no PII is written on-chain, which is our case. ANPD guidance could not be retrieved (site under a temporary election-period restriction). |
 
-## The two gaps that actually surfaced
+## Gaps identified and their current status
 
-Neither is what the report flagged. Both confirmed by reading the code.
+### 1. Certificate verification and org impersonation — RESOLVED
+- **Original finding:** Handshake and private payload gates previously failed open when `cert_verifier` was `None`.
+- **Resolution:** Shipped in #86 (fail closed on unverified orgs for all private paths), #110 (session-bound RFC 5705 TLS exporter possession proofs), and `--trust-store` federation anchors (ADR-011). Unverified peers stay connected for public sync but are denied private payloads.
 
-### 1. Certificate verification is inert in production — and it fails *open*
-
-`glasschain-node/src/main.rs` builds an `Organization` (root CA in hand) to
-issue the node's TLS identity, then drops it. `Node::set_cert_verifier` is
-called **only from two integration tests**
-(`pdc_distribution.rs:313`, `protocol_security.rs:835`). So at runtime
-`NodeState.cert_verifier` is `None`, and the #47 private-payload org gate —
-
-```rust
-let verification_required = s.cert_verifier.is_some();   // node.rs:2859
-let sender_ok = /* membership */ && (!verification_required || sender_verified == Some(true));
-```
-
-— evaluates `verification_required == false`, accepting the **self-asserted
-`Hello` org**. The same is true of the `org_verified` check at `node.rs:2453`.
-
-**This is not a missing one-liner.** Each node self-issues its own org root CA,
-so `CertChainVerifier::from_org(&own_org)` would reject every cross-org peer —
-the "no shared CA" limitation `AGENTS.md` records as accepted. Wiring it
-requires a federation trust-store / CA-distribution decision first. **Do not
-"fix" this by installing a single-org verifier in the node binary.**
-
-Related: `msp_policy.rs`'s module-level `ponytail:` note ("the directory stands
-in for certificate-bound MSP verification") is the same gap seen from the
-identity side.
-
-### 2. `record.signatures` are structurally count-only, permanently
-
-`canonical.rs` (`state_commitment` counterparty signatures) and
-`capability.rs` (`CapabilityActivation.signatures`) both carried `ponytail:`
-comments promising cryptographic verification "lands with the endorsement engine
-(#37/#45)". **#37 and #45 shipped and closed without touching them** — the
-engine verifies `Transaction.endorsements` carriers, and `grep` confirms
-`endorsement.rs` never reads `.signatures` at all. The comments were stale
-forward references to closed tickets (the failure mode `debt-gap-handoff.md`
-warns about: *"grep for a ticket number before closing it"*). Rewritten
-2026-09-02 to state the real ceiling and that binding them needs its own
-decision.
+### 2. `record.signatures` vs `Transaction.endorsements` — SETTLED
+- **Finding:** Canonical `record.signatures` are structural/informational.
+- **Resolution:** Cryptographic business authorization is performed strictly on `Transaction.endorsements` carriers against deterministic `PolicyHistory` policies (ADR-008, #45, #87). Do not attempt to re-verify `record.signatures` in the endorsement engine.
 
 ## Implication
 
@@ -228,35 +195,14 @@ rather than accepting its two-option follow-up framing.
 | GUI speculative latency and view-change metrics | **Partly adopt.** Show admission, verified finality, round changes/timeouts and recovery separately. Speculative latency is unavailable until such an interface exists; never label early admission as final. |
 | High-frequency flattening memory benchmarks | **Adopt.** `AnalyticalFlattener.records` is a growing vector; bounded event-bus buffers do not bound projections. It ingests AssetRegistration only, and node commit processing invokes it. Measure retained rows/RSS, lag, query/replay costs and impact on finality with representative input. |
 
-### Source-comment reconciliation
-
-The previous response understated the debt by calling every marker clean.
-**Six ponytail + one TODO** are now individually planned in
-[deferred-code-debt.md](../plans/deferred-code-debt.md), with source locations,
-triggers, next steps and acceptance checks. Two observations matter:
-
-- `TransientStore::get` denies expired reads after restart, but the in-memory
-  index cannot discover old keys for deletion. This is a retention gap, not a
-  harmless cache detail (D5).
-- `FlowTriage` names the already-closed purchase/recall tickets as its future
-  trigger. Checkpoints survive, but unattended discovery still does not (D6).
-  Source history references do not prove an operational recovery requirement met.
-
-Also correct the earlier scaling assertion: a survey of validator counts cannot
-prove that protocol optimization cannot surpass 300. It may improve the feasible
-operating point; demonstrate 300 first, then test beyond it under the same trust
-and quorum model. Fixed-fraction quorum delay is not universally proportional
-to the maximum-of-n Pareto formula previously quoted.
-
-### Additional safety observations while checking the report
-
-Not source-comment markers and not runtime fixes in this pass:
-`BftVote::vote_message` signs a hash but not round/phase metadata;
-`handle_vote` recreates the receipt tracker per message; `Message::Chain`
-reaches structural rather than full historical BLS validation. These contradict
-the prior blanket claim that vote attribution and every verification path are
-complete. The [zero-trust plan §8](../plans/zero-trust.md) records focused
-regressions and the design questions before fast paths or production claims.
+### Source debt and consensus safety resolution
+All seven source markers (D1–D7) have been settled in code (#106–#109, #114–#115).
+The consensus safety observations were implemented and verified in #95–#99 and PR #116:
+- Context-authenticated votes (`genesis_hash || height || round || phase || block_hash`) (#95, #99).
+- Bounded live receipt journal for equivocation detection (#96).
+- Full historical QC verification at sync and restart (#97), with real QC emission on sync adoption (PR #116).
+- Phase deadlines, bounded queues, and distinct-voter quorums (#98).
+- The only residual is updating `EquivocationProof::verify` payload format to match the context-bound envelope (Frontier A open).
 
 ### Sources re-read for this report
 

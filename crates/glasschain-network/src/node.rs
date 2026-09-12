@@ -4074,10 +4074,10 @@ async fn process_message(
 
                 // Every block adopted by sync is a commit: emit the
                 // certificate-bearing notification so commit consumers receive
-                // the attestation set on this path too (degenerate `PoW`
-                // certificate here; BFT certificate replay on sync is ADR-010
-                // adoption-gate work — certificates are not persisted with
-                // blocks yet, ticket #42).
+                // the attestation set on this path too. The block carries the
+                // QC it was committed with (`Block.certificate`, persisted
+                // with the block); PoW-era blocks fall back to the degenerate
+                // PoW certificate.
                 for block in &new_chain {
                     if block.index == 0 {
                         continue;
@@ -4085,7 +4085,10 @@ async fn process_message(
                     let _ = ctx.event_tx.send(NodeEvent::BlockReceived {
                         index: block.index,
                         hash: block.hash.clone(),
-                        certificate: QuorumCertificate::pow(block),
+                        certificate: block
+                            .certificate
+                            .clone()
+                            .unwrap_or_else(|| QuorumCertificate::pow(block)),
                     });
                 }
 
@@ -5690,6 +5693,7 @@ mod tests {
         let ctx = peer_context(&node);
         let (write_tx, write_rx) = tokio::sync::mpsc::channel::<Message>(16);
         let _ = write_rx;
+        let mut events = node.subscribe();
         let genesis = Ledger::new(1).chain.remove(0);
         let (_, validator_key) = test_validator("validator-a", 11);
         // Block 2 carries a real certificate signed by the height-2 set
@@ -5708,6 +5712,33 @@ mod tests {
         .await;
         assert!(!adopted.disconnect);
         assert_eq!(node.ledger.lock().await.chain.len(), 3, "chain adopted");
+
+        // Commit consumers on the sync path receive the block's **real**
+        // certificate, not a synthesized PoW placeholder.
+        let mut real_certificate_seen = false;
+        while let Ok(event) = events.try_recv() {
+            if let NodeEvent::BlockReceived {
+                index: 2,
+                certificate,
+                ..
+            } = event
+            {
+                assert!(
+                    !certificate.is_degenerate(),
+                    "the synced block's BFT certificate must reach consumers"
+                );
+                assert_eq!(
+                    certificate.block_hash,
+                    node.ledger.lock().await.chain[2].hash,
+                    "the emitted certificate names the block it was committed with"
+                );
+                real_certificate_seen = true;
+            }
+        }
+        assert!(
+            real_certificate_seen,
+            "the sync path must emit BlockReceived for block 2"
+        );
     }
 
     #[tokio::test]

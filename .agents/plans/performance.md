@@ -1,7 +1,7 @@
 # Plan — Best-in-class performance within zero-trust, ICP and LGPD constraints
 
-**Status:** active; structural work shipped, adoption/performance gates incomplete
-**Reviewed:** 2026-09-05 against `f7b434e`
+**Status:** active; Step 0 baselines (WAN proxy #108, D3 bench #106, read-path RSS #107) and hybrid TLS (#105) complete; active Priority Frontier C is Step 4 (BLS pairing backend / unblock 300-validator gate)
+**Reviewed:** 2026-09-12 against `7143c0c`
 **History:** [Performance programme](https://github.com/dbbvitor/GlassChain/issues/62) is closed, not proof that every step or production gate passed.
 **Related:** [ADR-002](../../docs/adr/adr-002-consensus-finality.md), [ADR-004](../../docs/adr/adr-004-scale-topology.md), [ADR-010](../../docs/adr/adr-010-capability-versioning-policy.md), [ADR-014](../../docs/adr/adr-014-bls-aggregated-certificates.md), [zero-trust](zero-trust.md), [source-comment debt](deferred-code-debt.md).
 

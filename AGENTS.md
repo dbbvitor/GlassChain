@@ -28,6 +28,14 @@ watcher automation engine, a TLS-encrypted TCP/libp2p P2P layer, and a gRPC API.
   the checks below locally before declaring work done, because a cold CI build
   takes minutes.
 
+### Pre-release status and architectural priorities
+
+**GlassChain has yet to be released or deployed to production.** There are no live production networks, historical customer ledgers, or external API consumers that require backward compatibility.
+
+- **Prioritize maintainability, human readability, and performance above backwards compatibility.**
+- Favor clean, direct refactoring over backward-compatibility shims, dual-format decoders, or speculative migration layers for superseded protocol versions or internal formats.
+- When an interface, data structure, or protocol evolves, delete or cleanly replace the obsolete path rather than burdening the codebase with legacy baggage.
+
 ---
 
 ## Setup and commands
@@ -159,6 +167,7 @@ Adding a gRPC method requires editing the `.proto` **and** the server impl; the
 Most style is enforced mechanically — read `Cargo.toml`'s `[workspace.lints]` and
 `clippy.toml` rather than guessing.
 
+- **Code evolution and compatibility:** Prioritize maintainability, human readability, and performance over backwards compatibility. Do not retain deprecated formats or scaffolding for pre-release iterations.
 - **No `unsafe`.** `unsafe_code = "deny"` workspace-wide. There is currently zero
   unsafe code. If you genuinely need it, add `#[allow(unsafe_code)]` with a
   `// SAFETY:` comment explaining soundness — and expect that to be questioned.
@@ -325,9 +334,10 @@ See [`.agents/README.md`](.agents/README.md) for file templates.
   they returned: `cargo check --workspace --all-targets --all-features --locked`,
   `cargo test --workspace --all-targets --all-features --locked`, and
   `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`.
-- Update `docs/operations.md` when CLI flags, REPL commands, the wire protocol
-  or gRPC change; keep README quick-start/navigation consistent without duplicating
-  the reference. Update `PLUGIN_KIT.md` when a provider trait changes.
+- Update relevant documentation whenever behavior, interfaces, or security controls change:
+  - Update `docs/operations.md` when CLI flags, REPL commands, the wire protocol, or gRPC change.
+  - Update `PLUGIN_KIT.md` when a provider trait changes.
+  - Keep `AGENTS.md`, `.agents/handoff.md`, `CONTEXT.md`, and relevant plans in sync with the current state of the repository. Never leave documentation drifted from working-tree code.
 - `target/` is ~29 GB and gitignored. Never add build output to a commit.
 
 ---
@@ -357,4 +367,7 @@ See [`.agents/README.md`](.agents/README.md) for file templates.
 
 Prefer the commands and paths above over re-exploring the repository. Search the
 codebase only when this file is incomplete or you find it to be wrong — and when
-you do, update this file as part of your change.
+you do, update this file and related docs as part of your change. Agents are
+responsible for actively maintaining documentation accuracy: whenever code,
+invariants, or security controls evolve, update `AGENTS.md` and the relevant
+documentation in `docs/` and `.agents/` to reflect the true state of the repository.

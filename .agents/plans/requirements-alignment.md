@@ -39,7 +39,7 @@ Paths in the evidence column are relative to `crates/`.
 
 | Req | Requirement | Current implementation / remaining work |
 |---|---|---|
-| 1.1 | MSP / X.509 identity | Partial: `glasschain-identity/src/cert_verifier.rs` verifies chains/intermediates/CRLs; `glasschain-node/src/main.rs` installs with `--org` + `--trust-store`. Persistent identity, certificate-bound endorsement principals and lifecycle operation remain. |
+| 1.1 | MSP / X.509 identity | Partial: `glasschain-identity/src/cert_verifier.rs` verifies chains/intermediates/CRLs; `glasschain-node/src/main.rs` installs with `--org` + `--trust-store`. OCSP verification/stapling, persistent identity, certificate-bound endorsement principals and lifecycle operation remain. |
 | 1.2 | RBAC | Not delivered as a complete role policy system. `glasschain-rpc/src/auth.rs` provides authentication; roles/permissions and production authorization need specification. |
 | 1.3 | Multi-party endorsement | Engine and commit gates shipped (`core/src/endorsement.rs`, `identity/src/msp_policy.rs`, `network/src/node.rs`); activation/provider configuration, canonical-record scope and recall independence remain gaps D1/D2/D4. |
 | 1.4 | Channels / private partitions | Partial: `identity/src/channel.rs`, member-gated PDC delivery/reconciliation over TCP exist; not a fully wired persistent channel-management service. libp2p remains experimental/unwired. |

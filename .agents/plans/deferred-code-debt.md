@@ -1,7 +1,7 @@
 # Plan — Source-comment debt and review follow-ups
 
-**Status:** reviewed; work below is planned, not implemented
-**Reviewed:** 2026-09-05 against `f7b434e`
+**Status:** completed; all seven markers (D1–D7) settled and benchmarked in code (#106–#109, #114–#115)
+**Reviewed:** 2026-09-12 against `7143c0c`
 **Scope:** all tracked source `TODO` and `ponytail:` comments, plus documentation-only matches.
 
 ## Goal and method
@@ -12,11 +12,14 @@ plans link here instead of maintaining separate lists. This review also updates
 those plans for the external HotStuff/PQC/learning-loop report and makes the root
 README a navigation overview. No runtime behaviour changes in this effort.
 
-Repomix packed all 97 Rust files without compression; searching
-`\bTODO\b|ponytail:` found **7 markers: 6 ponytail + 1 TODO**. A repository-wide
-`git grep -n -i -E 'TODO|ponytail:'` additionally found quotations in docs and
-three `todo!()` placeholders in `PLUGIN_KIT.md`, not executable workspace code.
-Line numbers below identify the reviewed revision; symbols are durable anchors.
+Searching `\bTODO\b|ponytail:` across `crates/` finds **3 remaining source markers (2 ponytail + 1 TODO)**:
+1. `crates/glasschain-core/src/endorsement.rs:395` (D1 — network-governance fallback; settled & documented in #115)
+2. `crates/glasschain-core/src/ledger.rs:78` (D3 — capability rebuild admission cost; benchmarked in #106)
+3. `crates/glasschain-network/tests/madsim_chaos.rs:631` (D7 — madsim-tokio migration; alternative TCP proxy shipped in #70/#108)
+
+The 4 other original ponytail markers (D2 in `endorsement.rs`, D4 in `msp_policy.rs`, D5 in `transient.rs`, D6 in `triage.rs`) were retired upon shipping their implementations (#109, #114, #115).
+`PLUGIN_KIT.md` additionally contains three `todo!()` sketch placeholders in example documentation code.
+All items are fully visible, tracked, and verified below.
 
 ## Inventory, grouped by file
 

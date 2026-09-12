@@ -29,14 +29,14 @@ inert** (the code exists, is tested, but no production binary activates it), and
 | 2 | TOFU peer registry (identity pinned on first contact) | **Enforced at runtime**, pins persist across restarts with signed rotation (#88); address-bound (accepted limit) | `PeerRegistry` / `verify_or_register` / `load_tofu_pins` (`node.rs`) |
 | 3 | Wire-version gate (`glasschain/6`) | **Enforced at runtime** | `process_message` Hello Step 0 (`node.rs`) |
 | 4 | Capability gates (`pdc`, `endorsement`, …) | **Enforced at runtime** (once a capability is activated in a committed block) | `CapabilityHistory::effective_set` (`glasschain-core/src/capability.rs`, `node.rs`) |
-| 5 | `CertChainVerifier` — `VerificationLevel::Full` cryptographic chain check | **Implemented but inert** — `NodeState.cert_verifier` is `None` in all four `Node` constructors; `set_cert_verifier` is called only from integration tests | `cert_verifier.rs`; `node.rs` `with_components`/`set_cert_verifier` |
+| 5 | `CertChainVerifier` — `VerificationLevel::Full` cryptographic chain check | **Implemented; installed by `glasschain-node` only with `--org` + `--trust-store`** — without it every private path fails closed (#86) | `cert_verifier.rs`; `node.rs` `with_components`/`set_cert_verifier` |
 | 6 | Certificate-verified PDC org gate (reject self-asserted `Hello` org) | **Implemented, fail-closed and possession-bound (#86, #110)**: private paths require a configured verifier, a certificate-verified member org, and a session-bound proof that the peer holds the certificate's key; a stock node without `--org`/`--trust-store` refuses private paths entirely (public sync unaffected) | `private_peer_trusted`, `payload_targets`, `verify_org_possession`, private-payload handlers (`node.rs`, `glasschain-identity/src/possession.rs`) |
 | 7 | Endorsement evaluation (carriers, `PolicyExpression`, operation defaults) | **Implemented but inert** — `NodeState.endorsement` is `None` in every production binary; `set_endorsement_provider` is called only from tests. Certificate-bound principal registration with height-based authorization shipped (#87, D4) in the provider; runtime wiring of remote principals remains | `glasschain-core/src/endorsement.rs`; `MspEndorsementProvider` (`glasschain-identity/src/msp_policy.rs`); `node.rs` |
 | 8 | Policy history replay, same-block policy/write rule | **Implemented; enforced only when a provider is attached and the `endorsement` capability is active** — the gates short-circuit on `endorsement: None` | `PolicyHistory`, `enforce_block_endorsements` (`node.rs`) |
 | 9 | PDC membership gate (admission / transport / storage / replay) | **Implemented and enforced when collections are configured** — but no production binary calls `set_collections`; exercised by integration tests only | `Channel::is_member`, `node.rs`, `tests/pdc_boundary.rs` |
 | 10 | Transient-store retention (default 72 h) + purge | **Implemented and enforced** — purge discovers persisted payloads from storage, so it survives restarts; the node runs a startup + 300 s sweep | `TransientStore` (`glasschain-storage/src/transient.rs`) |
 | 11 | Pull reconciliation (`RequestPrivatePayload`) | **Implemented; operator-triggered API, no production caller** | `reconcile_private_payloads` (`node.rs`) |
-| 12 | CRL / OCSP / any revocation check | **Not implemented** — no revocation path anywhere; chains are single-hop (no intermediates) | gap: issue #58 |
+| 12 | CRL / OCSP / any revocation check | **CRLs and intermediates enforced (ADR-013)**: missing/expired/revoked rejects, fail-closed; OCSP not implemented | `CertChainVerifier` (`glasschain-identity/src/cert_verifier.rs`) |
 | 13 | Trust persistence across restarts (peer registry, CA store) | **TOFU pins persist** (state key `tofu:peer:<addr>`, #88); certificate trust is config (`--trust-store`), not persisted state | `PeerRegistry`, `load_tofu_pins` (`node.rs`) |
 | 14 | RBAC / role principals (regulator, auditor, logistics) | **Not implemented** — deferred by ADR-008; principals are org members only | ADR-008 "Out of scope" |
 
@@ -168,46 +168,27 @@ is the critical one, and it is also recorded — in `.agents/memories/` and
 2. **There is no shared CA across organizations.** Every `Organization`
    self-issues its own Root CA at runtime. No actor holds a single CA that
    spans the federation, and there is no cross-org trust-store exchange.
-3. **Trust does not persist across restarts.** The peer registry is in-memory
-   and only `Block`/world-state data is stored; a restarted node re-learns every
-   peer from scratch (TOFU from first use again). A node whose certificate
-   rotated across a restart will re-register as a "new" peer.
-4. **Certificate verification is inert at runtime, and the PDC org gate
-   consequently fails open.** `NodeState.cert_verifier` is initialized to
-   `None` in every `Node::with_components` call (`node.rs`), and
-   `Node::set_cert_verifier` is called from exactly two integration tests
-   (`tests/pdc_distribution.rs`, `tests/protocol_security.rs`). In every
-   production binary — `glasschain-node` builds an `Organization` for TLS
-   identity purposes and then drops it; `glasschain-cli` never touches a node —
-   the value stays `None`. Consequences:
+3. **TOFU trust is persisted and address-bound.** Pins survive restarts and
+   move only under a signed rotation by the pinned identity key (#88); a peer
+   that changes its listen address is treated as brand-new, and a genuinely
+   lost identity key needs operator recovery (remove `tofu:peer:<addr>`).
+4. **Certificate verification is opt-in; private paths fail closed without
+   it.** `glasschain-node` installs `CertChainVerifier` only when both `--org`
+   and `--trust-store` are given; cross-org roots load from that store as
+   federation anchors, and distribution stays manual and out-of-band (no
+   shared CA). Without a verifier, every org-gated private path refuses
+   (#86); with one, a sender must present a certificate-verified member org
+   **and** prove possession of the certificate's key on the session (#110).
+   Unverified peers stay connected for public history (ADR-011), and a copied
+   certificate cannot impersonate an organization.
 
-   - The Hello handshake's org check (`process_message`, Step 2.5) computes
-     `has_verifier = cert_verifier.is_some()` → `false`, so
-     `org_verified = false` and **no peer is rejected for an unverifiable org**.
-   - The private-payload gate computes
-     `verification_required = cert_verifier.is_some()` → `false`, so the
-     membership check accepts the **self-asserted `Hello` org** as-is:
-     `sender_ok = membership && (!verification_required || sender_verified == Some(true))`.
-
-   **This is not a one-line fix.** Each node self-issues its own org Root CA,
-   so a single-org verifier (`CertChainVerifier::from_org(&own_org)`) would
-   reject *every* cross-org peer — the "no shared CA" limitation above. Wiring
-   verification into the binaries requires a federation trust-store /
-   CA-distribution decision first. Installing a single-org verifier in
-   `glasschain-node` is explicitly the wrong "fix" (it would disconnect the
-   network); the work is tracked as **issue #57**, and the design intent
-   (ticket #47: verify the Hello-carried org cert under a configured Root CA
-   and require CN == claimed org) is fully implemented and integration-tested —
-   it is the *wiring* that is absent.
-
-5. **No revocation — issue #58.** There is no CRL, OCSP, or any revocation
-   mechanism anywhere. `cert_verifier.rs` verifies signatures against the Root
-   CA and explicitly documents that revocation is not checked. Chains are
-   **single-hop**: `Organization::issue_identity` signs member certificates
-   directly with the root; `verify_signature` builds a one-hop path with no
-   intermediates. A decommissioned member's certificate stays valid until its
-   expiry. `AGENTS.md` does not list this as accepted; it is a genuine open
-   gap, and §4.3 notes the Brazilian legal pressure on it.
+5. **Revocation is fail-closed and go-forward (ADR-013).** `CertChainVerifier`
+   requires a current CRL from the issuing CA: missing, expired, or listed
+   serials all reject the certificate. CRLs and intermediate CAs load from
+   `--trust-store`; orgs mint them via `Organization::crl_pem()` after
+   `revoke_identity()`. Revocation affects new authorization only — committed
+   history stays valid — and the on-chain distribution registry remains
+   deferred (#74). OCSP is not implemented.
 
 6. **Membership and endorsement are separate; endorsement registration is
    certificate-bound but not yet wired.** `MspEndorsementProvider` can derive
@@ -479,10 +460,10 @@ All confirmed against the source (`.agents/memories/debt-gap-handoff.md`,
    more-specific update overrides a stricter channel-wide one.
 3. **Record families have no channel/contract scope.** Committed policies
    cannot reach `CanonicalRecord` transactions; `operation_default` is the
-   only record-level enforcement. In particular, the recall 2-of-2
-   **degenerates to self-approval** when the envelope issuer equals the payload
-   `issued_by` — the `ponytail:` comment in `endorsement.rs` calls it out;
-   configured multi-party policies for record families await channel wiring.
+   only record-level enforcement. Recall authority was resolved by owner
+   decision (D2, #115): the chain does not arbitrate recall authority; `recall`
+   requires only the issuing organization's signature and `issued_by` is informational
+   metadata for downstream quarantine/dispute workflows.
 4. **Peer-path write binding is aggregate, not per-transaction.** On replay
    paths (peer block, sync) `enforce_*_endorsements` checks only that every
    committed write is covered by *some* carrier in the block — it does not
@@ -758,16 +739,16 @@ The status table's claims, with the exact places to re-verify them:
 
 | Claim | Re-verify at |
 |---|---|
-| `cert_verifier` starts `None`; `set_cert_verifier` test-only | `node.rs` `with_components`; grep `set_cert_verifier` across `crates/` (only `tests/pdc_distribution.rs`, `tests/protocol_security.rs`) |
-| Payload org gate fails open | `node.rs` `process_message`, `PrivatePayload` branch: `verification_required = s.cert_verifier.is_some()` |
-| Endorsement provider test-only | grep `set_endorsement_provider` across `crates/` (tests + node unit tests only) |
+| `cert_verifier` starts `None`; installed only with `--org` + `--trust-store` | `glasschain-node/src/main.rs` config path; `node.rs` `set_cert_verifier` |
+| Payload org gate fails closed without a verifier and requires session-bound possession | `node.rs` `private_peer_trusted`, `PrivatePayload` branch; `glasschain-identity/src/possession.rs` |
+| Endorsement provider attached by the node with `--org`; enforcement needs the active capability | `glasschain-node/src/main.rs` `set_endorsement_provider`; `node.rs` gates |
 | No production `set_collections` | grep `set_collections` across `crates/glasschain-node`, `crates/glasschain-cli` (no matches) |
 | `PROTOCOL_VERSION` | `protocol.rs`: `"glasschain/6"` |
 | Retention default 72 h | `channel.rs` `default_retention_secs()` |
 | Next-height payload gates | `node.rs` `submit_private_payload` and `PrivatePayload` handler, both `effective_set(chain.len())` |
 | Committed, not declared, policy | `glasschain-core/src/endorsement.rs` `PolicyUpdate`/`PolicyHistory`; `channel.rs` doc on `endorsement_policy` |
 | No CRL/OCSP, single-hop | `cert_verifier.rs` module doc + `verify_signature`; grep for CRL/OCSP is empty |
-| Recall self-approval / operation defaults | `glasschain-core/src/endorsement.rs` `operation_default` + `ponytail:` comment |
+| Recall issuer-only authorization / operation defaults | `glasschain-core/src/endorsement.rs` `operation_default` (#115, D2) |
 | ADR-008 non-weakening unenforced | `PolicyHistory::policies_for` (full replacement) vs ADR-008 §1 |
 | Aggregate (not per-tx) peer-path binding | `enforce_block_endorsements` / `enforce_chain_endorsements` (empty `per_tx_writes` → block-level `covers`) |
 

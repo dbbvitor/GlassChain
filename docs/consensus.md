@@ -16,7 +16,7 @@ in the same sentence.
 | BFT: BLS vote round driver (prevote/precommit), multi-signer aggregate certificates, equivocation detection (#77) | **SHIPPED but default-off** (`bft` cargo feature) — dev/test round driver, **not an audited engine** | `crates/glasschain-core/src/bft.rs`, `crates/glasschain-network/src/rounds.rs`, node.rs `run_vote_round` |
 | Capability-gated engine selection (`bft_consensus` active at the candidate height) | **SHIPPED** (feature-gated) | `crates/glasschain-network/src/node.rs` `mine_async` |
 | BFT peer-block admission (certificate verified against the derived validator set) | **SHIPPED** (feature-gated; only while the capability is active) | node.rs `Message::Block` admission |
-| Certificate replay on chain sync / restart — structural admission only, no aggregate verification | **STAGED** — ADR-010 §7 adoption-gate work | `Ledger::block_consensus_admissible`, `try_replace_chain` |
+| Certificate replay on chain sync / restart — full verification under each height's effective validator set (#97) | **SHIPPED** (feature-gated) | node.rs `verify_chain_certificates`, `Ledger::try_replace_chain` |
 | Malachite (or another Tendermint-class Rust engine) behind the seam | **PLANNED** | ADR-002, ADR-010 §7, `.agents/memories/bft-at-scale.md` |
 | BFT in production | **BLOCKED** — four explicit adoption gates | ADR-010 §7 |
 
@@ -24,9 +24,10 @@ The single most important fact: **the network currently runs Proof-of-Work.
 BFT is staged and default-off.** The shipped round driver is a dev/test build:
 it gathers votes and produces real multi-signer BLS certificates on the wire,
 `bft`-built peers admit certificate-bearing blocks while the capability is
-active, and certificate-bearing chains survive restart and sync — but the
-sync/restart checks are *structural only*, the round driver is un-audited, and
-production adoption still waits on the four ADR-010 §7 gates (Section 5).
+active, and certificate-bearing chains survive restart and sync with full
+per-height certificate verification (`verify_chain_certificates`, #97) — but
+the round driver is un-audited and production adoption still waits on the four
+ADR-010 §7 gates (Section 5).
 
 ---
 
@@ -298,13 +299,14 @@ sequenceDiagram
    certificate regardless of how the block was admitted (node.rs:3374-3384) —
    an event-level wart; the block itself keeps its real certificate.
 3. **Chain sync** (`Message::RequestChain` / `Message::Chain`): the candidate
-   chain is endorsement-checked whole, then adopted via
-   `Ledger::try_replace_chain`, persisted block-by-block, and every adopted
-   block is re-emitted with a degenerate PoW certificate. `try_replace_chain`
-   now accepts certificate-bearing blocks through `block_consensus_admissible`,
-   but that check is **structural** — the ledger has no validator set, so no
-   aggregate is verified on this path; BFT certificate replay verification on
-   sync is adoption-gate work (Section 5).
+   chain is endorsement-checked whole and certificate-verified before
+   adoption: `verify_chain_certificates` replays the chain's own validator-
+   registry write sets and verifies every non-degenerate certificate under
+   the set effective at its height (#97). Bootstrap-era heights verify
+   against the attached static set on sync (fail closed without one), then
+   `Ledger::try_replace_chain` adopts and persists the chain block-by-block.
+   Each adopted block is re-emitted with its **own** certificate (or the
+   degenerate PoW certificate when it carries none).
 
 ### What the quorum-certificate work retired (#38)
 
@@ -331,8 +333,9 @@ and is still the sync-admission path (a longer candidate chain can replace the
 local one wholesale). What was retired is fork resolution *as a consensus
 property* — the concurrent-mining fork test and the manual mining commands.
 `try_replace_chain` accepts PoW blocks or certificate-bearing blocks through
-`block_consensus_admissible` — structural only, no aggregate verification — and
-is one of the adoption gates (Section 5, gate 2).
+`block_consensus_admissible`, with `verify_chain_certificates` running before
+adoption on the sync path (#97) — see Section 5, gate 2, for the remaining
+bootstrap caveat.
 
 ---
 
@@ -423,8 +426,8 @@ verified in the named source (`crates/glasschain-network/src/node.rs`,
 | # | Gate | Verified in source | Consequence today |
 |---|---|---|---|
 | 1 | BFT is gated behind the `bft` build feature **and** the committed `bft_consensus` capability | node.rs:3323-3330 — certificate-bearing blocks verify against the derived set only when the capability is active at the expected height; otherwise `has_valid_pow`; `#[cfg(not(feature = "bft"))]` is PoW unconditionally | A default-built node (no `bft`) rejects BFT blocks as PoW-invalid; a `bft`-built node accepts them only after a committed activation. Nodes never straddle engines silently. |
-| 2 | Chain **sync** (`Message::Chain`) admission is structural only | ledger.rs:215-222 `block_consensus_admissible` — PoW *or* a structurally valid non-degenerate `certificate.validate(block)`; ledger.rs:261-301 `try_replace_chain`; sync re-emits degenerate PoW events (node.rs:3431-3440) | A joining node can adopt a BFT-attested chain, but the ledger never verifies the aggregate — it has no validator set. Cryptographic certificate replay on sync is ADR-010 gate work. |
-| 3 | Restart (`restore_ledger` / `validate_chain`) is structural only | node.rs:582-610 and ledger.rs:229-256 — `block_consensus_admissible` per window; **genesis must still satisfy PoW** | BFT-attested blocks survive restart — the old "silently dropped" failure is gone — but the load check is shape, not quorum: a stored certificate is not re-verified against the set at load. |
+| 2 | Chain **sync** (`Message::Chain`) admission | node.rs `verify_chain_certificates` (registry write-set replay + per-height certificate verification, #97) before `try_replace_chain`; `block_consensus_admissible` keeps PoW-or-structural admission after that | A structurally plausible but cryptographically invalid QC, or one signed under the wrong historical set, rejects the whole candidate; bootstrap-era heights need the attached static set on sync. |
+| 3 | Restart (`restore_ledger`) | node.rs `restore_ledger` re-runs `verify_chain_certificates` on the stored chain (#97); **genesis must still satisfy PoW** | A stored invalid certificate falls back to a fresh ledger; bootstrap-era certificates fail closed on restart (the attached provider is installed later), which is documented. |
 | 4 | Genesis must satisfy PoW on every load/sync path | ledger.rs `validate_chain` and `try_replace_chain` genesis branches (ledger.rs:246-256, 293-300) | A BFT bootstrap does not exist; the first certificate-bearing block enters through the capability activation (as in `bft_finality.rs`). |
 | 5 | The round driver is dev/test, not an audited engine | rounds.rs:16-18 ("the minimal locking rule that prevents two conflicting quorums at one height **in the dev/test setting**"), `MAX_ROUNDS`/`phase_timeout` dev knobs; bootstrap falls back to the attached provider's static set | No liveness/safety guarantees beyond what its tests exercise. The four ADR-010 §7 gates below are unchanged: testnet, API/stability, licensing/stewardship, security audit. |
 
