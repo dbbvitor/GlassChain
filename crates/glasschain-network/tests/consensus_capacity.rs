@@ -40,13 +40,10 @@ use std::time::{Duration, Instant};
 
 const COLLECTION: &str = "pricing";
 
-fn free_addr() -> String {
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr.to_string()
-}
+#[path = "common/ports.rs"]
+mod ports;
+
+use ports::free_addr;
 
 /// The `pdc` capability activation for the dissemination phase.
 fn activation_tx(height: u64) -> Transaction {

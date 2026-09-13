@@ -29,7 +29,7 @@ gating, adoption gates), [`benchmarks/consensus-capacity.md`](benchmarks/consens
 
 | Requirement | Notes |
 |---|---|
-| **Rust 1.95** | Pinned in `rust-toolchain.toml`; rustup picks it up automatically. Edition 2021. |
+| **Rust 1.98.1** | Pinned in `rust-toolchain.toml`; rustup picks it up automatically. Edition 2021. |
 | **`protoc`** | **Required to build.** `glasschain-rpc` compiles
   `proto/glasschain/v1/glasschain.proto` at build time (`build.rs` via
   `tonic-prost-build`); `protoc` is **not vendored**. CI installs it
@@ -47,7 +47,7 @@ make setup
 Verify the toolchain and compiler are visible:
 
 ```bash
-rustc --version      # 1.95.x
+rustc --version      # 1.98.x
 protoc --version     # any recent release
 ```
 
@@ -704,9 +704,9 @@ code, default builds the fallbacks, and both must stay green.
 | Job | Runner | Runs |
 |---|---|---|
 | `fmt` / `clippy` | ubuntu | `cargo fmt --all --check`; clippy with `RUSTFLAGS=-D warnings` |
-| `test` | **matrix ubuntu / macOS / Windows** | `cargo check …` then `cargo test …` with `RUSTFLAGS=-D warnings`, `RUSTDOCFLAGS=-D warnings`, `RUST_TEST_THREADS=1` (serialised: the network integration tests use real loopback ports and TLS handshakes) |
-| `coverage` | ubuntu | `cargo tarpaulin … --engine llvm --out xml` (llvm engine because wasmtime traps abort the default ptrace engine), upload to Codecov when a token exists |
-| `audit` | ubuntu | `cargo audit --deny warnings --file Cargo.lock` (RustSec) |
+| `test` | **matrix ubuntu / macOS / Windows** | `cargo test --workspace --lib --bins --tests --all-features` with `RUSTFLAGS=-D warnings`, `RUSTDOCFLAGS=-D warnings` — parallel harnesses; loopback ports come from the shared per-process band allocator (`tests/common/ports.rs`), so no cross-test port race |
+| `coverage` | ubuntu | `cargo tarpaulin … --lib --bins --tests --engine llvm --out xml` (llvm engine because wasmtime traps abort the default ptrace engine; benches excluded like the test job), upload to Codecov when a token exists |
+| `audit` | ubuntu (own workflow: `audit.yml`) | `cargo audit --deny warnings --file Cargo.lock` (RustSec); prebuilt installs via `taiki-e/install-action` |
 
 All `protoc`-requiring jobs install it via `arduino/setup-protoc`, and the
 workflow is path-filtered to code — **docs-only changes skip CI**.
@@ -715,18 +715,18 @@ workflow is path-filtered to code — **docs-only changes skip CI**.
 
 | `make setup` | Install pinned toolchain + rustfmt/clippy + `protoc` (may need sudo) |
 | `make build` / `build-release` | `cargo build` / `cargo build --release` |
-| `make check` / `test` / `test-pkg pkg=…` / `test-one test=…` | Type-check / full workspace suite (CI gate, `RUST_TEST_THREADS=1`) / one crate / one test by substring |
+| `make check` / `test` / `test-pkg pkg=…` / `test-one test=…` | Type-check / full workspace suite (CI gate, benches excluded — see `make bench`) / one crate / one test by substring |
 | `make fmt` / `fmt-check` / `clippy` | Format (writes) / verify formatting (CI gate) / clippy `-D warnings` (CI gate) |
 | `make ci` | CI gates in order: fmt-check → clippy → check → test |
 | `make audit` / `coverage` / `coverage-xml` | `cargo audit --deny warnings` (needs `make tools`) / Tarpaulin HTML / Cobertura XML (CI shape) |
 | `make node id=… port=…` | Interactive node REPL — never in automation (Section 2) |
 | `make doc` / `clean` / `bench` | `cargo doc --workspace --no-deps` / `cargo clean` / criterion benches (see Section 12 caveat) |
 
-### Current state (verified 2026-09-02, recorded in `.agents/handoff.md`)
+### Current state (verified 2026-09-12, recorded in `.agents/handoff.md`)
 
-All four gates pass; **546 tests** across 29 test harnesses + doctests (537
-passing, 9 `#[ignore]`d — the capacity gate); clippy **zero diagnostics** at
-`-D warnings`.
+All four gates pass; **589 tests** across 33 test harnesses (parallel
+harnesses, benches excluded from the test gate — 9 `#[ignore]`d capacity/WAN
+gates run explicitly); clippy **zero diagnostics** at `-D warnings`.
 
 House rules that keep the gates green: no `unsafe`, no `unwrap`/`expect` in
 library code, per-crate `thiserror` enums, `log` in libraries, JSON via serde,
@@ -760,9 +760,13 @@ numbers: [`docs/benchmarks/consensus-capacity.md`](benchmarks/consensus-capacity
 ### Criterion benchmarks
 
 ```bash
+cargo bench -p glasschain-core        # crates/glasschain-core/benches/ledger_admission.rs (D3)
 cargo bench -p glasschain-vm          # crates/glasschain-vm/benches/vm_throughput.rs
 cargo bench -p glasschain-workflows   # crates/glasschain-workflows/benches/watcher_throughput.rs
 ```
+
+CI runs these in their own parallel workflow (`.github/workflows/bench.yml`),
+separate from the test gates; `make bench` runs the same three commands.
 
 - `vm_throughput.rs` — per-cost-centre WASM execution throughput (plan target:
   1,000+ autonomous inventory triggers/s).

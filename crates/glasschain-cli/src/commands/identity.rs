@@ -96,7 +96,7 @@ pub fn run(args: IdentityGenArgs, out: &mut dyn std::io::Write) -> Result<()> {
         log::info!("Creating organisation '{org_name}' with Root CA …");
         let mut org = Organization::new(org_name)?;
 
-        log::info!("Issuing member certificate for node '{}' …", &args.node_id);
+        log::info!("Issuing member certificate for node '{}' …", args.node_id);
         // `issue_identity` returns `&Identity`; clone so we own the value.
         let identity = org.issue_identity(&args.node_id)?.clone();
 
@@ -104,7 +104,7 @@ pub fn run(args: IdentityGenArgs, out: &mut dyn std::io::Write) -> Result<()> {
     } else {
         log::info!(
             "Generating standalone identity for node '{}' …",
-            &args.node_id
+            args.node_id
         );
         (Identity::generate(&args.node_id), None)
     };

@@ -12,14 +12,10 @@ use std::time::Duration;
 
 const HEX64: &str = "abababababababababababababababababababababababababababababababab";
 
-/// Pick an ephemeral port on localhost that is very likely free.
-fn free_addr() -> String {
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr.to_string()
-}
+#[path = "common/ports.rs"]
+mod ports;
+
+use ports::free_addr;
 
 fn payload_map(fields: Value) -> BTreeMap<String, Value> {
     serde_json::from_value(fields).expect("payload object")

@@ -35,13 +35,10 @@ async fn verified_node(node_id: &str, addr: &str, org: &mut Organization) -> Nod
     node
 }
 
-fn free_addr() -> String {
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr.to_string()
-}
+#[path = "common/ports.rs"]
+mod ports;
+
+use ports::free_addr;
 
 fn pricing_collection(retention_secs: u64) -> Channel {
     Channel::new(ChannelConfig {

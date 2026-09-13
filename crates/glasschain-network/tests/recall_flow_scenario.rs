@@ -403,13 +403,10 @@ impl RecallContext {
     }
 }
 
-fn free_addr() -> String {
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr.to_string()
-}
+#[path = "common/ports.rs"]
+mod ports;
+
+use ports::free_addr;
 
 fn storage() -> Arc<dyn StorageProvider> {
     Arc::new(InMemoryStorageProvider::new())

@@ -20,13 +20,10 @@ use tokio_rustls::TlsConnector;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn free_addr() -> String {
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr.to_string()
-}
+#[path = "common/ports.rs"]
+mod ports;
+
+use ports::free_addr;
 
 const CLIENT_CERT_A: &[u8] = b"capability-test-client-cert-A-0123456789";
 

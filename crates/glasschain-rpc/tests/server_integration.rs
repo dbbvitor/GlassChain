@@ -29,13 +29,23 @@ type NodeClient = NodeServiceClient<tonic::transport::Channel>;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Allocate an ephemeral loopback port that is very likely free.
+/// Allocate a unique loopback port for this test process.
+///
+/// Band-based allocator (same pattern as
+/// `glasschain-network/tests/common/ports.rs`, which this file cannot
+/// reach): parallel probes in this process each get a distinct port instead
+/// of racing on the bind→drop→rebind window.
 fn free_addr() -> String {
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr.to_string()
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let band = u16::try_from(std::process::id() % 32).expect("pid mod 32 fits u16");
+    loop {
+        let offset = NEXT.fetch_add(1, Ordering::Relaxed) % 300;
+        let port = 22_000 + band * 300 + offset;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return format!("127.0.0.1:{port}");
+        }
+    }
 }
 
 /// Start a bare node with a temporary in-memory ledger.
