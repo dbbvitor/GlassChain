@@ -47,6 +47,10 @@ The network's consensus posture: no participant is trusted by default. Commercia
 A consensus vote payload cryptographically binding the validator's signature to the full routing context (`domain || genesis-hash || height || round || phase || block-hash`) rather than an isolated block hash. Prevents cross-chain, cross-height, cross-round, and cross-phase vote replay.
 _Avoid_: bare hash vote, hash-only attestation
 
+**Equivocation proof**:
+Self-verifying evidence that one validator signed two different candidate hashes in the same consensus context (chain, height, round, phase). Both carried votes verify through the context envelope; detection records the proof, it never ejects anyone automatically.
+_Avoid_: slashable offense, automatic exclusion evidence
+
 **Light client**:
 A member organization that submits transactions and queries state through authenticated gRPC without operating a validator, verifying block headers against the validator set's signatures. It takes state validity on trust from the quorum and therefore cannot detect an invalid state transition. At national scale most members are light clients; provenance guarantees are unchanged because every submission is signed by an MSP identity.
 _Avoid_: full node, verifier (a light client verifies headers, not state)

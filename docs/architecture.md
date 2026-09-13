@@ -28,7 +28,7 @@ blocks, an in-memory pending pool, pluggable consensus (Proof-of-Work for
 dev/test, a staged Tendermint-class BFT behind the same seam), a WASM contract
 runtime, private data collections for selective disclosure, and a Tonic gRPC
 API. It is a Cargo workspace of 12 crates (~37k lines of Rust across the
-`crates/` tree), pinned to Rust 1.95, edition 2021, async on Tokio.
+`crates/` tree), pinned to Rust 1.98.1, edition 2021, async on Tokio.
 
 Architecturally the project hybridizes three reference systems, and each
 influence is visible in the code and in the accepted ADRs:

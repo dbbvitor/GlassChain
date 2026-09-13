@@ -9,6 +9,8 @@
 
 #![cfg(feature = "bft")]
 
+#[path = "common/ports.rs"]
+mod ports;
 #[path = "common/proxy.rs"]
 mod proxy;
 
@@ -20,33 +22,13 @@ use glasschain_core::{
     TransactionKind, ValidatorInfo, WriteOp, WriteVisibility,
 };
 use glasschain_network::Node;
+use ports::free_addr;
 use std::sync::Arc;
 use std::time::Duration;
 
 const CHANNEL: &str = "governance";
 const CONTRACT: &str = "validator-registry";
 const VALIDATORS: usize = 4;
-
-/// Allocate a unique loopback port for this test process.
-///
-/// Probing `bind(":0")` and dropping the listener races with sibling tests in
-/// the same binary: the kernel can hand the same just-freed ephemeral port to
-/// two probes before either node binds it (`AddrInUse` on CI). Ports are
-/// reserved from a per-process band below the OS ephemeral range (which
-/// starts at 32768 on Linux, 49152 on macOS/Windows), with a bind probe to
-/// skip ports held by anything else.
-fn free_addr() -> String {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    let band = u16::try_from(std::process::id() % 32).expect("pid mod 32 fits u16");
-    loop {
-        let offset = NEXT.fetch_add(1, Ordering::Relaxed) % 300;
-        let port = 22_000 + band * 300 + offset;
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return format!("127.0.0.1:{port}");
-        }
-    }
-}
 
 /// Deterministic BLS validator keys; canonical order is the key index.
 fn validator_keys() -> Vec<PrivateKey> {
