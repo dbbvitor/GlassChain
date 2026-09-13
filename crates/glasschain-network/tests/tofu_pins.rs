@@ -13,12 +13,10 @@ use glasschain_network::Node;
 use std::sync::Arc;
 use std::time::Duration;
 
-fn free_addr() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr.to_string()
-}
+#[path = "common/ports.rs"]
+mod ports;
+
+use ports::free_addr;
 
 /// A fail-closed verifier (ADR-013): the org's CRL rides along with its root.
 fn verifier_with_crl(org: &Organization) -> CertChainVerifier {

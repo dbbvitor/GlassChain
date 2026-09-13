@@ -49,12 +49,10 @@ use tokio::time::{sleep, timeout};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Allocate a free loopback port for testing.
-fn free_addr() -> String {
-    use std::net::TcpListener;
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().to_string()
-}
+#[path = "common/ports.rs"]
+mod ports;
+
+use ports::free_addr;
 
 fn inv_tx(owner: &str, delta: i64) -> Transaction {
     Transaction::new(TransactionKind::InventoryUpdate(InventoryUpdate {

@@ -38,14 +38,10 @@ use tokio_rustls::TlsConnector;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Pick an ephemeral loopback port that is very likely free.
-fn free_addr() -> String {
-    use std::net::TcpListener;
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr.to_string()
-}
+#[path = "common/ports.rs"]
+mod ports;
+
+use ports::free_addr;
 
 /// Certificate bytes presented by the raw test client in the pre-TLS exchange.
 /// The node treats these as opaque and only fingerprints them, so fixed dummy

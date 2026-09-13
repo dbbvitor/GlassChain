@@ -192,20 +192,16 @@ or an inactive-algorithm certificate rejects the whole candidate. The full
 verification cost is measured (see the `historical_verification_cost`
 ignored test).
 
-**Equivocation support is partial, not established end-to-end** (#77).
-`VoteReceipts` can detect two different hashes from the same key in one
-`(height, round, phase)` when kept across calls, and proof/event types exist.
-However, `handle_vote` creates a new tracker for each message and re-seeds only
-from already-detected proofs, not ordinary prior votes.
-`BftVote::vote_message` alone authenticates only the hash; the **context
-signature** (#95) now binds chain/height/round/phase, and verification of two
-signatures authenticates their shared voting context once both carry the
-envelope.
-
-Context binding, bounded persistent receipt state and a real two-conflicting-vote
-network regression are prerequisites to governance attribution. See
-[zero-trust §8](../.agents/plans/zero-trust.md). No automatic ejection or complete
-equivocation-detection guarantee is claimed.
+**Equivocation evidence is context-authenticated** (#77, #95; Frontier A
+concluded). Every verified vote is recorded in the node's bounded live
+receipt journal (#96), so two different hashes from the same key in one
+`(chain, height, round, phase)` — even across separate messages — produce an
+`EquivocationProof` that carries both dual-signed votes and verifies through
+the #95 context envelope: a proof cannot be assembled from votes of
+different contexts, chains, or keys. Detection is still live-only (a restart
+loses unreported evidence) and no automatic ejection follows; governance
+attribution beyond the recorded proof is future work. See
+[zero-trust §8](../.agents/plans/zero-trust.md).
 
 **The validator set is on-chain state** (ADR-009/ADR-010):
 `derive_validator_provider` (node.rs:2717) rebuilds the provider from
@@ -249,9 +245,11 @@ and `bft.rs`:
   order plus one BLS12-381 aggregate signature. `pow(block)` builds the
   degenerate (`signers_bitmap: []`) Proof-of-Work certificate; `is_degenerate()`
   detects it; `validate(block)` checks structural well-formedness / index / hash match.
-- `EquivocationProof { height, round, phase, public_key, first_signature, second_signature, … }`
-  — two signed, distinct hashes with claimed `(height, round, phase)` context;
-  authenticating that context remains a gap (bft.rs; see §2.2).
+- `EquivocationProof { height, round, phase, public_key, first_vote, second_vote }`
+  — both conflicting votes carried in full, each dual-signed over its own
+  hash and the shared `(chain, height, round, phase)` context envelope
+  (#95); `verify()` checks both votes, their context agreement and that the
+  hashes differ (bft.rs; see §2.2).
 - `CommitNotification { block, certificate }` — the unit every commit consumer
   receives: "the committed block plus the `QuorumCertificate` attesting it. No
   consumer may depend on 'the leader said so'."

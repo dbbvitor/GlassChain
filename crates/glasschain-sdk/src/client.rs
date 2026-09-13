@@ -126,21 +126,17 @@ impl GlasschainClient {
     /// Initialise a client with the given configuration.
     ///
     /// In a full production implementation this would open a `tonic` transport
-    /// channel and perform a health-check against the remote node.  Currently
-    /// the method is infallible and logs the target endpoint.
-    ///
-    /// # Errors
-    ///
-    /// Currently infallible.  Future releases will return
-    /// [`SdkError::Transport`] when the gRPC endpoint is unreachable.
-    #[allow(clippy::unused_async)] // intentionally async — will drive tonic in a future release
-    pub async fn new(config: GlasschainClientConfig) -> Result<Self, SdkError> {
+    /// channel and perform a health-check against the remote node; that work
+    /// will make this method async and fallible again. Currently it logs the
+    /// target endpoint and cannot fail.
+    #[must_use]
+    pub fn new(config: GlasschainClientConfig) -> Self {
         log::info!(
             "GlasschainClient initialised — endpoint: {}, node_id: {:?}",
             config.endpoint,
             config.node_id,
         );
-        Ok(Self { config })
+        Self { config }
     }
 
     /// Return the configured gRPC endpoint URL.

@@ -10,7 +10,7 @@ GlassChain is a federated distributed ledger for transparent supply-chain
 transactions, written in Rust. It has SHA-256 chained blocks with Proof-of-Work
 consensus, supply-chain transaction types, a contract/watcher automation engine, a
 TLS-encrypted TCP + libp2p P2P layer, and a Tonic/Prost gRPC API. It is a Cargo
-workspace of 12 crates (~37k lines of Rust) on the Rust **1.95** toolchain pinned
+workspace of 12 crates (~37k lines of Rust) on the Rust **1.98.1** toolchain pinned
 by `rust-toolchain.toml`, edition 2021, async on Tokio.
 
 ## Build and validate
@@ -22,7 +22,9 @@ Run these from the repository root:
 
 1. `cargo fmt --all --check`
 2. `cargo check --workspace --all-targets --all-features --locked`
-3. `cargo test --workspace --all-targets --all-features --locked`
+3. `cargo test --workspace --lib --bins --tests --all-features --locked` (benches
+   excluded: their test-mode setup mines a 10k-block history in debug; they stay
+   compile-checked by step 2 and run for real via `cargo bench`)
 4. `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
 
 Notes that will save you a failed run:
