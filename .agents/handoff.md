@@ -1,6 +1,6 @@
 # Handoff — GlassChain
 
-**Reviewed:** 2026-09-12
+**Reviewed:** 2026-09-13
 **Source baseline:** `main` / `origin/main` at `523cd42` (PR #116 / `fix/sync-certificate-events-and-doc-drift`).
 **Change branch:** `feat/frontier-a-dual-sign-proof-ci` — dual-sign `EquivocationProof` (Frontier A
 conclusion), parallel-safe test ports and CI speed, workflow badges, Rust
@@ -10,10 +10,12 @@ conclusion), parallel-safe test ports and CI speed, workflow badges, Rust
 
 1. Read [AGENTS.md](../AGENTS.md) for repository rules, then the
    [plan index](plans/README.md) for concluded versus pending work.
-2. Active priority sequence: **Frontier C (Consensus Capacity / BLST Backend) →
-   Frontier B (RBAC & Operational Tail) → Frontier D (Browser Demo)**.
+2. Previous priority sequence: **Frontier C (Consensus Capacity / BLST Backend)
+   → Frontier B (RBAC & Operational Tail) → Frontier D (Browser Demo)**.
    Frontier A concluded: `EquivocationProof` carries both dual-signed votes
-   and verifies through the #95 context envelope.
+   and verifies through the #95 context envelope. **Frontier C concluded
+   2026-09-13** (ADR-015: audited `blst` backend, sum-of-keys verify,
+   300-validator gate passing); next frontier is **Frontier B**.
 3. Read [zero-trust §8](plans/zero-trust.md) for consensus safety invariants.
 4. Read [source-comment debt](plans/deferred-code-debt.md) for settled D1–D7
    markers and benchmarks.
@@ -24,12 +26,12 @@ conclusion), parallel-safe test ports and CI speed, workflow badges, Rust
 
 | Area | Concluded / available | Still pending |
 |---|---|---|
-| Workspace | 12 Rust crates; wire `glasschain/6`; 14 accepted ADRs; D1–D7 settled | No browser package or demo bridge exists |
+| Workspace | 12 Rust crates; wire `glasschain/6`; 15 accepted ADRs; D1–D7 settled | No browser package or demo bridge exists |
 | Ledger/execution | Schema v1, capability/policy history, explicit WASM write sets and replay | Production durability acknowledgement and historical security gates |
 | Consensus | PoW dev/test default; BLS driver with context-authenticated votes (#95, #99), live receipt journal (#96), full historical QC verification on sync/restart (#97, PR #116), absolute phase deadlines/bounded queues/distinct voters (#98), dual-sign `EquivocationProof` (Frontier A concluded) | Production audit/testnet/APIs (ADR-010) |
 | Identity/privacy | TLS/TOFU with durable pins & signed rotation (#88), opt-in verifier with fail-closed private paths (#86), session-bound possession proofs (#110), CRLs/intermediates (ADR-013), cert-bound MSP principals with height authorization (#87, D4), fail-closed governance fallback (D1), issuer-signed recall (D2), restart-safe purge (D5) & triage discovery (D6) | OCSP verification & stapling, deployment access (operator RBAC/channel-management operations), explicit replica/backup retention policy, deferred on-chain revocation (#74) |
 | Workflows/read path | Checkpointed flow engine, purchase/recall flows, triage API with restart discovery (D6), provenance/flattener/event bus and RPC queries; D3 baseline measured (#106) | Unattended external integration, durable external indexer adapter, bounded projection costs |
-| Measurements | Prior local BFT p50 2,021 ms at 100 / 5,284 ms at 200; D3 admission bench (~21 ms at 10k); read-path memory baseline (#107); D7 WAN proxy profiles (#108) | 300-validator pass (pure-Rust pairing bottleneck; active Frontier C focus); long-run fleet memory |
+| Measurements | BFT finality on `blst` (ADR-015): p50 1 096 ms at 100 / 2 397 ms at 200 / 3 996 ms at 300, exact quorum every round. The 300 gate passes; verify is no longer the wall. D3 admission bench (~21 ms at 10k); read-path memory baseline (#107); D7 WAN proxy profiles (#108) | Long-run fleet memory; 400/500 sweep is out of scope |
 | PQ readiness | Discriminants shipped; negotiated X25519MLKEM768 hybrid TLS behind `pq-tls` shipped (#105) | Long-term archive evidence / migration policy; no guaranteed quantum-safe lifetime |
 | Demonstration | Web-app direction and browser/bridge/renderer acceptance gates specified | Entire implementation; Canvas2D baseline, optional WebGPU (Frontier D, queued after C and B) |
 
@@ -59,17 +61,22 @@ Code items D1–D6 and #86–#88 shipped with tests. Frontier B remains open on:
 - Explicit replica/backup physical retention and recovery policy.
 - On-chain revocation registry (#74) remains deferred.
 
-### C. Active Priority: Transport and performance (unblock 300 validators)
+### C. Transport and performance (concluded 2026-09-13)
 
 Hybrid TLS negotiation shipped (#105). Step 0 prerequisites (WAN proxy #108,
 D3 admission bench #106, read-path memory baseline #107) are complete.
-Active focus:
 
-- **Step 3 (BLS verification / pairing backend experiment, issue #85):** evaluate
-  `blst` vs pure-Rust `pairing` to unblock the 300-validator finality gate timeout.
-  Validate API portability, Windows/macOS/Linux CI, and aggregate-public-key verification.
-- **Completion:** comparable before/after evidence under unchanged quorum assumptions;
-  300-validator gate passing within budget.
+- **Step 4 (BLS backend, issue #85) concluded via ADR-015:** the audited `blst`
+  C backend replaces the pure-Rust `pairing` path; the same-message verify is
+  the sum-of-keys PopScheme check over `blstrs` — two pairing terms at any
+  quorum size. Measured: pure-Rust 80.0 ms → blst sum-of-keys 1.78 ms at
+  quorum 201 (`cargo bench -p glasschain-core --bench bft_verify`).
+- **Completion evidence:** the 300-validator finality gate now passes with
+  exact-quorum certificates every round — p50 1 096 ms (100) / 2 397 ms (200) /
+  3 996 ms (300), before/after in `docs/benchmarks/consensus-capacity.md`.
+  Remaining round cost is mesh replication, not verification.
+- Residual performance work stays on the performance plan: Step 1 codec
+  profiling, D3 admission rebuild optimization, Steps 5+ research only.
 
 ### D. Browser demonstration (queued after C and B)
 

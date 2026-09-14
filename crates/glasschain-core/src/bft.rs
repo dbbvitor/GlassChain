@@ -313,34 +313,53 @@ impl BftConsensusProvider {
 
 /// The IETF `PopScheme` multisig check (ADR-014): every signer's key is
 /// individually proof-of-possessed, so the same-message aggregate verifies as
-/// `e(-G1, agg_sig) * prod_i e(pk_i, hash) == identity`.
+/// `e(-G1, agg_sig) · prod_i e(pk_i, hash) == identity`. By bilinearity the
+/// signer keys collapse into one G1 sum — the entire check is **two pairing
+/// terms regardless of quorum size**, which is what unblocks the
+/// 300-validator gate (ADR-015, issue #85: the pure-Rust backend failed on
+/// the 299 × 202-term precommit re-verification herd).
 ///
-/// `bls-signatures`' pure-Rust backend only ships the *distinct-message*
-/// aggregate verify (it enforces message uniqueness as its rogue-key
-/// countermeasure); the same-message form is what a quorum certificate needs,
-/// and proof-of-possession replaces the uniqueness requirement.
+/// `bls-signatures` ships only the *distinct-message* aggregate verify (it
+/// enforces message uniqueness as its rogue-key countermeasure); the
+/// same-message form is what a quorum certificate needs, and
+/// proof-of-possession replaces the uniqueness requirement.
 #[cfg(feature = "bft")]
 fn verify_same_message_multisig(
     aggregate: &Signature,
     public_keys: &[[u8; 48]],
-    hash: &bls12_381::G2Projective,
+    hash: &blstrs::G2Projective,
 ) -> bool {
-    use bls12_381::{multi_miller_loop, G1Affine, G2Affine, G2Prepared, Gt};
+    use blstrs::{pairing, G1Affine, G1Projective, G2Affine, Gt};
+    use group::prime::PrimeCurveAffine as _;
+    use group::{Curve as _, Group as _};
 
-    let signature = G2Affine::from(*aggregate);
-    let g1_neg = -G1Affine::generator();
-    let hash_prepared = G2Prepared::from(G2Affine::from(hash));
-
-    let mut terms = vec![(g1_neg, G2Prepared::from(signature))];
+    let mut signer_keys = G1Projective::identity();
     for key in public_keys {
         let parsed = G1Affine::from_compressed(key);
         let Some(pk) = <Option<G1Affine>>::from(parsed) else {
             return false;
         };
-        terms.push((pk, hash_prepared.clone()));
+        signer_keys += pk;
     }
-    let refs: Vec<(&G1Affine, &G2Prepared)> = terms.iter().map(|(a, b)| (a, b)).collect();
-    multi_miller_loop(&refs).final_exponentiation() == Gt::identity()
+
+    let signature_bytes: [u8; 96] = match aggregate.as_bytes().try_into() {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    let Some(signature) = <Option<G2Affine>>::from(G2Affine::from_compressed(&signature_bytes))
+    else {
+        return false;
+    };
+    let Some(hash) =
+        <Option<G2Affine>>::from(G2Affine::from_compressed(&hash.to_affine().to_compressed()))
+    else {
+        return false;
+    };
+
+    // e(-G1, agg_sig) · e(sum_pk, hash) == identity.
+    let lhs = pairing(&-G1Affine::generator(), &signature);
+    let rhs = pairing(&G1Affine::from(signer_keys), &hash);
+    lhs + rhs == Gt::identity()
 }
 
 #[cfg(feature = "bft")]
