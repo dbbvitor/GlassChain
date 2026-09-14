@@ -217,3 +217,34 @@ this ADR.
 Open questions 4 and 5 determined whether the membership ladder is
 legitimate. Both are now owned and closed: see
 [ADR-009](adr-009-validator-eligibility.md).
+
+## Amendment note — one-phase speculative confirmation declined (2026-09-14)
+
+The requirement owner considered a HotStuff-1-style amendment: client-visible
+"will commit" acknowledgments one phase early (after the prevote quorum),
+as proposed by the performance plan Step 5 research
+(`.agents/plans/hotstuff1-rollback-design.md`).
+
+**Decision: declined for now; ADR-002 is unchanged.** Rationale, measured:
+
+- §8.2's "immediate, deterministic finality" is read as **finality**, not
+  client-perceived latency. Speculation does not shorten any phase and does
+  not move finality at the designed operating point (p50 ≈ 4.1 s at 300
+  validators); it only moves a *provisional* client-visible milestone
+  (~1.4 s instead of ~4.1 s), and throughput is untouched.
+- The measured wall is not the phase count: vote collection + receiver-side
+  post-commit work and large-block replication dominate
+  (`docs/benchmarks/consensus-capacity.md`). The pending optimization is
+  batching, not fewer phases.
+- Zero-trust containment is available in principle — a speculative ack
+  would have to carry the **verifiable prevote QC** (client-verified, two
+  pairing terms), never a leader assertion — but the ack itself remains a
+  voidable claim in a rival-validator network and a new public API surface
+  in a domain where early acks invite irreversible actions.
+
+**Revisit condition:** if, after the batching iteration lands, finality at
+the designed operating point plateaus above the sub-second target AND the
+product wants faster client-perceived acks, this question may be reopened
+with the constraint above as a hard precondition. Until then, no
+speculative path exists in the code, and client-visible results remain
+final-at-commit only.

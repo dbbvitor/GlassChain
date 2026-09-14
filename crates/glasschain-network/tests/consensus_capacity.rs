@@ -693,25 +693,48 @@ mod bft_finality_gate_section {
         signers: usize,
         /// Time until every connected replica holds the block.
         replication_ms: Option<u128>,
+        /// Leader-side per-phase split (Step 0): proposal / prevote / aggregate
+        /// / precommit / aggregate, recorded by the round driver.
+        phases: Option<glasschain_network::rounds::BftPhaseTimings>,
     }
 
     fn print_bft_round(m: &BftFinalityMetrics) {
+        let phases = m.phases.unwrap_or_default();
         println!(
-            "bft round {:>3}: leader finality {:>5} ms | signers {:>3} | replication {:>4?} ms",
-            m.seq, m.leader_finality_ms, m.signers, m.replication_ms
+            "bft round {:>3}: leader finality {:>5} ms | signers {:>3} | replication {:>4?} ms | proposal {} ms, prevote {} ms, prevote-agg {} ms, precommit {} ms, precommit-agg {} ms",
+            m.seq,
+            m.leader_finality_ms,
+            m.signers,
+            m.replication_ms,
+            phases.proposal_broadcast,
+            phases.prevote,
+            phases.prevote_aggregate,
+            phases.precommit,
+            phases.precommit_aggregate,
         );
     }
 
     fn print_bft_summary(label: &str, rounds: &[BftFinalityMetrics]) {
         let leader: Vec<u128> = rounds.iter().map(|r| r.leader_finality_ms).collect();
         let signers: Vec<usize> = rounds.iter().map(|r| r.signers).collect();
+        let phase = |pick: fn(&glasschain_network::rounds::BftPhaseTimings) -> u128| {
+            percentile(
+                rounds.iter().filter_map(|r| r.phases.as_ref().map(pick)),
+                50,
+            )
+        };
         println!(
-            "BFT-SUMMARY[{label}]: rounds={} | finality p50={} p95={} p99={} ms | signers min={}",
+            "BFT-SUMMARY[{label}]: rounds={} | finality p50={} p95={} p99={} ms | signers min={} | phases p50: proposal={} prevote={} prevote-agg={} precommit={} precommit-agg={} ms",
             rounds.len(),
             percentile(leader.clone(), 50),
             percentile(leader.clone(), 95),
             percentile(leader, 99),
             signers.iter().copied().min().unwrap_or(0),
+            phase(|t| t.proposal_broadcast),
+            phase(|t| t.prevote),
+            phase(|t| t.prevote_aggregate),
+            phase(|t| t.precommit),
+            phase(|t| t.precommit_aggregate),
         );
     }
 
@@ -783,6 +806,24 @@ mod bft_finality_gate_section {
         // Height 1's leader: 1 % n.
         let leader1 = 1 % validator_count;
         nodes[leader1].mine().await.unwrap();
+        // Blocks diffuse through k-fanout relay waves (latency plan #1), so
+        // a fixed sleep no longer guarantees every validator holds the
+        // activation block: a validator still at genesis would mine a local
+        // PoW fork instead of erroring as "not the round leader". Poll for
+        // mesh-wide convergence before the first vote round.
+        bft_poll_until(
+            "activation block diffused to every validator",
+            120,
+            || async {
+                for node in &nodes {
+                    if node.ledger_snapshot().await.chain.len() < 2 {
+                        return false;
+                    }
+                }
+                true
+            },
+        )
+        .await;
         // Height 2: the first vote round — its leader is 2 % n.
         nodes[leader1]
             .submit_transaction(canonical_record_tx(0))
@@ -886,6 +927,7 @@ mod bft_finality_gate_section {
                 leader_finality_ms,
                 signers,
                 replication_ms,
+                phases: nodes[leader].last_round_phase_timings().await,
             };
             print_bft_round(&m);
             all.push(m);
@@ -921,6 +963,13 @@ mod bft_finality_gate_section {
 
     #[cfg_attr(madsim, madsim::test)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "bft finality gate: run explicitly"]
+    async fn bft_finality_gate_10_validators() {
+        bft_finality_gate(10, 10, 10).await;
+    }
+
+    #[cfg_attr(madsim, madsim::test)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     #[ignore = "bft finality gate: minutes-long, needs a raised fd limit (ulimit -n 65535); run explicitly"]
     async fn bft_finality_gate_100_validators() {
         bft_finality_gate(100, 10, 10).await;
@@ -938,5 +987,241 @@ mod bft_finality_gate_section {
     #[ignore = "bft finality gate: heaviest mesh (~180k sockets); raise the fd limit first"]
     async fn bft_finality_gate_300_validators() {
         bft_finality_gate(300, 10, 10).await;
+    }
+
+    /// A lightweight workload transaction for the offered-load gate: no
+    /// canonical/capability gate, so the saturation measurement isolates
+    /// pool + round behavior, not record validation.
+    fn load_tx(seq: u64) -> Transaction {
+        Transaction::with_id(
+            format!("load-{seq}"),
+            TransactionKind::InventoryUpdate(glasschain_core::InventoryUpdate {
+                product_id: "LOAD-SKU".into(),
+                owner_id: "owner".into(),
+                quantity_delta: 1,
+                reason: "offered-load saturation".into(),
+            }),
+        )
+    }
+
+    async fn drive_saturation_round(
+        nodes: &[Node],
+        height: usize,
+        burst: Option<(u64, usize)>,
+    ) -> (
+        u128,
+        glasschain_network::PendingPoolStats,
+        glasschain_network::PendingPoolStats,
+        usize,
+        usize,
+    ) {
+        #[allow(clippy::cast_possible_truncation)]
+        let mut leader = height % nodes.len();
+        let mut rejected = 0usize;
+        if let Some((base, count)) = burst {
+            for i in 0..count {
+                if nodes[leader]
+                    .submit_transaction(load_tx(base + u64::try_from(i).expect("burst fits")))
+                    .await
+                    .is_err()
+                {
+                    // Explicit backpressure (Step 6): the bounded pool
+                    // rejected the submission — an operator-visible signal,
+                    // not a silent queue drain.
+                    rejected += 1;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        let pool_before = nodes[leader].pending_pool_stats().await;
+        let mine_start = Instant::now();
+        let mut committed = false;
+        for attempt in 0..4usize {
+            leader = (height + attempt) % nodes.len();
+            match nodes[leader].mine().await {
+                Ok(()) => {
+                    committed = true;
+                    break;
+                }
+                Err(error) if error.to_string().contains("round leader") => {}
+                Err(error) => panic!("round failed: {error}"),
+            }
+        }
+        assert!(committed, "the round must commit");
+        let pool_after = nodes[leader].pending_pool_stats().await;
+        (
+            mine_start.elapsed().as_millis(),
+            pool_before,
+            pool_after,
+            leader,
+            rejected,
+        )
+    }
+
+    /// Step 6 offered-load saturation gate (100 validators, BFT): burst
+    /// submissions between rounds while the leader keeps mining. Records —
+    /// per the plan — pending count/bytes under offered load, backlog drain,
+    /// and finality under load against the unloaded baseline. The failing
+    /// budget this study looks for is pool depth/bytes growth and round
+    /// latency, in that order.
+    #[cfg_attr(madsim, madsim::test)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "offered-load saturation: minutes-long, needs a raised fd limit; run explicitly"]
+    #[allow(clippy::too_many_lines)]
+    async fn bft_offered_load_saturation_100_validators() {
+        const VALIDATORS: usize = 100;
+        const UNLOADED_ROUNDS: usize = 5;
+        const LOADED_ROUNDS: usize = 8;
+        // Burst size: 2 000 by default; the failing-budget probe overrides
+        // it (e.g. `GLASSCHAIN_SATURATION_BURST=9000`) to push past the
+        // 8 000-tx pool bound and measure the explicit rejections.
+        let burst_size: usize = std::env::var("GLASSCHAIN_SATURATION_BURST")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(2_000);
+        let _ = env_logger::try_init();
+        println!(
+            "=== bft offered-load saturation: {VALIDATORS} validators, burst {burst_size} txs/round ==="
+        );
+        let keys = bft_keys(VALIDATORS);
+        let validators = bft_validators(&keys);
+        let mut nodes: Vec<Node> = Vec::with_capacity(VALIDATORS);
+        let mut addrs: Vec<String> = Vec::with_capacity(VALIDATORS);
+        for (i, key) in keys.iter().enumerate() {
+            let addr = free_addr();
+            let node = Node::new(format!("validator-{i}"), &addr, 1);
+            let provider = BftConsensusProvider::new(validators.clone(), *key).expect("valid set");
+            node.set_bft_consensus(Arc::new(provider)).await;
+            node.set_execution_provider(Arc::new(
+                glasschain_vm::WasmExecutionProvider::new().unwrap(),
+            ))
+            .await;
+            node.start(vec![]).await.expect("bind listener");
+            nodes.push(node);
+            addrs.push(addr);
+        }
+        let mut wave: usize = 0;
+        for i in 1..addrs.len() {
+            for dial in &addrs[..i] {
+                nodes[i].connect_peer(dial);
+                wave += 1;
+            }
+            if wave >= 500 {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                wave = 0;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+        // Activation from height 2 (same bootstrap shape as the finality gate).
+        nodes[0]
+            .submit_transaction(activation_bft_tx(2))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let leader1 = 1 % VALIDATORS;
+        nodes[leader1].mine().await.unwrap();
+        bft_poll_until("activation diffused", 60, || async {
+            for node in &nodes {
+                if node.ledger_snapshot().await.chain.len() < 2 {
+                    return false;
+                }
+            }
+            true
+        })
+        .await;
+
+        // Phase A — unloaded baseline.
+        let mut unloaded = Vec::new();
+        for seq in 1..=UNLOADED_ROUNDS {
+            let height = seq + 1;
+            bft_poll_until(
+                "replicas converged before the unloaded round",
+                120,
+                || async {
+                    for node in &nodes {
+                        if node.ledger_snapshot().await.chain.len() < height {
+                            return false;
+                        }
+                    }
+                    true
+                },
+            )
+            .await;
+            let (finality, _, _, _, _) = drive_saturation_round(&nodes, height, None).await;
+            unloaded.push(finality);
+        }
+        println!(
+            "unloaded: rounds={} finality p50={} p99={} ms",
+            unloaded.len(),
+            percentile(unloaded.clone(), 50),
+            percentile(unloaded.clone(), 99),
+        );
+
+        // Phase B — offered load: a burst of {BURST} txs per round.
+        let mut loaded = Vec::new();
+        let mut depth = Vec::new();
+        let mut bytes = Vec::new();
+        let mut drained = Vec::new();
+        let mut seq: u64 = 0;
+        for seq_round in 1..=LOADED_ROUNDS {
+            let height = UNLOADED_ROUNDS + seq_round + 1;
+            bft_poll_until(
+                "replicas converged before the loaded round",
+                120,
+                || async {
+                    for node in &nodes {
+                        if node.ledger_snapshot().await.chain.len() < height {
+                            return false;
+                        }
+                    }
+                    true
+                },
+            )
+            .await;
+            seq += burst_size as u64;
+            let (finality, before, after, _, rejected) =
+                drive_saturation_round(&nodes, height, Some((seq, burst_size))).await;
+            loaded.push(finality);
+            depth.push(u128::try_from(before.count).expect("pool fits"));
+            bytes.push(u128::try_from(before.bytes).expect("bytes fit"));
+            drained.push(after.count);
+            println!(
+                "loaded round {seq_round}: finality {} ms | pool before {} txs / {} B | \
+                 after {} txs | rejected {}",
+                finality, before.count, before.bytes, after.count, rejected,
+            );
+        }
+        println!(
+            "SATURATION-SUMMARY: loaded finality p50={} p99={} ms | pool depth p50={} max={} |              pool bytes p50={} | drained-to-zero rounds={}/{}",
+            percentile(loaded.clone(), 50),
+            percentile(loaded.clone(), 99),
+            percentile(depth.clone(), 50),
+            depth.iter().copied().max().unwrap_or(0),
+            percentile(bytes.clone(), 50),
+            drained.iter().filter(|d| **d == 0).count(),
+            LOADED_ROUNDS,
+        );
+        assert!(
+            depth.iter().copied().max().unwrap_or(0)
+                <= u128::try_from(glasschain_core::ledger::MAX_PENDING_TRANSACTIONS)
+                    .expect("bound fits"),
+            "the pool bound must hold under offered load"
+        );
+        if burst_size <= glasschain_core::ledger::MAX_BLOCK_TRANSACTIONS {
+            assert!(
+                drained.iter().all(|d| *d == 0),
+                "bursts within the slice quota must drain fully each round"
+            );
+        } else {
+            // Backpressure regime (Step 6 batching): the slice commits
+            // MAX_BLOCK_TRANSACTIONS per round, the bound rejects the excess,
+            // and the backlog persists — the pool bound is the designed
+            // operator signal, not an emergency valve.
+            assert!(
+                drained.iter().all(|d| *d > 0),
+                "bursts beyond the slice quota must leave a persistent backlog"
+            );
+        }
     }
 }

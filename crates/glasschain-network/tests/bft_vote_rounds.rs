@@ -14,6 +14,8 @@ mod ports;
 #[path = "common/proxy.rs"]
 mod proxy;
 
+use proxy::TcpProxy;
+
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use bls_signatures::{PrivateKey, Serialize as _};
 use glasschain_core::{
@@ -110,6 +112,21 @@ impl ExecutionProvider for RegistryProvider {
                     "registry execution id '{execution_id}' does not name a validator"
                 ))
             })?;
+        // Churn exercise: an execution id `remove-{i}` deletes that
+        // validator's registry entry (the governance reconfiguration write;
+        // real deployments use the same world-state seam).
+        if execution_id.starts_with("remove-") {
+            return Ok(ExecutionResult {
+                ephemeral: Vec::new(),
+                writes: vec![PersistentWrite {
+                    channel: CHANNEL.into(),
+                    contract: CONTRACT.into(),
+                    key: format!("validator-{index}"),
+                    op: WriteOp::Delete,
+                    visibility: WriteVisibility::Public,
+                }],
+            });
+        }
         Ok(ExecutionResult {
             ephemeral: Vec::new(),
             writes: vec![registry_write(index, &self.keys)],
@@ -350,16 +367,12 @@ const fn provider_quorum() -> usize {
     VALIDATORS * 2 / 3 + 1
 }
 
-/// D7 scenario — WAN-delayed votes still reach quorum (performance plan §5):
-/// every peer sits behind a WAN-shaped proxy (one-way latency + jitter on the
-/// leader's link), and the same on-chain-registry → activation → vote-round
-/// flow as the no-fault test must still commit a multi-signer certificate.
-/// Real TCP wall-clock, labeled separately from deterministic runs.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::too_many_lines)]
-async fn vote_rounds_reach_quorum_through_wan_delayed_votes() {
-    use proxy::{TcpProxy, WanProfile};
-    let _ = env_logger::try_init();
+/// A proxied four-validator BFT mesh (the D7 shared setup): every node sits
+/// behind an unshaped `TcpProxy` whose front it advertises, the full mesh is
+/// dialed through the fronts, and each node carries its validator provider
+/// plus the registry `ExecutionProvider`. Shaping is applied by the scenario
+/// via `set_profile` once `known_peers` reaches the full mesh.
+async fn proxied_bft_mesh() -> (Vec<Node>, Vec<TcpProxy>) {
     let keys = validator_keys();
     let validators = validators_with_pops(&keys);
 
@@ -369,21 +382,15 @@ async fn vote_rounds_reach_quorum_through_wan_delayed_votes() {
     // All relays start **unshaped** so the mesh handshake is not shaped
     // (shaping per TLS record compounds across a handshake and stalls mesh
     // formation at ≥~120 ms/chunk — the measured D7 finding). The profile is
-    // applied with `set_profile` once the mesh is up, so the scenario tests
-    // WAN-delayed votes on established links.
-    let shaped = WanProfile {
-        latency_ms: 200,
-        jitter_ms: 80,
-        bandwidth_bps: 0,
-    };
+    // applied with `set_profile` once the mesh is up, so WAN scenarios test
+    // lost/faulted **established** links, not the handshake.
     let mut proxies = Vec::new();
     for node in &nodes {
-        proxies.push(TcpProxy::spawn_with_profile(node.listen_addr(), WanProfile::none()).await);
+        proxies.push(TcpProxy::spawn(node.listen_addr()).await);
     }
     for (i, node) in nodes.iter_mut().enumerate() {
         node.set_advertise_addr(proxies[i].front_addr());
     }
-
     for (i, node) in nodes.iter().enumerate() {
         let provider =
             BftConsensusProvider::new(validators.clone(), keys[i]).expect("valid validators");
@@ -391,8 +398,6 @@ async fn vote_rounds_reach_quorum_through_wan_delayed_votes() {
         node.set_execution_provider(Arc::new(RegistryProvider { keys: keys.clone() }))
             .await;
     }
-
-    // Full mesh through the proxies.
     nodes[0].start(vec![]).await.unwrap();
     for (i, node) in nodes.iter().enumerate().skip(1) {
         let peers: Vec<String> = (0..VALIDATORS)
@@ -401,8 +406,6 @@ async fn vote_rounds_reach_quorum_through_wan_delayed_votes() {
             .collect();
         node.start(peers).await.unwrap();
     }
-    // Mesh up: every validator knows its three peers, then shape the link of
-    // the height-1 leader (node 1) for the vote round.
     poll_until("all validators see their three peers", 20, || async {
         let mut all = true;
         for node in &nodes {
@@ -413,9 +416,15 @@ async fn vote_rounds_reach_quorum_through_wan_delayed_votes() {
         all
     })
     .await;
-    proxies[1].set_profile(shaped).await;
+    (nodes, proxies)
+}
 
-    // ── Block 1 (PoW): register the validator set on-chain ─────────────────
+/// Blocks 1–2 through the mesh: register the validator set on-chain (block 1,
+/// Proof-of-Work) and activate `bft_consensus` from height 3 (block 2,
+/// Proof-of-Work). Converges
+/// every node before returning; height 3 is the first certificate-bearing
+/// block and is left to the scenario.
+async fn mine_registry_and_activation(nodes: &[Node], id_prefix: &str) {
     nodes[0]
         .submit_transaction(Transaction::new(TransactionKind::ContractCreation(
             glasschain_core::SmartContractDef {
@@ -439,7 +448,7 @@ async fn vote_rounds_reach_quorum_through_wan_delayed_votes() {
     for i in 0..VALIDATORS {
         nodes[0]
             .submit_transaction(Transaction::with_id(
-                format!("wan-register-{i}"),
+                format!("{id_prefix}-register-{i}"),
                 TransactionKind::ContractExecution(glasschain_core::ContractExecution {
                     contract_id: CONTRACT.into(),
                     purchase_order_tx_id: "po-1".into(),
@@ -458,7 +467,7 @@ async fn vote_rounds_reach_quorum_through_wan_delayed_votes() {
     nodes[leader_for(1)].mine().await.unwrap();
     poll_until("all nodes hold the registry block", 12, || async {
         let mut all = true;
-        for n in &nodes {
+        for n in nodes {
             if chain_len(n).await < 2 {
                 all = false;
             }
@@ -467,7 +476,6 @@ async fn vote_rounds_reach_quorum_through_wan_delayed_votes() {
     })
     .await;
 
-    // ── Block 2 (PoW): activate bft_consensus from height 3 onward ─────────
     nodes[leader_for(2)]
         .submit_transaction(activation_tx(3))
         .await
@@ -475,25 +483,98 @@ async fn vote_rounds_reach_quorum_through_wan_delayed_votes() {
     tokio::time::sleep(Duration::from_millis(400)).await;
     nodes[leader_for(2)].mine().await.unwrap();
     poll_until("all nodes hold the activation block", 14, || async {
-        let mut all = true;
-        for n in &nodes {
+        for n in nodes {
             if chain_len(n).await < 3 {
-                all = false;
+                return false;
             }
         }
-        all
+        true
     })
     .await;
+}
 
-    // ── Block 3: the vote round through WAN-delayed links ──────────────────
+/// D7 scenario 5 (performance Step 0) — the round leader loses its quorum
+/// links mid-round: the proxy carries the leader's frames to two of its three
+/// peers, so the leader cannot collect the 3-of-4 prevote quorum and the round
+/// times out (measured, bounded by the absolute phase deadline). Every node
+/// must stay consistent while the height is stalled; after repair the leader
+/// re-proposes, the round commits a multi-signer certificate, and no node ever
+/// finalizes a conflicting tip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
+async fn vote_round_leader_quorum_loss_fails_closed_and_heals_after_repair() {
+    let _ = env_logger::try_init();
+
+    let (nodes, proxies) = proxied_bft_mesh().await;
+    mine_registry_and_activation(&nodes, "leader-loss").await;
+
+    // ── Height 3: sever the leader's frame carriers to two peers ────────────
     let leader3 = leader_for(3);
+    assert_ne!(leader3, 0);
+    let severed = [(leader3 + 1) % VALIDATORS, (leader3 + 2) % VALIDATORS];
+    for &peer in &severed {
+        proxies[peer].partition().await;
+    }
     nodes[leader3]
-        .submit_transaction(plain_tx("wan-tx-after-activation"))
+        .submit_transaction(plain_tx("leader-loss-tx"))
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(400)).await;
+    // The leader cannot reach quorum: its prevote collection times out at an
+    // absolute deadline and the round budget is exhausted.
+    let started = std::time::Instant::now();
+    assert!(
+        nodes[leader3].mine().await.is_err(),
+        "the leader must not commit without quorum reach"
+    );
+    let stall = started.elapsed();
+    println!(
+        "Step 5 fault profile: leader-quorum loss fails closed at {stall:?} \
+         (phase deadline, no commit)"
+    );
+    assert!(stall < std::time::Duration::from_secs(20));
+    // The healthy peers cannot drive the height either (the round-0 proposer
+    // is the lost leader); nobody finalizes anything.
+    for (i, node) in nodes.iter().enumerate() {
+        if i == leader3 {
+            continue;
+        }
+        assert!(
+            node.mine().await.is_err(),
+            "a non-leader validator must not drive the height"
+        );
+    }
+    for (i, node) in nodes.iter().enumerate() {
+        if i == leader3 || severed.contains(&i) {
+            continue;
+        }
+        assert_eq!(
+            chain_len(node).await,
+            3,
+            "no validator may finalize block 3 while the leader lacks quorum"
+        );
+    }
+
+    // ── Repair: the carriers return and the height commits ──────────────────
+    for peer in severed {
+        proxies[peer].repair();
+    }
+    // Re-dial through the severed fronts (established relays were aborted).
+    for (i, node) in nodes.iter().enumerate() {
+        for &peer in &severed {
+            if peer != i {
+                node.connect_peer(proxies[peer].front_addr());
+            }
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    let heal_start = std::time::Instant::now();
     nodes[leader3].mine().await.unwrap();
-    poll_until("all nodes hold the WAN-delayed BFT block", 20, || async {
+    println!(
+        "Step 5 fault profile: after repair the round commits in {:?}",
+        heal_start.elapsed()
+    );
+    poll_until("all nodes hold the healed BFT block", 20, || async {
         let mut all = true;
         for n in &nodes {
             if chain_len(n).await < 4 {
@@ -504,7 +585,8 @@ async fn vote_rounds_reach_quorum_through_wan_delayed_votes() {
     })
     .await;
 
-    // No conflicting finalization: every node's tip is identical.
+    // No conflicting finalization: every node's tip is identical, and the
+    // block carries a real quorum certificate.
     let reference = nodes[0]
         .ledger_snapshot()
         .await
@@ -524,7 +606,7 @@ async fn vote_rounds_reach_quorum_through_wan_delayed_votes() {
         assert_eq!(
             (block.index, block.hash),
             reference_tip,
-            "WAN-delayed rounds must not leave conflicting tips"
+            "leader-quorum loss must not leave conflicting tips"
         );
         let certificate = block.certificate.expect("the block is BFT-attested");
         let signers = certificate
@@ -534,4 +616,257 @@ async fn vote_rounds_reach_quorum_through_wan_delayed_votes() {
             .sum::<u32>();
         assert!(signers as usize >= provider_quorum());
     }
+}
+
+/// D7 scenario 4 — WAN-delayed votes still reach quorum (performance plan §5):
+/// the height-3 leader's link is shaped (200 ms ± 80 ms one-way), and the
+/// on-chain-registry → activation → vote-round flow must still commit a
+/// multi-signer certificate. Real TCP wall-clock, labeled separately from
+/// deterministic runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vote_rounds_reach_quorum_through_wan_delayed_votes() {
+    use proxy::WanProfile;
+
+    let _ = env_logger::try_init();
+    let (nodes, proxies) = proxied_bft_mesh().await;
+    // Shape the established link of the height-1 leader (node 1).
+    let shaped = WanProfile {
+        latency_ms: 200,
+        jitter_ms: 80,
+        bandwidth_bps: 0,
+    };
+    proxies[1].set_profile(shaped).await;
+    mine_registry_and_activation(&nodes, "wan").await;
+
+    // ── Block 3: the vote round through WAN-delayed links ──────────────────
+    let leader3 = leader_for(3);
+    nodes[leader3]
+        .submit_transaction(plain_tx("wan-tx-after-activation"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    nodes[leader3].mine().await.unwrap();
+    poll_until("all nodes hold the WAN-delayed BFT block", 20, || async {
+        let mut all = true;
+        for n in &nodes {
+            if chain_len(n).await < 4 {
+                all = false;
+            }
+        }
+        all
+    })
+    .await;
+    assert_tips_agree(&nodes, "WAN-delayed rounds must not leave conflicting tips").await;
+}
+
+/// Every node's tip is identical (no conflicting finalization).
+async fn assert_tips_agree(nodes: &[Node], message: &str) {
+    let reference = nodes[0]
+        .ledger_snapshot()
+        .await
+        .chain
+        .last()
+        .cloned()
+        .expect("non-empty chain");
+    let reference_tip = (reference.index, reference.hash);
+    for node in nodes {
+        let block = node
+            .ledger_snapshot()
+            .await
+            .chain
+            .last()
+            .cloned()
+            .expect("non-empty chain");
+        assert_eq!((block.index, block.hash), reference_tip, "{message}");
+        let certificate = block.certificate.expect("the block is BFT-attested");
+        let signers = certificate
+            .signers_bitmap
+            .iter()
+            .map(|b| b.count_ones())
+            .sum::<u32>();
+        assert!(signers as usize >= provider_quorum());
+    }
+}
+
+/// Step 6 §5 scenario — a bandwidth-starved validator during a BFT vote
+/// round: one of the four validators is paced at ~4 KiB/s with 100 ms one-way
+/// latency after the mesh is up. The round must still commit: a 3-of-4
+/// quorum is reachable from the leader plus the two healthy peers, and the
+/// starved validator either catches up late or is simply absent from the
+/// certificate — safety untouched, no conflicting tips. CPU throttling
+/// cannot be simulated honestly over a proxy; this shapes the network side
+/// of a slow validator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn vote_round_commits_without_a_bandwidth_starved_validator() {
+    use proxy::WanProfile;
+
+    let _ = env_logger::try_init();
+    let (nodes, proxies) = proxied_bft_mesh().await;
+    // Starve one validator's relay after the mesh is up.
+    let starved = VALIDATORS - 1;
+    let profile = WanProfile {
+        latency_ms: 100,
+        jitter_ms: 20,
+        bandwidth_bps: 4 * 1024,
+    };
+    proxies[starved].set_profile(profile).await;
+    mine_registry_and_activation(&nodes, "straggler").await;
+
+    // The first BFT round must commit without needing the starved node.
+    let leader3 = leader_for(3);
+    nodes[leader3]
+        .submit_transaction(plain_tx("straggler-tx"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let straggler_start = std::time::Instant::now();
+    nodes[leader3].mine().await.unwrap();
+    println!(
+        "Step 6 straggler: the height-3 round committed in {:?} with one validator \
+         bandwidth-starved",
+        straggler_start.elapsed()
+    );
+    poll_until("all healthy nodes hold the straggler block", 20, || async {
+        let mut all = true;
+        for (i, n) in nodes.iter().enumerate() {
+            if i != starved && chain_len(n).await < 4 {
+                all = false;
+            }
+        }
+        all
+    })
+    .await;
+    assert_tips_agree(
+        &nodes,
+        "a starved validator must not leave conflicting tips",
+    )
+    .await;
+}
+
+/// Step 7 liveness exercise — validator-set churn across heights (ADR-009
+/// per-height set changes through the real driver): after the four-set
+/// commits its first BFT block, a governance write removes one validator;
+/// the next round must commit under the NEW set (quorum floor(2·3/3)+1 = 3,
+/// proposer rotation over three entries, registry cache invalidated by
+/// content hash) with identical tips — the removed validator's vote is no
+/// longer needed and no node forks. This is the in-repo half of the epoch-
+/// change exercise; failure-domain placement and fleet participation
+/// metrics remain deployer evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::too_many_lines)]
+async fn validator_set_churn_reconfigures_the_round() {
+    let _ = env_logger::try_init();
+    let (nodes, _proxies) = proxied_bft_mesh().await;
+    mine_registry_and_activation(&nodes, "churn").await;
+
+    // ── Block 3: the first BFT block (four validators), carrying the churn write.
+    let leader3 = leader_for(3);
+    nodes[leader3]
+        .submit_transaction(Transaction::with_id(
+            "remove-3",
+            TransactionKind::ContractExecution(glasschain_core::ContractExecution {
+                contract_id: CONTRACT.into(),
+                purchase_order_tx_id: "po-1".into(),
+                buyer_id: "governance".into(),
+                seller_id: "seller-1".into(),
+                product_id: "registry".into(),
+                quantity: 1,
+                currency: "BRL".into(),
+                total_price: 1,
+            }),
+        ))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    nodes[leader3].mine().await.unwrap();
+    poll_until("all nodes hold the churn block", 12, || async {
+        let mut all = true;
+        for n in &nodes {
+            if chain_len(n).await < 4 {
+                all = false;
+            }
+        }
+        all
+    })
+    .await;
+    for node in &nodes {
+        let chain = node.ledger_snapshot().await.chain;
+        let signers = chain[3]
+            .certificate
+            .as_ref()
+            .expect("block 3 is BFT-attested")
+            .signers_bitmap
+            .iter()
+            .map(|b| b.count_ones())
+            .sum::<u32>();
+        assert!(
+            signers as usize >= provider_quorum(),
+            "block 3 is certified by the four-validator set, got {signers}"
+        );
+    }
+
+    // ── Height 4: the round must use the three-validator set. Proposer walk:
+    // (4 + round) % 3. Drive with the "not the round leader" retry.
+    let mut committed = None;
+    for attempt in 0..VALIDATORS {
+        let candidate = (4 + attempt) % VALIDATORS;
+        match nodes[candidate].mine().await {
+            Ok(()) => {
+                committed = Some(candidate);
+                break;
+            }
+            Err(error) if error.to_string().contains("round leader") => {}
+            Err(error) => panic!("churn round failed: {error}"),
+        }
+    }
+    assert!(
+        committed.is_some(),
+        "the height-4 round must commit under the churned set"
+    );
+    poll_until("all nodes hold the post-churn block", 12, || async {
+        let mut all = true;
+        for n in &nodes {
+            if chain_len(n).await < 5 {
+                all = false;
+            }
+        }
+        all
+    })
+    .await;
+
+    // The post-churn certificate names only the remaining validators, and
+    // every node agrees on the tip.
+    let reference = nodes[0]
+        .ledger_snapshot()
+        .await
+        .chain
+        .last()
+        .cloned()
+        .expect("non-empty chain");
+    let reference_tip = (reference.index, reference.hash);
+    for node in &nodes {
+        let block = node
+            .ledger_snapshot()
+            .await
+            .chain
+            .last()
+            .cloned()
+            .expect("non-empty chain");
+        assert_eq!(
+            (block.index, block.hash),
+            reference_tip,
+            "churn must not leave conflicting tips"
+        );
+        let certificate = block.certificate.expect("the block is BFT-attested");
+        let signers = certificate
+            .signers_bitmap
+            .iter()
+            .map(|b| b.count_ones())
+            .sum::<u32>() as usize;
+        assert!(
+            signers == 3,
+            "the post-churn certificate must carry the three-set quorum exactly, got {signers}"
+        );
+    }
+    println!("Step 7 churn: the round committed under the reconfigured set");
 }

@@ -1,9 +1,26 @@
 # Plan — Best-in-class performance within zero-trust, ICP and LGPD constraints
 
-**Status:** active; Step 0 baselines (WAN proxy #108, D3 bench #106, read-path RSS #107) and hybrid TLS (#105) complete; **Frontier C concluded 2026-09-13** — Step 4 (BLS backend, ADR-015) shipped: `blst` selected, sum-of-keys verify, 300-validator gate passing (p50 3 996 ms). Next open steps: Step 1 codec profiling, D3 admission optimization, Step 5+.
-**Reviewed:** 2026-09-13 against main
+**Status:** active. Concluded 2026-09-14, in step order: **Step 0** (WAN/mem
+baselines + per-phase round timing), **Frontier C's scaling lever / Step 4**
+(blst, ADR-015, #121 merged), **Step 1** (codec profiled at the BLS shape:
+569–660 B, 1.0–1.5 µs — JSON stays the wire), **Step 3** (D3 incremental
+index in `Ledger`: admission ~0.19 ms flat, was ~21 ms at 10k), **Step 6
+first installment** (bounded 8 000-tx pool + stats + handshake re-audit
+clean through 140 ms). Durability decided (ADR-016). The latency-opportunity
+plan shipped its implementable candidates with gates executed: concurrent
+vote verification, priority lanes, height-bounded catch-up (wire `/7`),
+reconnect backoff — 300-gate p50 4 612 → 4 117 ms; **Step 6 batching shipped**
+(4 000-tx slice; the previously failing 9 000-tx probe now sustains:
+740 KB blocks converge 8/8, finality p50 5 275 ms under 9 000-tx offered
+load); scale table complete (10/100/200/300 → 194 ms/1.1 s/2.5 s/4.1 s);
+§5 read-path gaps closed (lagging-subscriber drop counts, burst-vs-steady);
+Step 5 fault profile recorded; #6 declined for now (ADR-002 amendment note);
+block-relay gossip measured and reverted. Open: node-level peak-RSS
+harness; 400/500 sweeps under hardware budgets; **Step 7 remains deployer
+evidence, not code work**.
+**Reviewed:** 2026-09-14 against main
 **History:** [Performance programme](https://github.com/dbbvitor/GlassChain/issues/62) is closed, not proof that every step or production gate passed.
-**Related:** [ADR-002](../../docs/adr/adr-002-consensus-finality.md), [ADR-004](../../docs/adr/adr-004-scale-topology.md), [ADR-010](../../docs/adr/adr-010-capability-versioning-policy.md), [ADR-014](../../docs/adr/adr-014-bls-aggregated-certificates.md), [zero-trust](zero-trust.md), [source-comment debt](deferred-code-debt.md).
+**Related:** [ADR-002](../../docs/adr/adr-002-consensus-finality.md), [ADR-004](../../docs/adr/adr-004-scale-topology.md), [ADR-010](../../docs/adr/adr-010-capability-versioning-policy.md), [ADR-014](../../docs/adr/adr-014-bls-aggregated-certificates.md), [ADR-016](../../docs/adr/adr-016-quorum-replication-durability.md), [zero-trust](zero-trust.md), [source-comment debt](deferred-code-debt.md).
 
 ## Goal
 
@@ -26,35 +43,46 @@ re-run by this documentation review:
 
 | Harness / scale | Recorded result | Scope |
 |---|---|---|
-| `bft_finality_gate_100` | p50 2,021 ms; p95/p99 2,162 ms | Release, loopback, shared runtime, synthetic workload |
-| `bft_finality_gate_200` | p50 5,284 ms; p95/p99 5,744 ms | Same; exact-quorum certificates, no view changes in recorded run |
-| `bft_finality_gate_300` | Not passing on the pure-Rust pairing path | First vote 34.8 s; subsequent verification exceeds the budget |
+| `bft_finality_gate_100` | p50 ~1.1 s (2026-09-14: 1 145/1 096 ms across runs) | Release, loopback, shared runtime, synthetic workload, blst backend |
+| `bft_finality_gate_200` | p50 2 397 ms | Same; exact-quorum certificates |
+| `bft_finality_gate_300` | **passes** on the blst backend: p50 3 996–4 612 ms (2026-09-13/14 runs); 4 117 ms with the latency-plan optimizations | Same; exact quorum 201 every round |
 | `consensus_capacity` 200/300 | PoW production/propagation, recovery and PDC measurements | Not BFT finality or WAN/testnet evidence |
 
 Short runs do not establish a reliable p99; the table preserves the reported
-figures, not a tail-latency guarantee. A backend swap has not been measured here.
-There is no demonstrated 10× speedup or automatic pass at 300.
+figures, not a tail-latency guarantee. The blst swap (ADR-015) is measured —
+see the benchmark record's before/after table. There is no demonstrated 10×
+speedup or automatic pass beyond 300.
 
 ### Shipped and superseded work
 
 - Broadcast fan-out uses independent bounded peer channels with `try_send`;
-  full broadcast channels now increment per-peer `dropped_outbound` counters.
+  full broadcast channels increment per-peer `dropped_outbound` counters;
+  consensus/background priority lanes split each peer's queue
+  (`dropped_outbound` vs `dropped_background`).
 - Mine-path block broadcast precedes persistence; `after_block_commit` offloads
   `storage.apply_block` through awaited `spawn_blocking`.
 - PDC reconciliation now fans requests to all member peers. Its return value is
   requests queued, **not** payloads delivered; completion/retry remains separate.
 - Propagation thresholds share a start/poll loop; stride sampling reduces the
   observer's lock contention. `NodeState` caches capability history incrementally.
-- Wire versions `/5` and `/6` shipped base64/signature discriminants and BLS QCs.
-  Current peer codec remains JSON. `Attestation` was removed by ADR-014.
+- Wire versions `/5`–`/7`: base64/signature discriminants and BLS QCs, then
+  height-bounded chain catch-up (`RequestChainFrom` + `Chain { from_index,
+  blocks }`, wire `/7`). Current peer codec remains JSON. `Attestation` was
+  removed by ADR-014.
 - Ed25519 batch verification and the old attestation lookup optimization were
   superseded by BLS. Do not reimplement obsolete steps.
+- Latency-plan candidates (`.agents/plans/latency-opportunities.md`):
+  bounded-concurrency vote verification, consensus priority lanes,
+  height-bounded catch-up and reconnect backoff shipped 2026-09-14; block-relay
+  gossip measured and **reverted** (negative result, benchmark record).
 - Liveness placement/SLA guidance exists in `docs/liveness.md`; guidance is not
   proof of runtime placement enforcement or measured fleet availability.
 
-**Residual D3:** `Ledger::add_transaction` still rebuilds capability history for
-canonical records/activations and scans historical/pending IDs, including when
-called by `Node::submit_transaction`. The node cache did not remove this cost.
+**Residual D3 — resolved 2026-09-14 (Step 3).** `Ledger::add_transaction`
+now maintains an incremental capability history + committed-ID set folded
+block-wise (reset on chain replacement); admission is flat in history size
+(~0.19 ms at a 10 000-record history — was ~21 ms; see the benchmark
+record).
 
 ## 2. Can optimizations help beyond 300 validators?
 
@@ -103,15 +131,17 @@ identically distributed delays, the order statistic tends toward the relevant
 quantile; at scale dependencies and changing load invalidate that simple model.
 Measure faults and correlation rather than extrapolating from a formula.
 
-**No extra WAL.** Sled already logs writes; block+write-set replay already
-rebuilds derived state. A third log is not a cure for scheduling or queueing.
-`SledStorageProvider::flush` is only called in a test; the default periodic flush
-is not an application durability acknowledgement or a hard 500 ms loss bound.
+**Durability decided (ADR-016).** "Committed" is quorum replication; local
+stable-storage acknowledgement is a separate metric, not merged into the
+commit path. Sled already logs writes; block+write-set replay rebuilds
+derived state — no third WAL. `SledStorageProvider::flush` exists for the
+explicit durable-ack mode only; the default periodic flush is not an
+application durability acknowledgement or a hard 500 ms loss bound.
 
-Before a persistent pilot, decide what “committed” promises across process crash,
-power loss and quorum-wide failure. Compare current periodic flushing with
-explicit durable acknowledgement and, only if useful, bounded group commit.
-Measure throughput/p99 plus crash recovery. Do not postpone required durability
+Before a persistent pilot, decide what “committed” promises across power loss
+**per measurement** (the ADR answers for the architecture), implement the
+explicit durable-ack mode if the pilot wants it, and measure throughput/p99
+plus crash recovery. Do not postpone required durability
 merely to protect a latency number. Keep logical finality, replication and local
 stable-storage acknowledgement as separate metrics.
 
@@ -130,17 +160,33 @@ Shipped scenarios (`real_tcp_wan_*`, 4 validators, wall-clock):
 - partition-while-mining then repair — no conflicting finalization;
   time-without-quorum measured separately and printed;
 - BFT vote round with the leader's link shaped 200 ms ± 80 ms — quorum
-  commits, no conflicting tips.
+  commits, no conflicting tips;
+- BFT leader-quorum loss: two of the leader's three peers separated at
+  height 3 — no node finalizes, the height stalls, and after repair the
+  certificate commits with identical tips (`bft_vote_rounds.rs`);
+- bandwidth budget: one node's relay paced at ~8 KiB/s — convergence without
+  conflicting tips (`tcp_partition.rs`).
 
-**Measured finding (Step 0 follow-up):** mesh formation through a shaped
-relay at ≥~120 ms per chunk stalls (~4 × 5 s reconnect cycles) while
-60–80 ms one-way converges in ~2 s. Audit the dial/hello handshake budget
-before scaling profiles up; larger profiles otherwise wait.
+**Measured finding (Step 0 follow-up) — re-audited 2026-09-14 (Step 6):** the
+first recording (2026-09-09) found mesh formation through a shaped relay
+stalls at ≥~120 ms per chunk (~4 × 5 s reconnect cycles). The Step-6
+handshake-budget audit (`real_tcp_wan_handshake_budget_audit_opt_in`) does
+**not** reproduce the stall on current main: formation through shaped-from-
+the-first-byte relays came in at 604 ms (60 ms profile), 812 ms (100 ms) and
+1 207 ms (140 ms), with a commit round converging at every profile. The
+audit is opt-in and re-recordable; WAN profiles no longer carry the
+formation stall as a hard gate, but a re-run at scaled profiles (>200 ms)
+must re-pass the audit before those rows are used.
 
-Still open: leader-loss, slow CPU/disk, stale/duplicate-vote floods,
-saturation scenarios and 10/100/200/300 sweeps under explicit hardware
-budgets. Deterministic madsim execution stays optional behind
-compatibility evidence, not a prerequisite to these WAN measurements.
+Still open: slow CPU/disk scenario (leader-loss and saturation landed 2026-09-14
+— `bft_round…leader_quorum_loss…heals` in `bft_vote_rounds.rs`, and
+`real_tcp_wan_low_bandwidth_budget_still_converges` in `tcp_partition.rs`).
+Stale/duplicate-vote floods stay covered by the in-process node tests; a
+real-TCP variant exists only if a measured divergence shows one. The §5
+handshake-budget audit (mesh formation stalls at ≥~120 ms shaped delay)
+gates scaling the profiles further. 10/100/200/300 sweeps happen under
+explicit hardware budgets. Deterministic madsim execution stays optional
+behind compatibility evidence, not a prerequisite to these WAN measurements.
 
 ### High-frequency flattening and read-path memory — baseline measured
 
@@ -168,69 +214,85 @@ batch export/pagination and a rebuildable projection come before a new
 database or service. A slow analytics consumer must not block consensus, and
 loss recovery must replay committed history rather than silently omit events.
 
-## Frontier C residual map (2026-09-13, post-ADR-015)
+## Frontier C residual map (2026-09-14, post-latency-plan)
 
 With the backend swap and the sum-of-keys verify landed, certificate
 verification is flat at ~1.8 ms (quorum 201) and is **no longer a scaling
 lever** — the two changes that were, are done. The measured round budget at
-300 (p50 3 996 ms) now decomposes roughly as: vote collection + aggregation
-(sub-second) and **mesh replication ~1.31 s** of fan-out to 300 peers. The
-remaining improvement opportunities, ranked by measured headroom:
+300 (p50 4 117 ms with the latency-plan optimizations) decomposes roughly as:
+prevote collection 783 ms, precommit collection 1 904 ms, aggregation ~1.2 s
+across both phases, and post-commit mesh replication ~1.3–1.6 s (separately
+polled). The remaining improvement opportunities, ranked by measured headroom:
 
-1. **Mesh replication / fan-out at scale (Step 6, biggest headroom).** 1.3 s of
-   a 4 s round at 300 is the leader broadcasting blocks and collecting votes
-   point-to-point over a full mesh. Bounded admission, batching and
-   explicit backpressure come before any Narwhal-style availability layer.
-   Sub-item: the §5 handshake-budget finding (mesh formation stalls at
-   ≥~120 ms shaped delay) gates WAN profiles before scaling them.
-2. **D3 admission rebuild (Step 3).** ~21 ms per canonical admission at a
-   10 000-record history, linear, duplicate IDs pay the same rebuild. One
-   rebuildable capability/ID index at the owning layer — not a per-caller fix.
-3. **Codec cost (Step 1).** JSON encode/decode never profiled with the current
-   BLS shape (sub-1 KB certificates and 48-byte keys are new since the last
-   measurement). Binary encoding only if profiling says it matters.
-4. **Durability promise (§4).** What "committed" guarantees across power loss
-   is undecided — periodic Sled flush is not a durability acknowledgement.
-   Decide before any pilot; measure crash recovery, keep finality metrics
-   separate.
-5. **Read-path bounds (§5).** Flattener/provenance projections are linear
+1. **Receiver-side post-commit cost at scale (Step 6, biggest headroom).** The
+   relay experiment (reverted) showed replication is bound by per-node
+   validate + index + watcher work on shared cores, not by the leader's
+   sends. Bounded admission (8 000-tx pool), pool stats, priority lanes and
+   the height-bounded catch-up shipped 2026-09-14; the offered-load
+   saturation study (100 validators) holds at 2 000-tx bursts (+52 %
+   finality, full drain every round). Fair batching and explicit backpressure
+   metrics remain open, gated on a failing budget being measured first.
+2. **Vote-collection phases at 300.** 783 ms + 1 904 ms remain the two
+   dominant phase costs; concurrent verification already landed. Batching
+   (per-round proposal slices) is only justified when the saturation study
+   names it the failing budget.
+3. **Durability promise (§4) — decided (ADR-016, 2026-09-14).** "Committed"
+   means quorum-replicated; local disk flush is not the durability promise and
+   stays a separate pilot-gated metric; no WAL. A single node heals missing
+   local tiers from peers (restart replay + repair-from-peers); a power-loss
+   pilot needs the explicit durable-ack mode before how it appears in latency
+   numbers is claimed.
+4. **Read-path bounds (§5).** Flattener/provenance projections are linear
    (~3 KiB/record, 299 MiB @ 100 k) and ingest inside `after_block_commit`;
    bounded export + rebuildable projection remain the fix path if deployment
    scale budgets fail.
-6. **Steps 5 and 7 — research only.** HotStuff-1-style latency candidates need
-   a design/prototype with fallback/fault assumptions; liveness placement
-   enforcement is operational, not a code change.
+5. **Steps 5 and 7 — research only.** The Step 5 fault profile recorded
+   2026-09-14: leader-quorum loss fails closed at the 3 s phase deadline
+   (no commit), and the round commits 173 ms after repair. Next research
+   step: a rollback/prefix-fork design doc before any HotStuff-1-style
+   candidate; liveness placement enforcement is operational, not a code
+   change.
 
 Not opportunities: sampled committees or probabilistic finality (§2), a new
 WAL (§4), or unsafe/C beyond ADR-015's conditions (ADR-015 §1).
 
 ## 6. Ordered path (stable Step 0–7 names)
 
-- [ ] **Step 0 — trustworthy measurement and safety baseline.** Retain both
-  existing harnesses, add §5 WAN/round-change and memory scenarios, instrument
-  proposal/vote/verification/commit/replication/flush separately. Record commit,
-  toolchain/features, security configuration, workload, seed, offered vs committed
-  rate, topology, CPU/RAM, bytes and repetitions. Count timeouts/rejects instead
-  of excluding them; use offered-load timing to avoid hiding queueing delay.
+- [x] **Step 0 — trustworthy measurement and safety baseline.** Both existing
+  harnesses retained; §5 WAN/round-changes shipped (proxy #108), read-path
+  memory baseline (#107), per-phase round timing recorded via
+  `Node::last_round_phase_timings` and the gate summaries (2026-09-14:
+  proposal/prevote/aggregate/precommit/aggregate p50s in
+  `docs/benchmarks/consensus-capacity.md`); D7 scenarios cover no-fault,
+  asymmetric delay, partition+repair, leader-quorum loss + heal and a
+  bandwidth-budget link; stale/duplicate-vote floods stay covered in-process.
+  Recorded runs must still state commit, toolchain/features, hardware,
+  workload, topology and repetitions (they do in the benchmark record; new
+  runs update it). Re-run variants on changed hosts and keep timeouts counted.
   Longer runs and primary-source, like-for-like competitor measurements are
   required before claiming sub-second or best-in-class performance.
-- [ ] **Step 1 — remaining codec costs, measured first.** Base64/discriminants
-  shipped. Profile JSON encode/decode and bytes with the *current* BLS shape;
-  consider binary encoding only when it matters. A wire/history compatibility
-  decision and decode-boundary tests precede a swap.
+- [x] **Step 1 — remaining codec costs, measured first.** Profiled
+  (`cargo bench -p glasschain-network --features bft --bench wire_codec`,
+  2026-09-14): round messages are 569–660 B and 1.0–1.5 µs to encode or
+  decode; even 300 validators move codec cost ≈ 0.5 ms per two-phase round
+  against 916/2 215 ms collection phases — **<1 %** of the round. Decision
+  recorded: JSON stays the wire format; no binary encoding
+  (`docs/benchmarks/consensus-capacity.md` §wire codec). Wire/history
+  compatibility note: `/6` already base64 + discriminants.
 - [x] **Step 2 — Ed25519 batch verification: superseded.** BLS removed the
   per-attestation certificate loop. Invalid aggregate rejection does not identify
   an individual signer; attribution relies on authenticated votes/evidence, not
   a sequential fallback that no longer exists.
-- [ ] **Step 3 — history-dependent admission (D3).** Old quadratic attestation
-  lookup is obsolete; the `ledger_admission` criterion bench
-  (`cargo bench -p glasschain-core --bench ledger_admission`) records the
-  baseline: admission cost is linear in committed history — ~214 µs/admission
-  at 100 committed records, ~2.3 ms at 1 000, ~21 ms at 10 000 (release,
-  64-admission bursts); duplicate IDs pay the same rebuild; the pending-pool
-  arm is minor at a 1 000-record history. Optimize the shared
-  ownership/invalidation (one rebuildable capability/ID index at the owning
-  layer), not just one caller.
+- [x] **Step 3 — history-dependent admission (D3): done 2026-09-14.** One
+  rebuildable index at the owning layer, as specified: `Ledger` keeps an
+  incremental `CapabilityHistory` (folded block-wise, reset on chain
+  replacement, lazily rebuilt after deserialization) plus a block-wise
+  committed-ID set. `add_transaction` and `commit_mined_block` no longer
+  rebuild from genesis and the per-caller fixes (node caches) sit on top of
+  it. Measured on the `ledger_admission` bench: ~2.3 → 0.19 ms at 1 000,
+  ~21.3 → 0.19 ms at 10 000 (−99 %), duplicate IDs no longer pay the
+  rebuild; cost is flat in history size (`docs/benchmarks/consensus-capacity.md`).
+  Regression: `ledger::tests::test_d3_index_semantics_match_full_rebuild…`.
 - [x] **Step 4 — BLS backend: done (ADR-015, 2026-09-13).** The audited `blst`
   C backend is selected and the pure-Rust `pairing` path is retired, decided
   once as policy ADR-015 ([#85](https://github.com/dbbvitor/GlassChain/issues/85)
@@ -244,28 +306,75 @@ WAL (§4), or unsafe/C beyond ADR-015's conditions (ADR-015 §1).
   (p50 3 996 ms, exact quorum 201 every round; 100 → 1 096 ms, 200 → 2 397 ms
   p50 — before/after evidence in `docs/benchmarks/consensus-capacity.md`).
   Remaining round cost is mesh replication, not verification.
-- [ ] **Step 5 — in-family latency candidates, research only.** Profile and fix
-  the existing driver before borrowing HotStuff-1/SBFT ideas. Their safe early
-  reply conditions are protocol-specific, not a one-phase toggle. Any proposal
-  must specify fallback, locking/view synchronization and fault assumptions;
-  client-visible speculative results may not be called final or authorize
-  inventory, payment, endorsement or private-data side effects. Benchmark
-  rollback/prefix-fork cases only after a design/prototype exists. Adoption that
-  changes ADR-002 semantics requires an explicit decision, not this report.
-- [ ] **Step 6 — mempool/dissemination, simplest changes first.** Measure D3,
-  pending count/**bytes**/age, bursts, duplicates, slow proposers and backlog
-  drain under offered load. Specify bounded admission, fair batching, explicit
-  backpressure, retry/idempotency and abandoned-proposal restoration first.
-  A 20-tx pool drained each round is not a saturation study. Consider
-  Narwhal-style availability/dissemination only if propagation or persistent
-  backlog remains dominant after these changes. It does not cure hot-key
-  contention. Availability certificates, missing payload recovery, GC and PDC
-  authorization need a design; DAG ordering/Snow consensus are not implied.
-- [ ] **Step 7 — operational liveness.** Guidance shipped, enforcement and
-  operational evidence remain gates. Exercise real failure-domain placement,
-  epoch changes and participation monitoring without reputation weighting or
-  weakened quorum. Use authenticated signer data for metrics, not penalties
-  inferred from unverified or missing traffic.
+- [ ] **Step 5 — in-family latency candidates, research only.** Research
+  brief completed 2026-09-14 (`.agents/memories/latency-candidates.md`);
+  the driver's fault profile recorded 2026-09-14 (`bft_vote_rounds.rs`):
+  leader-quorum loss fails closed at the 3 s phase deadline — no node
+  finalizes, no conflicting tip — and after repair the round commits in
+  173 ms. Verified against the HotStuff-1 v3 / SBFT report: the prefix
+  speculation dilemma and slotting are real HotStuff-1 mechanics (the
+  report's "No-Gap Rule" name is unverified); GlassChain's measured round
+  attributes to collection phases and receiver-side post-commit work, so
+  "thread starvation / allocator remediation" does not apply here.
+  Remaining research work, in order: a rollback/prefix-fork design doc,
+  then prototype + rollback/prefix-fork benches. Their safe early-reply
+  conditions are protocol-specific, not a one-phase toggle. Any proposal
+  must specify fallback, locking/view synchronization and fault
+  assumptions; client-visible speculative results may not be called final
+  or authorize inventory, payment, endorsement or private-data side
+  effects. Adoption that changes ADR-002 semantics requires an explicit
+  decision (an ADR), not this report. **The decision was made 2026-09-14:
+  declined for now** — ADR-002 carries the amendment note; the rollback
+  design doc remains the evidence pack if the revisit condition is met.
+- [ ] **Step 6 — mempool/dissemination, simplest changes first.**
+  *Shipped 2026-09-14 (installments 1–2):* bounded pending-pool admission
+  (`MAX_PENDING_TRANSACTIONS = 8 000`, explicit rejection; duplicates ride
+  free — `ledger::tests::test_pending_pool_bound_rejects_and_drains`),
+  pool stats (`Node::pending_pool_stats`: depth + serialized bytes),
+  peer-path flood failures warn-and-drop, consensus/background priority
+  lanes with per-class drop counters, height-bounded chain catch-up
+  (wire `/7`: `RequestChainFrom` for gaps, full bootstrap for fresh nodes —
+  `chain_catch_up_recovery_at_1k_blocks_opt_in` recorded a 1 004-block
+  bootstrap in 272 ms), and reconnect backoff (1 s → 2 s → cap 5 s).
+  *Shipped 2026-09-14 (installment 3 — batching):* `MAX_BLOCK_TRANSACTIONS
+  = 4_000` slice per round (≈740 KB, >2× headroom under the measured-good
+  925 KB ceiling); excess stays pending and flows into following rounds;
+  stale-tip/endorsement restores bypass the bound so already-admitted
+  transactions are never lost. *Saturation re-run:* the 9 000-tx probe that
+  previously failed (8.3 s round + convergence failure) now **sustains** —
+  740 KB blocks converge 8/8, 4 000 committed per round, a 4 000-tx backlog
+  persists, 3 000–4 800 explicit rejections per round, finality p50 5 275 ms
+  under that sustained load. The pool bound is the designed backpressure
+  signal. *Scale table complete (10/100/200/300):* 194 ms / 1 145 ms /
+  2 468 ms / 4 117 ms finality p50, exact quorums. *§5 read-path gaps
+  closed:* lagging-subscriber drop counts are receiver-observable exactly
+  (`published − capacity`), and burst-vs-steady ingestion with concurrent
+  query load stays sub-ms/block with 73–105 µs query p50.
+  *Still open:* node-level peak-RSS harness; 400/500 sweeps under
+  explicit hardware budgets. Consider Narwhal-style
+  availability/dissemination only if propagation or persistent backlog
+  remains dominant after batching (the relay experiment already showed
+  receiver-side cost is the bound, not dissemination shape). It does not
+  cure hot-key contention. Availability certificates, missing payload
+  recovery, GC and PDC authorization need a design; DAG ordering/Snow
+  consensus are not implied.
+- [ ] **Step 7 — operational liveness.** The in-repo half of the epoch-
+  change exercise shipped 2026-09-14
+  (`validator_set_churn_reconfigures_the_round`): a governance delete
+  reconfigures the validator set across heights and the next round commits
+  under the new set — quorum recomputed, proposer rotated, no forks.
+  Research confirmed there is no other code gap to close: guidance shipped,
+  enforcement and operational evidence remain the gates. Exercise real
+  failure-domain placement (multi-rack / multi-AZN / multi-ASN evidence
+  from deployment manifests, not from code) and participation monitoring
+  without reputation weighting or weakened quorums — an authenticated
+  participation read (from the certificates' signer bitmaps) is the one
+  optional future piece, deferred until an operator consumer exists. Use authenticated signer data for metrics — signed
+  votes/QC/evidence only, never penalties inferred from unverified or
+  missing traffic (the D7 flood/duplicate coverage already pins the
+  in-protocol side of this). Unweighted quorums and rotation are ADR-009
+  policy: every active validator holds equal power, maintained through the
+  on-chain registry.
 
 ## Validation and claim gates
 

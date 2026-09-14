@@ -37,9 +37,7 @@ use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc::{
-    error::TrySendError, Receiver, Sender, UnboundedReceiver, UnboundedSender,
-};
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{broadcast, Mutex};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -105,6 +103,15 @@ pub struct ContractSummary {
     pub status: String,
     pub quantity_purchased: u64,
     pub max_quantity: u64,
+}
+
+/// Pending-pool depth and serialized bytes (`Node::pending_pool_stats`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingPoolStats {
+    /// Transactions queued for the next block.
+    pub count: usize,
+    /// Serialized bytes the pool currently retains.
+    pub bytes: usize,
 }
 
 // ── TLS context ───────────────────────────────────────────────────────────────
@@ -182,6 +189,52 @@ impl ServerCertVerifier for AcceptAnyCert {
     }
 }
 
+/// The consensus message classes that must never wait behind a transaction
+/// flood (latency plan #3): one proposal/precommit/block/vote delayed by a
+/// saturated mempool queue costs the whole round its phase deadline.
+/// Everything else — transactions, peer discovery chatter — is background.
+const fn is_consensus_class(msg: &Message) -> bool {
+    matches!(
+        msg,
+        Message::Proposal { .. }
+            | Message::Precommit { .. }
+            | Message::Vote(_)
+            | Message::Block(_)
+            | Message::RequestChain
+            | Message::Chain { .. }
+    )
+}
+
+/// The per-peer write handle (latency plan #3): two bounded queues, drained
+/// consensus-first. Zero-trust untouched — classification only schedules;
+/// every message is still authenticated and validated on receipt.
+#[derive(Clone)]
+struct PeerWrite {
+    consensus: Sender<Message>,
+    background: Sender<Message>,
+}
+
+impl PeerWrite {
+    fn try_send(&self, msg: Message) -> bool {
+        // Returns false only when the classified queue is full; the caller
+        // counts the drop (large `TrySendError` payloads stay out of the
+        // return type).
+        if is_consensus_class(&msg) {
+            self.consensus.try_send(msg).is_ok()
+        } else {
+            self.background.try_send(msg).is_ok()
+        }
+    }
+
+    async fn send(&self, msg: Message) -> bool {
+        if is_consensus_class(&msg) {
+            self.consensus.send(msg).await.is_ok()
+        } else {
+            self.background.send(msg).await.is_ok()
+        }
+    }
+}
+
 // ── Internal state ────────────────────────────────────────────────────────────
 
 /// Mutable state that requires short-duration exclusive access.
@@ -193,12 +246,17 @@ struct NodeState {
     watcher: WatcherService,
     known_peers: HashSet<String>,
     /// Per-peer write channels; keyed by the peer's stable listen address.
-    peer_senders: HashMap<String, Sender<Message>>,
+    peer_senders: HashMap<String, PeerWrite>,
     /// Cumulative outbound messages dropped because a peer's 256-slot write
     /// channel was full — the tail-at-scale straggler counter (#62 §5.1/§5.6).
     /// A chronically rising count is a peer that cannot keep up and is
     /// silently missing blocks until it resyncs.
     dropped_outbound: HashMap<String, u64>,
+    /// Cumulative outbound drops on the background queue (latency plan #3).
+    dropped_background: HashMap<String, u64>,
+    /// Reconnect backoff attempts per stable peer address (latency plan #5).
+    /// Reset when the peer's Hello completes.
+    reconnect_attempts: HashMap<String, u32>,
     /// Incremental capability history: advanced block-by-block at the commit
     /// choke point and rebuilt from the chain on start/sync/replacement —
     /// never re-derived from genesis per admission (#62 Step-0 attribution:
@@ -212,6 +270,11 @@ struct NodeState {
     /// Equivocation proofs detected at vote receipt (#77).
     #[cfg(feature = "bft")]
     equivocations: Vec<EquivocationProof>,
+    /// Per-phase wall-clock split of the most recent successful vote round
+    /// driven here (performance Step 0): read by the measurement harness and
+    /// operators via [`Node::last_round_phase_timings`].
+    #[cfg(feature = "bft")]
+    bft_phase_timings: Option<crate::rounds::BftPhaseTimings>,
     /// Live vote-receipt journal (#96): every verified vote is recorded keyed
     /// by `(height, round, phase, key)`, bounded by `VOTE_RECEIPT_CAP` and
     /// pruned to the current + previous height. Held for the node's lifetime
@@ -300,7 +363,7 @@ impl NodeState {
     /// targets (ADR-003). Fail closed (#86, zero-trust §2): without a
     /// configured certificate verifier this is always empty, so private
     /// cleartext is never sent to a peer on a self-asserted org.
-    fn payload_targets(&self, collection: &Channel) -> Vec<Sender<Message>> {
+    fn payload_targets(&self, collection: &Channel) -> Vec<PeerWrite> {
         self.peer_senders
             .iter()
             .filter(|(addr, _)| {
@@ -330,7 +393,7 @@ impl NodeState {
     /// Write channels of peers that support the `active` capability set;
     /// read-only observers are excluded from active-write relay (ADR-010
     /// decision 6).
-    fn relay_targets(&self, active: &glasschain_core::CapabilitySet) -> Vec<Sender<Message>> {
+    fn relay_targets(&self, active: &glasschain_core::CapabilitySet) -> Vec<PeerWrite> {
         self.peer_senders
             .iter()
             .filter(|(addr, _)| !self.peer_registry.is_read_only(addr, active))
@@ -739,10 +802,14 @@ impl Node {
                 known_peers: HashSet::new(),
                 peer_senders: HashMap::new(),
                 dropped_outbound: HashMap::new(),
+                dropped_background: HashMap::new(),
+                reconnect_attempts: HashMap::new(),
                 #[cfg(feature = "bft")]
                 bft_round: None,
                 #[cfg(feature = "bft")]
                 equivocations: Vec::new(),
+                #[cfg(feature = "bft")]
+                bft_phase_timings: None,
                 #[cfg(feature = "bft")]
                 bft_receipts: crate::rounds::VoteReceipts::default(),
                 #[cfg(feature = "bft")]
@@ -1347,12 +1414,12 @@ impl Node {
         // Store outside the state lock (the store is a cheap Arc handle).
         transient.put(collection, &commitment, &payload, retention_secs)?;
         for target in targets {
-            if let Err(e) = target.try_send(Message::PrivatePayload {
+            if !target.try_send(Message::PrivatePayload {
                 collection: collection.to_owned(),
                 commitment: commitment.clone(),
                 payload: payload.clone(),
             }) {
-                log::warn!("Private payload delivery to a member peer failed: {e}");
+                log::warn!("Private payload delivery to a member peer failed");
             }
         }
         log::info!(
@@ -1457,13 +1524,13 @@ impl Node {
         let mut sent = 0usize;
         for target in &targets {
             for commitment in &missing {
-                if let Err(e) = target.try_send(Message::RequestPrivatePayload {
+                if target.try_send(Message::RequestPrivatePayload {
                     collection: collection.to_owned(),
                     commitment: commitment.clone(),
                 }) {
-                    log::warn!("Reconcile request for '{collection}' failed: {e}");
-                } else {
                     sent += 1;
+                } else {
+                    log::warn!("Reconcile request for '{collection}' failed");
                 }
             }
         }
@@ -2053,12 +2120,12 @@ impl Node {
                     log::warn!("Failed to hold own payload for collection '{collection}'");
                 }
                 for target in targets {
-                    if let Err(e) = target.try_send(Message::PrivatePayload {
+                    if !target.try_send(Message::PrivatePayload {
                         collection: collection.clone(),
                         commitment: commitment.clone(),
                         payload: value.clone(),
                     }) {
-                        log::warn!("Private payload delivery to a member peer failed: {e}");
+                        log::warn!("Private payload delivery to a member peer failed");
                     }
                 }
             }
@@ -2250,9 +2317,10 @@ impl Node {
     async fn restore_pending(ledger: &Arc<Mutex<Ledger>>, transactions: Vec<Transaction>) {
         let mut l = ledger.lock().await;
         for tx in transactions {
-            if let Err(e) = l.add_transaction(tx) {
-                log::warn!("Failed to restore transaction to the pending pool: {e}");
-            }
+            // Bypasses the admission bound deliberately: these were already
+            // admitted before the candidate was rejected, so a full pool
+            // must not drop them on the restore path.
+            l.restore_transaction(tx);
         }
     }
 
@@ -2352,10 +2420,24 @@ impl Node {
         Ok(evaluations)
     }
 
-    /// Rebuild the derived world state from committed blocks in block order.
-    /// Return a snapshot of the current ledger state.
+    /// Snapshot the current ledger state.
     pub async fn ledger_snapshot(&self) -> Ledger {
         self.ledger.lock().await.clone()
+    }
+
+    /// Pending-pool statistics (Step 6 observability): queue depth and
+    /// serialized bytes. Read-only visibility for operators and measurement
+    /// harnesses. A transaction that fails to serialize contributes zero
+    /// bytes (the wire codec is exercised by decode paths, not here).
+    pub async fn pending_pool_stats(&self) -> PendingPoolStats {
+        let ledger = { self.ledger.lock().await.clone() };
+        let count = ledger.pending_transactions.len();
+        let bytes = ledger
+            .pending_transactions
+            .iter()
+            .map(|tx| serde_json::to_vec(tx).map(|v| v.len()).unwrap_or_default())
+            .sum();
+        PendingPoolStats { count, bytes }
     }
 
     /// Return the list of known peer addresses.
@@ -2375,7 +2457,7 @@ impl Node {
     /// validate history, but not participate in relaying active writes
     /// (ADR-010 decision 6). Blocks and sync traffic still reach them.
     async fn broadcast(&self, message: Message) {
-        let senders: Vec<(String, Sender<Message>)> = {
+        let senders: Vec<(String, PeerWrite)> = {
             let s = self.state.lock().await;
             if matches!(message, Message::Transaction(_)) {
                 let active = active_set_at_tip(&s, &self.ledger).await;
@@ -2394,23 +2476,39 @@ impl Node {
                     .collect()
             }
         };
+        Self::try_send_all(&self.state, senders, message).await;
+    }
+
+    /// The shared bounded-queue fan-out with per-peer drop accounting.
+    async fn try_send_all(
+        state: &Arc<Mutex<NodeState>>,
+        senders: Vec<(String, PeerWrite)>,
+        message: Message,
+    ) {
         for (addr, sender) in senders {
-            match sender.try_send(message.clone()) {
-                Err(TrySendError::Full(_)) => {
-                    let total = {
-                        let mut s = self.state.lock().await;
-                        let entry = s.dropped_outbound.entry(addr.clone()).or_insert(0);
-                        *entry += 1;
-                        let total = *entry;
-                        drop(s);
-                        total
+            if !sender.try_send(message.clone()) {
+                // Per-class drop accounting (latency plan #3): a full
+                // consensus queue and a full background queue are different
+                // operator signals.
+                let consensus = is_consensus_class(&message);
+                let total = {
+                    let mut s = state.lock().await;
+                    let map = if consensus {
+                        &mut s.dropped_outbound
+                    } else {
+                        &mut s.dropped_background
                     };
-                    log::warn!(
-                        "Dropping outbound message: peer channel full (peer {addr}, \
-                         {total} dropped cumulative)"
-                    );
-                }
-                Ok(()) | Err(TrySendError::Closed(_)) => {}
+                    let entry = map.entry(addr.clone()).or_insert(0);
+                    *entry += 1;
+                    let total = *entry;
+                    drop(s);
+                    total
+                };
+                log::warn!(
+                    "Dropping outbound {} message: peer channel full (peer {addr}, \
+                     {total} dropped cumulative)",
+                    if consensus { "consensus" } else { "background" }
+                );
             }
         }
     }
@@ -2521,11 +2619,13 @@ impl Node {
             }
 
             // ── Phase 1: prevote ────────────────────────────────────────────
+            let proposal_start = std::time::Instant::now();
             self.broadcast(Message::Proposal {
                 block: block.clone(),
                 round,
             })
             .await;
+            let proposal_broadcast_ms = proposal_start.elapsed().as_millis();
             let phase_start = std::time::Instant::now();
             let genesis_hash = self.ledger.lock().await.chain[0].hash.clone();
             let seed = provider.sign_vote(
@@ -2543,6 +2643,7 @@ impl Node {
                 &provider,
             )
             .await;
+            let prevote_ms = phase_start.elapsed().as_millis();
             log::info!(
                 "bft round {round} at height {height}: {}/{} prevotes collected in {:?}",
                 prevotes.len(),
@@ -2559,7 +2660,9 @@ impl Node {
                 }
                 continue;
             }
+            let prevote_aggregate_start = std::time::Instant::now();
             let (prevote_bitmap, prevote_aggregate) = provider.aggregate_votes(&prevotes)?;
+            let prevote_aggregate_ms = prevote_aggregate_start.elapsed().as_millis();
             let prevote_certificate = QuorumCertificate {
                 block_index: height,
                 block_hash: block.hash.clone(),
@@ -2569,13 +2672,14 @@ impl Node {
             };
 
             // ── Phase 2: precommit (justified by the prevote quorum) ───────
+            let precommit_start = std::time::Instant::now();
             self.broadcast(Message::Precommit {
                 block: block.clone(),
                 round,
                 prevote_certificate,
             })
             .await;
-            let phase_start = std::time::Instant::now();
+            let phase_start = precommit_start;
             let seed = provider.sign_vote(
                 &genesis_hash,
                 height,
@@ -2591,6 +2695,7 @@ impl Node {
                 &provider,
             )
             .await;
+            let precommit_ms = phase_start.elapsed().as_millis();
             self.state.lock().await.bft_vote_tx = None;
             if precommits.len() < quorum {
                 round += 1;
@@ -2601,7 +2706,9 @@ impl Node {
                 }
                 continue;
             }
+            let precommit_aggregate_start = std::time::Instant::now();
             let (signers_bitmap, aggregate_signature) = provider.aggregate_votes(&precommits)?;
+            let precommit_aggregate_ms = precommit_aggregate_start.elapsed().as_millis();
             let certificate = QuorumCertificate {
                 block_index: height,
                 block_hash: block.hash.clone(),
@@ -2610,6 +2717,16 @@ impl Node {
                 algorithm: glasschain_core::wire::SignatureAlgorithm::Bls12381,
             };
             block.certificate = Some(certificate.clone());
+            self.state.lock().await.bft_phase_timings = Some(crate::rounds::BftPhaseTimings {
+                proposal_broadcast: proposal_broadcast_ms,
+                prevote: prevote_ms,
+                prevote_aggregate: prevote_aggregate_ms,
+                precommit: precommit_ms,
+                precommit_aggregate: precommit_aggregate_ms,
+            });
+            log::info!(
+                "bft round {round} at height {height}: phases proposal={proposal_broadcast_ms}ms prevote={prevote_ms}ms prevote-agg={prevote_aggregate_ms}ms precommit={precommit_ms}ms precommit-agg={precommit_aggregate_ms}ms"
+            );
             return Ok(CommitNotification { block, certificate });
         }
     }
@@ -2624,6 +2741,14 @@ impl Node {
             .get(addr)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Per-phase split of the most recent successful vote round driven here
+    /// (performance Step 0), or `None` before the first committed round.
+    #[must_use]
+    #[cfg(feature = "bft")]
+    pub async fn last_round_phase_timings(&self) -> Option<crate::rounds::BftPhaseTimings> {
+        self.state.lock().await.bft_phase_timings
     }
 
     /// Post-commit hook: persist the block, index it, fire the event bus,
@@ -2979,37 +3104,79 @@ async fn collect_phase_votes(
         voters_seen.insert(seed.public_key.clone());
         collected.push(seed);
     }
+    // Bounded-concurrency verification (latency plan #2): BLS vote
+    // verification is CPU-bound, so the arriving burst is verified in
+    // parallel batches instead of one-at-a-time. Batch size is bounded by
+    // the host's core count; counting, distinct-voter dedup and the
+    // absolute deadline are identical to the serial path — a vote drained
+    // from the channel before the deadline counts even if its verification
+    // finishes after it, and votes still queued at the deadline are dropped
+    // exactly as the blocking `recv` would drop them.
+    let batch_size = std::thread::available_parallelism()
+        .map_or(2, std::num::NonZeroUsize::get)
+        .min(quorum.max(1));
+    let provider = std::sync::Arc::new(provider.clone());
     loop {
         let now = std::time::Instant::now();
         if now >= deadline {
             break;
         }
-        match tokio::time::timeout(deadline - now, vote_rx.recv()).await {
-            Ok(Some(vote)) => {
-                if vote.height != seed_height
-                    || vote.round != seed_round
-                    || vote.phase != seed_phase
-                {
-                    continue;
-                }
-                // Duplicate copies of an already-counted voter are dropped
-                // before paying for their verification (§8.4 flood relief);
-                // a vote that fails verification is not recorded as seen, so
-                // a later valid vote from the same voter still counts.
-                if voters_seen.contains(&vote.public_key) {
-                    continue;
-                }
-                if provider.verify_vote(&vote).is_err() {
-                    log::warn!("bft: dropping unverifiable vote at height {seed_height}");
-                    continue;
-                }
-                voters_seen.insert(vote.public_key.clone());
-                collected.push(vote);
-                if collected.len() == quorum {
-                    break;
-                }
+        let Ok(Some(first)) = tokio::time::timeout(deadline - now, vote_rx.recv()).await else {
+            break;
+        };
+        let mut batch = vec![first];
+        while batch.len() < batch_size {
+            match vote_rx.try_recv() {
+                Ok(vote) => batch.push(vote),
+                Err(_) => break,
             }
-            _ => break,
+        }
+        // Cheap filters before any verification cost: out-of-context votes
+        // and duplicate copies of an already-counted voter are dropped
+        // before paying for their verification (§8.4 flood relief). The
+        // batch-local key set applies the same rule to copies that arrive
+        // inside one burst, which the serial path ruled out one vote at a
+        // time.
+        let mut batch_voters: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        batch.retain(|vote| {
+            vote.height == seed_height
+                && vote.round == seed_round
+                && vote.phase == seed_phase
+                && !voters_seen.contains(&vote.public_key)
+                && batch_voters.insert(vote.public_key.clone())
+        });
+        if batch.is_empty() {
+            continue;
+        }
+        let mut verifying = Vec::with_capacity(batch.len());
+        for vote in &batch {
+            let provider = std::sync::Arc::clone(&provider);
+            let vote = vote.clone();
+            verifying.push(tokio::task::spawn_blocking(move || {
+                provider.verify_vote(&vote)
+            }));
+        }
+        for (vote, handle) in std::iter::zip(batch, verifying) {
+            if handle
+                .await
+                .unwrap_or_else(|error| {
+                    log::warn!("bft vote verifier panicked, dropping the vote: {error}");
+                    Err(glasschain_core::CoreError::InvalidTransaction(
+                        "vote verifier failed".into(),
+                    ))
+                })
+                .is_err()
+            {
+                // A vote that fails verification is not recorded as seen, so
+                // a later valid vote from the same voter still counts.
+                log::warn!("bft: dropping unverifiable vote at height {seed_height}");
+                continue;
+            }
+            voters_seen.insert(vote.public_key.clone());
+            collected.push(vote);
+            if collected.len() == quorum {
+                return collected;
+            }
         }
     }
     collected
@@ -3020,7 +3187,7 @@ async fn collect_phase_votes(
 #[cfg(feature = "bft")]
 async fn handle_proposal(
     ctx: &PeerContext,
-    write_tx: &Sender<Message>,
+    write_tx: &PeerWrite,
     block: Block,
     round: u32,
 ) -> MessageEffect {
@@ -3079,7 +3246,7 @@ async fn handle_proposal(
         round_state.proposal = Some(block);
         s.bft_round = Some(round_state);
         drop(s);
-        if write_tx.send(Message::Vote(vote)).await.is_err() {
+        if !write_tx.send(Message::Vote(vote)).await {
             log::warn!("Failed to deliver prevote to the round leader");
         }
     } else {
@@ -3150,7 +3317,7 @@ async fn handle_vote(ctx: &PeerContext, vote: glasschain_core::BftVote) -> Messa
 #[cfg(feature = "bft")]
 async fn handle_precommit(
     ctx: &PeerContext,
-    write_tx: &Sender<Message>,
+    write_tx: &PeerWrite,
     block: Block,
     round: u32,
     prevote_certificate: QuorumCertificate,
@@ -3191,7 +3358,7 @@ async fn handle_precommit(
     );
     s.bft_round = Some(round_state);
     drop(s);
-    if write_tx.send(Message::Vote(vote)).await.is_err() {
+    if !write_tx.send(Message::Vote(vote)).await {
         log::warn!("Failed to deliver precommit vote to the round leader");
     }
     MessageEffect::default()
@@ -3389,8 +3556,20 @@ fn verify_chain_certificates(
 /// Handle a single peer connection (inbound or outbound).
 ///
 /// Reader and writer halves are passed in directly (already split from a TLS
+/// Reconnect backoff ladder (latency plan #5): 1 s, 2 s, then capped at
+/// 5 s — a repaired link reconnects in about a second; a long outage does
+/// not spin.
+const fn reconnect_delay_secs(attempt: u32) -> u64 {
+    match attempt {
+        0 => 1,
+        1 => 2,
+        _ => 5,
+    }
+}
+
 /// stream).  A dedicated writer task drains an mpsc channel so broadcast never
 /// blocks on I/O.  The read loop runs in the calling task.
+#[allow(clippy::too_many_lines)]
 async fn handle_peer(
     mut reader: PeerReader,
     writer: PeerWriter,
@@ -3399,17 +3578,49 @@ async fn handle_peer(
     observed_peer_cert_fingerprint: String,
     peer_cert_der: Vec<u8>,
 ) {
-    let (write_tx, mut write_rx): (Sender<Message>, Receiver<Message>) =
+    let (consensus_tx, mut consensus_rx): (Sender<Message>, Receiver<Message>) =
         tokio::sync::mpsc::channel(256);
+    let (background_tx, mut background_rx): (Sender<Message>, Receiver<Message>) =
+        tokio::sync::mpsc::channel(256);
+    let write_tx = PeerWrite {
+        consensus: consensus_tx,
+        background: background_tx,
+    };
 
     {
         let waddr = addr.clone();
         tokio::spawn(async move {
             let mut writer = writer;
-            while let Some(msg) = write_rx.recv().await {
-                if let Err(e) = writer.send(&msg).await {
-                    log::warn!("Write error to {waddr}: {e}");
-                    break;
+            let mut consensus_open = true;
+            let mut background_open = true;
+            // Consensus-first drain (latency plan #3): a Proposal, Precommit,
+            // Block or Vote never waits behind queued transactions; the
+            // background queue drains only when consensus is idle. One
+            // background item runs per idle consensus drain, so sustained
+            // consensus traffic can starve transactions for at most one item
+            // at a time — the intended shape under flood.
+            while consensus_open || background_open {
+                tokio::select! {
+                    biased;
+                    msg = consensus_rx.recv(), if consensus_open => match msg {
+                        Some(msg) => {
+                            if let Err(e) = writer.send(&msg).await {
+                                log::warn!("Write error to {waddr}: {e}");
+                                break;
+                            }
+                        }
+                        None => consensus_open = false,
+                    },
+                    msg = background_rx.recv(), if background_open => match msg {
+                        Some(msg) => {
+                            if writer.send(&msg).await.is_err() {
+                                log::warn!("Write error to {waddr}");
+                                break;
+                            }
+                        }
+                        None => background_open = false,
+                    },
+                    else => break,
                 }
             }
         });
@@ -3419,7 +3630,7 @@ async fn handle_peer(
     // through the call chain — no shared mutable state needed.
 
     let hello = build_local_hello(&ctx).await;
-    if write_tx.try_send(hello).is_err() {
+    if !write_tx.try_send(hello) {
         log::warn!("Failed to queue Hello for {addr}");
         return;
     }
@@ -3472,10 +3683,24 @@ async fn handle_peer(
     let _ = ctx.event_tx.send(NodeEvent::PeerDisconnected(display_addr));
 
     if let Some(stable) = registered {
+        // Bounded backoff (latency plan #5): the first retry fires quickly
+        // (a repaired link should not pay a flat 5 s window), later retries
+        // cap at 5 s so a long outage doesn't spin.
+        let attempt = ctx
+            .state
+            .lock()
+            .await
+            .reconnect_attempts
+            .entry(stable.clone())
+            .and_modify(|count| *count += 1)
+            .or_insert(0)
+            .checked_sub(1)
+            .unwrap_or(0);
+        let delay = std::time::Duration::from_secs(reconnect_delay_secs(attempt));
         let dtx = ctx.dial_tx.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            log::info!("Attempting to reconnect to {stable}");
+            tokio::time::sleep(delay).await;
+            log::info!("Attempting to reconnect to {stable} (attempt {attempt})");
             let _ = dtx.send(stable);
         });
     }
@@ -3610,10 +3835,10 @@ async fn process_message(
     msg: Message,
     addr: &str,
     ctx: &PeerContext,
-    write_tx: &Sender<Message>,
+    write_tx: &PeerWrite,
     current_stable_addr: Option<&str>,
     observed_cert_fingerprint: &str,
-    _peer_cert_der: &[u8],
+    peer_cert_der: &[u8],
 ) -> MessageEffect {
     match msg {
         Message::Hello {
@@ -3809,6 +4034,9 @@ async fn process_message(
                 s.known_peers.insert(peer_listen_addr.clone());
                 s.peer_senders
                     .insert(peer_listen_addr.clone(), write_tx.clone());
+                // A successful handshake resets the backoff ladder (latency
+                // plan #5).
+                s.reconnect_attempts.remove(&peer_listen_addr);
             }
             let _ = ctx
                 .event_tx
@@ -3816,7 +4044,17 @@ async fn process_message(
 
             let local_len = ctx.ledger.lock().await.chain.len() as u64;
             if chain_length > local_len {
-                let _ = write_tx.try_send(Message::RequestChain);
+                // Height-bounded catch-up (latency plan #4): a node already
+                // holding history pulls only the missing suffix; a fresh
+                // node (nothing beyond genesis) bootstraps with the full
+                // chain so the wholesale replace + one rebuild applies.
+                if local_len <= 1 {
+                    let _ = write_tx.try_send(Message::RequestChain);
+                } else {
+                    let _ = write_tx.try_send(Message::RequestChainFrom {
+                        from_index: local_len,
+                    });
+                }
             }
 
             MessageEffect {
@@ -3874,7 +4112,7 @@ async fn process_message(
                 }
             }
 
-            let senders: Vec<Sender<Message>> = {
+            let senders: Vec<PeerWrite> = {
                 let s = ctx.state.lock().await;
                 let active = active_set_at_tip(&s, &ctx.ledger).await;
                 s.relay_targets(&active)
@@ -3979,7 +4217,12 @@ async fn process_message(
             };
 
             if too_far_ahead {
-                let _ = write_tx.try_send(Message::RequestChain);
+                // Height-bounded catch-up (latency plan #4): pull only the
+                // missing suffix, not the whole chain.
+                let local_len = ctx.ledger.lock().await.chain.len() as u64;
+                let _ = write_tx.try_send(Message::RequestChainFrom {
+                    from_index: local_len,
+                });
                 return MessageEffect::default();
             }
 
@@ -4022,7 +4265,7 @@ async fn process_message(
                     certificate: QuorumCertificate::pow(&block),
                 });
 
-                let senders: Vec<Sender<Message>> = {
+                let senders: Vec<PeerWrite> = {
                     let s = ctx.state.lock().await;
                     let active = active_set_at_tip(&s, &ctx.ledger).await;
                     s.relay_targets(&active)
@@ -4040,75 +4283,123 @@ async fn process_message(
 
         Message::RequestChain => {
             let chain = ctx.ledger.lock().await.chain.clone();
-            let _ = write_tx.try_send(Message::Chain(chain));
+            let _ = write_tx.try_send(Message::Chain {
+                from_index: 0,
+                blocks: chain,
+            });
             MessageEffect::default()
         }
 
-        Message::Chain(candidate) => {
-            // A synced chain is adopted wholesale: endorsement enforcement
-            // must hold on the candidate itself before any block is adopted
-            // (ADR-008 §4 — no commit path bypasses evaluation).
-            if let Err(e) = Node::enforce_chain_endorsements(&ctx.state, &candidate).await {
-                log::warn!("Rejected chain replacement from {addr}: {e}");
-                return MessageEffect::default();
-            }
-            // Historical QC verification (#97, §8.3): a structurally plausible
-            // but cryptographically invalid (or wrong-historical-set)
-            // certificate must never be adopted via sync. Height-0-era
-            // bootstrap blocks verify against the attached provider's static
-            // genesis set (ADR-009 §5).
-            #[cfg(feature = "bft")]
-            let bootstrap = ctx.state.lock().await.consensus.clone();
-            #[cfg(feature = "bft")]
-            if let Err(e) = verify_chain_certificates(&candidate, bootstrap.as_deref()) {
-                log::warn!("Rejected chain replacement from {addr}: {e}");
-                return MessageEffect::default();
-            }
-            let replaced = {
-                let mut l = ctx.ledger.lock().await;
-                l.try_replace_chain(candidate)
+        Message::RequestChainFrom { from_index } => {
+            // Height-bounded catch-up (latency plan #4): answer with only
+            // the missing suffix. Zero-trust unchanged — the receiver folds
+            // every block through the standard single-block admission path.
+            let suffix = {
+                let ledger = ctx.ledger.lock().await;
+                let from = usize::try_from(from_index).unwrap_or(usize::MAX);
+                ledger.chain.get(from..).map(<[Block]>::to_vec)
             };
-            if replaced {
-                // Persist the new chain.
-                let new_chain = { ctx.ledger.lock().await.chain.clone() };
-                for block in &new_chain {
-                    if let Err(e) = ctx.storage.put_block(block) {
-                        log::warn!("Storage: failed to persist block {}: {e}", block.index);
+            if let Some(blocks) = suffix {
+                let _ = write_tx.try_send(Message::Chain { from_index, blocks });
+            } else {
+                // The requester is ahead of us: answer with the full chain
+                // so it can decide.
+                let chain = ctx.ledger.lock().await.chain.clone();
+                let _ = write_tx.try_send(Message::Chain {
+                    from_index: 0,
+                    blocks: chain,
+                });
+            }
+            MessageEffect::default()
+        }
+
+        Message::Chain { from_index, blocks } => {
+            if from_index == 0 {
+                // A full chain is adopted wholesale: endorsement enforcement
+                // must hold on the candidate itself before any block is
+                // adopted (ADR-008 §4 — no commit path bypasses evaluation).
+                if let Err(e) = Node::enforce_chain_endorsements(&ctx.state, &blocks).await {
+                    log::warn!("Rejected chain replacement from {addr}: {e}");
+                    return MessageEffect::default();
+                }
+                // Historical QC verification (#97, §8.3): a structurally plausible
+                // but cryptographically invalid (or wrong-historical-set)
+                // certificate must never be adopted via sync. Height-0-era
+                // bootstrap blocks verify against the attached provider's static
+                // genesis set (ADR-009 §5).
+                #[cfg(feature = "bft")]
+                let bootstrap = ctx.state.lock().await.consensus.clone();
+                #[cfg(feature = "bft")]
+                if let Err(e) = verify_chain_certificates(&blocks, bootstrap.as_deref()) {
+                    log::warn!("Rejected chain replacement from {addr}: {e}");
+                    return MessageEffect::default();
+                }
+                let replaced = {
+                    let mut l = ctx.ledger.lock().await;
+                    l.try_replace_chain(blocks)
+                };
+                if replaced {
+                    // Persist the new chain.
+                    let new_chain = { ctx.ledger.lock().await.chain.clone() };
+                    for block in &new_chain {
+                        if let Err(e) = ctx.storage.put_block(block) {
+                            log::warn!("Storage: failed to persist block {}: {e}", block.index);
+                        }
+                    }
+
+                    // Every block adopted by sync is a commit: emit the
+                    // certificate-bearing notification so commit consumers receive
+                    // the attestation set on this path too. The block carries the
+                    // QC it was committed with (`Block.certificate`, persisted
+                    // with the block); PoW-era blocks fall back to the degenerate
+                    // PoW certificate.
+                    for block in &new_chain {
+                        if block.index == 0 {
+                            continue;
+                        }
+                        let _ = ctx.event_tx.send(NodeEvent::BlockReceived {
+                            index: block.index,
+                            hash: block.hash.clone(),
+                            certificate: block
+                                .certificate
+                                .clone()
+                                .unwrap_or_else(|| QuorumCertificate::pow(block)),
+                        });
+                    }
+
+                    Node::rebuild_runtime_state_from_chain(
+                        &ctx.ledger,
+                        &ctx.state,
+                        &ctx.storage,
+                        &ctx.provenance,
+                        &ctx.flattener,
+                    )
+                    .await;
+                    log::info!(
+                        "Contract engine and watcher state rebuilt from synced chain ({} blocks)",
+                        new_chain.len()
+                    );
+                }
+            } else {
+                // Height-bounded suffix (latency plan #4): every block is
+                // folded through the standard single-block admission path —
+                // the same gating as a relayed block, just less transport.
+
+                for block in blocks {
+                    let effect = Box::pin(process_message(
+                        Message::Block(block),
+                        addr,
+                        ctx,
+                        write_tx,
+                        current_stable_addr,
+                        observed_cert_fingerprint,
+                        peer_cert_der,
+                    ))
+                    .await;
+                    if effect.disconnect {
+                        return effect;
                     }
                 }
-
-                // Every block adopted by sync is a commit: emit the
-                // certificate-bearing notification so commit consumers receive
-                // the attestation set on this path too. The block carries the
-                // QC it was committed with (`Block.certificate`, persisted
-                // with the block); PoW-era blocks fall back to the degenerate
-                // PoW certificate.
-                for block in &new_chain {
-                    if block.index == 0 {
-                        continue;
-                    }
-                    let _ = ctx.event_tx.send(NodeEvent::BlockReceived {
-                        index: block.index,
-                        hash: block.hash.clone(),
-                        certificate: block
-                            .certificate
-                            .clone()
-                            .unwrap_or_else(|| QuorumCertificate::pow(block)),
-                    });
-                }
-
-                Node::rebuild_runtime_state_from_chain(
-                    &ctx.ledger,
-                    &ctx.state,
-                    &ctx.storage,
-                    &ctx.provenance,
-                    &ctx.flattener,
-                )
-                .await;
-                log::info!(
-                    "Contract engine and watcher state rebuilt from synced chain ({} blocks)",
-                    new_chain.len()
-                );
             }
             MessageEffect::default()
         }
@@ -4292,12 +4583,12 @@ async fn process_message(
             }
             match transient.get(&collection, &commitment) {
                 Ok(Some(payload)) => {
-                    if let Err(e) = write_tx.try_send(Message::PrivatePayload {
+                    if !write_tx.try_send(Message::PrivatePayload {
                         collection,
                         commitment,
                         payload,
                     }) {
-                        log::warn!("Reconcile response delivery failed: {e}");
+                        log::warn!("Reconcile response delivery failed");
                     }
                 }
                 Ok(None) => {
@@ -5527,6 +5818,10 @@ mod tests {
         let ctx = peer_context(&node);
         let mut events = node.event_tx.subscribe();
         let (write_tx, _write_rx) = tokio::sync::mpsc::channel::<Message>(16);
+        let write_tx = PeerWrite {
+            consensus: write_tx.clone(),
+            background: write_tx,
+        };
         let genesis = node.ledger.lock().await.chain[0].hash.clone();
 
         let conflicting = [
@@ -5568,6 +5863,10 @@ mod tests {
         node.set_bft_consensus(Arc::new(provider.clone())).await;
         let ctx = peer_context(&node);
         let (write_tx, _write_rx) = tokio::sync::mpsc::channel::<Message>(16);
+        let write_tx = PeerWrite {
+            consensus: write_tx.clone(),
+            background: write_tx,
+        };
         let genesis = node.ledger.lock().await.chain[0].hash.clone();
 
         for v in [
@@ -5696,8 +5995,12 @@ mod tests {
     async fn sync_adopts_chains_with_valid_historical_certificates() {
         let node = Node::new("sync-target", "127.0.0.1:0", 1);
         let ctx = peer_context(&node);
-        let (write_tx, write_rx) = tokio::sync::mpsc::channel::<Message>(16);
+        let (consensus_tx, write_rx) = tokio::sync::mpsc::channel::<Message>(16);
         let _ = write_rx;
+        let write_tx = PeerWrite {
+            consensus: consensus_tx.clone(),
+            background: consensus_tx,
+        };
         let mut events = node.subscribe();
         let genesis = Ledger::new(1).chain.remove(0);
         let (_, validator_key) = test_validator("validator-a", 11);
@@ -5706,7 +6009,10 @@ mod tests {
         // attaches it.
         let chain = historical_chain(&genesis, &[vec![validator_key]]);
         let adopted = process_message(
-            Message::Chain(chain),
+            Message::Chain {
+                from_index: 0,
+                blocks: chain,
+            },
             "127.0.0.1:40001",
             &ctx,
             &write_tx,
@@ -5757,10 +6063,16 @@ mod tests {
         let outsider = vec![bls_signatures::PrivateKey::new([222; 64])];
         let chain = historical_chain(&genesis, &[outsider.clone(), outsider]);
         process_message(
-            Message::Chain(chain),
+            Message::Chain {
+                from_index: 0,
+                blocks: chain,
+            },
             "127.0.0.1:40002",
             &ctx,
-            &(tokio::sync::mpsc::channel::<Message>(16)).0,
+            &PeerWrite {
+                consensus: (tokio::sync::mpsc::channel::<Message>(16)).0,
+                background: (tokio::sync::mpsc::channel::<Message>(16)).0,
+            },
             None,
             "peer-fingerprint",
             &[],
@@ -5802,6 +6114,14 @@ mod tests {
             3,
             "valid history is restored intact"
         );
+    }
+
+    #[test]
+    fn reconnect_backoff_ladder() {
+        assert_eq!(reconnect_delay_secs(0), 1, "first retry fires quickly");
+        assert_eq!(reconnect_delay_secs(1), 2);
+        assert_eq!(reconnect_delay_secs(2), 5, "later retries cap at 5 s");
+        assert_eq!(reconnect_delay_secs(50), 5, "a long outage never spins");
     }
 
     #[test]
@@ -6052,6 +6372,40 @@ mod tests {
         let seed = provider.sign_vote(&genesis.hash, 5, 0, VotePhase::Prevote, "hash-a");
         let collected = collect_phase_votes(&mut vote_rx, seed, 3, deadline, &provider).await;
         assert_eq!(collected.len(), 3, "live quorum-sized traffic is intact");
+    }
+
+    /// Latency plan #2 regression: a quorum-sized burst that arrives in one
+    /// shot (plus duplicate copies riding the flood) is verified under
+    /// bounded concurrency and still yields exactly the distinct-voter
+    /// quorum — duplicates never consume verification budget or inflate the
+    /// count.
+    #[tokio::test]
+    #[cfg(feature = "bft")]
+    async fn concurrent_verification_keeps_distinct_voter_quorum_under_burst() {
+        let (provider, keys) = three_validator_provider();
+        let genesis = Ledger::new(1).chain.remove(0);
+        let (vote_tx, mut vote_rx) = tokio::sync::mpsc::channel(crate::rounds::VOTE_CHANNEL_CAP);
+        // One burst: all validators' votes plus duplicate copies of each.
+        for key in &keys[1..] {
+            let vote = glasschain_core::BftVote::sign(
+                &genesis.hash,
+                5,
+                0,
+                VotePhase::Prevote,
+                "hash-a",
+                key,
+            );
+            for _ in 0..3 {
+                vote_tx.send(vote.clone()).await.expect("burst queued");
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let seed = provider.sign_vote(&genesis.hash, 5, 0, VotePhase::Prevote, "hash-a");
+        let collected = collect_phase_votes(&mut vote_rx, seed, 3, deadline, &provider).await;
+        assert_eq!(collected.len(), 3, "quorum of distinct voters collected");
+        let distinct: std::collections::HashSet<&Vec<u8>> =
+            collected.iter().map(|v| &v.public_key).collect();
+        assert_eq!(distinct.len(), 3, "no duplicate voter inflated the count");
     }
 
     /// Two-node handshake through the TLS construction paths (zero-trust ZT-3,

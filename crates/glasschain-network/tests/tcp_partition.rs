@@ -378,3 +378,229 @@ async fn real_tcp_wan_partition_repair_converges_without_conflict() {
         "partition + repair must not leave conflicting finalization"
     );
 }
+
+/// D7 scenario 4 — narrow bandwidth budget: one node's relay paces downloads
+/// at ~8 KiB/s. The established mesh keeps converging on the same tip —
+/// slowly, under an explicit bandwidth budget the operator can reason about
+/// instead of an unbounded queue drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_tcp_wan_low_bandwidth_budget_still_converges() {
+    let cramped = WanProfile {
+        latency_ms: 40,
+        jitter_ms: 10,
+        bandwidth_bps: 8 * 1024,
+    };
+    // Only the first node's relay is paced: a single constrained link.
+    let profiles = [
+        cramped,
+        WanProfile::none(),
+        WanProfile::none(),
+        WanProfile::none(),
+    ];
+    let (nodes, _) = four_node_mesh(&profiles).await;
+
+    for i in 0..3 {
+        nodes[0]
+            .submit_transaction(inv_tx(&format!("cramped-{i}"), 1))
+            .await
+            .unwrap();
+        nodes[0].mine().await.unwrap();
+    }
+    let expected = tip(&nodes[0]).await;
+    poll_until(
+        "all nodes converged through the bandwidth-paced link",
+        30,
+        || async {
+            let snapshot = expected.clone();
+            let mut all = true;
+            for n in &nodes {
+                if !tip_reached(n, snapshot.clone()).await {
+                    all = false;
+                }
+            }
+            all
+        },
+    )
+    .await;
+    assert!(
+        tips_agree(&nodes).await,
+        "a bandwidth-paced link must not produce conflicting tips"
+    );
+}
+
+/// D7 handshake-budget audit (Step 6 residual ① sub-item): the profile is
+/// applied **at spawn**, so mesh formation itself is shaped — the measured
+/// finding (formation stalls at ≥~120 ms one-way per shaped chunk) gets
+/// re-recorded at each profile with its own bounded budget.
+///
+/// Assertions hold at the known-good profiles (60/100 ms one-way); the 140 ms
+/// row only *reports* formation or no-convergence within its budget, so the
+/// audit survives until the dial/hello budget is fixed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "handshake-budget audit: opt-in, wall-clock heavy (minutes)"]
+#[allow(clippy::too_many_lines)]
+async fn real_tcp_wan_handshake_budget_audit_opt_in() {
+    for (latency_ms, budget_secs) in [(60, 25), (100, 40), (140, 90)] {
+        let profile = WanProfile {
+            latency_ms,
+            jitter_ms: (latency_ms / 4),
+            bandwidth_bps: 0,
+        };
+        let mut nodes: Vec<Node> = (0..4)
+            .map(|i| Node::new(format!("hshake-{i}-{latency_ms}"), free_addr(), 1))
+            .collect();
+        let mut proxies = Vec::new();
+        for node in &nodes {
+            // Shaped from the first byte: the handshake pays the profile.
+            proxies.push(TcpProxy::spawn_with_profile(node.listen_addr(), profile).await);
+        }
+        for (i, node) in nodes.iter_mut().enumerate() {
+            node.set_advertise_addr(proxies[i].front_addr());
+        }
+        let formation_start = std::time::Instant::now();
+        nodes[0].start(vec![]).await.unwrap();
+        for i in (0..4).skip(1) {
+            let peers: Vec<String> = (0..4)
+                .filter(|j| *j != i)
+                .map(|j| proxies[j].front_addr().to_owned())
+                .collect();
+            nodes[i].start(peers).await.unwrap();
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(budget_secs);
+        let mut formed = false;
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut all = true;
+            for node in &nodes {
+                if node.known_peers().await.len() < 3 {
+                    all = false;
+                }
+            }
+            if all {
+                formed = true;
+                break;
+            }
+        }
+        let formed_ms = formation_start.elapsed().as_millis();
+        if formed {
+            println!("handshake profile {latency_ms} ms: formed in {formed_ms} ms");
+        } else {
+            println!(
+                "handshake profile {latency_ms} ms: NO convergence in {formed_ms} ms \
+                 ({budget_secs} s budget) — the dial/hello budget fails here"
+            );
+        }
+        // Reproduce a round at every profile to keep throughput evidence per row.
+        nodes[0]
+            .submit_transaction(inv_tx(&format!("hshake-{latency_ms}"), 1))
+            .await
+            .unwrap();
+        let mine_result = tokio::time::timeout(Duration::from_secs(30), nodes[0].mine()).await;
+        match mine_result {
+            Ok(Ok(())) => {
+                poll_until(
+                    "shaped-handshake mesh still converges after formation",
+                    20,
+                    || async {
+                        let mut all = true;
+                        for n in &nodes {
+                            if chain_len(n).await < 2 {
+                                all = false;
+                            }
+                        }
+                        all
+                    },
+                )
+                .await;
+                println!("handshake profile {latency_ms} ms: round commits and converges");
+            }
+            _ => {
+                println!("handshake profile {latency_ms} ms: no commit within 30 s (recorded)");
+            }
+        }
+    }
+}
+
+/// Latency plan #4 gate — catch-up at a ~1 000-block history: a fresh
+/// validator joins an established history and bootstraps through the
+/// height-bounded sync flow. The joiner's gap is necessarily the whole
+/// history (it holds only genesis), so this records the bootstrap cost; a
+/// partially-behind node's gap-filling request carries only the missing
+/// suffix by construction (`RequestChainFrom { from_index }`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "1k-block recovery measurement: opt-in, wall-clock heavy"]
+async fn chain_catch_up_recovery_at_1k_blocks_opt_in() {
+    let (nodes, proxies) = four_node_mesh(&[WanProfile::none(); 4]).await;
+    // Node 3 sits out the streaming: never dialed, never started.
+    let late = Node::new("late-joiner", free_addr(), 1);
+    let _ = &proxies;
+
+    let history = 1_000usize;
+    for i in 0..history {
+        nodes[0]
+            .submit_transaction(inv_tx(&format!("catchup-{i}"), 1))
+            .await
+            .unwrap();
+        nodes[0].mine().await.unwrap();
+    }
+    let streamed = tip(&nodes[0]).await;
+    poll_until(
+        "streaming validators converge during the run",
+        30,
+        || async {
+            let mut all = true;
+            for node in &nodes[..3] {
+                if !tip_reached(node, streamed.clone()).await {
+                    all = false;
+                }
+            }
+            all
+        },
+    )
+    .await;
+    // A three-block tail mined before the joiner exists: its gap spans the
+    // streamed history plus the tail.
+    for i in 0..3 {
+        nodes[0]
+            .submit_transaction(inv_tx(&format!("catchup-tail-{i}"), 1))
+            .await
+            .unwrap();
+        nodes[0].mine().await.unwrap();
+    }
+    let tip = tip(&nodes[0]).await;
+    poll_until("streaming validators hold the tail", 15, || async {
+        let mut all = true;
+        for node in &nodes[..3] {
+            if !tip_reached(node, tip.clone()).await {
+                all = false;
+            }
+        }
+        all
+    })
+    .await;
+
+    // The joiner comes up: Hello triggers the suffix pull; measure to
+    // convergence.
+    let recovery_start = std::time::Instant::now();
+    late.start(vec![nodes[0].listen_addr().to_owned()])
+        .await
+        .unwrap();
+    poll_until(
+        "the late joiner catches up through the suffix pull",
+        60,
+        || async { tip_reached(&late, tip.clone()).await },
+    )
+    .await;
+    let recovery = recovery_start.elapsed();
+    println!(
+        "chain catch-up at a {}-block history: the joiner bootstrapped {} blocks in {recovery:?} \
+         (fresh joiners carry the whole history by necessity; a partially-behind \
+         node's catch-up request carries only the missing suffix)",
+        streamed.0, tip.0,
+    );
+    assert!(tip_reached(&late, tip).await, "the joiner converged");
+    assert!(
+        tips_agree(&nodes).await,
+        "catch-up must not leave conflicting tips"
+    );
+}

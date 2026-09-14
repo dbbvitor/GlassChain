@@ -62,6 +62,7 @@ bls-signatures = { version = "0.15", default-features = false, features = ["blst
 hex = "0.4"
 glasschain-vm = { path = "../glasschain-vm" }
 glasschain-storage = { path = "../glasschain-storage" }
+criterion = "0.8"
 # default-features = false drops madsim's `rpc` feature, whose optional
 # bincode 1.x dependency is unmaintained (RUSTSEC-2025-0141). Only `macros`
 # is used by tests/madsim_chaos.rs.
@@ -72,6 +73,7 @@ madsim     = { version = "0.2", default-features = false, features = [
 [features]
 default       = []
 insecure-tls  = []
+
 # Negotiated post-quantum hybrid key exchange (zero-trust ZT-3, post-quantum
 # plan): selects the aws-lc-rs provider for the peer transport and offers the
 # X25519MLKEM768 hybrid first, classical X25519 second. Certificate
@@ -83,6 +85,11 @@ pq-tls        = ["rustls/aws_lc_rs"]
 # Enables `glasschain-core/bft` so the node can attest blocks with a real
 # quorum certificate instead of dev/test Proof-of-Work.
 bft = ["glasschain-core/bft", "dep:bls-signatures"]
+
+[[bench]]
+name = "wire_codec"
+harness = false
+required-features = ["bft"]
 
 [lints]
 workspace = true

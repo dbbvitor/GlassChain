@@ -125,11 +125,32 @@ pub enum Message {
         commitment: String,
     },
 
-    /// Ask a peer to send its full chain.
+    /// Ask a peer to send its full chain (bootstrap sync).
     RequestChain,
 
-    /// Response to [`Message::RequestChain`]: the sender's full chain.
-    Chain(Vec<Block>),
+    /// Ask a peer for only the chain suffix from `from_index` onward — the
+    /// height-bounded catch-up (latency plan #4): a node that missed a few
+    /// blocks no longer pulls the whole chain to fill a small gap. The
+    /// responder answers with [`Message::Chain`] carrying
+    /// `blocks[from_index..]`.
+    RequestChainFrom {
+        /// The first block index the requester is missing (its current chain
+        /// length — the next height it cannot reach).
+        from_index: u64,
+    },
+
+    /// Response to [`Message::RequestChain`] / [`Message::RequestChainFrom`]:
+    /// the sender's chain. `from_index == 0` carries the full chain and the
+    /// receiver adopts it wholesale (`try_replace_chain`); a suffix carries
+    /// `blocks[from..]` and every block is folded through the standard
+    /// single-block admission path — genesis-anchored, fully validated
+    /// (zero-trust unchanged: less data, same checks).
+    Chain {
+        /// Index of `blocks[0]` — 0 for a full chain.
+        from_index: u64,
+        /// The chain or suffix blocks in order.
+        blocks: Vec<Block>,
+    },
 
     /// Ask a peer for its list of known peer addresses.
     RequestPeers,
@@ -153,4 +174,7 @@ pub enum Message {
 /// post-quantum plan action 2) — a `/4` peer cannot parse the new encoding.
 /// `/6` restructured the quorum certificate into a BLS12-381 aggregate
 /// signature with a signer bitmap (ADR-014) — a `/5` peer cannot parse it.
-pub const PROTOCOL_VERSION: &str = "glasschain/6";
+/// `/7` added height-bounded chain catch-up: `RequestChainFrom` and the
+/// `Chain { from_index, blocks }` response shape (latency plan #4) — a `/6`
+/// peer cannot parse either.
+pub const PROTOCOL_VERSION: &str = "glasschain/7";

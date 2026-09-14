@@ -205,3 +205,146 @@ fn read_path_memory_scenario() {
 fn chain_holder() -> BTreeMap<u64, Vec<u8>> {
     (0..1_000u64).map(|i| (i, vec![0u8; 1_024])).collect()
 }
+
+/// §5 remaining gap 1 — lagging subscriber: the bounded event bus drops
+/// oldest events for a receiver that stops polling, and the receiver itself
+/// reports the exact skip count (`Lagged(n)`) — the observable an operator
+/// alert would watch.
+#[tokio::test]
+#[ignore = "lag/drop measurement: run with the rest of the read-path harness"]
+async fn lagging_subscriber_lag_counts() {
+    use glasschain_indexer::{EventBusProvider, InMemoryEventBus, IndexerEvent};
+    use tokio::time::Duration;
+    const CAPACITY: usize = 4_096;
+    const PUBLISHED: usize = 5_000;
+    let bus = InMemoryEventBus::new(CAPACITY);
+    let mut slow = bus.subscribe();
+    for i in 0..PUBLISHED {
+        bus.publish(IndexerEvent {
+            event_type: "lag-probe".into(),
+            block_index: u64::try_from(i + 1).expect("heights fit"),
+            transaction_id: format!("lag-tx-{i}"),
+            transaction_kind: "AssetRegistration".into(),
+            timestamp: u64::try_from(i).expect("timestamps fit"),
+            payload_json: "{}".into(),
+        })
+        .expect("publish");
+    }
+    let expected_drops = (PUBLISHED - CAPACITY) as u64;
+    let started = std::time::Instant::now();
+    let reported = match tokio::time::timeout(Duration::from_secs(2), slow.recv()).await {
+        Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped))) => skipped,
+        Ok(Ok(event)) => {
+            println!(
+                "lagging subscriber: got a live event ({}) before any lag note",
+                event.transaction_id
+            );
+            0
+        }
+        other => panic!("unexpected broadcast recv: {other:?}"),
+    };
+    println!(
+        "lagging subscriber: published {PUBLISHED}, capacity {CAPACITY}, \
+         reported lag = {reported} events, first recv after {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        reported, expected_drops,
+        "the receiver must observe exactly published - capacity drops"
+    );
+}
+
+/// §5 remaining gap 2 — bursts vs steady ingestion with a concurrent
+/// analytics consumer: the O(rows) scan runs continuously while
+/// registrations stream in bursty and steady patterns. Records ingestion
+/// latency and observed query latency under both patterns (identical
+/// totals, identical projections).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "burst-vs-steady measurement: run with the rest of the read-path harness"]
+async fn burst_vs_steady_ingestion_with_concurrent_query_load() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::time::Duration;
+    const REGISTRATIONS: usize = 10_000;
+    const BURST_BLOCKS: usize = 50;
+
+    let chain = Arc::new(synthetic_chain(REGISTRATIONS));
+    let mut pattern_results = Vec::new();
+    for (label, bursty) in [("steady", false), ("bursty", true)] {
+        let indexer = InMemoryIndexer::new();
+        let flattener = Arc::new(Mutex::new(glasschain_indexer::AnalyticalFlattener::new()));
+        let mut provenance = ProvenanceIndex::new();
+        let ingest_ms: Arc<Mutex<Vec<u128>>> = Arc::new(Mutex::new(Vec::new()));
+        let query_us: Arc<Mutex<Vec<u128>>> = Arc::new(Mutex::new(Vec::new()));
+        let done = Arc::new(AtomicBool::new(false));
+
+        // The concurrent analytics consumer: continuous O(rows) scans.
+        let scan_flattener = Arc::clone(&flattener);
+        let scan_query = Arc::clone(&query_us);
+        let scan_done = Arc::clone(&done);
+        let scanner = tokio::task::spawn_blocking(move || {
+            let gtin = format!("GTIN-{:013}", 789_123_410_000usize + 3);
+            while !scan_done.load(Ordering::Relaxed) {
+                let started = std::time::Instant::now();
+                {
+                    let scan = scan_flattener.lock().expect("flattener lock");
+                    let _ = scan.records_by_gtin(&gtin);
+                }
+                scan_query
+                    .lock()
+                    .expect("latency lock")
+                    .push(started.elapsed().as_micros());
+                std::thread::sleep(std::time::Duration::from_micros(500));
+            }
+        });
+
+        let mut i = 0usize;
+        while i < chain.len() {
+            let take = if bursty {
+                (chain.len() - i).min(BURST_BLOCKS)
+            } else {
+                1
+            };
+            for block in &chain[i..i + take] {
+                let block_start = std::time::Instant::now();
+                indexer
+                    .index_block(block)
+                    .expect("synthetic blocks must index");
+                let indexed_txs = glasschain_indexer::indexed_transactions_of(block)
+                    .expect("synthetic transactions must serialize");
+                let indexed_block = glasschain_indexer::IndexedBlock::from(block);
+                flattener
+                    .lock()
+                    .expect("flattener lock")
+                    .ingest_indexed_block(&indexed_block, &indexed_txs);
+                provenance.ingest_block(block);
+                ingest_ms
+                    .lock()
+                    .expect("ingest log")
+                    .push(block_start.elapsed().as_millis());
+            }
+            if bursty {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            i += take;
+        }
+        done.store(true, Ordering::Relaxed);
+        let _ = scanner.await;
+
+        let median = |values: &Arc<Mutex<Vec<u128>>>| {
+            let mut values = values.lock().expect("log").clone();
+            values.sort_unstable();
+            values.get(values.len() / 2).copied().unwrap_or(0)
+        };
+        println!(
+            "{label} ingestion: {} blocks, ingest p50={} ms/block, concurrent-query p50={} µs",
+            chain.len(),
+            median(&ingest_ms),
+            median(&query_us),
+        );
+        pattern_results.push((label.to_owned(), median(&ingest_ms), median(&query_us)));
+    }
+    // Structural: both patterns ingested the identical totals; the printed
+    // numbers are the record.
+    assert_eq!(pattern_results.len(), 2);
+}

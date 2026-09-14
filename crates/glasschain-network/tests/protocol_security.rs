@@ -343,8 +343,12 @@ async fn block_from_unauthenticated_peer_is_ignored() {
         .expect("timeout waiting for chain reply")
         .expect("chain reply missing");
     match reply {
-        Message::Chain(chain) => {
-            assert_eq!(chain.len(), 1, "unauthenticated block must not be appended");
+        Message::Chain { blocks, .. } => {
+            assert_eq!(
+                blocks.len(),
+                1,
+                "unauthenticated block must not be appended"
+            );
         }
         other => panic!("expected Chain reply, got {other:?}"),
     }
@@ -390,11 +394,11 @@ async fn block_too_far_ahead_requests_chain() {
 
     let reply = timeout(Duration::from_secs(2), reader.receive())
         .await
-        .expect("timeout waiting for RequestChain")
+        .expect("timeout waiting for RequestChainFrom")
         .expect("reply missing");
     assert!(
-        matches!(reply, Message::RequestChain),
-        "expected RequestChain, got {reply:?}"
+        matches!(reply, Message::RequestChainFrom { from_index: 1 }),
+        "expected a height-bounded catch-up request from index 1, got {reply:?}"
     );
     assert_eq!(node.ledger_snapshot().await.chain.len(), 1);
 }
@@ -465,7 +469,7 @@ async fn transaction_from_unauthenticated_peer_is_ignored() {
             .await
             .expect("timeout waiting for chain reply")
             .expect("chain reply missing"),
-        Message::Chain(_)
+        Message::Chain { .. }
     ));
 }
 
@@ -577,7 +581,7 @@ async fn goodbye_is_handled_gracefully() {
             .await
             .expect("timeout waiting for chain reply")
             .expect("chain reply missing"),
-        Message::Chain(_)
+        Message::Chain { .. }
     ));
 
     // The client then closes, and the node reports a graceful disconnect.
@@ -994,5 +998,69 @@ async fn copied_certificate_without_private_key_is_rejected() {
             .await,
         None,
         "a copied certificate without its key must not deliver private payloads"
+    );
+}
+
+/// (4b) Latency plan #4: a `Chain` suffix from a Hello-verified peer is
+/// folded block by block through the standard admission path — a node that
+/// is behind catches up without adopting anything wholesale, and a block
+/// that does not chain is rejected while the rest still applies.
+#[tokio::test]
+async fn chain_suffix_folds_through_block_admission() {
+    let addr = free_addr();
+    let node = Node::new("suffix-node", &addr, 1);
+    node.start(vec![]).await.unwrap();
+
+    let (_reader, mut writer) =
+        complete_hello(&addr, CLIENT_CERT_A, "suffix-client", "127.0.0.1:1").await;
+
+    let genesis = node.ledger_snapshot().await.chain.remove(0);
+    let mut blocks = Vec::new();
+    let mut previous = genesis;
+    for index in 1..=3u64 {
+        let mut block = Block::new(index, vec![], previous.hash.clone());
+        block.mine(1);
+        blocks.push(block.clone());
+        previous = block;
+    }
+    writer
+        .send(&Message::Chain {
+            from_index: 1,
+            blocks: blocks.clone(),
+        })
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the suffix was not adopted in time"
+        );
+        if node.ledger_snapshot().await.chain.len() == 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        node.ledger_snapshot().await.chain[3].hash,
+        blocks[2].hash,
+        "the tip is the suffix's last block"
+    );
+
+    // A suffix carrying a non-chaining block is rejected per block.
+    let mut bad = Block::new(4, vec![], "not-the-tip".into());
+    bad.mine(1);
+    writer
+        .send(&Message::Chain {
+            from_index: 4,
+            blocks: vec![bad],
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        node.ledger_snapshot().await.chain.len(),
+        4,
+        "a non-chaining suffix block must not be appended"
     );
 }
