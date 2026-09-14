@@ -402,6 +402,29 @@ mod tests {
     }
 
     #[test]
+    fn test_committed_blocks_survive_provider_reopen() {
+        // ADR-016 regression: a block accepted by `apply_block` is discoverable
+        // after another provider instance is opened over the same directory
+        // (the process-restart half of the durability promise; power loss is
+        // covered by quorum replication plus here by sled's flush). Reopening
+        // first (`drop` then reopen) matters: in-memory copies must not mask
+        // what actually persisted.
+        let (store, dir) = open_temp();
+        let g = genesis();
+        store.apply_block(&g).unwrap();
+
+        let dir = dir.keep();
+        drop(store);
+        let reopened = SledStorageProvider::open(&dir).expect("reopen");
+        assert_eq!(reopened.latest_block_index().unwrap(), Some(0));
+        assert_eq!(reopened.get_block(0).unwrap().unwrap().hash, g.hash);
+        assert!(reopened.get_state("no-such-key").unwrap().is_none());
+        reopened.flush().unwrap();
+        drop(reopened);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
     fn test_provider_name() {
         let (store, _dir) = open_temp();
         assert_eq!(store.name(), "sled");

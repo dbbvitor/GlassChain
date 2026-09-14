@@ -111,6 +111,190 @@ No production capacity claim: loopback, in-process, synthetic workload. The
 backend selection per se does not assert sub-second finality at scale — the
 measured p50 at 300 is ~4.0 s on loopback.
 
+### Phase decomposition (2026-09-14, Step 0 instrumentation)
+
+`run_vote_round` now records per-phase wall clock
+(`Node::last_round_phase_timings`, printed per round and as p50s in the gate
+summary). First recorded run, release, same shared 4-core host as the table
+above, 10 rounds:
+
+| Validators | finality p50 | proposal | prevote | prevote-agg | precommit | precommit-agg | replication |
+|---|---|---|---|---|---|---|---|
+| 100 | 1 145 ms | 3 ms | 237 ms | 196 ms | 420 ms | 196 ms | ~230 ms |
+| 300 | 4 612 ms | 16 ms | 916 ms | 619 ms | 2 215 ms | 620 ms | ~1.6 s |
+
+Notes: `precommit` includes the Precommit broadcast and the validators'
+prevote-certificate re-verification; the aggregation columns are the leader's
+aggregate + certificate assembly only (blst sum-of-keys — flat ~0.2/0.6 s
+reflected in the round's collection intervals, not in verify). Phase sums
+(~4 385 ms at 300) sit just under the 4 612 ms finality; the separately
+polled replication lags the in-memory commit and overlaps the post-commit
+window, so finality is not the sum. Run-to-run variance on this shared host is
+±15 % (the 2026-09-13 run recorded 3 996 ms; same gate, same day). The
+dominant measured cost remains the two vote-collection phases against the
+full mesh — mesh fan-out (Step 6) is the lever, verification is not
+(~1.8 ms/cert — unchanged).
+
+Operationally noted: the gate needs a raised fd limit above 65 535 at 300
+validators (the full mesh holds ~180 K sockets across the harness process —
+`ulimit -n 524288` passed; 65535 aborts with `Too many open files`).
+
+### Wire codec profile (2026-09-14, Step 1, ADR-015 shape)
+
+`cargo bench -p glasschain-network --features bft --bench wire_codec`
+(release). Message variants that make up one round, current BLS wire (`/6`,
+base64 signatures + bitmap certificate):
+
+| Variant | wire size | encode | decode |
+|---|---|---|---|
+| Block (200-signer certificate attached) | 628 B | 0.97 µs | 1.31 µs |
+| Vote | 569 B | 1.01 µs | 1.23 µs |
+| Proposal (pre-certificate block) | 651 B | 1.02 µs | 1.44 µs |
+| Precommit (block + prevote certificate) | 660 B | 1.03 µs | 1.47 µs |
+
+Attribution: a round at 300 moves ~1 proposal + 1 precommit (leader) and
+~300 votes + ~300 precommit echoes (validators) — even 300 × 1.5 µs ≈
+**0.5 ms** across both phases, against measured collection phases of 916 ms
+and 2 215 ms. Codec cost is **<1 % of the round**. Decision: no binary
+encoding; JSON stays the wire format.
+
+### D3 admission after the incremental index (2026-09-14, Step 3)
+
+`Ledger::add_transaction` no longer rebuilds capability history or scans
+committed IDs per admission: an incremental capability history plus a
+committed-ID set fold chain-wise (rebuilt as one full scan when first
+needed, reset on chain replacement; `Ledger` carries untracked marker
+fields that a deserialized ledger rebuilds lazily). Before/after on the
+same `ledger_admission` bench (release, 64-admission bursts):
+
+| History size | before (rebuild per admission) | after | change |
+|---|---|---|---|
+| 1 000 | ~2.3 ms | ~0.19 ms | −92 % |
+| 10 000 | ~21.3 ms | ~0.19 ms | −99.1 % |
+
+Admission cost is **flat in history size** (176–190 µs across 100/1 000/10
+000, dominated by the burst's mining setup), and duplicate IDs no longer pay
+the rebuild (188 µs, was ~21 ms at 10k). Canonical validation semantics
+unchanged — the folded index agrees with a from-genesis rebuild and resets on
+chain replacement (regression: `test_d3_index_semantics_match_full_rebuild…`).
+
+### Latency-plan opportunities (2026-09-14, Step 5 review → `.agents/plans/latency-opportunities.md`)
+
+After-evidence run at 300 (release, same shared host, 10 rounds, all items
+live — bounded-concurrency vote verification, priority lanes, height-bounded
+catch-up, reconnect backoff):
+
+| Phase | before (2026-09-14 a.m.) | after | change |
+|---|---|---|---|
+| finality p50 | 4 612 ms | **4 117 ms** | −11 % |
+| prevote collect | 916 ms | 783 ms | −15 % |
+| precommit collect | 2 215 ms | 1 904 ms | −14 % |
+
+Quorum stays exact-201 every round; the gate's convergence polls unchanged.
+Per-item evidence:
+
+- **Bounded-concurrency vote verification** (`collect_phase_votes` verifies
+  bursts on `spawn_blocking`, batch ≤ cores; distinct-voter/dedup/deadline
+  semantics preserved — `concurrent_verification_keeps_distinct_voter_quorum_under_burst`).
+  Drives the prevote/precommit reductions above.
+- **Consensus/background priority lanes**: two bounded queues per peer,
+  consensus-class (Proposal/Precommit/Block/Vote/Chain) drained first, with
+  per-class drop counters (`dropped_outbound` / `dropped_background`).
+  Flood/liveness behavior unchanged in the §8.4 in-process tests; zero-trust
+  unchanged (scheduling only).
+- **Height-bounded catch-up**: `RequestChainFrom { from_index }` +
+  `Chain { from_index, blocks }` (wire `/7`); the too-far-ahead path now
+  pulls only the missing suffix and the receiver folds every block through
+  the standard single-block admission path (regression:
+  `chain_suffix_folds_through_block_admission`). Reconnect sync picks the
+  shape: fresh nodes bootstrap with the full chain + one rebuild, nodes
+  holding history pull the suffix only.
+  `chain_catch_up_recovery_at_1k_blocks_opt_in` recorded a 1 004-block
+  bootstrap in **272 ms** (release, loopback mesh).
+- **Reconnect backoff**: 1 s → 2 s → capped 5 s instead of flat 5 s
+  (`reconnect_backoff_ladder`); handshake reset clears the ladder.
+- **Step 7 churn exercise** (`validator_set_churn_reconfigures_the_round`):
+  after the four-validator set certifies block 3, a governance delete
+  removes one validator; the height-4 round commits under the reconfigured
+  set — quorum exactly 3-of-3, proposer rotated, registry cache invalidated
+  by content hash, identical tips on every node (including the removed one).
+  The in-repo half of the epoch-change exercise; failure-domain placement
+  and fleet participation metrics remain deployer evidence.
+- **Step 5 fault profile** (`bft_vote_rounds.rs` leader-quorum-loss): the
+  round **fails closed at 3.01 s** under the phase deadline — no node
+  finalizes without quorum reach — and after link repair the round commits
+  in **173 ms**. Safety boundary measured, not assumed.
+- **Step 6 offered-load saturation** (`bft_offered_load_saturation_100_validators`,
+  release, 100 validators, 5 unloaded + 8 loaded rounds, burst size
+  env-overridable): unloaded finality p50 1 158–1 170 ms; the measured curve:
+
+  | burst txs/round | finality p50 (p99) | pool depth / bytes | drain | rejections |
+  |---|---|---|---|---|
+  | 400 | 1 229 ms (+6 %) | 400 / 73 KB | 8/8 | 0 |
+  | 2 000 | 1 774 ms (+52 %, p99 1 958) | 2 000 / 368 KB | 8/8 | 0 |
+  | 5 000 | 3 330 ms (+187 %, p99 3 543) | 5 000 / 925 KB | 8/8 | 0 |
+  | 9 000 | **8 294 ms round 1** | 8 000 / 1.48 MB | round 1 | **1 000** (bound engaged) |
+
+  At 9 000-tx bursts on the pre-batching code the gate **failed**: after the
+  1 000 explicit rejections (the operator-visible bound), the ~1.4 MB block
+  never converged across the 100-validator mesh within the 120 s poll.
+  **The failing budget was found: replication of ~1.5 MB blocks** — the
+  measured trigger for batching.
+- **Step 6 batching (shipped, same study re-run)**: `MAX_BLOCK_TRANSACTIONS
+  = 4_000` slice per round; excess stays pending and flows into the next
+  rounds; stale-tip restores bypass the bound (`test_restore_bypasses_the_bound`,
+  `test_slice_quota_spreads_a_burst_across_rounds`). The 9 000-tx probe now
+  **sustains**: 4 000-tx (≈740 KB) blocks converge 8/8, 4 000 committed per
+  round with a 4 000-tx backlog and 3 000–4 800 explicit rejections per
+  round, finality p50 **5 275 ms** under sustained 9 000-tx offered load
+  (was 8.3 s + convergence failure). Default 2 000-tx bursts: p50 1 728 ms,
+  full drain 8/8 (fits one slice). The failing budget is not reachable at
+  this scale anymore — the bound is the designed operator signal, not an
+  emergency valve.
+- **Scale table (2026-09-14, all optimizations live, release, same host):**
+  10 validators → finality p50 **194 ms** (quorum 7 exact); 100 → 1 145 ms;
+  200 → 2 468 ms (quorum 134 exact); 300 → 4 117 ms (quorum 201 exact).
+- **§5 read-path gaps closed** (`read_path_memory.rs`, release):
+  *lagging subscriber* — publishing 5 000 events into a 4 096-slot bus
+  reports exactly `published − capacity` = **904** drops to the lagged
+  receiver (`Lagged(n)`), observed within 2 µs; the drop count is the
+  operator-visible signal. *Bursts vs steady* (1 250 blocks, 10 000
+  registrations, concurrent O(rows) query load): ingestion sub-ms/block in
+  both patterns; concurrent-query p50 **105 µs** steady vs **73 µs** bursty
+  — the analytics consumer does not explode under burst input. Node-level
+  peak-RSS remains open (needs a node-level harness).
+- **Step 6 straggler scenario** (`vote_round_commits_without_a_bandwidth_starved_validator`):
+  one validator paced at 4 KiB/s + 100 ms one-way; the height-3 round
+  commits in **148 ms** on the 3-of-4 quorum with identical tips. CPU
+  throttling is not proxy-simulable — this covers the network side of a
+  slow validator.
+- **Gossip relay of blocks — measured, REVERTED.** k-fanout relay with a
+  seen-ring dedup was implemented and measured on a 100-node mesh: with
+  deterministic per-relayer windows the union of waves leaves **permanent
+  coverage gaps** (nodes stuck behind the tip with no pull trigger), and
+  even with per-relay entropy rotation waves stalled. The existing
+  leader-serial block fan-out is already pipelined by the concurrent
+  per-peer writer tasks, so replication at 300 is bound by receiver-side
+  post-commit work (per-node validate + index + watcher on shared cores),
+  not by leader sends — relay cannot move that number. Reverted before
+  merge; the negative result redirects Step 6's remaining work to per-node
+  post-commit cost, not dissemination shape. Full mesh-wide relay needs
+  pull-based anti-entropy (a design project, not a patch).
+
+### Mempool bound and handshake re-audit (2026-09-14, Step 6)
+
+- Bounded pending-pool admission: `MAX_PENDING_TRANSACTIONS = 8 000`;
+  overflow rejects with an operator-visible error (`pending pool is full`),
+  duplicates ride free, a mine drains the bound (regression:
+  `test_pending_pool_bound_rejects_and_drains`). Wire-frame consequence: an
+  8 000-tx small-workload pool stays in one round well under the 16 MiB
+  frame limit.
+- Handshake-budget audit re-run: shaped-from-byte-one relays formed 300-ms-jitter
+  meshes at 60 ms (604 ms), 100 ms (812 ms), 140 ms (1 207 ms), and a round
+  commits at every profile — the ≥120 ms formation stall recorded on
+  2026-09-09 is not reproduced on current main (`tcp_partition.rs`
+  `real_tcp_wan_handshake_budget_audit_opt_in`, re-runnable).
+
 ---
 
 **Observed, honestly — ATTRIBUTED and FIXED (2026-09-03, #62 Step 0):**

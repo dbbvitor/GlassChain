@@ -8,6 +8,25 @@ use serde::{Deserialize, Serialize};
 /// Default Proof-of-Work difficulty (number of leading zero characters required).
 pub const DEFAULT_DIFFICULTY: usize = 2;
 
+/// Bounded pending-pool admission (Step 6): at most this many transactions
+/// queue for the next block.
+///
+/// A node under flood rejects new submissions beyond the bound instead of
+/// growing the queue without limit — an operator-visible backpressure
+/// signal. The bound also keeps a one-round drain under the 16 MiB wire
+/// frame limit.
+pub const MAX_PENDING_TRANSACTIONS: usize = 8_000;
+
+/// Per-round block slice (Step 6 batching): each mining round commits at
+/// most this many pending transactions.
+///
+/// Keeps a round's wire footprint under the measured mesh-replication
+/// ceiling — a 5 000-tx block (≈925 KB) converged 8/8 at 100 validators in
+/// the saturation study, while ~1.4 MB blocks failed convergence. Excess
+/// transactions remain pending and flow into following rounds; the pool
+/// bound, not this quota, is the admission gate.
+pub const MAX_BLOCK_TRANSACTIONS: usize = 4_000;
+
 /// The `GlassChain` distributed ledger.
 ///
 /// Maintains a validated chain of [`Block`]s and a pool of pending
@@ -20,6 +39,26 @@ pub struct Ledger {
     pub pending_transactions: Vec<Transaction>,
     /// `PoW` difficulty used when mining new blocks.
     pub difficulty: usize,
+    /// One rebuildable admission index (performance Step 3): the incremental
+    /// capability history has folded the first `history_len` chain blocks.
+    /// Untracked marker fields; serde skips them — a deserialized ledger
+    /// rebuilds the index from `chain` on the first admission.
+    #[serde(skip)]
+    #[serde(default)]
+    history_len: usize,
+    /// Incremental capability history folded over `chain[..history_len]`,
+    /// extended block-wise — never rebuilt from genesis per admission.
+    #[serde(skip)]
+    #[serde(default)]
+    capability_history: Option<CapabilityHistory>,
+    /// Committed transaction IDs (idempotency): a full scan builds the set
+    /// once, afterwards it extends block-wise alongside `ids_len`.
+    #[serde(skip)]
+    #[serde(default)]
+    ids_len: usize,
+    #[serde(skip)]
+    #[serde(default)]
+    committed_ids: Option<std::collections::HashSet<String>>,
 }
 
 impl Default for Ledger {
@@ -54,6 +93,10 @@ impl Ledger {
             chain: vec![genesis],
             pending_transactions: Vec::new(),
             difficulty,
+            history_len: 0,
+            capability_history: None,
+            ids_len: 0,
+            committed_ids: None,
         }
     }
 
@@ -75,16 +118,21 @@ impl Ledger {
                 "transaction id must not be empty".into(),
             ));
         }
-        // ponytail: O(chain) capability-history rebuild per admission; the
-        // idempotency scan below is O(chain) anyway — cache when blocks grow.
         let next_height = self.chain.last().map_or(1, |b| b.index + 1);
+        self.fold_capability()?;
         match &tx.kind {
             TransactionKind::CanonicalRecord(ref record) => {
-                let history = CapabilityHistory::build_from_blocks(&self.chain)?;
-                validate_record_under(&history.effective_set(next_height), record)?;
+                let Some(history) = self.capability_history.as_ref() else {
+                    return Err(CoreError::EmptyLedger);
+                };
+                let set = history.effective_set(next_height);
+                validate_record_under(&set, record)?;
             }
             TransactionKind::CapabilityActivation(ref activation) => {
-                let mut history = CapabilityHistory::build_from_blocks(&self.chain)?;
+                let Some(history) = self.capability_history.as_ref() else {
+                    return Err(CoreError::EmptyLedger);
+                };
+                let mut history = history.clone();
                 history.apply(activation.clone(), next_height)?;
             }
             TransactionKind::PolicyUpdate(ref update) => {
@@ -101,16 +149,72 @@ impl Ledger {
             _ => {}
         }
         // Idempotency check: reject if already committed or pending.
+        self.fold_committed_ids();
         let already_committed = self
-            .chain
-            .iter()
-            .flat_map(|b| b.transactions.iter())
-            .any(|t| t.id == tx.id);
+            .committed_ids
+            .as_ref()
+            .is_some_and(|ids| ids.contains(&tx.id));
         let already_pending = self.pending_transactions.iter().any(|t| t.id == tx.id);
         if !already_committed && !already_pending {
+            if self.pending_transactions.len() >= MAX_PENDING_TRANSACTIONS {
+                return Err(CoreError::InvalidTransaction(format!(
+                    "pending pool is full ({MAX_PENDING_TRANSACTIONS} transactions); \
+                     wait for the next block before resubmitting"
+                )));
+            }
             self.pending_transactions.push(tx);
         }
         Ok(())
+    }
+
+    /// Fold `chain[history_len..]` into the incremental capability index:
+    /// identical semantics to `CapabilityHistory::build_from_blocks` (each
+    /// block validated under the set effective at its height, ADR-010), but
+    /// the cost is the tail, not the whole chain. Indexes reset on chain
+    /// replacement; a deserialized ledger is empty-tracked and folds on the
+    /// first admission.
+    fn fold_capability(&mut self) -> Result<(), CoreError> {
+        if self.history_len == self.chain.len() {
+            return Ok(());
+        }
+        let history = self
+            .capability_history
+            .get_or_insert_with(CapabilityHistory::default);
+        while self.history_len < self.chain.len() {
+            history.validate_block(&self.chain[self.history_len].clone())?;
+            self.history_len += 1;
+        }
+        Ok(())
+    }
+
+    /// The committed-ID set (idempotency): full scan once, block-wise after.
+    fn fold_committed_ids(&mut self) {
+        if self.committed_ids.is_none() {
+            let mut set = std::collections::HashSet::new();
+            for block in &self.chain {
+                for tx in &block.transactions {
+                    set.insert(tx.id.clone());
+                }
+            }
+            self.ids_len = self.chain.len();
+            self.committed_ids = Some(set);
+            return;
+        }
+        let ids = self.committed_ids.as_mut().expect("present");
+        while self.ids_len < self.chain.len() {
+            for tx in &self.chain[self.ids_len].transactions {
+                ids.insert(tx.id.clone());
+            }
+            self.ids_len += 1;
+        }
+    }
+
+    /// Drop the incremental admission indexes (chain was replaced).
+    fn reset_indexes(&mut self) {
+        self.history_len = 0;
+        self.capability_history = None;
+        self.ids_len = 0;
+        self.committed_ids = None;
     }
 
     /// Mine a new block containing all pending transactions.
@@ -130,27 +234,59 @@ impl Ledger {
     pub fn mine_pending_transactions(&mut self) -> Result<&Block, CoreError> {
         let previous = self.chain.last().ok_or(CoreError::EmptyLedger)?.clone();
         let index = previous.index + 1;
-        let transactions = std::mem::take(&mut self.pending_transactions);
+        // Step 6 batching: drain one slice, not the whole pool.
+        let take = self.pending_transactions.len().min(MAX_BLOCK_TRANSACTIONS);
+        let transactions: Vec<Transaction> = self.pending_transactions.drain(..take).collect();
         let mut block = Block::new(index, transactions, previous.hash);
         block.mine(self.difficulty);
         self.chain.push(block);
+        self.fold_committed_ids();
         Ok(self.chain.last().expect("just pushed"))
     }
 
-    /// Snapshot the chain tip and drain the pending pool for **out-of-lock** mining.
+    /// Snapshot the chain tip and drain one **slice** of the pending pool for
+    /// out-of-lock mining (Step 6 batching: at most
+    /// [`MAX_BLOCK_TRANSACTIONS`], so a round's block stays under the
+    /// measured replication ceiling; the rest stays pending for the next
+    /// rounds).
     ///
     /// Returns `(index, previous_hash, pending_transactions, difficulty)`.
-    /// After calling this the pending pool is empty; the caller must either
-    /// commit the mined block via [`commit_mined_block`] (which also handles
-    /// restoring transactions on a stale tip) or push the transactions back
-    /// manually.
+    /// After calling this the pending pool holds at most
+    /// `len - MAX_BLOCK_TRANSACTIONS`; the caller must either commit the
+    /// mined block via [`commit_mined_block`] (which also handles restoring
+    /// transactions on a stale tip) or push the transactions back manually.
     ///
     /// # Errors
     /// Returns `Err(CoreError::EmptyLedger)` if the chain is empty.
     pub fn prepare_mining(&mut self) -> Result<(u64, String, Vec<Transaction>, usize), CoreError> {
         let prev = self.chain.last().ok_or(CoreError::EmptyLedger)?.clone();
-        let txns = std::mem::take(&mut self.pending_transactions);
+        let take = self.pending_transactions.len().min(MAX_BLOCK_TRANSACTIONS);
+        let txns: Vec<Transaction> = self.pending_transactions.drain(..take).collect();
         Ok((prev.index + 1, prev.hash, txns, self.difficulty))
+    }
+
+    /// Return a transaction to the pending pool without re-admission gating
+    /// (stale-tip restore path): these transactions were already admitted,
+    /// so the bound must never make the restore lose them — a transiently
+    /// oversized pool is correct, silently dropped resubmissions are not.
+    pub fn restore_transaction(&mut self, tx: Transaction) {
+        if self
+            .committed_ids
+            .as_ref()
+            .is_some_and(|ids| ids.contains(&tx.id))
+        {
+            return;
+        }
+        // Idempotent restore: the stale-tip path restores the exact set that
+        // was drained, but a repeated restore must not double-count.
+        if self
+            .pending_transactions
+            .iter()
+            .any(|queued| queued.id == tx.id)
+        {
+            return;
+        }
+        self.pending_transactions.push(tx);
     }
 
     /// Append a pre-mined block if `expected_prev_hash` still matches the chain tip.
@@ -174,9 +310,11 @@ impl Ledger {
             .hash
             .clone();
         if tip_hash != expected_prev_hash {
-            // Chain advanced while we were mining; restore transactions to pool.
+            // Chain advanced while we were mining; restore transactions to
+            // the pool without re-admission gating — they were already
+            // admitted, so the bound must not drop them here.
             for tx in block.transactions {
-                let _ = self.add_transaction(tx);
+                self.restore_transaction(tx);
             }
             log::warn!("Mined block is stale (chain tip moved); transactions restored to pool");
             return Ok(false);
@@ -186,11 +324,25 @@ impl Ledger {
         // height, and every policy update under the replayed policy history
         // (including the same-block policy/write conflict rule), so a crafted
         // block never commits invalid content.
-        let mut history = CapabilityHistory::build_from_blocks(&self.chain)?;
+        self.fold_capability()?;
+        let Some(history) = self.capability_history.as_mut() else {
+            // fold_capability fills the cache; this arm is unreachable but
+            // cannot be unwrapped without a justification.
+            return Err(CoreError::EmptyLedger);
+        };
         history.validate_block(&block)?;
         let mut policies = PolicyHistory::build_from_blocks(&self.chain)?;
         policies.validate_block(&block)?;
         self.chain.push(block);
+        // The validated block is already folded into the capability history;
+        // mark it consumed and keep the ID set current.
+        self.history_len = self.chain.len();
+        if let Some(ids) = self.committed_ids.as_mut() {
+            self.ids_len = self.chain.len();
+            for tx in &self.chain[self.chain.len() - 1].transactions {
+                ids.insert(tx.id.clone());
+            }
+        }
         Ok(true)
     }
 
@@ -304,6 +456,7 @@ impl Ledger {
             candidate.len()
         );
         self.chain = candidate;
+        self.reset_indexes();
         true
     }
 
@@ -385,6 +538,93 @@ mod tests {
         Transaction::with_id("canonical:1", TransactionKind::CanonicalRecord(record))
     }
 
+    /// Step-6 bounded admission: a full pool rejects new submissions with an
+    /// explicit error instead of growing without limit, duplicates still ride
+    /// free (idempotency never consumes capacity), and a drain clears the
+    /// bound.
+    #[test]
+    fn test_pending_pool_bound_rejects_and_drains() {
+        let mut ledger = Ledger::new(1);
+        for i in 0..MAX_PENDING_TRANSACTIONS {
+            let mut tx = inventory_tx("owner-mempool");
+            tx.id = format!("mempool-{i}");
+            ledger.pending_transactions.push(tx); // push directly: 8k mines would be slow
+        }
+        let overflow = inventory_tx("owner-mempool");
+        let error = ledger
+            .add_transaction(overflow)
+            .expect_err("a full pool must reject");
+        assert!(
+            error.to_string().contains("pending pool is full"),
+            "the error must be operator-visible: {error}"
+        );
+        // Duplicates do not consume capacity: the pool stays at the bound.
+        let duplicate = ledger.pending_transactions[0].clone();
+        ledger
+            .add_transaction(duplicate)
+            .expect("duplicate rides free");
+        assert_eq!(ledger.pending_transactions.len(), MAX_PENDING_TRANSACTIONS);
+        // A slice drains per round (Step 6 batching): one mine commits
+        // MAX_BLOCK_TRANSACTIONS, the backlog persists into the next rounds.
+        ledger.mine_pending_transactions().expect("drain one slice");
+        assert_eq!(
+            ledger.pending_transactions.len(),
+            MAX_PENDING_TRANSACTIONS - MAX_BLOCK_TRANSACTIONS,
+            "one slice drained, the backlog persists"
+        );
+        let after_drain = inventory_tx("owner-mempool");
+        ledger
+            .add_transaction(after_drain)
+            .expect("room under the bound");
+    }
+
+    /// Step-6 restore path: transactions restored after a stale tip bypass
+    /// the admission bound — an already-admitted transaction is never lost,
+    /// and a transiently oversized pool is correct.
+    #[test]
+    fn test_restore_bypasses_the_bound() {
+        let mut ledger = Ledger::new(1);
+        for i in 0..MAX_PENDING_TRANSACTIONS {
+            let mut tx = inventory_tx("owner-restore");
+            tx.id = format!("restore-{i}");
+            ledger.pending_transactions.push(tx);
+        }
+        let restored = inventory_tx("owner-restore");
+        ledger.restore_transaction(restored.clone());
+        assert_eq!(
+            ledger.pending_transactions.len(),
+            MAX_PENDING_TRANSACTIONS + 1,
+            "the restored transaction is kept even at the bound"
+        );
+        // Re-restoring the same transaction rides free: the restore path
+        // carries the exact txs that were drained, so no pool-side dedup is
+        // needed, but a repeated restore must not double-count either.
+        ledger.restore_transaction(restored);
+        assert_eq!(
+            ledger.pending_transactions.len(),
+            MAX_PENDING_TRANSACTIONS + 1,
+            "the restored transaction is kept even at the bound"
+        );
+    }
+
+    /// Step-6 slice semantics: a burst larger than the slice quota persists
+    /// in the pending pool across rounds and drains over consecutive mines.
+    #[test]
+    fn test_slice_quota_spreads_a_burst_across_rounds() {
+        let mut ledger = Ledger::new(1);
+        for i in 0..(MAX_BLOCK_TRANSACTIONS + 500) {
+            let mut tx = inventory_tx("owner-burst");
+            tx.id = format!("slice-{i}");
+            ledger.add_transaction(tx).expect("burst under the bound");
+        }
+        ledger.mine_pending_transactions().expect("slice 1");
+        assert_eq!(ledger.chain[1].transactions.len(), MAX_BLOCK_TRANSACTIONS);
+        assert_eq!(ledger.pending_transactions.len(), 500, "backlog persists");
+        ledger.mine_pending_transactions().expect("slice 2");
+        assert_eq!(ledger.chain[2].transactions.len(), 500, "the tail drains");
+        assert!(ledger.pending_transactions.is_empty());
+    }
+
     /// A capability activation declaring `activation_height`.
     fn activation_tx(id: &str, activation_height: u64) -> Transaction {
         Transaction::with_id(
@@ -454,6 +694,85 @@ mod tests {
             "candidate with invalid canonical record must be rejected"
         );
         assert_eq!(ledger.chain.len(), 2, "local chain stays authoritative");
+    }
+
+    /// D3 Step 3 regression: admission after a growing committed history
+    /// stays correct — the incremental index must behave exactly like a
+    /// fresh rebuild (same accept/reject/idempotency decisions), including
+    /// after a direct chain-level append (`mine_pending_transactions`) and a
+    /// chain replacement.
+    #[test]
+    fn test_d3_index_semantics_match_full_rebuild_after_history_growth() {
+        let mut ledger = Ledger::new(1);
+        // An activation plus ordinary blocks that grow the chain the index
+        // must track.
+        ledger
+            .add_transaction(activation_tx("canonical_schema_v1", 2))
+            .expect("activation");
+        ledger.mine_pending_transactions().expect("mine block 1");
+        for _i in 0..30usize {
+            ledger.add_transaction(inventory_tx("owner-a")).unwrap();
+            ledger.mine_pending_transactions().expect("mine");
+        }
+        ledger
+            .add_transaction(canonical_tx(true))
+            .expect("canonical record admitted at height > 2");
+
+        // Idempotency across the committed pool: a committed ID is silently
+        // dropped; a distinct ID is admitted.
+        ledger
+            .mine_pending_transactions()
+            .expect("commit the record");
+        ledger
+            .add_transaction(canonical_tx(true))
+            .expect("duplicate is silently ignored");
+        let pending = ledger.pending_transactions.len();
+        ledger
+            .add_transaction(Transaction {
+                id: "distinct-1".into(),
+                ..inventory_tx("owner-b")
+            })
+            .expect("distinct id admitted");
+        assert_eq!(ledger.pending_transactions.len(), pending + 1);
+
+        // The folded history must agree with a from-genesis rebuild.
+        let folded = ledger.capability_history.as_ref().expect("folded");
+        assert_eq!(
+            ledger.history_len,
+            ledger.chain.len(),
+            "the whole chain is folded"
+        );
+        let rebuilt = CapabilityHistory::build_from_blocks(&ledger.chain).expect("valid chain");
+        assert_eq!(
+            folded.effective_set(ledger.chain.len() as u64 + 1),
+            rebuilt.effective_set(ledger.chain.len() as u64 + 1),
+            "incremental index and full rebuild agree on the effective set"
+        );
+
+        // Chain replacement invalidates the index; the next admission folds
+        // the new chain instead of mixing in stale state.
+        let mut longer = ledger.chain.clone();
+        let mut extra = Block::new(
+            longer.last().unwrap().index + 1,
+            vec![inventory_tx("owner-d")],
+            longer.last().unwrap().hash.clone(),
+        );
+        extra.mine(1);
+        longer.push(extra);
+        assert!(
+            ledger.try_replace_chain(longer),
+            "a longer valid candidate replaces"
+        );
+        assert!(ledger.capability_history.is_none());
+        assert_eq!(ledger.history_len, 0, "the index reset");
+        ledger
+            .add_transaction(inventory_tx("owner-c"))
+            .expect("admission works after a replacement");
+        assert_eq!(
+            ledger.history_len,
+            ledger.chain.len(),
+            "index refolded from the new chain"
+        );
     }
 
     #[test]

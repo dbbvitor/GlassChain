@@ -1,10 +1,22 @@
 # Handoff — GlassChain
 
-**Reviewed:** 2026-09-13
-**Source baseline:** `main` / `origin/main` at `523cd42` (PR #116 / `fix/sync-certificate-events-and-doc-drift`).
-**Change branch:** `feat/frontier-a-dual-sign-proof-ci` — dual-sign `EquivocationProof` (Frontier A
-conclusion), parallel-safe test ports and CI speed, workflow badges, Rust
-1.98.1 pin and a dedicated parallel bench workflow.
+**Reviewed:** 2026-09-14
+**Source baseline:** `main` / `origin/main` at `4560f33` (PR #121 / ADR-015 `blst` backend, merged).
+**Latest working sessions (2026-09-14):** performance steps worked in order —
+Step 0 (per-phase round timing + D7 scenarios, ADR-016 durability decision),
+Step 1 (codec profiled — JSON stays the wire), Step 3 (incremental D3
+admission index: flat ~0.19 ms from ~21 ms at 10k), Step 6 installments
+(bounded 8 000-tx pool, stats, priority lanes, handshake re-audit, batching:
+4 000-tx slice — the previously failing 9 000-tx probe now sustains, 740 KB
+blocks converge 8/8, p50 5 275 ms under 9 000-tx offered load), the
+latency-opportunity plan with all gated items executed (concurrent vote
+verification, lanes, height-bounded catch-up wire `/7`, reconnect backoff —
+300-gate p50 4 612 → 4 117 ms), scale table complete (10/100/200/300 →
+194 ms/1.1 s/2.5 s/4.1 s), §5 read-path gaps closed (lagging-subscriber
+drops receiver-observable; burst-vs-steady sub-ms/block), Step 5 fault
+profile recorded (fail-closed 3.01 s, heal 173 ms), #6 declined for now
+(ADR-002 amendment note; rollback design doc exists), block-relay gossip
+measured and reverted. Step 7's in-repo half shipped (validator-set churn across heights — ADR-009 reconfiguration exercised through the driver); Open: node-level peak-RSS harness; 400/500 sweeps under hardware budgets; Step 7's deployment half (failure-domain placement evidence, fleet participation) is deployer work.
 
 ## Start here
 
@@ -26,12 +38,12 @@ conclusion), parallel-safe test ports and CI speed, workflow badges, Rust
 
 | Area | Concluded / available | Still pending |
 |---|---|---|
-| Workspace | 12 Rust crates; wire `glasschain/6`; 15 accepted ADRs; D1–D7 settled | No browser package or demo bridge exists |
+| Workspace | 12 Rust crates; wire `glasschain/6`; 16 accepted ADRs (ADR-016 durability); D1–D7 settled | No browser package or demo bridge exists |
 | Ledger/execution | Schema v1, capability/policy history, explicit WASM write sets and replay | Production durability acknowledgement and historical security gates |
 | Consensus | PoW dev/test default; BLS driver with context-authenticated votes (#95, #99), live receipt journal (#96), full historical QC verification on sync/restart (#97, PR #116), absolute phase deadlines/bounded queues/distinct voters (#98), dual-sign `EquivocationProof` (Frontier A concluded) | Production audit/testnet/APIs (ADR-010) |
 | Identity/privacy | TLS/TOFU with durable pins & signed rotation (#88), opt-in verifier with fail-closed private paths (#86), session-bound possession proofs (#110), CRLs/intermediates (ADR-013), cert-bound MSP principals with height authorization (#87, D4), fail-closed governance fallback (D1), issuer-signed recall (D2), restart-safe purge (D5) & triage discovery (D6) | OCSP verification & stapling, deployment access (operator RBAC/channel-management operations), explicit replica/backup retention policy, deferred on-chain revocation (#74) |
 | Workflows/read path | Checkpointed flow engine, purchase/recall flows, triage API with restart discovery (D6), provenance/flattener/event bus and RPC queries; D3 baseline measured (#106) | Unattended external integration, durable external indexer adapter, bounded projection costs |
-| Measurements | BFT finality on `blst` (ADR-015): p50 1 096 ms at 100 / 2 397 ms at 200 / 3 996 ms at 300, exact quorum every round. The 300 gate passes; verify is no longer the wall. D3 admission bench (~21 ms at 10k); read-path memory baseline (#107); D7 WAN proxy profiles (#108) | Long-run fleet memory; 400/500 sweep is out of scope |
+| Measurements | BFT finality on `blst` (ADR-015): p50 1 145 ms at 100 / 4 612 ms at 300 (2026-09-14) with the per-phase decomposition recorded; the 300 gate passes and verify is no longer the wall (fan-out is). D3 admission bench (~21 ms at 10k); read-path memory baseline (#107); D7 WAN scenarios (proxy #108 + leader-quorum loss + bandwidth budget); Step 0 marked done | Long-run fleet memory; 400/500 sweep is out of scope; slow-CPU/disk WAN scenario |
 | PQ readiness | Discriminants shipped; negotiated X25519MLKEM768 hybrid TLS behind `pq-tls` shipped (#105) | Long-term archive evidence / migration policy; no guaranteed quantum-safe lifetime |
 | Demonstration | Web-app direction and browser/bridge/renderer acceptance gates specified | Entire implementation; Canvas2D baseline, optional WebGPU (Frontier D, queued after C and B) |
 

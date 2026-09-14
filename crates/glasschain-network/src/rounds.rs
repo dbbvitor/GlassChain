@@ -164,6 +164,26 @@ impl VoteReceipts {
     }
 }
 
+/// Per-phase wall-clock split of one successful vote round on the leader.
+///
+/// Performance Step 0 instrumentation: proposal/vote/verify/commit are
+/// measured separately, so a round budget can be attributed to its phases
+/// instead of collapsing into one end-to-end number. Wall-clock milliseconds,
+/// recorded at phase completion.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BftPhaseTimings {
+    /// Proposal broadcast enqueue duration (fan-out, not delivery).
+    pub proposal_broadcast: u128,
+    /// Prevote collection (includes the voters' block verification).
+    pub prevote: u128,
+    /// Prevote aggregate + certificate assembly.
+    pub prevote_aggregate: u128,
+    /// Precommit collection (includes prevote-certificate re-verification).
+    pub precommit: u128,
+    /// Precommit aggregate + final certificate assembly.
+    pub precommit_aggregate: u128,
+}
+
 /// Deterministic proposer for `(height, round)`: round-robin over the
 /// validator set's canonical order (ADR-009 — one org one slot, equal power).
 #[cfg(feature = "bft")]
