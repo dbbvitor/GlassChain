@@ -1,7 +1,7 @@
 # Plan — Best-in-class performance within zero-trust, ICP and LGPD constraints
 
-**Status:** active; Step 0 baselines (WAN proxy #108, D3 bench #106, read-path RSS #107) and hybrid TLS (#105) complete; active Priority Frontier C is Step 4 (BLS pairing backend / unblock 300-validator gate)
-**Reviewed:** 2026-09-12 against `7143c0c`
+**Status:** active; Step 0 baselines (WAN proxy #108, D3 bench #106, read-path RSS #107) and hybrid TLS (#105) complete; **Frontier C concluded 2026-09-13** — Step 4 (BLS backend, ADR-015) shipped: `blst` selected, sum-of-keys verify, 300-validator gate passing (p50 3 996 ms). Next open steps: Step 1 codec profiling, D3 admission optimization, Step 5+.
+**Reviewed:** 2026-09-13 against main
 **History:** [Performance programme](https://github.com/dbbvitor/GlassChain/issues/62) is closed, not proof that every step or production gate passed.
 **Related:** [ADR-002](../../docs/adr/adr-002-consensus-finality.md), [ADR-004](../../docs/adr/adr-004-scale-topology.md), [ADR-010](../../docs/adr/adr-010-capability-versioning-policy.md), [ADR-014](../../docs/adr/adr-014-bls-aggregated-certificates.md), [zero-trust](zero-trust.md), [source-comment debt](deferred-code-debt.md).
 
@@ -168,6 +168,42 @@ batch export/pagination and a rebuildable projection come before a new
 database or service. A slow analytics consumer must not block consensus, and
 loss recovery must replay committed history rather than silently omit events.
 
+## Frontier C residual map (2026-09-13, post-ADR-015)
+
+With the backend swap and the sum-of-keys verify landed, certificate
+verification is flat at ~1.8 ms (quorum 201) and is **no longer a scaling
+lever** — the two changes that were, are done. The measured round budget at
+300 (p50 3 996 ms) now decomposes roughly as: vote collection + aggregation
+(sub-second) and **mesh replication ~1.31 s** of fan-out to 300 peers. The
+remaining improvement opportunities, ranked by measured headroom:
+
+1. **Mesh replication / fan-out at scale (Step 6, biggest headroom).** 1.3 s of
+   a 4 s round at 300 is the leader broadcasting blocks and collecting votes
+   point-to-point over a full mesh. Bounded admission, batching and
+   explicit backpressure come before any Narwhal-style availability layer.
+   Sub-item: the §5 handshake-budget finding (mesh formation stalls at
+   ≥~120 ms shaped delay) gates WAN profiles before scaling them.
+2. **D3 admission rebuild (Step 3).** ~21 ms per canonical admission at a
+   10 000-record history, linear, duplicate IDs pay the same rebuild. One
+   rebuildable capability/ID index at the owning layer — not a per-caller fix.
+3. **Codec cost (Step 1).** JSON encode/decode never profiled with the current
+   BLS shape (sub-1 KB certificates and 48-byte keys are new since the last
+   measurement). Binary encoding only if profiling says it matters.
+4. **Durability promise (§4).** What "committed" guarantees across power loss
+   is undecided — periodic Sled flush is not a durability acknowledgement.
+   Decide before any pilot; measure crash recovery, keep finality metrics
+   separate.
+5. **Read-path bounds (§5).** Flattener/provenance projections are linear
+   (~3 KiB/record, 299 MiB @ 100 k) and ingest inside `after_block_commit`;
+   bounded export + rebuildable projection remain the fix path if deployment
+   scale budgets fail.
+6. **Steps 5 and 7 — research only.** HotStuff-1-style latency candidates need
+   a design/prototype with fallback/fault assumptions; liveness placement
+   enforcement is operational, not a code change.
+
+Not opportunities: sampled committees or probabilistic finality (§2), a new
+WAL (§4), or unsafe/C beyond ADR-015's conditions (ADR-015 §1).
+
 ## 6. Ordered path (stable Step 0–7 names)
 
 - [ ] **Step 0 — trustworthy measurement and safety baseline.** Retain both
@@ -195,14 +231,19 @@ loss recovery must replay committed history rather than silently omit events.
   arm is minor at a 1 000-record history. Optimize the shared
   ownership/invalidation (one rebuildable capability/ID index at the owning
   layer), not just one caller.
-- [ ] **Step 4 — BLS follow-up, not a new adoption.** Aggregation shipped. QC
-  signature is 96 bytes **plus `ceil(n/8)` bitmap and metadata**; the whole
-  certificate is not O(1). `verify_same_message_multisig` currently performs
-  O(quorum) pairing terms. Compare PoP-validated aggregate-public-key verification
-  and an audited `blst` path before selecting a backend. Check subgroup/identity
-  rejection, duplicate keys/signers, signed message domains and byte-for-byte
-  compatibility against existing fixtures. [Backend review](https://github.com/dbbvitor/GlassChain/issues/85)
-  records the trade; no speed multiplier or passing 300 gate is assumed.
+- [x] **Step 4 — BLS backend: done (ADR-015, 2026-09-13).** The audited `blst`
+  C backend is selected and the pure-Rust `pairing` path is retired, decided
+  once as policy ADR-015 ([#85](https://github.com/dbbvitor/GlassChain/issues/85)
+  — accepted, feature-gated, byte-identical signatures; `aws-lc-rs` was already
+  behind `pq-tls`). The same-message verify moved from a 202-term
+  multi-Miller loop to the **sum-of-keys PopScheme check over `blstrs`** —
+  two pairing terms at any quorum size (`crates/glasschain-core/src/bft.rs`,
+  PoP at registration is the rogue-key defense). Measured
+  (`cargo bench -p glasschain-core --bench bft_verify`): pure-Rust 80.0 ms →
+  blst sum-of-keys 1.78 ms at quorum 201. **The 300-validator gate now passes**
+  (p50 3 996 ms, exact quorum 201 every round; 100 → 1 096 ms, 200 → 2 397 ms
+  p50 — before/after evidence in `docs/benchmarks/consensus-capacity.md`).
+  Remaining round cost is mesh replication, not verification.
 - [ ] **Step 5 — in-family latency candidates, research only.** Profile and fix
   the existing driver before borrowing HotStuff-1/SBFT ideas. Their safe early
   reply conditions are protocol-specific, not a one-phase toggle. Any proposal

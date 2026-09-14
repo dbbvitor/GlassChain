@@ -74,14 +74,46 @@ The vote-round driver makes REAL deterministic finality measurable. Three
 | 200 | **5 284 ms** | 5 744 | 5 744 | ~3.1 s | exact 134 every round | 5.4 s |
 | 300 | **not passing on the pure-Rust backend** — first vote 34.8 s, then the precommit re-verification herd (299 × 202-pairing multi-miller loops) exceeds the scaled phase budget | | | | | |
 
-**The honest finding:** finality is stable and deterministic at 100 and 200
-(exact-quorum certificates every round, no view changes), and the 300 gate is
-blocked on the **documented `blst`-backend follow-up** — ADR-014's pure-Rust
-pairing cost is O(quorum) per verifier per phase; `blst` shrinks it ~10×.
-This is exactly the scaling wall `phase_timeout(n) = 3 s + n/10` encodes, and
-the liveness doc's §4 guidance (round timeout tracks the ⅔n-th order
-statistic) measured against it. No production capacity claim: loopback,
-in-process, synthetic workload.
+## BFT finality on the `blst` backend (2026-09-13, ADR-015 / #85 swap)
+
+`bls-signatures` moved from the pure-Rust `pairing` backend to the audited `blst`
+C backend (ADR-015), with the same-message verify rewritten over `blstrs` as the
+**sum-of-keys PopScheme check**: per bilinearity the signer keys collapse into
+one G1 sum, so a certificate verification is **two pairing terms regardless of
+quorum size** — not `quorum + 1` Miller loops. The `_300` gate now passes
+end to end, release, loopback, 4-core/15 GB shared host (not 8 threads; mesh
+setup dominated by 44 950 dials):
+
+| Validators | finality p50 | p95 | p99 | replication | quorum/round | first vote |
+|---|---|---|---|---|---|---|
+| 100 | **1 096 ms** | 1 143 | 1 143 | ~210 ms | exact 67 every round | 1.16 s |
+| 200 | **2 397 ms** | 2 508 | 2 508 | ~650 ms | exact 134 every round | 2.32 s |
+| 300 | **3 996 ms** | 4 072 | 4 072 | ~1.31 s | exact 201 every round | 3.94 s |
+
+Before/after: unchanged quorum assumptions, same harness, same machine class —
+p50 −46 % at 100 and −55 % at 200, and the previously unpassable 300 gate
+commits every round at exact quorum 201. Certificate verification is no longer
+the wall: the remaining round cost is dominated by mesh replication (the
+leader's ~4 s budget at 300 now tracks wire fan-out, not pairings).
+
+Micro-benchmark (`cargo bench -p glasschain-core --bench bft_verify`, release,
+same machine; criterion medians):
+
+| Verify path (quorum 201) | time |
+|---|---|
+| pure-Rust `pairing`, 202-term multi-Miller loop | **80.0 ms** |
+| `blst`, 202-term multi-Miller loop | 44.0 ms |
+| `blst`, sum-of-keys (shipped) | **1.78 ms** |
+| pure-Rust `pairing`, 102-term loop / 101 quorum | 42.0 ms |
+| `blst`, sum-of-keys @ 101 | 1.54 ms |
+
+No production capacity claim: loopback, in-process, synthetic workload. The
+backend selection per se does not assert sub-second finality at scale — the
+measured p50 at 300 is ~4.0 s on loopback.
+
+---
+
+**Observed, honestly — ATTRIBUTED and FIXED (2026-09-03, #62 Step 0):**
 
 ---
 

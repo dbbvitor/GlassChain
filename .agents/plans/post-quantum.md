@@ -75,8 +75,10 @@ audit/licence review.
 
 **Cost, uncoupled from a blanket C debate:** aws-lc-sys builds via `cmake`; ring and
 wasmtime already carry C/C++ builds in this graph, so the "audited C backends?"
-question (shared with `blst`, issue #85) is **not a blanket new blockade** — per
-backend, on measured need. The real risk is the CI build.
+question (shared with `blst`, issue #85) is **settled by ADR-015
+(2026-09-13)**: audited C backends are accepted, feature-gated, with CI-matrix
+and cargo-audit conditions. `aws-lc-rs` behind `pq-tls` is its retroactive
+basis. The real risk remains the CI build.
 
 **libp2p:** no action — classical Noise/X25519 has no shipping PQ option (upstream
 `mlkem-hfs` PR open). Do not promote libp2p to the active transport without revisiting.
@@ -185,7 +187,7 @@ Corrected framing (Follow-up 3):
    `install_default`, three ring references in `node.rs`, two in tests), consistent
    feature lines, and a negotiated-group test (`X25519MLKEM768`) on the two-node path.
    Four gates green on Ubuntu, macOS, Windows. No new dependency (aws-lc-rs already
-   locked); the C-backend question shared with issue #85 is per-backend, not a blanket
+   locked); answered retroactively by ADR-015 (issue #85 closed on it)
    blockade.
 2. ~~Add an algorithm discriminant / widen `ValidatorInfo.public_key`~~ **Done
    2026-09-03** (§3). The ML-DSA *migration* stays deferred behind the §3 trigger.

@@ -47,6 +47,12 @@ rotation would make that constant), and a binary-codec-first ordering
 > 10× gain nor passing 300 follows from selecting `blst`. This note does **not**
 > reverse decision 2.
 
+> **Amendment (2026-09-13, ADR-015):** the `blst` C backend is now accepted and
+> selected — decision 2's "no additional C backend" is superseded by
+> [ADR-015](adr-015-audited-c-crypto-backends.md). Decisions 1 and 3–6 (plain
+> multisig, PoP, scope, wire shape, gating) stand; signatures are byte-identical
+> across backends.
+
 ## Decision
 
 1. **Plain BLS12-381 multisignature aggregation** — each participating validator
