@@ -59,6 +59,16 @@ pub enum Message {
         /// nodes without an identity and on older peers.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fingerprint_proof: Option<String>,
+        /// Base64 DER of an issuer-signed OCSP response attesting the
+        /// sender's organization certificate (ADR-017). The receiver verifies
+        /// the staple **locally** against the trust store — no responder
+        /// network queries — and a `revoked` staple fails the session's org
+        /// verification closed; absent, invalid or expired staples fall back
+        /// to the fail-closed CRL path (ADR-013). The org certificate rides
+        /// this Hello (the TLS transport certificate is self-signed), so the
+        /// staple rides the Hello too.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ocsp_response_der: Option<String>,
         /// The sender's stable TCP listening address (e.g. `"192.168.1.5:8000"`).
         ///
         /// Peers must use this address (rather than the TCP source address, which

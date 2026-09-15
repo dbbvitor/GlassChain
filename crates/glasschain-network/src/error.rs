@@ -16,4 +16,9 @@ pub enum NetworkError {
 
     #[error("core error: {0}")]
     Core(#[from] glasschain_core::CoreError),
+
+    /// An admin (ADR-017) operation named a collection this node has not
+    /// configured.
+    #[error("unknown collection `{0}`")]
+    UnknownCollection(String),
 }

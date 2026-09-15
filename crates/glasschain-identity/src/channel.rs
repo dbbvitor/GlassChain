@@ -206,6 +206,15 @@ impl Channel {
             self.config.member_ids.push(nid);
         }
     }
+
+    /// Remove a member from the channel. Returns `true` when `node_id` was a
+    /// member (regulators stay members — they are not listed in
+    /// `member_ids` and cannot be removed this way).
+    pub fn remove_member(&mut self, node_id: &str) -> bool {
+        let was_member = self.member_set.remove(node_id);
+        self.config.member_ids.retain(|id| id != node_id);
+        was_member
+    }
 }
 
 #[cfg(test)]

@@ -32,6 +32,7 @@ tokio        = { version = "1.53", features = [
 thiserror    = "2.0"
 log          = "0.4"
 base64       = "0.23"
+hex          = "0.4"
 tokio-rustls = "0.26"
 rustls       = { version = "0.23", features = ["ring"] }
 rcgen        = "0.14"
@@ -59,7 +60,6 @@ tempfile     = "3"
 ed25519-dalek = "3.0"
 # BLS keys for the bft_finality scenario (cfg-gated with the bft feature).
 bls-signatures = { version = "0.15", default-features = false, features = ["blst"] }
-hex = "0.4"
 glasschain-vm = { path = "../glasschain-vm" }
 glasschain-storage = { path = "../glasschain-storage" }
 criterion = "0.8"

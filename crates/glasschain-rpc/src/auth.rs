@@ -34,10 +34,20 @@
 //! | [`MspAuthInterceptor::new`]        | Passes the request through (backward-compatible) |
 //! | [`MspAuthInterceptor::new_strict`] | Rejects the request with `UNAUTHENTICATED`        |
 
+use base64::Engine as _;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use glasschain_identity::CertChainVerifier;
+use rustls_pki_types::pem::PemObject as _;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Metadata header carrying the caller's base64 DER organization certificate
+/// (ADR-017 admin authorization).
+///
+/// The certificate must verify against this node's trust store, name the
+/// calling node in its subject CN, and carry the admin Organizational Unit.
+pub const CERT_HEADER: &str = "x-glasschain-cert";
 
 // ── TrustedKeyRegistry ────────────────────────────────────────────────────────
 
@@ -303,6 +313,212 @@ impl tonic::service::Interceptor for MspAuthInterceptor {
     }
 }
 
+// ── AdminGate (ADR-017 operator RBAC) ────────────────────────────────────────
+
+/// Certificate-bound operator authorization (ADR-017): a caller is an
+/// **operator administrator** only when every one of these holds:
+///
+/// 1. the three `x-glasschain-*` headers are present and well-formed,
+/// 2. a base64 DER certificate rides `x-glasschain-cert`,
+/// 3. the certificate verifies against this node's trust store — chain,
+///    validity, CRL, all fail-closed (ADR-011/ADR-013),
+/// 4. the certificate's subject CN equals `x-glasschain-node-id`,
+/// 5. the header signature verifies under the **certificate's own key** over
+///    `{node_id}:{timestamp}` — possession, bound to the replay window,
+/// 6. the verified subject carries the admin Organizational Unit
+///    (`glasschain_identity::ADMIN_ROLE`).
+///
+/// Without a configured verifier the gate refuses everything: there is no
+/// trust basis to admit an administrator.
+///
+/// The verifier sits behind a shared lock so an operator can hot-reload the
+/// trust store (`reload-trust-store` REPL command, ADR-017 residual plan
+/// ZT-R3): every clone of the gate sees the swap.
+#[derive(Clone)]
+pub struct AdminGate {
+    verifier: Arc<std::sync::RwLock<Arc<CertChainVerifier>>>,
+    /// The ±seconds replay window around now for the header timestamp.
+    skew_secs: u64,
+}
+
+impl std::fmt::Debug for AdminGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminGate").finish_non_exhaustive()
+    }
+}
+
+impl AdminGate {
+    /// Build a gate that admits only certs issued under `verifier`'s trust
+    /// store carrying the admin role.
+    #[must_use]
+    pub fn new(verifier: Arc<CertChainVerifier>) -> Self {
+        Self {
+            verifier: Arc::new(std::sync::RwLock::new(verifier)),
+            skew_secs: 60,
+        }
+    }
+
+    /// Hot-swap the trust store this gate verifies against (ZT-R3): the next
+    /// authorization sees the new chain/CRLs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal verifier lock was poisoned (a panic while
+    /// another thread held the write guard).
+    pub fn update_verifier(&self, verifier: Arc<CertChainVerifier>) {
+        *self
+            .verifier
+            .write()
+            .expect("AdminGate verifier lock poisoned") = verifier;
+    }
+
+    /// Authorize `metadata` as an admin principal. Returns the verified
+    /// subject CN (the certificate-bound node id).
+    ///
+    /// # Errors
+    ///
+    /// [`tonic::Status::permission_denied`] for every failure: missing or
+    /// malformed headers, an unverifiable certificate, a CN/node-id mismatch,
+    /// a possession failure, a non-admin role, or an expired timestamp.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal verifier lock was poisoned.
+    pub fn authorize(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<String, tonic::Status> {
+        let node_id = metadata
+            .get("x-glasschain-node-id")
+            .and_then(|mv| mv.to_str().ok())
+            .ok_or_else(|| tonic::Status::permission_denied("missing x-glasschain-node-id"))?;
+        let ts_str = metadata
+            .get("x-glasschain-auth-ts")
+            .and_then(|mv| mv.to_str().ok())
+            .ok_or_else(|| tonic::Status::permission_denied("missing x-glasschain-auth-ts"))?;
+        let sig_hex = metadata
+            .get("x-glasschain-auth-sig")
+            .and_then(|mv| mv.to_str().ok())
+            .ok_or_else(|| tonic::Status::permission_denied("missing x-glasschain-auth-sig"))?;
+        let cert_b64 = metadata
+            .get(CERT_HEADER)
+            .and_then(|mv| mv.to_str().ok())
+            .ok_or_else(|| {
+                tonic::Status::permission_denied(format!(
+                    "missing {CERT_HEADER}: an admin operation requires an organization certificate"
+                ))
+            })?;
+
+        let ts: u64 = ts_str
+            .parse()
+            .map_err(|_| tonic::Status::permission_denied("invalid timestamp format"))?;
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now_secs.abs_diff(ts) > self.skew_secs {
+            return Err(tonic::Status::permission_denied("token expired"));
+        }
+
+        let cert_der = use_base64::decode(cert_b64)
+            .map_err(|_| tonic::Status::permission_denied("certificate is not valid base64"))?;
+        // The shared verifier snapshot: hot-reload (ZT-R3) swaps behind this
+        // lock and every clone of the gate sees the new chain/CRLs.
+        let verifier = self
+            .verifier
+            .read()
+            .expect("AdminGate verifier lock poisoned")
+            .clone();
+        // Chain, validity, CRL — fail closed (ADR-011/ADR-013).
+        verifier.verify_cert_der(&cert_der).map_err(|e| {
+            tonic::Status::permission_denied(format!("certificate verification failed: {e}"))
+        })?;
+        // Subject CN must name the calling node.
+        let cn = verifier.verified_subject_cn(&cert_der).map_err(|e| {
+            tonic::Status::permission_denied(format!("certificate subject CN missing: {e}"))
+        })?;
+        if cn != node_id {
+            return Err(tonic::Status::permission_denied(format!(
+                "certificate CN '{cn}' does not match node id '{node_id}'"
+            )));
+        }
+        // Possession: the header signature verifies under the certificate's
+        // own key over `{node_id}:{timestamp}`.
+        let public_key = glasschain_identity::certificate_ed25519_public_key_der(&cert_der)
+            .ok_or_else(|| {
+                tonic::Status::permission_denied("certificate carries no ed25519 public key")
+            })?;
+        let sig_bytes: [u8; 64] = hex::decode(sig_hex)
+            .ok()
+            .and_then(|decoded| decoded.try_into().ok())
+            .ok_or_else(|| tonic::Status::permission_denied("invalid signature encoding"))?;
+        let verifying_key = VerifyingKey::from_bytes(&public_key)
+            .map_err(|_| tonic::Status::permission_denied("invalid certificate public key"))?;
+        let challenge = format!("{node_id}:{ts_str}");
+        verifying_key
+            .verify(challenge.as_bytes(), &Signature::from_bytes(&sig_bytes))
+            .map_err(|_| tonic::Status::permission_denied("signature verification failed"))?;
+        // The certificate-bound admin role (ADR-017).
+        if glasschain_identity::certificate_admin_role_der(&cert_der).as_deref()
+            != Some(glasschain_identity::ADMIN_ROLE)
+        {
+            return Err(tonic::Status::permission_denied(format!(
+                "certificate does not carry the admin role (OU={} required)",
+                glasschain_identity::ADMIN_ROLE
+            )));
+        }
+        Ok(cn)
+    }
+}
+
+/// Local alias so the gate's base64 dependency is explicit.
+mod use_base64 {
+    pub use base64::engine::general_purpose::STANDARD as Engine;
+    pub use base64::Engine as _;
+
+    /// Decode a base64 string to bytes.
+    pub fn decode(input: &str) -> Result<Vec<u8>, base64::DecodeError> {
+        Engine.decode(input)
+    }
+}
+
+/// Build the four ADR-017 admin headers from a certificate PEM and its
+/// 32-byte ed25519 seed — the client side of [`AdminGate`].
+///
+/// The caller's node id is the certificate's verified subject CN, so a
+/// stolen certificate cannot name a different node.
+///
+/// # Errors
+///
+/// Returns `Err` for an unparseable certificate, a certificate without a
+/// subject CN, or an invalid seed.
+pub fn admin_headers_from_cert(
+    cert_pem: &str,
+    seed: &[u8; 32],
+) -> Result<[(&'static str, String); 4], String> {
+    let node_id = glasschain_identity::certificate_subject_cn(cert_pem)
+        .ok_or_else(|| "certificate carries no subject CN".to_owned())?;
+    let signing_key = SigningKey::from_bytes(seed);
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let challenge = format!("{node_id}:{ts}");
+    let sig_hex = hex::encode(signing_key.sign(challenge.as_bytes()).to_bytes());
+    let cert_der: rustls_pki_types::CertificateDer<'static> =
+        rustls_pki_types::CertificateDer::from_pem_slice(cert_pem.as_bytes())
+            .map_err(|e| format!("certificate is not PEM: {e}"))?;
+    Ok([
+        ("x-glasschain-node-id", node_id),
+        ("x-glasschain-auth-ts", ts.to_string()),
+        ("x-glasschain-auth-sig", sig_hex),
+        (
+            CERT_HEADER,
+            base64::engine::general_purpose::STANDARD.encode(cert_der.as_ref()),
+        ),
+    ])
+}
+
 // ── AuthTokenBuilder ──────────────────────────────────────────────────────────
 
 /// Builds the three MSP auth metadata headers for outbound gRPC calls.
@@ -382,8 +598,211 @@ impl AuthTokenBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use glasschain_identity::Organization;
+    use glasschain_identity::{CertChainVerifier, Identity, Organization};
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_verifier(org: &Organization) -> CertChainVerifier {
+        // Fail-closed ADR-013 posture: the CRL rides with the root.
+        let mut verifier = CertChainVerifier::from_org(org).expect("verifier");
+        verifier.add_crl_pem(&org.crl_pem().unwrap()).expect("crl");
+        verifier
+    }
+
+    /// Build metadata carrying all four admin headers: the MSP headers, the
+    /// timestamp, the signature over `{node_id}:{ts}` under the certificate
+    /// key, and the base64 DER certificate itself (ADR-017).
+    fn admin_metadata(
+        identity: &Identity,
+        node_id: &str,
+        verifier: &CertChainVerifier,
+    ) -> tonic::metadata::MetadataMap {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_secs();
+        let sig = identity.sign_bytes(format!("{node_id}:{ts}").as_bytes());
+        let cert_der = rustls_pki_types::CertificateDer::from_pem_slice(
+            identity.certificate_pem.as_ref().expect("cert").as_bytes(),
+        )
+        .expect("cert der");
+        // The self-test path first: the cert must check out.
+        verifier
+            .verify_cert_der(cert_der.as_ref())
+            .expect("test cert verifies");
+        let mut map = tonic::metadata::MetadataMap::new();
+        map.insert(
+            "x-glasschain-node-id",
+            node_id.parse().expect("valid header"),
+        );
+        map.insert(
+            "x-glasschain-auth-ts",
+            ts.to_string().parse().expect("valid header"),
+        );
+        map.insert(
+            "x-glasschain-auth-sig",
+            hex::encode(sig).parse().expect("valid header"),
+        );
+        map.insert(
+            CERT_HEADER,
+            base64::engine::general_purpose::STANDARD
+                .encode(cert_der.as_ref())
+                .parse()
+                .expect("valid header"),
+        );
+        map
+    }
+
+    /// An admin-role member certificate signed by the live key is admitted,
+    /// and the verified CN is the caller.
+    #[test]
+    fn admin_gate_accepts_a_cert_bound_admin() {
+        let mut org = Organization::new("PharmaCorp").unwrap();
+        let admin = org
+            .issue_identity_with_role("admin-node", Some(glasschain_identity::ADMIN_ROLE))
+            .unwrap()
+            .clone();
+        let gate = AdminGate::new(Arc::new(test_verifier(&org)));
+        let metadata = admin_metadata(&admin, "admin-node", &test_verifier(&org));
+        assert_eq!(gate.authorize(&metadata).expect("authorized"), "admin-node");
+    }
+
+    /// `admin_headers_from_cert` produces headers that pass `authorize` —
+    /// the client/server header contract end to end.
+    #[test]
+    fn admin_headers_from_cert_round_trip() {
+        let mut org = Organization::new("PharmaCorp").unwrap();
+        let admin = org
+            .issue_identity_with_role("admin-node", Some(glasschain_identity::ADMIN_ROLE))
+            .unwrap()
+            .clone();
+        let verifier = test_verifier(&org);
+        // The seed from the custody snapshot (ADR-018) drives the headers.
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&org.export_json().unwrap()).unwrap();
+        let seed_hex = snapshot["members"][0]["seed_hex"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&hex::decode(&seed_hex).unwrap());
+        let gate = AdminGate::new(Arc::new(verifier));
+        let headers = admin_headers_from_cert(admin.certificate_pem.as_ref().unwrap(), &seed)
+            .expect("headers");
+        let mut map = tonic::metadata::MetadataMap::new();
+        for (name, value) in &headers {
+            map.insert(*name, value.parse().expect("valid header value"));
+        }
+        assert_eq!(gate.authorize(&map).expect("authorized"), "admin-node");
+    }
+
+    /// A member certificate without the admin role is refused — membership
+    /// alone is not operator authority.
+    #[test]
+    fn admin_gate_rejects_a_non_admin_certificate() {
+        let mut org = Organization::new("PharmaCorp").unwrap();
+        let member = org.issue_identity("member-node").unwrap().clone();
+        let gate = AdminGate::new(Arc::new(test_verifier(&org)));
+        let metadata = admin_metadata(&member, "member-node", &test_verifier(&org));
+        let error = gate.authorize(&metadata).expect_err("must refuse");
+        assert!(error.to_string().contains("admin role"), "{error}");
+    }
+
+    /// A certificate from a foreign organization fails the chain check
+    /// before any role decision.
+    #[test]
+    fn admin_gate_rejects_a_foreign_certificate() {
+        let mut org = Organization::new("PharmaCorp").unwrap();
+        let _admin = org
+            .issue_identity_with_role("admin-node", Some(glasschain_identity::ADMIN_ROLE))
+            .unwrap()
+            .clone();
+        let mut foreign = Organization::new("MedCorp").unwrap();
+        let outsider = foreign
+            .issue_identity_with_role("admin-node", Some(glasschain_identity::ADMIN_ROLE))
+            .unwrap()
+            .clone();
+        let gate = AdminGate::new(Arc::new(test_verifier(&org)));
+        let metadata = admin_metadata(&outsider, "admin-node", &test_verifier(&foreign));
+        let error = gate.authorize(&metadata).expect_err("must refuse");
+        assert!(error.to_string().contains("verification failed"), "{error}");
+    }
+
+    /// A signature from a different key than the certificate's own is
+    /// rejected — possession is proven per request.
+    #[test]
+    fn admin_gate_rejects_a_stolen_signature() {
+        let mut org = Organization::new("PharmaCorp").unwrap();
+        let admin = org
+            .issue_identity_with_role("admin-node", Some(glasschain_identity::ADMIN_ROLE))
+            .unwrap()
+            .clone();
+        let impostor = org.issue_identity("impostor").unwrap().clone();
+        let verifier = test_verifier(&org);
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let cert_der = rustls_pki_types::CertificateDer::from_pem_slice(
+            admin.certificate_pem.as_ref().unwrap().as_bytes(),
+        )
+        .unwrap();
+        let mut map = tonic::metadata::MetadataMap::new();
+        map.insert("x-glasschain-node-id", "admin-node".parse().unwrap());
+        map.insert("x-glasschain-auth-ts", ts.to_string().parse().unwrap());
+        map.insert(
+            "x-glasschain-auth-sig",
+            // Signed by the impostor's key, presented with the admin's cert.
+            hex::encode(impostor.sign_bytes(format!("admin-node:{ts}").as_bytes()))
+                .parse()
+                .unwrap(),
+        );
+        map.insert(
+            CERT_HEADER,
+            base64::engine::general_purpose::STANDARD
+                .encode(cert_der.as_ref())
+                .parse()
+                .unwrap(),
+        );
+        let gate = AdminGate::new(Arc::new(verifier));
+        let error = gate.authorize(&map).expect_err("must refuse");
+        assert!(error.to_string().contains("signature"), "{error}");
+    }
+
+    /// A timestamp outside the replay window is refused even with a
+    /// otherwise-valid admin certificate.
+    #[test]
+    fn admin_gate_rejects_an_expired_timestamp() {
+        let mut org = Organization::new("PharmaCorp").unwrap();
+        let admin = org
+            .issue_identity_with_role("admin-node", Some(glasschain_identity::ADMIN_ROLE))
+            .unwrap()
+            .clone();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 3600;
+        let sig = admin.sign_bytes(format!("admin-node:{ts}").as_bytes());
+        let cert_der = rustls_pki_types::CertificateDer::from_pem_slice(
+            admin.certificate_pem.as_ref().unwrap().as_bytes(),
+        )
+        .unwrap();
+        let mut map = tonic::metadata::MetadataMap::new();
+        map.insert("x-glasschain-node-id", "admin-node".parse().unwrap());
+        map.insert("x-glasschain-auth-ts", ts.to_string().parse().unwrap());
+        map.insert("x-glasschain-auth-sig", hex::encode(sig).parse().unwrap());
+        map.insert(
+            CERT_HEADER,
+            base64::engine::general_purpose::STANDARD
+                .encode(cert_der.as_ref())
+                .parse()
+                .unwrap(),
+        );
+        let gate = AdminGate::new(Arc::new(test_verifier(&org)));
+        let error = gate.authorize(&map).expect_err("must refuse");
+        assert!(error.to_string().contains("expired"), "{error}");
+    }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 

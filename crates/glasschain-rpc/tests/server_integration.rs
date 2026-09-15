@@ -4,6 +4,7 @@
 //! `crates/glasschain-network/tests/node_integration.rs` does), serve a
 //! [`GlasschainServer`] on an ephemeral loopback port, and drive its gRPC
 //! surface over a real Tonic in-process TCP connection.
+use base64::Engine as _;
 use glasschain_core::{
     ContractExecution, EndorsementRequest, EndorserIdentity, InventoryUpdate, Principal,
     PurchaseConditions, PurchaseOrder, ScopedTarget, SmartContractDef, SupplyOffer, TraceableAsset,
@@ -19,6 +20,7 @@ use glasschain_rpc::proto::glasschain_v1::{
     SubscribeToEventsRequest, VerifyEndorsementRequest,
 };
 use glasschain_rpc::server::GlasschainServer;
+use rustls_pki_types::pem::PemObject as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -707,4 +709,161 @@ async fn test_verify_endorsement_without_provider_reports_configuration_gap() {
         "{:?}",
         response.rejection_reason
     );
+}
+
+// ── ADR-017 operator RBAC: channel management over gRPC ──────────────────────
+
+/// A fail-closed verifier for the admin gate under test (ADR-013): the CRL
+/// rides with the root, matching what `glasschain-node` installs.
+fn gate_verifier(
+    org: &glasschain_identity::Organization,
+) -> glasschain_identity::CertChainVerifier {
+    let mut verifier = glasschain_identity::CertChainVerifier::from_org(org).unwrap();
+    verifier.add_crl_pem(&org.crl_pem().unwrap()).unwrap();
+    verifier
+}
+
+/// Install the admin authorization headers for `identity` on `req`
+/// (ADR-017): the MSP headers, the signature over `{node_id}:{ts}` under the
+/// certificate key, and the base64 DER certificate itself.
+fn stamp_admin_headers(
+    identity: &glasschain_identity::Identity,
+    node_id: &str,
+    req: &mut tonic::Request<impl prost::Message>,
+) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let sig = identity.sign_bytes(format!("{node_id}:{ts}").as_bytes());
+    let cert_der = rustls_pki_types::CertificateDer::from_pem_slice(
+        identity.certificate_pem.as_ref().unwrap().as_bytes(),
+    )
+    .unwrap();
+    req.metadata_mut()
+        .insert("x-glasschain-node-id", node_id.parse().unwrap());
+    req.metadata_mut()
+        .insert("x-glasschain-auth-ts", ts.to_string().parse().unwrap());
+    req.metadata_mut()
+        .insert("x-glasschain-auth-sig", hex::encode(sig).parse().unwrap());
+    req.metadata_mut().insert(
+        glasschain_rpc::CERT_HEADER,
+        base64::engine::general_purpose::STANDARD
+            .encode(cert_der.as_ref())
+            .parse()
+            .unwrap(),
+    );
+}
+
+/// Fail closed: without a verifier (no admin gate), channel-management RPCs
+/// are refused regardless of the caller's credentials.
+#[tokio::test]
+async fn admin_channel_ops_fail_closed_without_a_gate() {
+    let node = start_node().await;
+    let (channel, _handle) = start_server(node).await;
+    let mut client = NodeServiceClient::new(channel);
+    let err = client
+        .create_channel(glasschain_rpc::proto::glasschain_v1::CreateChannelRequest {
+            name: "pricing".into(),
+            description: "test".into(),
+            member_ids: vec!["org-a".into()],
+            retention_secs: 0,
+        })
+        .await
+        .expect_err("must refuse without a gate");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(err.message().contains("certificate verifier"), "{err:?}");
+}
+
+/// The happy path: an admin-role certificate drives create → add → remove on
+/// a live server, and the node's collection membership reflects it.
+#[tokio::test]
+async fn admin_channel_ops_manage_collections_end_to_end() {
+    use glasschain_rpc::proto::glasschain_v1::{
+        AddChannelMemberRequest, CreateChannelRequest, RemoveChannelMemberRequest,
+    };
+
+    let mut org = glasschain_identity::Organization::new("PharmaCorp").unwrap();
+    let admin = org
+        .issue_identity_with_role("admin-node", Some(glasschain_identity::ADMIN_ROLE))
+        .unwrap()
+        .clone();
+    let node = start_node().await;
+    let node_for_check = Arc::clone(&node);
+    let addr = free_addr();
+    let endpoint = format!("http://{addr}");
+    let gate = glasschain_rpc::AdminGate::new(std::sync::Arc::new(gate_verifier(&org)));
+    let handle = tokio::spawn(async move {
+        let server = glasschain_rpc::GlasschainServer::new(node).with_admin_gate(gate);
+        let _ = server.serve(addr.parse().unwrap()).await;
+    });
+    let channel = connect(&endpoint).await;
+    let mut client = NodeServiceClient::new(channel);
+    std::mem::forget(handle);
+
+    let mut create = tonic::Request::new(CreateChannelRequest {
+        name: "pricing".into(),
+        description: "admin-created collection".into(),
+        member_ids: vec!["org-member".into()],
+        retention_secs: 0,
+    });
+    stamp_admin_headers(&admin, "admin-node", &mut create);
+    let created = client.create_channel(create).await.unwrap().into_inner();
+    assert!(created.created);
+
+    let mut add = tonic::Request::new(AddChannelMemberRequest {
+        name: "pricing".into(),
+        member_id: "org-second".into(),
+    });
+    stamp_admin_headers(&admin, "admin-node", &mut add);
+    client.add_channel_member(add).await.unwrap();
+
+    let mut remove = tonic::Request::new(RemoveChannelMemberRequest {
+        name: "pricing".into(),
+        member_id: "org-second".into(),
+    });
+    stamp_admin_headers(&admin, "admin-node", &mut remove);
+    let removed = client
+        .remove_channel_member(remove)
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(removed.removed);
+
+    // The collection exists on the node and org-second's removal took effect:
+    // membership is checked through the node's own gate.
+    let names = node_for_check.collection_names().await;
+    assert_eq!(names, vec!["pricing".to_owned()]);
+}
+
+/// A member certificate without the admin role cannot create a collection.
+#[tokio::test]
+async fn admin_channel_ops_reject_a_non_admin_certificate() {
+    let mut org = glasschain_identity::Organization::new("PharmaCorp").unwrap();
+    let member = org.issue_identity("plain-node").unwrap().clone();
+    let node = start_node().await;
+    let addr = free_addr();
+    let endpoint = format!("http://{addr}");
+    let gate = glasschain_rpc::AdminGate::new(std::sync::Arc::new(gate_verifier(&org)));
+    let handle = tokio::spawn(async move {
+        let server = glasschain_rpc::GlasschainServer::new(node).with_admin_gate(gate);
+        let _ = server.serve(addr.parse().unwrap()).await;
+    });
+    let channel = connect(&endpoint).await;
+    std::mem::forget(handle);
+    let mut client = NodeServiceClient::new(channel);
+
+    let mut create =
+        tonic::Request::new(glasschain_rpc::proto::glasschain_v1::CreateChannelRequest {
+            name: "pricing".into(),
+            description: "test".into(),
+            member_ids: vec![],
+            retention_secs: 0,
+        });
+    stamp_admin_headers(&member, "plain-node", &mut create);
+    let err = client
+        .create_channel(create)
+        .await
+        .expect_err("a non-admin must be refused");
+    assert!(err.message().contains("admin role"), "{err:?}");
 }

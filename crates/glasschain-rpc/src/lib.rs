@@ -46,5 +46,8 @@ pub mod proto {
     }
 }
 
-pub use auth::{AuthTokenBuilder, MspAuthInterceptor, TrustedKeyRegistry};
+pub use auth::{
+    admin_headers_from_cert, AdminGate, AuthTokenBuilder, MspAuthInterceptor, TrustedKeyRegistry,
+    CERT_HEADER,
+};
 pub use server::GlasschainServer;

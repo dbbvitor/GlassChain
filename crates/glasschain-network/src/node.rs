@@ -22,7 +22,7 @@ use glasschain_core::{
 #[cfg(feature = "bft")]
 use glasschain_core::{BftConsensusProvider, EquivocationProof, VotePhase};
 use glasschain_identity::CertChainVerifier;
-use glasschain_identity::{Channel, Identity};
+use glasschain_identity::{Channel, ChannelConfig, Identity};
 use glasschain_indexer::{
     indexed_transactions_of, AnalyticalFlattener, EventBusProvider, InMemoryEventBus,
     InMemoryIndexer, IndexedBlock, IndexerProvider, ProvenanceIndex,
@@ -295,6 +295,10 @@ struct NodeState {
     peer_registry: PeerRegistry,
     /// Optional CA certificate verifier; when set, peer certs must be org-issued.
     cert_verifier: Option<Arc<CertChainVerifier>>,
+    /// This node's OCSP staple (ADR-017): the issuer-signed live revocation
+    /// status of its own organization certificate, minted at startup and
+    /// stapled on every Hello. `None` without an org identity or staple.
+    ocsp_staple: Option<Vec<u8>>,
     /// Optional node identity for signing autonomous watcher transactions.
     identity: Option<Arc<Identity>>,
     /// Derived world-state cache: the materialized committed write sets,
@@ -615,11 +619,12 @@ impl PeerRegistry {
                 }
                 return Ok(TofuOutcome::Rotated);
             }
-            // Same identity: refresh verification data that improved (e.g. the
-            // org became verified, or the identity certificate appeared).
-            if org_verified && !existing.org_verified {
-                existing.org_verified = true;
-            }
+            // Same identity: the pin's identity fields stay, but org
+            // verification is **session evidence** — each Hello re-authorizes
+            // or downgrades it (zero-trust §5 established-session
+            // reauthorization: a check at a previous Hello cannot promise
+            // indefinite membership). Identity/fingerprint pins never flap.
+            existing.org_verified = org_verified;
             if existing.public_key.is_none() && public_key.is_some() {
                 existing.public_key = public_key;
             }
@@ -688,6 +693,74 @@ fn persist_tofu_pin(storage: &Arc<dyn StorageProvider>, listen_addr: &str, peer:
             }
         }
         Err(e) => log::warn!("TOFU: failed to encode pin for {listen_addr}: {e}"),
+    }
+}
+
+/// The state-seam key prefix for persisted equivocation proofs
+/// (zero-trust residual ZT-R4). Evidence is storage state, never on-chain —
+/// committed history and replay determinism are untouched (ADR-009: proofs
+/// record, they never eject anyone).
+#[cfg(feature = "bft")]
+const EQUIVOCATION_PREFIX: &str = "equivocation:";
+
+/// The durable key for one proof: `(height, round, validator-key)` — a
+/// validator's conflicting vote pair in one context is one proof.
+#[cfg(feature = "bft")]
+fn equivocation_key(proof: &EquivocationProof) -> String {
+    format!(
+        "{EQUIVOCATION_PREFIX}{}:{}:{}",
+        proof.height,
+        proof.round,
+        hex::encode(&proof.public_key)
+    )
+}
+
+/// Persist an equivocation proof through the state seam (ZT-R4): detection
+/// outlives a restart. A write failure is logged — the proof stays in
+/// memory and the next detection re-attempts.
+#[cfg(feature = "bft")]
+fn persist_equivocation_proof(storage: &Arc<dyn StorageProvider>, proof: &EquivocationProof) {
+    match serde_json::to_vec(proof) {
+        Ok(bytes) => {
+            if let Err(e) = storage.put_state(&equivocation_key(proof), &bytes) {
+                log::warn!("equivocation: failed to persist proof: {e}");
+            }
+        }
+        Err(e) => log::warn!("equivocation: failed to encode proof: {e}"),
+    }
+}
+
+/// Load persisted equivocation proofs at startup (ZT-R4). Deduplicated by
+/// key; unreadable entries are logged and skipped — evidence is advisory
+/// (governance input), not a trust decision, so a corrupt record must not
+/// poison the node.
+#[cfg(feature = "bft")]
+async fn load_equivocation_proofs(
+    storage: &Arc<dyn StorageProvider>,
+    state: &Arc<Mutex<NodeState>>,
+) {
+    let keys = match storage.list_state_keys(EQUIVOCATION_PREFIX) {
+        Ok(keys) => keys,
+        Err(e) => {
+            log::warn!("equivocation: cannot enumerate persisted proofs: {e}");
+            return;
+        }
+    };
+    let mut proofs = Vec::new();
+    for key in keys {
+        match storage.get_state(&key) {
+            Ok(Some(raw)) => match serde_json::from_slice::<EquivocationProof>(&raw) {
+                Ok(proof) => proofs.push(proof),
+                Err(e) => log::warn!("equivocation: unreadable persisted proof at {key}: {e}"),
+            },
+            Ok(None) => {}
+            Err(e) => log::warn!("equivocation: cannot read persisted proof at {key}: {e}"),
+        }
+    }
+    let loaded = proofs.len();
+    if loaded > 0 {
+        state.lock().await.equivocations.extend(proofs);
+        log::info!("equivocation: loaded {loaded} persisted proof(s) from previous session(s)");
     }
 }
 
@@ -819,6 +892,7 @@ impl Node {
                 capability_history: None,
                 peer_registry: PeerRegistry::new(),
                 cert_verifier: None,
+                ocsp_staple: None,
                 identity: identity.clone(),
                 world_state: HashMap::new(),
                 executor: None,
@@ -1340,6 +1414,91 @@ impl Node {
         self.state.lock().await.collections = collections;
     }
 
+    /// ADR-017 operator RBAC: create a private data collection at runtime
+    /// (the gRPC `CreateChannel` admin operation backs onto this).
+    ///
+    /// The collection is this node's **runtime declaration** — membership
+    /// gates the private-payload paths immediately. The authoritative,
+    /// committed source for collection-scoped endorsement policy stays the
+    /// chain's `PolicyUpdate` records (ADR-008); a channel created here is
+    /// not itself persisted to storage, matching `set_collections`' runtime
+    /// semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError::UnknownCollection`] when a collection with
+    /// `config.name` already exists.
+    pub async fn admin_create_channel(&self, config: ChannelConfig) -> Result<(), NetworkError> {
+        {
+            let mut s = self.state.lock().await;
+            if s.collection(&config.name).is_some() {
+                return Err(NetworkError::UnknownCollection(config.name));
+            }
+            s.collections.push(Channel::new(config));
+        }
+        Ok(())
+    }
+
+    /// ADR-017 operator RBAC: admit `member_id` to the collection `name`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError::UnknownCollection`] when the collection is not
+    /// configured.
+    #[allow(clippy::significant_drop_tightening)] // the guard must span the mutation
+    pub async fn admin_channel_add_member(
+        &self,
+        name: &str,
+        member_id: &str,
+    ) -> Result<(), NetworkError> {
+        {
+            // The state guard must span the mutation: the collection is
+            // mutated through the borrowed Vec itself.
+            let mut s = self.state.lock().await;
+            let Some(collection) = s.collections.iter_mut().find(|c| c.config.name == name) else {
+                return Err(NetworkError::UnknownCollection(name.to_owned()));
+            };
+            collection.add_member(member_id);
+        }
+        Ok(())
+    }
+
+    /// ADR-017 operator RBAC: remove `member_id` from the collection `name`.
+    /// Returns `false` when the id was not a member.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError::UnknownCollection`] when the collection is not
+    /// configured.
+    #[allow(clippy::significant_drop_tightening)] // the guard must span the mutation
+    pub async fn admin_channel_remove_member(
+        &self,
+        name: &str,
+        member_id: &str,
+    ) -> Result<bool, NetworkError> {
+        {
+            // The state guard must span the mutation: the collection is
+            // mutated through the borrowed Vec itself.
+            let mut s = self.state.lock().await;
+            let Some(collection) = s.collections.iter_mut().find(|c| c.config.name == name) else {
+                return Err(NetworkError::UnknownCollection(name.to_owned()));
+            };
+            Ok(collection.remove_member(member_id))
+        }
+    }
+
+    /// The configured collection names — read access for the admin RPC layer.
+    #[must_use]
+    pub async fn collection_names(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .await
+            .collections
+            .iter()
+            .map(|c| c.config.name.clone())
+            .collect()
+    }
+
     /// Submit a private payload to the collection `collection` (ADR-003,
     /// ticket #46).
     ///
@@ -1579,6 +1738,21 @@ impl Node {
         self.state.lock().await.cert_verifier = Some(Arc::new(verifier));
     }
 
+    /// Set this node's OCSP staple (ADR-017): the issuer-signed live
+    /// revocation status of this node's own certificate, sent on every Hello.
+    /// `glasschain-node` mints it at startup from the organization it creates
+    /// under `--org`.
+    pub async fn set_ocsp_staple(&self, staple_der: Vec<u8>) {
+        self.state.lock().await.ocsp_staple = Some(staple_der);
+    }
+
+    /// The configured certificate verifier, shared with the gRPC admin gate
+    /// (ADR-017). `None` without a verifier.
+    #[must_use]
+    pub async fn cert_verifier(&self) -> Option<Arc<CertChainVerifier>> {
+        self.state.lock().await.cert_verifier.clone()
+    }
+
     /// Set the node identity used to sign autonomous watcher transactions.
     ///
     /// After this call, every `PurchaseOrder` generated by the
@@ -1609,6 +1783,13 @@ impl Node {
         // Persisted TOFU pins (#88): a restart keeps the trust decisions made
         // before it, with signed rotation as the only way a fingerprint moves.
         load_tofu_pins(&self.storage, &self.state).await;
+
+        // Durable equivocation evidence (zero-trust residual ZT-R4): proofs
+        // detected before a restart reload from the state seam — detection
+        // outlives the session even though nothing is ejected automatically
+        // (ADR-009).
+        #[cfg(feature = "bft")]
+        load_equivocation_proofs(&self.storage, &self.state).await;
 
         // Retention sweep (D5): purge expired private payloads at startup and
         // on a fixed interval. The sweep enumerates storage, so payloads
@@ -3020,6 +3201,16 @@ async fn build_local_hello(ctx: &PeerContext) -> Message {
             &ctx.local_tls_cert_fingerprint,
         )))
     });
+    // OCSP staple (ADR-017): this node's issuer-signed live revocation
+    // status for its own certificate, minted at startup. `None` without an
+    // identity or without a minted staple — the receiver then applies its
+    // fail-closed CRL path only.
+    let ocsp_response_der = {
+        let s = ctx.state.lock().await;
+        s.ocsp_staple
+            .as_ref()
+            .map(|staple| BASE64_STANDARD.encode(staple))
+    };
     Message::Hello {
         node_id: ctx.node_id.clone(),
         tls_cert_fingerprint: ctx.local_tls_cert_fingerprint.clone(),
@@ -3036,6 +3227,7 @@ async fn build_local_hello(ctx: &PeerContext) -> Message {
         certificate_pem,
         certificate_proof,
         fingerprint_proof,
+        ocsp_response_der,
         listen_addr: ctx.listen_addr.clone(),
     }
 }
@@ -3291,7 +3483,8 @@ async fn handle_vote(ctx: &PeerContext, vote: glasschain_core::BftVote) -> Messa
                     proof.round
                 );
                 detected = Some(proof.clone());
-                s.equivocations.push(proof);
+                s.equivocations.push(proof.clone());
+                persist_equivocation_proof(&ctx.storage, &proof);
             }
         }
         if let Some(vote_tx) = &s.bft_vote_tx {
@@ -3852,6 +4045,7 @@ async fn process_message(
             certificate_pem: peer_certificate_pem,
             certificate_proof: peer_certificate_proof,
             fingerprint_proof: peer_fingerprint_proof,
+            ocsp_response_der: peer_ocsp_response_der,
         } => {
             log::info!(
                 "Hello from {addr} (id={peer_id}, chain_len={chain_length}, listen={peer_listen_addr})"
@@ -3937,7 +4131,29 @@ async fn process_message(
                             })
                         })
                     });
-                let rejected = has_verifier && !possession_ok;
+                // Live OCSP staple (ADR-017): the issuer's own signed status,
+                // verified locally. A revoked staple fails the session closed
+                // even though the CRL path passed; a malformed, mismatched or
+                // expired staple is simply not a positive signal — it falls
+                // back to the CRL result, never upgrading or blocking it.
+                let staple_revoked = has_verifier
+                    && possession_ok
+                    && peer_ocsp_response_der.is_some_and(|staple| {
+                        let Some(pem) = peer_certificate_pem.as_ref() else {
+                            return false;
+                        };
+                        let session_verifier = s.cert_verifier.clone();
+                        session_verifier.is_some_and(|verifier| {
+                            BASE64_STANDARD.decode(staple).is_ok_and(|staple| {
+                                matches!(
+                                    verifier.verify_ocsp_staple(pem, &staple),
+                                    Ok(glasschain_identity::OcspStatus::Revoked)
+                                )
+                            })
+                        })
+                    });
+                let org_verified = possession_ok && !staple_revoked;
+                let rejected = has_verifier && !org_verified;
                 drop(s);
                 if rejected {
                     // ADR-011 decision: an unverified organization stays
@@ -3950,7 +4166,7 @@ async fn process_message(
                          paths will not trust it"
                     );
                 }
-                possession_ok
+                org_verified
             };
 
             // ── Step 2: TOFU peer registry ────────────────────────────
@@ -4914,6 +5130,108 @@ mod tests {
             .is_err());
     }
 
+    /// Zero-trust §5 established-session reauthorization: each Hello's
+    /// verification result is **session evidence** — a known peer's pin keeps
+    /// its identity fields but the org-verified bit follows the fresh
+    /// evidence (downgrade on failure, restore on success). Identity and
+    /// fingerprint never flap.
+    #[test]
+    fn tofu_known_hello_reauthorizes_org_verification() {
+        let mut reg = PeerRegistry::new();
+        reg.verify_or_register(
+            "127.0.0.1:8000",
+            "node-a",
+            "aaa",
+            "org-a",
+            true,
+            Some(vec![1u8; 32]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(reg.org_verified("127.0.0.1:8000", "org-a"), Some(true));
+
+        // A Hello that no longer verifies downgrades the bit…
+        reg.verify_or_register(
+            "127.0.0.1:8000",
+            "node-a",
+            "aaa",
+            "org-a",
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            reg.org_verified("127.0.0.1:8000", "org-a"),
+            Some(false),
+            "a failed re-verification must downgrade the session evidence"
+        );
+
+        // …and a later verifying Hello restores it. The pinned identity
+        // fields are untouched throughout.
+        reg.verify_or_register("127.0.0.1:8000", "node-a", "aaa", "org-a", true, None, None)
+            .unwrap();
+        assert_eq!(reg.org_verified("127.0.0.1:8000", "org-a"), Some(true));
+        let peer = reg.peers.get("127.0.0.1:8000").unwrap();
+        assert_eq!(peer.node_id, "node-a");
+        assert_eq!(peer.cert_fingerprint, "aaa");
+        assert_eq!(peer.public_key.as_deref(), Some([1u8; 32].as_slice()));
+    }
+
+    /// The Hello's OCSP staple (ADR-017) survives a JSON wire round trip.
+    #[test]
+    fn hello_carries_ocsp_staple_on_the_wire() {
+        let msg = Message::Hello {
+            node_id: "node-a".into(),
+            tls_cert_fingerprint: "fp".into(),
+            chain_length: 1,
+            version: PROTOCOL_VERSION.to_owned(),
+            capabilities: Vec::new(),
+            org: "org-a".into(),
+            certificate_pem: None,
+            certificate_proof: None,
+            fingerprint_proof: None,
+            ocsp_response_der: Some("Q0JDQ0NT".to_owned()),
+            listen_addr: "127.0.0.1:8000".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            json.contains("ocsp_response_der"),
+            "the staple must serialize onto the wire"
+        );
+        let decoded: Message = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, Message::Hello { .. }));
+        let Message::Hello {
+            ocsp_response_der, ..
+        } = decoded
+        else {
+            unreachable!("matched above");
+        };
+        assert_eq!(ocsp_response_der.as_deref(), Some("Q0JDQ0NT"));
+
+        // A Hello without a staple omits the field entirely (wire shape of
+        // peers that mint nothing).
+        let bare = Message::Hello {
+            node_id: "node-a".into(),
+            tls_cert_fingerprint: "fp".into(),
+            chain_length: 1,
+            version: PROTOCOL_VERSION.to_owned(),
+            capabilities: Vec::new(),
+            org: "org-a".into(),
+            certificate_pem: None,
+            certificate_proof: None,
+            fingerprint_proof: None,
+            ocsp_response_der: None,
+            listen_addr: "127.0.0.1:8000".into(),
+        };
+        assert!(
+            !serde_json::to_string(&bare)
+                .unwrap()
+                .contains("ocsp_response_der"),
+            "an absent staple must be skipped on the wire"
+        );
+    }
+
     // ── helpers for chain-restore tests ───────────────────────────────────────
 
     /// Mine a `n_blocks`-long valid chain and persist it to `storage`.
@@ -5851,6 +6169,60 @@ mod tests {
             .await
             .expect("a detection event must be broadcast");
         assert!(matches!(event, NodeEvent::EquivocationDetected { .. }));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "bft")]
+    async fn equivocation_proofs_survive_a_restart() {
+        // ZT-R4: a detected proof persists through the state seam; a
+        // simulated restart reloads it without any on-chain write (ADR-009:
+        // evidence is advisory, replay determinism untouched).
+        let node = Node::new("n-under-test", "127.0.0.1:0", 2);
+        let provider = single_validator_provider();
+        node.set_bft_consensus(Arc::new(provider.clone())).await;
+        let ctx = peer_context(&node);
+        let (write_tx, _write_rx) = tokio::sync::mpsc::channel::<Message>(16);
+        let write_tx = PeerWrite {
+            consensus: write_tx.clone(),
+            background: write_tx,
+        };
+        let genesis = node.ledger.lock().await.chain[0].hash.clone();
+        for v in [
+            provider.sign_vote(&genesis, 5, 0, VotePhase::Prevote, "hash-a"),
+            provider.sign_vote(&genesis, 5, 0, VotePhase::Prevote, "hash-b"),
+        ] {
+            process_message(
+                Message::Vote(v),
+                "127.0.0.1:40000",
+                &ctx,
+                &write_tx,
+                None,
+                "peer-fingerprint",
+                &[],
+            )
+            .await;
+        }
+        assert_eq!(ctx.state.lock().await.equivocations.len(), 1);
+        // The proof reached storage.
+        let keys = node
+            .storage
+            .list_state_keys(EQUIVOCATION_PREFIX)
+            .expect("enumerate");
+        assert_eq!(keys.len(), 1, "detection must persist exactly one proof");
+
+        // Restart: forget the in-memory copy, reload from the seam.
+        ctx.state.lock().await.equivocations.clear();
+        load_equivocation_proofs(&node.storage, &node.state).await;
+        assert_eq!(
+            ctx.state.lock().await.equivocations.len(),
+            1,
+            "the persisted proof must reload at startup"
+        );
+        let reloaded = ctx.state.lock().await.equivocations[0].clone();
+        assert!(
+            reloaded.verify().is_ok(),
+            "the reloaded proof still verifies"
+        );
     }
 
     #[tokio::test]

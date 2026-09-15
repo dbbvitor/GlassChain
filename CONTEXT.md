@@ -36,6 +36,10 @@ _Avoid_: bearer certificate, unverified identity claim
 A storage-persisted peer public key binding keyed by advertised network address, loaded at node startup. Can be rotated only by presenting a signed rotation message from the currently pinned key. Prevents in-memory trust amnesia and fails closed on pin corruption.
 _Avoid_: in-memory peer registry, blind TOFU
 
+**Durable identity file**:
+The operator-owned file (ADR-018) carrying a node's Root CA key pair, serial bookkeeping, revocation history and member identity seeds. Created on first start, loaded after — the node re-presents the same key, certificate and anchor across restarts. Never written to replicated storage.
+_Avoid_: ephemeral per-start identity, in-storage private key
+
 **Validator**:
 A member organization that participates in block finality voting. In v1 every member organization is a validator (full participation); bounding the validator set later is configuration, not redesign — the consensus family supports per-height validator-set changes. Validating is an operational role, not a status: it confers no read access, no authority to authorize a business change, and no fee or settlement advantage. Bounding the set is a liveness requirement (a quorum needs ⅔+ of validators responsive), not an exclusion mechanism.
 _Avoid_: miner (the retired proof-of-work role); tier, rank (validator is a role a member holds, not a class it belongs to)
@@ -98,6 +102,18 @@ _Avoid_: caller-supplied organization label
 **Height-stamped authorization**:
 Authorization evaluation bounded strictly by block height (`valid_from` and `revoked_at` block indices) rather than mutable wall-clock time or external CRL lookups during historical replay. Ensures deterministic state re-execution across restarts and syncs.
 _Avoid_: wall-clock authorization, dynamic CRL evaluation on historical blocks
+
+**OCSP stapling**:
+An issuer-signed OCSP response a peer staples on its Hello at session establishment, attesting its organization certificate's live status. Verified locally against the trust store without outbound responder network queries; a revoked staple fails the session closed, an absent or expired staple falls back to the fail-closed CRL files.
+_Avoid_: live OCSP responder query, external OCSP egress
+
+**MSP admin principal**:
+A member organization identity whose verified certificate carries the admin Organizational Unit, authorizing channel-management operations on a node.
+_Avoid_: bearer admin token, unauthenticated management API
+
+**Backup scrubbing**:
+The retention sweep run over a copied storage directory before it is archived, removing expired private data collection payloads the live node's purge can never reach.
+_Avoid_: unscrubbed physical snapshot retention
 
 **Private data collection (PDC)**:
 A named set of member organizations authorized to hold a class of private payloads. Only a hash commitment is written to the global chain; payloads are disseminated point-to-point to collection members, purge after the collection's retention window, and remain pullable by late peers for the retention period. Regulator organizations are members of every collection by default.

@@ -4,6 +4,8 @@
 //! - An `*Args` struct (derived from [`clap::Args`]) that owns the parsed flags.
 //! - A `run(args)` (or `async run(args)`) function that implements the command logic.
 
+pub mod backup_scrub;
+pub mod channel_admin;
 pub mod contract;
 pub mod identity;
 pub mod inspect;

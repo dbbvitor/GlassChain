@@ -89,6 +89,7 @@ Verified from the argument parser in `crates/glasschain-node/src/main.rs`
 | `--org <NAME>` | Organization name. Causes the node to create an organization Root CA and issue an identity-backed TLS certificate | none (anonymous self-signed cert) | no |
 | `--identity-node-id <ID>` | Node ID embedded in the issued TLS identity certificate (CN) | value of `--id` | no |
 | `--trust-store <PATH>` | PEM file or directory holding the peer organizations' Root/intermediate CA certificates (`*.pem`) and their signed CRLs (`*.crl`, ADR-013). **Requires `--org`.** Verification is fail-closed: a peer whose issuing CA has no current CRL in the store is rejected. Without it, peer organizations are not certificate-verified (logged at startup) | none | no |
+| `--identity-file <PATH>` | Operator-owned durable identity file (ADR-018): the node's Root CA key pair, serial bookkeeping, revocation history and member seeds. Created (mode `0600` on Unix) on first start, loaded after — the same identity key, certificate and Root CA are re-presented, so persisted TOFU pins keep verifying across restarts. **Requires `--org`.** Keep the file out of storage copies/archives: it carries private keys. Without it the identity is regenerated every start (dev behaviour; logged as a warning) | none (ephemeral per start) | no |
 | `--rpc-addr <ADDR>` | Address to bind the gRPC server (e.g. `0.0.0.0:50051`). **When omitted, the gRPC server is not started** | none | no |
 | `--help`, `-h` | Print usage text and exit | — | — |
 
@@ -204,6 +205,7 @@ validation happens at parse time so bad input never reaches the ledger
 | `pending` | — | Lists pending (unmined) transactions with their kinds. |
 | `peers` | — | Lists known peer listen addresses; `No connected peers.` when empty. |
 | `contracts` | — | Lists registered smart contracts with buyer, product, status, and `purchased/max` quantity. |
+| `reload-trust-store` | `reload-trust-store <PATH>` | Re-reads the federation trust store (ADR-011/ADR-013, ZT-R3): a PEM file or directory of `*.pem` (anchors/intermediates) and `*.crl` files, and hot-swaps the certificate verifier atomically. The next `Hello` verifies against it; the admin gate sees the new chain/CRLs immediately. Requires the node was started with `--org` (it re-verifies against the own Root CA) and a re-readable trust-store path. |
 | `quit`, `exit` | — | Shuts the node down gracefully. |
 
 Per-command usage errors print verbatim (e.g. `Usage: supply <seller>
@@ -237,6 +239,8 @@ Commands:
   identity-gen     Generate a new node identity (with optional org Root CA)
   contract-deploy  Deploy a smart contract to a GlassChain node
   ledger-inspect   Inspect the ledger state (blocks, assets, chain status)
+  backup-scrub     Purge expired private payloads from a storage copy (ADR-017)
+  channel-admin    Drive the ADR-017 channel-management RPCs as an admin principal
   help             Print this message or the help of the given subcommand
 
 Options:
@@ -285,6 +289,28 @@ glasschain ledger-inspect --endpoint http://127.0.0.1:50051
 # … --block 42  |  --gtin 07891234567890 [--serial SN-00001]
 ```
 
+### `channel-admin` (ADR-017)
+
+Drive the channel-management RPCs as a **certificate-bound admin principal**:
+the caller presents an organization-issued certificate carrying the admin
+Organizational Unit and signs the header challenge with its own key. The
+server's `AdminGate` verifies the chain, CRL, CN and possession.
+
+```bash
+glasschain channel-admin --endpoint http://127.0.0.1:50051 \
+    --cert admin.pem --key-seed <64-hex-seed> \
+    create-channel --name pricing --description "Private pricing" \
+        --member org-member [--retention-secs 3600]
+
+# … add-member --name pricing --member-id org-second
+# … remove-member --name pricing --member-id org-second
+```
+
+The `--key-seed` is the admin identity's ed25519 seed — the `seed_hex` field
+of the durable identity file (`identity-gen`/ADR-018 flow). A member
+certificate without the admin role is refused (`admin role` in the
+`PERMISSION_DENIED` message); any call without the headers is refused too.
+
 ---
 
 ## 5. The gRPC API
@@ -307,6 +333,9 @@ one plain-HTTP/2 (no TLS) port — use `grpcurl -plaintext`.
 | `LedgerService` | `GetVerifiableLineage` | `GetVerifiableLineageRequest{asset_id}` → `GetVerifiableLineageResponse` | unary | ✅ — custody chain + flat-record completeness + average trust score from the provenance index / analytical flattener; `INVALID_ARGUMENT` on empty `asset_id` |
 | `NodeService` | `GetNodeStatus` | `GetNodeStatusRequest{}` → `GetNodeStatusResponse{node_id, listen_addr, version, chain_length, peer_count}` | unary | ✅ — note `version` is currently hard-coded `"glasschain/1"` |
 | `NodeService` | `GetPeers` | `GetPeersRequest{}` → `GetPeersResponse{peer_addresses}` | unary | ✅ |
+| `NodeService` | `CreateChannel` | `CreateChannelRequest{name, description, member_ids, retention_secs}` → `CreateChannelResponse{created}` | unary | ✅ — ADR-017 admin-only: requires the `x-glasschain-*` headers **and** a certificate-bound admin principal (`x-glasschain-cert`); `PERMISSION_DENIED` without a configured verifier |
+| `NodeService` | `AddChannelMember` | `AddChannelMemberRequest{name, member_id}` → `AddChannelMemberResponse{added}` | unary | ✅ — same admin gate; `NOT_FOUND` for an unconfigured collection |
+| `NodeService` | `RemoveChannelMember` | `RemoveChannelMemberRequest{name, member_id}` → `RemoveChannelMemberResponse{removed}` | unary | ✅ — same admin gate; `NOT_FOUND` for an unconfigured collection |
 | `IdentityService` | `ExchangeCertificate` | `ExchangeCertificateRequest{org_name, root_ca_cert_pem, node_id}` → `ExchangeCertificateResponse` | unary | ⚠️ implemented as **acknowledge-only**: always `accepted: true`, but `node_cert_pem` is empty ("populated once identity integration is complete"; no trust store is modified) |
 | `IdentityService` | `VerifyEndorsement` | `VerifyEndorsementRequest{proposal_json}` → `VerifyEndorsementResponse` | unary | ✅ real evaluation — but only when an endorsement provider is attached (see Section 9); on a stock node it returns `approved: false` with `"no endorsement provider configured on this node"` |
 
@@ -589,11 +618,16 @@ feed `--all-features` builds).
    path refuses (#86); with it, senders must be certificate-verified members
    **and** prove possession of the certificate key on the session (#110).
    Anything not org-gated still rests on TOFU fingerprint pinning.
-2. **Revocation is enforced but manually distributed, and OCSP is absent.**
-   CRLs and intermediate CAs load from `--trust-store` and a missing, expired,
-   or listed serial rejects the certificate (ADR-013, fail-closed). Revocation
-   is go-forward only; the on-chain distribution registry remains deferred
-   (#74).
+2. **Revocation is fail-closed; the OCSP staple is local-only, and
+   distribution stays manual.** CRLs and intermediate CAs load from
+   `--trust-store` and a missing, expired, or listed serial rejects the
+   certificate (ADR-013, fail-closed). An identity-backed node additionally
+   staples an issuer-signed OCSP response on every `Hello` (ADR-017):
+   receivers verify it **locally** — no responder network queries — and a
+   `revoked` staple fails the session's org verification closed. Malformed,
+   mismatched, or expired staples are not positive signals and fall back to
+   the CRL result. Revocation is go-forward only; the on-chain distribution
+   registry remains deferred (#74).
 3. **Endorsement enforcement requires both a provider and the active
    capability.** `glasschain-node` attaches an `MspEndorsementProvider` when it
    has an organizational identity (`--org`); enforcement engages only once the
@@ -611,6 +645,44 @@ feed `--all-features` builds).
    verifier configured every private path fails closed (#86); with one, the
    sender must present a certificate-verified member org **and** prove
    possession of its key on the session (#110).
+
+### Admin RBAC and channel management over gRPC (ADR-017)
+
+`NodeService` carries three channel-management operations — `CreateChannel`,
+`AddChannelMember`, `RemoveChannelMember` — and each call requires a
+**certificate-bound MSP admin principal**. A caller is authorized only when:
+
+1. the `x-glasschain-node-id` / `x-glasschain-auth-ts` /
+   `x-glasschain-auth-sig` headers are present (the signature covers
+   `{node_id}:{timestamp}` and sits inside a ±60 s replay window);
+2. the base64 DER certificate in `x-glasschain-cert` verifies against the
+   node's trust store — chain, validity, CRL, all fail-closed;
+3. the certificate's subject CN equals the calling node id;
+4. the signature verifies under the **certificate's own key** (possession);
+5. the verified subject carries the admin Organizational Unit
+   (`OU=admin`, minted via `Organization::issue_identity_with_role`).
+
+The gate installs when the certificate verifier does (`--org` +
+`--trust-store`); without it these RPCs return `PermissionDenied` — there is
+no trust basis for an operator. Collection-scoped endorsement policy stays
+authoritative in the committed `PolicyUpdate` records; the RPCs mutate the
+node's runtime collection declaration.
+
+### Physical backup retention (ADR-017)
+
+The node's D5 sweep purges expired private payloads from the **live** store
+only. Before archiving a physical backup, copy the storage directory and
+scrub the copy:
+
+```bash
+cp -r /var/lib/glasschain/storage /backups/storage-$(date +%F)
+glasschain backup-scrub --storage /backups/storage-$(date +%F)
+```
+
+The chain's hash commitments persist in the copy; the expired private
+cleartext does not. Raw block-device snapshots need disk-level encryption key
+destruction at retention expiry — scrubbing a copy is the only control for a
+file-level backup.
 
 ### Governance bootstrap (D1)
 

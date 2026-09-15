@@ -37,6 +37,22 @@ service NodeService {
 
   // Return the list of known peer addresses.
   rpc GetPeers(GetPeersRequest) returns (GetPeersResponse);
+
+  // ADR-017 operator RBAC: channel-management operations. Every call requires
+  // a certificate-bound MSP admin principal — the `x-glasschain-*` headers
+  // plus a base64 DER certificate in `x-glasschain-cert` whose subject CN
+  // equals `x-glasschain-node-id`, whose key signs the header challenge, and
+  // which carries the admin Organizational Unit in its verified subject.
+  // Without a configured certificate verifier these RPCs fail closed.
+
+  // Create a new private data collection on this node (runtime declaration).
+  rpc CreateChannel(CreateChannelRequest) returns (CreateChannelResponse);
+
+  // Add a member organization to an existing collection.
+  rpc AddChannelMember(AddChannelMemberRequest) returns (AddChannelMemberResponse);
+
+  // Remove a member organization from an existing collection.
+  rpc RemoveChannelMember(RemoveChannelMemberRequest) returns (RemoveChannelMemberResponse);
 }
 
 // ─── Identity Service ──────────────────────────────────────────────────────
@@ -146,6 +162,44 @@ message GetPeersRequest {}
 
 message GetPeersResponse {
   repeated string peer_addresses = 1;
+}
+
+// ─── NodeService channel-management messages (ADR-017) ────────────────────
+
+message CreateChannelRequest {
+  // Unique collection name (e.g. "pharma-anvisa-channel").
+  string name = 1;
+  // Human-readable description.
+  string description = 2;
+  // Member organization IDs. Regulators are added automatically.
+  repeated string member_ids = 3;
+  // The collection's private-payload retention window in seconds (ADR-003);
+  // zero selects the 72-hour default.
+  uint64 retention_secs = 4;
+}
+
+message CreateChannelResponse {
+  // `true` when the collection was created on this node.
+  bool created = 1;
+}
+
+message AddChannelMemberRequest {
+  string name = 1;
+  // The member organization ID to admit.
+  string member_id = 2;
+}
+
+message AddChannelMemberResponse {
+  bool added = 1;
+}
+
+message RemoveChannelMemberRequest {
+  string name = 1;
+  string member_id = 2;
+}
+
+message RemoveChannelMemberResponse {
+  bool removed = 1;
 }
 
 // ─── IdentityService messages ──────────────────────────────────────────────

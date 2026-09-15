@@ -171,6 +171,7 @@ impl From<CertVerificationError> for IdentityError {
 // ── Verifier ──────────────────────────────────────────────────────────────────
 
 /// One trusted Root CA: an own-organization anchor or a federation anchor.
+#[derive(Clone)]
 struct TrustAnchor {
     /// Human-readable organization name, used in error/log messages.
     org_name: String,
@@ -191,6 +192,7 @@ struct TrustAnchor {
 /// peer certificate to this organisation's Root CA. Lowering `level` to
 /// [`VerificationLevel::Structural`] reduces the check to a Distinguished Name
 /// comparison that any party can satisfy by self-signing; do that only in tests.
+#[derive(Clone)]
 pub struct CertChainVerifier {
     /// Full DER encoding of the Root CA certificate.
     ///
@@ -218,7 +220,7 @@ pub struct CertChainVerifier {
     /// without a current CRL from the issuing CA, revocation status is unknown
     /// and the certificate is rejected (webpki `UnknownStatusPolicy::Deny`),
     /// and an expired CRL is an error too (`ExpirationPolicy::Enforce`).
-    crls: Vec<webpki::CertRevocationList<'static>>,
+    crls: Vec<webpki::OwnedCertRevocationList>,
 }
 
 // ── Constructors ──────────────────────────────────────────────────────────────
@@ -394,7 +396,7 @@ impl CertChainVerifier {
                 .map_err(|e| CertVerificationError::PemError(e.to_string()))?;
         let crl = webpki::OwnedCertRevocationList::from_der(der.as_ref())
             .map_err(|e| CertVerificationError::ParseError(e.to_string()))?;
-        self.crls.push(crl.into());
+        self.crls.push(crl);
         Ok(())
     }
 
@@ -417,7 +419,7 @@ impl CertChainVerifier {
             let crl = crl.map_err(|e| CertVerificationError::PemError(e.to_string()))?;
             let crl = webpki::OwnedCertRevocationList::from_der(crl.as_ref())
                 .map_err(|e| CertVerificationError::ParseError(e.to_string()))?;
-            self.crls.push(crl.into());
+            self.crls.push(crl);
             added += 1;
         }
         if added == 0 {
@@ -578,8 +580,13 @@ impl CertChainVerifier {
             .map(|i| rustls_pki_types::CertificateDer::from(i.cert_der.as_slice()))
             .collect();
 
-        let crls: Vec<&webpki::CertRevocationList<'static>> = self.crls.iter().collect();
-        let revocation = webpki::RevocationOptionsBuilder::new(&crls)
+        // ponytail: each verify clones the stored CRLs into the borrowed
+        // view webpki wants; fine at trust-store sizes, hold them once behind
+        // a prebuilt RevocationOptions if profiling ever disagrees.
+        let crls: Vec<webpki::CertRevocationList<'static>> =
+            self.crls.iter().map(|owned| owned.clone().into()).collect();
+        let crl_refs: Vec<&webpki::CertRevocationList<'static>> = crls.iter().collect();
+        let revocation = webpki::RevocationOptionsBuilder::new(&crl_refs)
             .map_err(|_| CertVerificationError::CrlMissing)?
             .with_expiration_policy(webpki::ExpirationPolicy::Enforce)
             .build();
@@ -690,6 +697,88 @@ impl CertChainVerifier {
     #[must_use]
     pub fn root_ca_der(&self) -> &[u8] {
         &self.root_cert_der
+    }
+
+    /// Verify the OCSP staple `staple_der` for the certificate `peer_cert_pem`
+    /// (ADR-017): the staple's signature must verify under the **issuing CA's
+    /// public key** — the trusted certificate whose Subject DN matches the
+    /// certificate's Issuer DN (own root, federation anchor, or intermediate)
+    /// — the certID must name this certificate's serial, and the response
+    /// must be fresh (`thisUpdate ≤ now ≤ nextUpdate`).
+    ///
+    /// Fail-closed posture: any parse, mismatch or expiry error means the
+    /// staple is unusable and the caller falls back to the CRL path (ADR-013
+    /// verification already rejects missing/stale/revoked CRL status).
+    /// Only [`OcspStatus::Revoked`] is a *negative* live result: the issuer
+    /// itself attests the certificate was revoked, so the session's org
+    /// verification fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OcspError`](crate::ocsp::OcspError) for a malformed response,
+    /// a signature that does not verify under the issuer's key, an expired
+    /// response, a certID mismatch, or no matching issuer anchor in this
+    /// verifier.
+    pub fn verify_ocsp_staple(
+        &self,
+        peer_cert_pem: &str,
+        staple_der: &[u8],
+    ) -> Result<crate::ocsp::OcspStatus, crate::ocsp::OcspError> {
+        use crate::ocsp::{parse_staple, OcspError};
+        use rustls_pki_types::pem::PemObject;
+
+        let peer_der = CertificateDer::from_pem_slice(peer_cert_pem.as_bytes())
+            .map_err(|_| OcspError::Malformed)?;
+        let peer_cert =
+            Certificate::from_der(peer_der.as_ref()).map_err(|_| OcspError::Malformed)?;
+        let peer_serial = peer_cert
+            .tbs_certificate()
+            .serial_number()
+            .as_bytes()
+            .to_vec();
+        let mut issuer_der = Vec::new();
+        peer_cert
+            .tbs_certificate()
+            .issuer()
+            .encode_to_vec(&mut issuer_der)
+            .map_err(|_| OcspError::Malformed)?;
+
+        // The issuing CA is the trusted certificate whose Subject DN matches
+        // the peer certificate's Issuer DN — own root, federation anchor, or
+        // intermediate (the same structural match `add_anchor` records).
+        let anchors: Vec<&[u8]> = std::iter::once(self.root_cert_der.as_slice())
+            .chain(
+                self.federation_anchors
+                    .iter()
+                    .map(|a| a.cert_der.as_slice()),
+            )
+            .chain(self.intermediates.iter().map(|i| i.cert_der.as_slice()))
+            .collect();
+        let issuer_public_key = anchors
+            .iter()
+            .find_map(|anchor| {
+                let ca = Certificate::from_der(anchor).ok()?;
+                let mut subject_der = Vec::new();
+                ca.tbs_certificate()
+                    .subject()
+                    .encode_to_vec(&mut subject_der)
+                    .ok()?;
+                (subject_der == issuer_der).then(|| {
+                    ca.tbs_certificate()
+                        .subject_public_key_info()
+                        .subject_public_key
+                        .as_bytes()
+                        .map(<[u8]>::to_vec)
+                })
+            })
+            .flatten()
+            .ok_or(OcspError::Malformed)?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        parse_staple(staple_der)?.verify_against(&issuer_public_key, &peer_serial, now)
     }
 }
 

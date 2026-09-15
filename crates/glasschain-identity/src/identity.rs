@@ -50,6 +50,23 @@ impl Identity {
         }
     }
 
+    /// Restore an identity from a persisted 32-byte ed25519 seed — the
+    /// durable-custody path (ADR-018). `crate::Organization::import_json`
+    /// rebuilds member identities with it; the seed stays inside the crate.
+    pub(crate) fn from_seed(node_id: impl Into<String>, seed: [u8; 32]) -> Self {
+        Self {
+            node_id: node_id.into(),
+            signing_key: SigningKey::from_bytes(&seed),
+            certificate_pem: None,
+        }
+    }
+
+    /// The raw 32-byte ed25519 seed this identity signs with — custody
+    /// material, exposed only within the crate (ADR-018 export path).
+    pub(crate) fn seed_bytes(&self) -> [u8; 32] {
+        self.signing_key.to_bytes()
+    }
+
     /// Return the raw 32-byte public key.
     #[must_use]
     pub fn public_key_bytes(&self) -> [u8; 32] {

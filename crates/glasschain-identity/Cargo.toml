@@ -28,6 +28,11 @@ time = { version = "0.3", default-features = false, features = ["std"] }
 # lib name is `webpki`; `ring` matches the provider glasschain-network already
 # selects for rustls, so both crates share one crypto backend.
 rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
+# OCSP staple signing/verification (ADR-017): P-256 over the CA key, already
+# the rcgen/rustls provider in this workspace.
+ring = "0.17"
+# certID SHA-256 hashes (ADR-017), the same 0.11 tree glasschain-core uses.
+sha2 = "0.11"
 
 [dev-dependencies]
 

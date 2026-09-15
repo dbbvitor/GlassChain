@@ -86,6 +86,7 @@ async fn send_hello(
         certificate_pem: None,
         certificate_proof: None,
         fingerprint_proof: None,
+        ocsp_response_der: None,
         listen_addr: listen_addr.to_owned(),
     };
     writer.send(&msg).await.unwrap();

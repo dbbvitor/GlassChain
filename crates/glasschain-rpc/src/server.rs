@@ -1,15 +1,17 @@
 //! Tonic gRPC server implementations for `LedgerService` and `NodeService`.
 
-use crate::auth::{MspAuthInterceptor, TrustedKeyRegistry};
+use crate::auth::{AdminGate, MspAuthInterceptor, TrustedKeyRegistry};
 use crate::proto::glasschain_v1::{
     identity_service_server::{IdentityService, IdentityServiceServer},
     ledger_service_server::{LedgerService, LedgerServiceServer},
     node_service_server::{NodeService, NodeServiceServer},
+    AddChannelMemberRequest, AddChannelMemberResponse, CreateChannelRequest, CreateChannelResponse,
     CustodyEventProto, ExchangeCertificateRequest, ExchangeCertificateResponse, GetBlockRequest,
     GetBlockResponse, GetChainStatusRequest, GetChainStatusResponse, GetNodeStatusRequest,
     GetNodeStatusResponse, GetPeersRequest, GetPeersResponse, GetVerifiableLineageRequest,
     GetVerifiableLineageResponse, QueryAssetHistoryRequest, QueryAssetHistoryResponse,
-    StreamBlocksRequest, StreamBlocksResponse, SubmitTransactionRequest, SubmitTransactionResponse,
+    RemoveChannelMemberRequest, RemoveChannelMemberResponse, StreamBlocksRequest,
+    StreamBlocksResponse, SubmitTransactionRequest, SubmitTransactionResponse,
     SubscribeToEventsRequest, SubscribeToEventsResponse, TransactionProto,
     VerifyEndorsementRequest, VerifyEndorsementResponse,
 };
@@ -186,6 +188,9 @@ struct ServerState {
     node: Arc<Node>,
     provenance: Arc<tokio::sync::Mutex<glasschain_indexer::ProvenanceIndex>>,
     flattener: Arc<tokio::sync::Mutex<glasschain_indexer::AnalyticalFlattener>>,
+    /// ADR-017 operator RBAC: the gate that authorizes channel-management
+    /// RPCs. `None` ⇒ those RPCs fail closed.
+    admin: Option<AdminGate>,
 }
 
 // ── LedgerService implementation ──────────────────────────────────────────────
@@ -478,6 +483,15 @@ impl LedgerService for ServerState {
 
 // ── NodeService implementation ────────────────────────────────────────────────
 
+/// Reject an admin operation when no admin gate is configured — fail closed:
+/// without a certificate verifier there is no trust basis for an operator.
+fn admin_gate_unavailable() -> Status {
+    Status::permission_denied(
+        "admin operations require a configured certificate verifier \
+         (start the node with --org and --trust-store)",
+    )
+}
+
 #[tonic::async_trait]
 impl NodeService for ServerState {
     async fn get_node_status(
@@ -502,6 +516,99 @@ impl NodeService for ServerState {
     ) -> Result<Response<GetPeersResponse>, Status> {
         let peer_addresses = self.node.known_peers().await;
         Ok(Response::new(GetPeersResponse { peer_addresses }))
+    }
+
+    async fn create_channel(
+        &self,
+        request: Request<CreateChannelRequest>,
+    ) -> Result<Response<CreateChannelResponse>, Status> {
+        let Some(gate) = self.admin.as_ref() else {
+            return Err(admin_gate_unavailable());
+        };
+        gate.authorize(request.metadata())?;
+        let req = request.into_inner();
+        if req.name.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "collection name must not be empty",
+            ));
+        }
+        let retention = if req.retention_secs == 0 {
+            glasschain_identity::default_retention_secs()
+        } else {
+            req.retention_secs
+        };
+        self.node
+            .admin_create_channel(glasschain_identity::ChannelConfig {
+                name: req.name,
+                member_ids: req.member_ids,
+                description: req.description,
+                endorsement_policy: None,
+                retention_secs: retention,
+            })
+            .await
+            .map_err(|e| match e {
+                glasschain_network::NetworkError::UnknownCollection(name) => {
+                    Status::already_exists(format!("collection `{name}` already exists"))
+                }
+                other => Status::internal(other.to_string()),
+            })?;
+        log::info!("admin: collection created via RPC");
+        Ok(Response::new(CreateChannelResponse { created: true }))
+    }
+
+    async fn add_channel_member(
+        &self,
+        request: Request<AddChannelMemberRequest>,
+    ) -> Result<Response<AddChannelMemberResponse>, Status> {
+        let Some(gate) = self.admin.as_ref() else {
+            return Err(admin_gate_unavailable());
+        };
+        let caller = gate.authorize(request.metadata())?;
+        let req = request.into_inner();
+        self.node
+            .admin_channel_add_member(&req.name, &req.member_id)
+            .await
+            .map_err(|e| match e {
+                glasschain_network::NetworkError::UnknownCollection(name) => {
+                    Status::not_found(format!("collection `{name}` is not configured"))
+                }
+                other => Status::internal(other.to_string()),
+            })?;
+        log::info!(
+            "admin: '{}' added member '{}' to collection '{}'",
+            caller,
+            req.member_id,
+            req.name
+        );
+        Ok(Response::new(AddChannelMemberResponse { added: true }))
+    }
+
+    async fn remove_channel_member(
+        &self,
+        request: Request<RemoveChannelMemberRequest>,
+    ) -> Result<Response<RemoveChannelMemberResponse>, Status> {
+        let Some(gate) = self.admin.as_ref() else {
+            return Err(admin_gate_unavailable());
+        };
+        let caller = gate.authorize(request.metadata())?;
+        let req = request.into_inner();
+        let removed = self
+            .node
+            .admin_channel_remove_member(&req.name, &req.member_id)
+            .await
+            .map_err(|e| match e {
+                glasschain_network::NetworkError::UnknownCollection(name) => {
+                    Status::not_found(format!("collection `{name}` is not configured"))
+                }
+                other => Status::internal(other.to_string()),
+            })?;
+        log::info!(
+            "admin: '{}' removed member '{}' from collection '{}'",
+            caller,
+            req.member_id,
+            req.name
+        );
+        Ok(Response::new(RemoveChannelMemberResponse { removed }))
     }
 }
 
@@ -615,13 +722,29 @@ pub struct GlasschainServer {
     node: Arc<Node>,
     /// Optional MSP authentication interceptor.
     auth: Option<MspAuthInterceptor>,
+    /// Optional admin gate (ADR-017) for the channel-management RPCs.
+    admin: Option<AdminGate>,
 }
 
 impl GlasschainServer {
     /// Create a new server backed by the given node, with no authentication.
     #[must_use]
     pub const fn new(node: Arc<Node>) -> Self {
-        Self { node, auth: None }
+        Self {
+            node,
+            auth: None,
+            admin: None,
+        }
+    }
+
+    /// Attach the ADR-017 admin gate: `NodeService`'s channel-management
+    /// RPCs (`CreateChannel`, `AddChannelMember`, `RemoveChannelMember`)
+    /// then require a certificate-bound MSP admin principal. Without a gate
+    /// those RPCs fail closed.
+    #[must_use]
+    pub fn with_admin_gate(mut self, gate: AdminGate) -> Self {
+        self.admin = Some(gate);
+        self
     }
 
     /// Create a server with MSP authentication.
@@ -644,6 +767,7 @@ impl GlasschainServer {
         Self {
             node,
             auth: Some(interceptor),
+            admin: None,
         }
     }
 
@@ -678,6 +802,7 @@ impl GlasschainServer {
             provenance: self.node.provenance_index(),
             flattener: self.node.analytical_flattener(),
             node: self.node,
+            admin: self.admin,
         };
 
         log::info!("GlassChain gRPC server listening on {addr}");

@@ -2,9 +2,9 @@ use glasschain_core::{
     endorsement::Principal, InventoryUpdate, PurchaseConditions, PurchaseOrder, SmartContractDef,
     SupplyOffer, TraceableAsset, TraceableAssetRegistration, Transaction, TransactionKind,
 };
-use glasschain_identity::{CertChainVerifier, MspEndorsementProvider, Organization};
+use glasschain_identity::{CertChainVerifier, Identity, MspEndorsementProvider, Organization};
 use glasschain_network::{Node, NodeEvent};
-use glasschain_rpc::GlasschainServer;
+use glasschain_rpc::{AdminGate, GlasschainServer};
 use glasschain_storage::SledStorageProvider;
 use glasschain_vm::WasmExecutionProvider;
 use std::env;
@@ -40,6 +40,117 @@ fn parse_price(s: &str) -> Option<u64> {
 }
 
 /// Print usage information.
+/// Build a certificate verifier from the trust store at `path` — a PEM file
+/// or a directory of `*.pem` (anchors/intermediates) and `*.crl` (ADR-013)
+/// files. Shared by startup and the `reload-trust-store` REPL command
+/// (zero-trust residual ZT-R3): both load the same way.
+///
+/// Returns the verifier plus `(files_loaded, crls_loaded)` for the startup
+/// log line.
+fn build_trust_store_verifier(
+    org: &str,
+    root_pem: &str,
+    path: &str,
+) -> Result<(CertChainVerifier, usize, usize), String> {
+    let mut verifier = CertChainVerifier::from_pem(org, root_pem)
+        .map_err(|e| format!("cannot build certificate verifier for `{org}`: {e}"))?;
+    let load = |v: &mut CertChainVerifier, p: &std::path::Path| {
+        v.add_federation_root_file(p).map_err(|e| e.to_string())
+    };
+    let load_crl = |v: &mut CertChainVerifier, p: &std::path::Path| {
+        v.add_crl_file(p).map_err(|e| e.to_string())
+    };
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => {
+            let mut added = 0usize;
+            let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(path)
+                .map_err(|e| format!("cannot read trust store directory `{path}`: {e}"))?
+                .filter_map(|entry| entry.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.extension()
+                        .is_some_and(|ext| ext == "pem" || ext == "crl")
+                })
+                .collect();
+            files.sort();
+            for file in &files {
+                // `*.crl` files hold the organizations' signed CRLs (ADR-013);
+                // `*.pem` files hold Root/intermediate CA certificates.
+                let res = if file.extension().is_some_and(|ext| ext == "crl") {
+                    load_crl(&mut verifier, file)
+                } else {
+                    load(&mut verifier, file)
+                };
+                res.map_err(|e| {
+                    format!("cannot load trust anchor from `{}`: {e}", file.display())
+                })?;
+                added += 1;
+            }
+            let crls = verifier.crl_count();
+            Ok((verifier, added, crls))
+        }
+        Ok(_) => {
+            load(&mut verifier, std::path::Path::new(path))?;
+            let crls = verifier.crl_count();
+            Ok((verifier, 1, crls))
+        }
+        Err(e) => Err(format!("cannot load trust store at `{path}`: {e}")),
+    }
+}
+
+/// Load-or-create the operator-owned identity file (ADR-018).
+///
+/// Returns `(organization, identity, freshly_created)`.
+fn load_or_create_identity_file(
+    path: &std::path::Path,
+    org_name: &str,
+    identity_name: &str,
+) -> Result<(Organization, Arc<Identity>, bool), String> {
+    if path.exists() {
+        let json = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read identity file `{}`: {e}", path.display()))?;
+        let organization = Organization::import_json(&json)
+            .map_err(|e| format!("identity file `{}` is corrupt: {e}", path.display()))?;
+        let member = organization
+            .get_member(identity_name)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "identity file `{}` holds organization `{}` but no member \
+                     `{identity_name}`; fix --identity-node-id or re-provision",
+                    path.display(),
+                    organization.name
+                )
+            })?;
+        if organization.name != org_name {
+            return Err(format!(
+                "--org '{org_name}' does not match the identity file's organization \
+                 '{}'",
+                organization.name
+            ));
+        }
+        Ok((organization, Arc::new(member), false))
+    } else {
+        let mut organization = Organization::new(org_name)
+            .map_err(|e| format!("cannot create organization `{org_name}`: {e}"))?;
+        let identity = organization
+            .issue_identity(identity_name)
+            .map_err(|e| format!("cannot issue identity `{identity_name}`: {e}"))?
+            .clone();
+        let json = organization
+            .export_json()
+            .map_err(|e| format!("cannot serialize identity material: {e}"))?;
+        std::fs::write(path, &json)
+            .map_err(|e| format!("cannot write identity file `{}`: {e}", path.display()))?;
+        // Owner read/write only — the file carries private keys.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok((organization, Arc::new(identity), true))
+    }
+}
+
 fn usage() {
     eprintln!(
         r#"GlassChain Node
@@ -61,6 +172,11 @@ OPTIONS:
                             certificates of the peer organizations to trust (ADR-011).
                             Requires --org. Without it, peer organizations are NOT
                             certificate-verified.
+    --identity-file <PATH>  Operator-owned durable identity file (ADR-018): created
+                            on first start, loaded after — the same identity key,
+                            certificate and Root CA across restarts, so persisted
+                            TOFU pins keep verifying. Requires --org. Without it the
+                            identity is regenerated every start (dev behaviour).
     --rpc-addr <ADDR>       Address to bind the gRPC server (e.g. "0.0.0.0:50051").
                             When omitted, the gRPC server is not started.
     --help                  Show this help message
@@ -92,6 +208,11 @@ INTERACTIVE COMMANDS (after startup):
         Print known peers.
 
     contracts    List all registered smart contracts.
+
+    reload-trust-store <PATH>
+        Re-read the federation trust store (PEM/CRL files) and hot-swap the
+        certificate verifier (ADR-011/ADR-013, ZT-R3). Requires --org and the
+        identity Root CA this node was started with.
 
     quit / exit
         Shut down the node.
@@ -151,6 +272,12 @@ enum ReplCommand {
     Pending,
     Peers,
     Contracts,
+    /// Reload the federation trust store (ZT-R3): re-read `--trust-store`
+    /// files and hot-swap the verifier (peer paths take effect at the next
+    /// Hello; the admin gate sees the new chain/CRLs immediately).
+    ReloadTrustStore {
+        path: String,
+    },
     Quit,
 }
 
@@ -318,6 +445,15 @@ fn parse_command(line: &str) -> Result<Option<ReplCommand>, String> {
         "pending" => Ok(Some(ReplCommand::Pending)),
         "peers" => Ok(Some(ReplCommand::Peers)),
         "contracts" => Ok(Some(ReplCommand::Contracts)),
+        "reload-trust-store" => {
+            if parts.len() != 2 {
+                return Err("Usage: reload-trust-store <PATH>".to_owned());
+            }
+            Ok(Some(ReplCommand::ReloadTrustStore {
+                path: parts[1].to_owned(),
+            }))
+        }
+
         "quit" | "exit" => Ok(Some(ReplCommand::Quit)),
 
         other => Err(format!(
@@ -347,6 +483,7 @@ async fn main() {
     let mut org_name: Option<String> = None;
     let mut identity_node_id: Option<String> = None;
     let mut trust_store: Option<String> = None;
+    let mut identity_file: Option<String> = None;
     let mut rpc_addr: Option<String> = None;
 
     let mut i = 1;
@@ -400,6 +537,12 @@ async fn main() {
                     trust_store = Some(v.clone());
                 }
             }
+            "--identity-file" => {
+                i += 1;
+                if let Some(v) = args.get(i) {
+                    identity_file = Some(v.clone());
+                }
+            }
             "--rpc-addr" => {
                 i += 1;
                 if let Some(v) = args.get(i) {
@@ -416,29 +559,81 @@ async fn main() {
     );
 
     let mut org_root_pem: Option<String> = None;
+    let mut ocsp_staple: Option<Vec<u8>> = None;
+    // ADR-017 operator RBAC: the gRPC channel-management gate, installed when
+    // the certificate verifier is. `None` ⇒ admin RPCs fail closed.
+    // Survives the gRPC spawn so `reload-trust-store` can hot-swap it (ZT-R3).
+    let mut admin_gate_handle: Option<AdminGate> = None;
+    // ── Identity custody (ADR-018) ───────────────────────────────────────────
+    // Without `--identity-file` the organization is regenerated every start
+    // (dev behaviour: every restart is a new key). With `--identity-file` the
+    // node owns a durable identity file: created on first start, loaded after
+    // — the same identity key, certificate and root CA re-presented, so
+    // persisted TOFU pins keep verifying across restarts.
+
     let identity = org_name.as_ref().map(|org| {
         let identity_name = identity_node_id.clone().unwrap_or_else(|| node_id.clone());
-        let mut organization = match Organization::new(org.clone()) {
-            Ok(v) => v,
-            Err(e) => {
-                log::error!("Failed to create organization `{org}`: {e}");
-                std::process::exit(1);
-            }
-        };
-        let issued_identity = match organization.issue_identity(identity_name.clone()) {
-            Ok(v) => v.clone(),
-            Err(e) => {
-                log::error!(
-                    "Failed to issue identity `{identity_name}` from organization `{org}`: {e}"
+        let (organization, issued_identity) = identity_file.as_deref().map_or_else(
+            || {
+                log::warn!(
+                    "No --identity-file: organization `{org}` and identity `{identity_name}` are \
+                     regenerated every start (new key, new certificate, new Root CA) — persisted \
+                     TOFU pins on peers will refuse this node until an operator removes them \
+                     (start with --identity-file <PATH> for durable custody, ADR-018)"
                 );
-                std::process::exit(1);
-            }
-        };
+                let mut organization = Organization::new(org.clone()).unwrap_or_else(|e| {
+                    log::error!("Failed to create organization `{org}`: {e}");
+                    std::process::exit(1);
+                });
+                let issued_identity = organization
+                    .issue_identity(identity_name.clone())
+                    .unwrap_or_else(|e| {
+                        log::error!(
+                            "Failed to issue identity `{identity_name}` from organization `{org}`: {e}"
+                        );
+                        std::process::exit(1);
+                    })
+                    .clone();
+                (organization, Arc::new(issued_identity))
+            },
+            |file| {
+                let (organization, identity, created) =
+                    load_or_create_identity_file(std::path::Path::new(file), org, &identity_name)
+                        .unwrap_or_else(|e| {
+                            log::error!("{e}");
+                            std::process::exit(1);
+                        });
+                if created {
+                    log::info!(
+                        "Durable identity material created at `{file}` (0600) — the node re-presents the same identity key and Root CA across restarts (ADR-018)"
+                    );
+                } else {
+                    log::info!(
+                        "Loaded durable identity material for node `{identity_name}` from `{file}` (ADR-018)"
+                    );
+                }
+                (organization, identity)
+            },
+        );
         log::info!(
-            "Using identity-backed TLS certificate for node `{identity_name}` issued by organization `{org}`"
+            "Using identity-backed TLS certificate for node `{identity_name}` issued by organization `{}`",
+            organization.name
         );
         org_root_pem = Some(organization.root_ca_cert_pem.clone());
-        Arc::new(issued_identity)
+        // ADR-017: mint this node's OCSP staple — the issuer-signed live
+        // revocation status of its own certificate, stapled on every Hello.
+        match organization.ocsp_response_der(&identity_name) {
+            Ok(staple) => {
+                ocsp_staple = Some(staple);
+                log::info!(
+                    "OCSP staple minted for node `{identity_name}` (verified locally by peers; no responder network queries)"
+                );
+            }
+            Err(e) => log::warn!(
+                "OCSP staple minting failed for node `{identity_name}`: {e} — peers fall back to the CRL path"
+            ),
+        }
+        issued_identity
     });
 
     // Build the node — optionally backed by persistent Sled storage.
@@ -497,6 +692,11 @@ async fn main() {
         }
     }
 
+    // Staple the minted OCSP response on every Hello (ADR-017).
+    if let Some(staple) = ocsp_staple {
+        node.set_ocsp_staple(staple).await;
+    }
+
     // Attach the MSP endorsement provider when the node has an organizational
     // identity. Attaching it is necessary but not sufficient: enforcement also
     // requires the `endorsement` capability to be active at the candidate
@@ -528,80 +728,26 @@ async fn main() {
         trust_store.as_deref(),
     ) {
         (Some(org), Some(root_pem), Some(path)) => {
-            let mut verifier = match CertChainVerifier::from_pem(org, root_pem) {
-                Ok(v) => v,
+            let (verifier, files, crls) = match build_trust_store_verifier(org, root_pem, path) {
+                Ok(result) => result,
                 Err(e) => {
-                    log::error!("Failed to build certificate verifier for `{org}`: {e}");
+                    log::error!("{e}");
                     std::process::exit(1);
                 }
             };
-            let load = |v: &mut CertChainVerifier, p: &std::path::Path| {
-                v.add_federation_root_file(p).map_err(|e| e.to_string())
-            };
-            let load_crl = |v: &mut CertChainVerifier, p: &std::path::Path| {
-                v.add_crl_file(p).map_err(|e| e.to_string())
-            };
-            let result: Result<(usize, usize), String> = match std::fs::metadata(path) {
-                Ok(meta) if meta.is_dir() => {
-                    let mut added = 0usize;
-                    let mut files: Vec<std::path::PathBuf> = match std::fs::read_dir(path) {
-                        Ok(entries) => entries
-                            .filter_map(|entry| entry.ok().map(|e| e.path()))
-                            .filter(|p| {
-                                p.extension()
-                                    .is_some_and(|ext| ext == "pem" || ext == "crl")
-                            })
-                            .collect(),
-                        Err(e) => {
-                            log::error!("Failed to read trust store directory `{path}`: {e}");
-                            std::process::exit(1);
-                        }
-                    };
-                    files.sort();
-                    for file in &files {
-                        // `*.crl` files hold the organizations' signed CRLs
-                        // (ADR-013); `*.pem` files hold Root/intermediate CA
-                        // certificates.
-                        let res = if file.extension().is_some_and(|ext| ext == "crl") {
-                            load_crl(&mut verifier, file)
-                        } else {
-                            load(&mut verifier, file)
-                        };
-                        if let Err(e) = res {
-                            log::error!(
-                                "Failed to load trust anchor from `{}`: {e}",
-                                file.display()
-                            );
-                            std::process::exit(1);
-                        }
-                        added += 1;
-                    }
-                    // ADR-013 fail-closed: without CRLs every peer verification
-                    // rejects, so make the omission loud at startup.
-                    if verifier.federation_anchor_count() > 0 && verifier.crl_count() == 0 {
-                        log::warn!(
-                            "Trust store has federation anchors but no CRLs: every peer \
-                             verification will fail until '*.crl' files are added"
-                        );
-                    }
-                    Ok((added, verifier.crl_count()))
-                }
-                Ok(_) => load(&mut verifier, std::path::Path::new(path))
-                    .map(|()| (1usize, verifier.crl_count())),
-                Err(e) => Err(e.to_string()),
-            };
-            match result {
-                Ok((files, crls)) => {
-                    log::info!(
-                        "Certificate verification enabled: own organization `{org}` plus {files} trust-store file(s) from `{path}` — {crls} CRL(s) loaded; revocation is fail-closed (peers whose issuing CA has no current CRL are rejected)"
-                    );
-                    node.set_cert_verifier(verifier).await;
-                }
-                Err(e) => {
-                    log::error!("Failed to load trust store at `{path}`: {e}");
-                    std::process::exit(1);
-                }
+            // ADR-013 fail-closed: without CRLs every peer verification
+            // rejects, so make the omission loud at startup.
+            if verifier.federation_anchor_count() > 0 && verifier.crl_count() == 0 {
+                log::warn!(
+                    "Trust store has federation anchors but no CRLs: every peer \
+                     verification will fail until '*.crl' files are added"
+                );
             }
+            log::info!(
+                "Certificate verification enabled: own organization `{org}` plus {files} trust-store file(s) from `{path}` — {crls} CRL(s) loaded; revocation is fail-closed (peers whose issuing CA has no current CRL are rejected)"
+            );
+            node.set_cert_verifier(verifier.clone()).await;
+            admin_gate_handle = Some(AdminGate::new(Arc::new(verifier)));
         }
         (Some(_), Some(_), None) => {
             log::warn!(
@@ -706,6 +852,12 @@ async fn main() {
         match addr_str.parse::<SocketAddr>() {
             Ok(addr) => {
                 let server = GlasschainServer::new(rpc_node);
+                // ADR-017: the gate is installed only with a configured
+                // verifier; channel-management RPCs fail closed without one.
+                let server = match admin_gate_handle.as_ref() {
+                    Some(gate) => server.with_admin_gate(gate.clone()),
+                    None => server,
+                };
                 tokio::spawn(async move {
                     if let Err(e) = server.serve(addr).await {
                         log::error!("gRPC server error: {e}");
@@ -722,7 +874,10 @@ async fn main() {
     println!("GlassChain node `{node_id}` is running on {listen_addr}");
     println!("Type 'help' for available commands.\n");
 
-    // Interactive REPL.
+    // Interactive REPL. REPL-scope copies of the identity material the
+    // `reload-trust-store` command needs (ZT-R3).
+    let org_name_for_repl = org_name.clone();
+    let org_root_pem_for_repl = org_root_pem.clone();
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
     let mut line = String::new();
@@ -955,6 +1110,36 @@ async fn main() {
                 }
             }
 
+            ReplCommand::ReloadTrustStore { path } => {
+                match (
+                    org_name_for_repl.as_deref(),
+                    org_root_pem_for_repl.as_deref(),
+                ) {
+                    (Some(org), Some(root_pem)) => {
+                        match build_trust_store_verifier(org, root_pem, &path) {
+                            Ok((verifier, files, crls)) => {
+                                node.set_cert_verifier(verifier.clone()).await;
+                                // The admin gate shares the swap (ZT-R3):
+                                // it verifies against the new chain/CRLs
+                                // from the next authorization on.
+                                if let Some(gate) = admin_gate_handle.as_ref() {
+                                    gate.update_verifier(Arc::new(verifier));
+                                }
+                                println!(
+                                    "Trust store reloaded from {path}: {files} file(s), {crls} CRL(s) — the next Hello verifies against it."
+                                );
+                            }
+                            Err(e) => eprintln!("Error: {e}"),
+                        }
+                    }
+                    _ => {
+                        eprintln!(
+                            "reload-trust-store requires --org (there is no own Root CA to verify against)"
+                        );
+                    }
+                }
+            }
+
             ReplCommand::Quit => {
                 println!("Shutting down.");
                 break;
@@ -967,7 +1152,66 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_command, parse_price, ReplCommand};
+    use super::{build_trust_store_verifier, parse_command, parse_price, ReplCommand};
+    use glasschain_identity::Organization;
+
+    /// ZT-R3: the shared loader produces a verifier that (a) loads `*.pem`
+    /// anchors and `*.crl` files from a directory, (b) accepts a single-file
+    /// store, and (c) rejects a missing path. Reload is just "call it again".
+    #[test]
+    fn build_trust_store_verifier_loads_dir_file_and_reports() {
+        let mut org = Organization::new("PharmaCorp").unwrap();
+        let peer_org = Organization::new("MedCorp").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "glasschain-trust-store-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("peer-root.pem"), &peer_org.root_ca_cert_pem).unwrap();
+        std::fs::write(dir.join("peer-root.crl"), peer_org.crl_pem().unwrap()).unwrap();
+
+        // Directory store: one anchor file + one CRL file.
+        let (verifier, files, crls) =
+            build_trust_store_verifier("PharmaCorp", &org.root_ca_cert_pem, dir.to_str().unwrap())
+                .unwrap();
+        assert_eq!(files, 2);
+        assert_eq!(crls, 1);
+        assert_eq!(verifier.federation_anchor_count(), 1);
+        // A member of the *own* org still verifies through the reloaded
+        // verifier (rotation must not lose the own anchor).
+        let identity = org.issue_identity("node-a").unwrap().clone();
+        let mut with_own_crl = verifier;
+        with_own_crl.add_crl_pem(&org.crl_pem().unwrap()).unwrap();
+        assert!(with_own_crl
+            .verify_cert_pem(identity.certificate_pem.as_ref().unwrap())
+            .is_ok());
+
+        // Single-file store.
+        let single = dir.join("single.pem");
+        std::fs::write(&single, &peer_org.root_ca_cert_pem).unwrap();
+        let (_, files, crls) = build_trust_store_verifier(
+            "PharmaCorp",
+            &org.root_ca_cert_pem,
+            single.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(files, 1);
+        assert_eq!(crls, 0);
+
+        // Missing path.
+        assert!(build_trust_store_verifier(
+            "PharmaCorp",
+            &org.root_ca_cert_pem,
+            dir.join("nope").to_str().unwrap()
+        )
+        .is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parse_price_accepts_whole_number() {

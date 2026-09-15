@@ -7,6 +7,8 @@
 //! | `identity-gen`    | Generate a new node identity (standalone or org-issued). |
 //! | `contract-deploy` | Deploy a smart contract to a `GlassChain` node.            |
 //! | `ledger-inspect`  | Inspect the ledger state (blocks, assets, chain status). |
+//! | `backup-scrub`    | Purge expired private payloads from a storage copy (ADR-017). |
+//! | `channel-admin`   | Drive the ADR-017 channel-management RPCs as an admin principal. |
 //!
 //! # Usage
 //!
@@ -66,6 +68,15 @@ enum Commands {
     ///
     /// Shows which gRPC call would be issued against the configured endpoint.
     LedgerInspect(commands::inspect::LedgerInspectArgs),
+
+    /// Prune expired private payloads from a (copied) storage directory
+    /// before archiving it (ADR-017). Run it on a *copy*: the live node's
+    /// D5 sweep covers the running store, physical backups do not.
+    BackupScrub(commands::backup_scrub::BackupScrubArgs),
+
+    /// Administer channel membership over gRPC as a certificate-bound admin
+    /// principal (ADR-017): create a collection, add or remove a member.
+    ChannelAdmin(commands::channel_admin::ChannelAdminArgs),
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────────
@@ -84,6 +95,8 @@ fn main() -> anyhow::Result<()> {
         Commands::IdentityGen(args) => commands::identity::run(args, &mut std::io::stdout())?,
         Commands::ContractDeploy(args) => commands::contract::run(args, &mut std::io::stdout())?,
         Commands::LedgerInspect(args) => commands::inspect::run(&args, &mut std::io::stdout())?,
+        Commands::BackupScrub(args) => commands::backup_scrub::run(args, &mut std::io::stdout())?,
+        Commands::ChannelAdmin(args) => commands::channel_admin::run(args, &mut std::io::stdout())?,
     }
 
     Ok(())
