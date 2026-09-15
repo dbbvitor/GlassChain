@@ -563,7 +563,7 @@ impl NodeService for ServerState {
         let Some(gate) = self.admin.as_ref() else {
             return Err(admin_gate_unavailable());
         };
-        let caller = gate.authorize(request.metadata())?;
+        gate.authorize(request.metadata())?;
         let req = request.into_inner();
         self.node
             .admin_channel_add_member(&req.name, &req.member_id)
@@ -574,12 +574,7 @@ impl NodeService for ServerState {
                 }
                 other => Status::internal(other.to_string()),
             })?;
-        log::info!(
-            "admin: '{}' added member '{}' to collection '{}'",
-            caller,
-            req.member_id,
-            req.name
-        );
+        log::info!("admin: channel member added via RPC");
         Ok(Response::new(AddChannelMemberResponse { added: true }))
     }
 
@@ -590,7 +585,7 @@ impl NodeService for ServerState {
         let Some(gate) = self.admin.as_ref() else {
             return Err(admin_gate_unavailable());
         };
-        let caller = gate.authorize(request.metadata())?;
+        gate.authorize(request.metadata())?;
         let req = request.into_inner();
         let removed = self
             .node
@@ -602,12 +597,7 @@ impl NodeService for ServerState {
                 }
                 other => Status::internal(other.to_string()),
             })?;
-        log::info!(
-            "admin: '{}' removed member '{}' from collection '{}'",
-            caller,
-            req.member_id,
-            req.name
-        );
+        log::info!("admin: channel member removed via RPC");
         Ok(Response::new(RemoveChannelMemberResponse { removed }))
     }
 }

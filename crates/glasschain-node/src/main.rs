@@ -629,8 +629,8 @@ async fn main() {
                     "OCSP staple minted for node `{identity_name}` (verified locally by peers; no responder network queries)"
                 );
             }
-            Err(e) => log::warn!(
-                "OCSP staple minting failed for node `{identity_name}`: {e} — peers fall back to the CRL path"
+            Err(_) => log::warn!(
+                "OCSP staple minting failed; peers fall back to the CRL path"
             ),
         }
         issued_identity
