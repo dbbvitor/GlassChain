@@ -6,16 +6,24 @@
 
 use crate::error::IdentityError;
 use crate::identity::Identity;
+use crate::ocsp::{mint_good_response, OcspError, OcspMintInput};
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, Issuer, KeyPair, KeyUsagePurpose,
-    RevokedCertParams, SerialNumber,
+    RevocationReason, RevokedCertParams, SerialNumber,
 };
+use rustls_pki_types::pem::PemObject as _;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use x509_cert::der::{Decode, Encode};
 
 /// How long a minted CRL stays current (`next_update`). An operator must
 /// re-publish at least this often; verifiers fail closed on an expired CRL
 /// (ADR-013).
 const CRL_VALIDITY_DAYS: i64 = 30;
+
+/// The Organizational-Unit value marking an **operator administrator**
+/// certificate (ADR-017). Only certs carrying this OU satisfy the admin gate.
+pub const ADMIN_ROLE: &str = "admin";
 
 /// An organization that manages member identities and acts as the Root CA for
 /// the `GlassChain` MSP.
@@ -31,6 +39,15 @@ pub struct Organization {
     /// Root CA issuer — bundles the CA params and key pair so member certificates
     /// can be signed without needing the original `Certificate` object.
     ca_issuer: Issuer<'static, KeyPair>,
+    /// The Root CA's PKCS#8 private-key DER, stashed before `Issuer::new`
+    /// consumes the key pair — the OCSP staple signer (ADR-017).
+    ca_key_pkcs8_der: Vec<u8>,
+    /// The Root CA's Subject DN, full DER encoding — the OCSP responderID
+    /// and certID issuer-name-hash input.
+    ca_subject_der: Vec<u8>,
+    /// The Root CA's raw public-key bytes (SPKI bit-string contents) — the
+    /// OCSP certID issuer-key-hash input.
+    ca_public_key: Vec<u8>,
     /// Registered member identities, keyed by `node_id`.
     members: HashMap<String, Identity>,
     /// Serial number counter for issued certificates.
@@ -58,9 +75,14 @@ impl Organization {
         dn.push(DnType::OrganizationName, org_name.clone());
         params.distinguished_name = dn;
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        // The root signs member certificates and mints the organization's
-        // CRLs (ADR-013); verifiers may enforce the crlSign key usage.
-        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        // The root signs member certificates, mints the organization's CRLs
+        // (ADR-013) and signs OCSP staples (ADR-017); verifiers may enforce
+        // the crlSign and digitalSignature key usages.
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
 
         let key_pair = KeyPair::generate().map_err(|e| IdentityError::CertGen(e.to_string()))?;
 
@@ -71,6 +93,23 @@ impl Organization {
             .map_err(|e| IdentityError::CertGen(e.to_string()))?;
         let root_ca_cert_pem = cert.pem();
 
+        // Stash the signer material the OCSP staple minter needs (ADR-017):
+        // PKCS#8 private key, Subject DN and raw public key, all before
+        // Issuer::new consumes them.
+        let ca_key_pkcs8_der = key_pair.serialize_der();
+        let ca_public_key = key_pair.public_key_raw().to_vec();
+        let ca_subject_der = {
+            let parsed = x509_cert::Certificate::from_der(cert.der().as_ref())
+                .map_err(|e| IdentityError::CertGen(e.to_string()))?;
+            let mut out = Vec::new();
+            parsed
+                .tbs_certificate()
+                .subject()
+                .encode_to_vec(&mut out)
+                .map_err(|e| IdentityError::CertGen(e.to_string()))?;
+            out
+        };
+
         // Issuer::new consumes params and key_pair; all Cow values are Owned
         // so the issuer carries 'static lifetime and can be stored in the struct.
         let ca_issuer = Issuer::new(params, key_pair);
@@ -79,6 +118,9 @@ impl Organization {
             name: org_name,
             root_ca_cert_pem,
             ca_issuer,
+            ca_key_pkcs8_der,
+            ca_subject_der,
+            ca_public_key,
             members: HashMap::new(),
             next_serial: 1,
             issued_serials: HashMap::new(),
@@ -104,6 +146,27 @@ impl Organization {
         &mut self,
         node_id: impl Into<String>,
     ) -> Result<&Identity, IdentityError> {
+        self.issue_identity_with_role(node_id, None)
+    }
+
+    /// Issue a member identity carrying an operational role (ADR-017): the
+    /// role is stamped into the certificate's subject as an
+    /// Organizational-Unit name (`OU=admin` for
+    /// [`ADMIN_ROLE`]), so a verifying party can read it from the verified
+    /// chain — never from a caller-supplied label.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(IdentityError::CertGen)` as [`Self::issue_identity`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal member registry is inconsistent (should never occur in practice).
+    pub fn issue_identity_with_role(
+        &mut self,
+        node_id: impl Into<String>,
+        role: Option<&str>,
+    ) -> Result<&Identity, IdentityError> {
         let nid: String = node_id.into();
         let mut identity = Identity::generate(nid.clone());
 
@@ -113,6 +176,9 @@ impl Organization {
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, nid.clone());
         dn.push(DnType::OrganizationName, self.name.clone());
+        if let Some(role) = role {
+            dn.push(DnType::OrganizationalUnitName, role);
+        }
         params.distinguished_name = dn;
         params.is_ca = rcgen::IsCa::NoCa;
         let serial = self.take_serial();
@@ -137,6 +203,69 @@ impl Organization {
         self.issued_serials.insert(nid.clone(), serial);
         self.members.insert(nid.clone(), identity);
         Ok(self.members.get(&nid).expect("just inserted"))
+    }
+
+    /// Mint an OCSP staple attesting **good** for the member certificate
+    /// issued to `node_id` (ADR-017). The response is signed by this
+    /// organization's Root CA and stays fresh for [`OCSP_VALIDITY_SECS`];
+    /// the member staples it on its `Hello` and receiving nodes verify it
+    /// locally (no responder network queries).
+    ///
+    /// Revoked or never-issued nodes cannot be attested: minting is refused,
+    /// so a staple is always a live "good" attestation from the issuer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::CertGen`] when `node_id` has no live issued
+    /// certificate or the response cannot be minted.
+    pub fn ocsp_response_der(&self, node_id: &str) -> Result<Vec<u8>, IdentityError> {
+        self.ocsp_response_for_serial(node_id, self.issued_serials.get(node_id))
+    }
+
+    fn ocsp_response_for_serial(
+        &self,
+        node_id: &str,
+        serial: Option<&rcgen::SerialNumber>,
+    ) -> Result<Vec<u8>, IdentityError> {
+        let serial = serial.ok_or_else(|| {
+            IdentityError::CertGen(format!("no live issued certificate for node `{node_id}`"))
+        })?;
+        let mut serial_be = [0u8; 8];
+        let raw = serial.to_bytes();
+        serial_be[8usize.saturating_sub(raw.len())..].copy_from_slice(&raw);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        mint_good_response(&OcspMintInput {
+            serial: serial_be,
+            issuer_subject_der: &self.ca_subject_der,
+            issuer_public_key: &self.ca_public_key,
+            issuer_pkcs8_der: &self.ca_key_pkcs8_der,
+            now,
+            validity_secs: crate::ocsp::OCSP_VALIDITY_SECS,
+        })
+        .map_err(|e: OcspError| IdentityError::CertGen(e.to_string()))
+    }
+
+    /// The Root CA's PKCS#8 private-key DER — exposed for the OCSP minter's
+    /// tests; operators' persistent material is never serialized here.
+    #[allow(dead_code)]
+    pub(crate) fn ca_key_pkcs8_der(&self) -> &[u8] {
+        &self.ca_key_pkcs8_der
+    }
+
+    /// The Root CA's Subject DN, full DER encoding — test accessor for the
+    /// OCSP minter.
+    #[allow(dead_code)]
+    pub(crate) fn ca_subject_der(&self) -> &[u8] {
+        &self.ca_subject_der
+    }
+
+    /// The Root CA's raw public-key bytes — test accessor for the OCSP minter.
+    #[allow(dead_code)]
+    pub(crate) fn ca_public_key(&self) -> &[u8] {
+        &self.ca_public_key
     }
 
     /// Revoke a previously issued member certificate (ADR-013).
@@ -239,7 +368,11 @@ impl Organization {
         dn.push(DnType::OrganizationName, self.name.clone());
         params.distinguished_name = dn;
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
         params.serial_number = Some(self.take_serial());
 
         let key = KeyPair::generate().map_err(|e| IdentityError::CertGen(e.to_string()))?;
@@ -248,11 +381,27 @@ impl Organization {
             .signed_by(&key, &self.ca_issuer)
             .map_err(|e| IdentityError::CertGen(e.to_string()))?;
         let cert_pem = cert.pem();
+        let key_pkcs8_der = key.serialize_der();
+        let public_key = key.public_key_raw().to_vec();
+        let subject_der = {
+            let parsed = x509_cert::Certificate::from_der(cert.der().as_ref())
+                .map_err(|e| IdentityError::CertGen(e.to_string()))?;
+            let mut out = Vec::new();
+            parsed
+                .tbs_certificate()
+                .subject()
+                .encode_to_vec(&mut out)
+                .map_err(|e| IdentityError::CertGen(e.to_string()))?;
+            out
+        };
         let issuer = Issuer::new(issuer_params, key);
         Ok(IntermediateCa {
             cert_pem,
             org_name: self.name.clone(),
             issuer,
+            key_pkcs8_der,
+            subject_der,
+            public_key,
             next_serial: 1,
             issued_serials: HashMap::new(),
             revoked: Vec::new(),
@@ -276,6 +425,12 @@ pub struct IntermediateCa {
     /// Organization name stamped into issued member certificates.
     org_name: String,
     issuer: Issuer<'static, KeyPair>,
+    /// The intermediate's PKCS#8 private-key DER — the OCSP staple signer.
+    key_pkcs8_der: Vec<u8>,
+    /// The intermediate's Subject DN, full DER encoding.
+    subject_der: Vec<u8>,
+    /// The intermediate's raw public-key bytes.
+    public_key: Vec<u8>,
     next_serial: u64,
     issued_serials: HashMap<String, SerialNumber>,
     revoked: Vec<RevokedCertParams>,
@@ -301,6 +456,21 @@ impl IntermediateCa {
         &mut self,
         node_id: impl Into<String>,
     ) -> Result<Identity, IdentityError> {
+        self.issue_identity_with_role(node_id, None)
+    }
+
+    /// Issue an intermediate-issued member identity carrying an operational
+    /// role (ADR-017). Mirrors [`Organization::issue_identity_with_role`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(IdentityError::CertGen)` if the certificate cannot be
+    /// generated.
+    pub fn issue_identity_with_role(
+        &mut self,
+        node_id: impl Into<String>,
+        role: Option<&str>,
+    ) -> Result<Identity, IdentityError> {
         let nid: String = node_id.into();
         let mut identity = Identity::generate(nid.clone());
 
@@ -308,6 +478,9 @@ impl IntermediateCa {
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, nid.clone());
         dn.push(DnType::OrganizationName, self.org_name.clone());
+        if let Some(role) = role {
+            dn.push(DnType::OrganizationalUnitName, role);
+        }
         params.distinguished_name = dn;
         params.is_ca = rcgen::IsCa::NoCa;
         let serial = SerialNumber::from(self.next_serial);
@@ -324,6 +497,36 @@ impl IntermediateCa {
 
         self.issued_serials.insert(nid, serial);
         Ok(identity)
+    }
+
+    /// Mint an OCSP staple attesting **good** for a member certificate issued
+    /// by this intermediate CA (ADR-017). See
+    /// [`Organization::ocsp_response_der`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::CertGen`] when the node has no live issued
+    /// certificate or the response cannot be minted.
+    pub fn ocsp_response_der(&self, node_id: &str) -> Result<Vec<u8>, IdentityError> {
+        let serial = self.issued_serials.get(node_id).ok_or_else(|| {
+            IdentityError::CertGen(format!("no live issued certificate for node `{node_id}`"))
+        })?;
+        let mut serial_be = [0u8; 8];
+        let raw = serial.to_bytes();
+        serial_be[8usize.saturating_sub(raw.len())..].copy_from_slice(&raw);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        mint_good_response(&OcspMintInput {
+            serial: serial_be,
+            issuer_subject_der: &self.subject_der,
+            issuer_public_key: &self.public_key,
+            issuer_pkcs8_der: &self.key_pkcs8_der,
+            now,
+            validity_secs: crate::ocsp::OCSP_VALIDITY_SECS,
+        })
+        .map_err(|e: OcspError| IdentityError::CertGen(e.to_string()))
     }
 
     /// Revoke a previously issued member certificate (ADR-013). See
@@ -370,14 +573,364 @@ impl IntermediateCa {
     }
 }
 
+// ── Durable custody (ADR-018) ─────────────────────────────────────────────────
+
+/// One revoked certificate, in the durable snapshot form: serial hex, Unix
+/// revocation time and the RFC 5280 reason code.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RevokedRecord {
+    pub serial_hex: String,
+    pub revocation_time_unix: i64,
+    pub reason_code: u8,
+}
+
+/// One registered member identity, in the durable snapshot form: node id,
+/// ed25519 seed (hex) and the issued certificate PEM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemberRecord {
+    pub node_id: String,
+    pub seed_hex: String,
+    pub certificate_pem: String,
+}
+
+/// The durable form of an [`Organization`] (ADR-018): the state an
+/// operator-owned identity file carries across restarts so the node
+/// re-presents the same keys instead of re-keying.
+///
+/// Fields: Root CA key material, serial bookkeeping, revocation history and
+/// member identities. The `ca_key_pkcs8_der_hex` and `seed_hex` fields are
+/// **private key material**: the caller owns where the snapshot lives
+/// (permission the file, keep it out of replicated/archived storage).
+/// Nothing in `GlassChain` writes it to the storage seam.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrganizationSnapshot {
+    pub name: String,
+    pub root_ca_cert_pem: String,
+    /// Root CA PKCS#8 private key, hex-encoded — the cert/CRL/staple signer.
+    pub ca_key_pkcs8_der_hex: String,
+    pub next_serial: u64,
+    /// Issued serials by node id (hex-encoded serial bytes) —
+    /// `revoke_identity` bookkeeping and the staple certID.
+    pub issued_serials: Vec<(String, String)>,
+    pub revoked: Vec<RevokedRecord>,
+    pub members: Vec<MemberRecord>,
+}
+
+/// Map an RFC 5280 revocation reason code back to `rcgen`'s enum. Code 7 is
+/// unassigned (RFC 5280) — `Unspecified` stands in and a warning logs.
+fn revocation_reason_from_code(code: u8) -> RevocationReason {
+    match code {
+        0 => RevocationReason::Unspecified,
+        1 => RevocationReason::KeyCompromise,
+        2 => RevocationReason::CaCompromise,
+        3 => RevocationReason::AffiliationChanged,
+        4 => RevocationReason::Superseded,
+        5 => RevocationReason::CessationOfOperation,
+        6 => RevocationReason::CertificateHold,
+        8 => RevocationReason::RemoveFromCrl,
+        9 => RevocationReason::PrivilegeWithdrawn,
+        10 => RevocationReason::AaCompromise,
+        other => {
+            log::warn!("custody: unknown revocation reason code {other}; treating as unspecified");
+            RevocationReason::Unspecified
+        }
+    }
+}
+
+/// The RFC 5280 reason code for `rcgen`'s enum.
+const fn revocation_reason_code(reason: RevocationReason) -> u8 {
+    match reason {
+        RevocationReason::Unspecified => 0,
+        RevocationReason::KeyCompromise => 1,
+        RevocationReason::CaCompromise => 2,
+        RevocationReason::AffiliationChanged => 3,
+        RevocationReason::Superseded => 4,
+        RevocationReason::CessationOfOperation => 5,
+        RevocationReason::CertificateHold => 6,
+        RevocationReason::RemoveFromCrl => 8,
+        RevocationReason::PrivilegeWithdrawn => 9,
+        RevocationReason::AaCompromise => 10,
+    }
+}
+
+impl Organization {
+    /// Serialize the organization's durable state (ADR-018): Root CA key
+    /// pair, serial bookkeeping, revocations and member identities. The
+    /// output contains **private key material** — the caller owns the file
+    /// (permission it, keep it out of replicated/archived storage).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::CertGen`] if serialization fails or a member
+    /// has no certificate to persist.
+    pub fn export_json(&self) -> Result<String, IdentityError> {
+        let members = self
+            .members
+            .iter()
+            .map(|(node_id, identity)| {
+                Ok(MemberRecord {
+                    node_id: node_id.clone(),
+                    seed_hex: hex::encode(identity.seed_bytes()),
+                    certificate_pem: identity.certificate_pem.clone().ok_or_else(|| {
+                        IdentityError::CertGen(format!(
+                            "member `{node_id}` has no certificate to persist"
+                        ))
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>, IdentityError>>()?;
+        let revoked = self
+            .revoked
+            .iter()
+            .map(|params| RevokedRecord {
+                serial_hex: hex::encode(params.serial_number.to_bytes()),
+                revocation_time_unix: params.revocation_time.unix_timestamp(),
+                reason_code: params.reason_code.map_or(0, revocation_reason_code),
+            })
+            .collect();
+        let snapshot = OrganizationSnapshot {
+            name: self.name.clone(),
+            root_ca_cert_pem: self.root_ca_cert_pem.clone(),
+            ca_key_pkcs8_der_hex: hex::encode(&self.ca_key_pkcs8_der),
+            next_serial: self.next_serial,
+            issued_serials: self
+                .issued_serials
+                .iter()
+                .map(|(node_id, serial)| (node_id.clone(), hex::encode(serial.to_bytes())))
+                .collect(),
+            revoked,
+            members,
+        };
+        serde_json::to_string_pretty(&snapshot).map_err(|e| IdentityError::CertGen(e.to_string()))
+    }
+
+    /// Rebuild an [`Organization`] from [`export_json`](Self::export_json)
+    /// output (ADR-018): the same Root CA key (so peers' trust-store anchors
+    /// keep verifying), the same member keys (so possession proofs, TOFU
+    /// rotation signatures and TLS fingerprints survive restarts), and the
+    /// same serial bookkeeping (so CRLs stay coherent).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::CertGen`] for malformed JSON, a corrupt CA
+    /// key, an unparseable root certificate, or a member record whose seed
+    /// is not 32 bytes.
+    pub fn import_json(json: &str) -> Result<Self, IdentityError> {
+        let snapshot: OrganizationSnapshot =
+            serde_json::from_str(json).map_err(|e| IdentityError::CertGen(e.to_string()))?;
+        let ca_key_pkcs8_der = hex::decode(&snapshot.ca_key_pkcs8_der_hex)
+            .map_err(|e| IdentityError::CertGen(format!("CA key is not hex: {e}")))?;
+
+        // Restore the CA key pair (the P-256 algorithm the original
+        // generated with).
+        let key_pair = KeyPair::from_pkcs8_der_and_sign_algo(
+            &rustls_pki_types::PrivatePkcs8KeyDer::from(ca_key_pkcs8_der.clone()),
+            &rcgen::PKCS_ECDSA_P256_SHA256,
+        )
+        .map_err(|e| IdentityError::CertGen(format!("CA key does not restore: {e}")))?;
+
+        // Same construction as `new()`: the issuer's subject DN must match
+        // the persisted root certificate so newly issued members chain to
+        // the same anchor.
+        let mut params = CertificateParams::default();
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, format!("{} Root CA", snapshot.name));
+        dn.push(DnType::OrganizationName, snapshot.name.clone());
+        params.distinguished_name = dn;
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        let ca_issuer = Issuer::new(params, key_pair);
+
+        // Re-derive the signer material the staple minter needs.
+        let root_der =
+            rustls_pki_types::CertificateDer::from_pem_slice(snapshot.root_ca_cert_pem.as_bytes())
+                .map_err(|e| IdentityError::CertGen(format!("root CA is not PEM: {e}")))?;
+        let ca_subject_der = {
+            let parsed = x509_cert::Certificate::from_der(root_der.as_ref())
+                .map_err(|e| IdentityError::CertGen(e.to_string()))?;
+            let mut out = Vec::new();
+            parsed
+                .tbs_certificate()
+                .subject()
+                .encode_to_vec(&mut out)
+                .map_err(|e| IdentityError::CertGen(e.to_string()))?;
+            out
+        };
+        // The staple certID issuer-key-hash input: derived straight from the
+        // restored key (`Issuer` exposes no public key accessor).
+        let ca_public_key = {
+            use ring::rand::SystemRandom;
+            use ring::signature::{EcdsaKeyPair, KeyPair as _};
+            EcdsaKeyPair::from_pkcs8(
+                &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+                &ca_key_pkcs8_der,
+                &SystemRandom::new(),
+            )
+            .map_err(|e| IdentityError::CertGen(format!("CA key does not restore: {e}")))?
+            .public_key()
+            .as_ref()
+            .to_vec()
+        };
+
+        let issued_serials = snapshot
+            .issued_serials
+            .iter()
+            .map(|(node_id, serial_hex)| {
+                let bytes = hex::decode(serial_hex)
+                    .map_err(|e| IdentityError::CertGen(format!("serial is not hex: {e}")))?;
+                Ok((node_id.clone(), SerialNumber::from_slice(&bytes)))
+            })
+            .collect::<Result<HashMap<String, SerialNumber>, IdentityError>>()?;
+        let revoked = snapshot
+            .revoked
+            .iter()
+            .map(|record| {
+                Ok(RevokedCertParams {
+                    serial_number: SerialNumber::from_slice(
+                        &hex::decode(&record.serial_hex).map_err(|e| {
+                            IdentityError::CertGen(format!("serial is not hex: {e}"))
+                        })?,
+                    ),
+                    revocation_time: time::OffsetDateTime::from_unix_timestamp(
+                        record.revocation_time_unix,
+                    )
+                    .map_err(|e| IdentityError::CertGen(e.to_string()))?,
+                    reason_code: Some(revocation_reason_from_code(record.reason_code)),
+                    invalidity_date: None,
+                })
+            })
+            .collect::<Result<Vec<RevokedCertParams>, IdentityError>>()?;
+        let mut members = HashMap::new();
+        for member in &snapshot.members {
+            let seed = hex::decode(&member.seed_hex)
+                .map_err(|e| IdentityError::CertGen(format!("seed is not hex: {e}")))?;
+            let seed: [u8; 32] = seed
+                .try_into()
+                .map_err(|_| IdentityError::CertGen("member seed is not 32 bytes".to_owned()))?;
+            let mut identity = Identity::from_seed(member.node_id.clone(), seed);
+            identity.certificate_pem = Some(member.certificate_pem.clone());
+            members.insert(member.node_id.clone(), identity);
+        }
+
+        Ok(Self {
+            name: snapshot.name,
+            root_ca_cert_pem: snapshot.root_ca_cert_pem,
+            ca_issuer,
+            ca_key_pkcs8_der,
+            ca_subject_der,
+            ca_public_key,
+            members,
+            next_serial: snapshot.next_serial,
+            issued_serials,
+            revoked,
+        })
+    }
+}
+
 /// Current UTC time, the single place CRL minting gets the clock from.
 fn time_now() -> time::OffsetDateTime {
     time::OffsetDateTime::now_utc()
 }
 
+/// Issue an admin-role identity from `org` (ADR-017) — the shared helper the
+/// OCSP and RBAC tests exercise the admin path through.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::Organization;
+
+    pub fn admin_org_with_admin(org: &mut Organization, node_id: &str) -> crate::Identity {
+        org.issue_identity_with_role(node_id, Some(crate::msp::ADMIN_ROLE))
+            .expect("admin identity")
+            .clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ADR-018: durable custody snapshots ─────────────────────────────────
+
+    use crate::cert_verifier::CertChainVerifier;
+    use crate::ocsp::OcspStatus;
+
+    /// Export → drop → import re-presents the same keys: identical root CA,
+    /// identical member keys (possession proofs keep verifying), continued
+    /// serial bookkeeping (no collision after import), revocations intact
+    /// (the CRL still lists them), and staples still mint.
+    #[test]
+    fn snapshot_round_trip_preserves_keys_serials_and_revocations() {
+        let mut org = Organization::new("PharmaCorp").unwrap();
+        let live = org.issue_identity("admin-node").unwrap().clone();
+        let revoked_identity = org.issue_identity("node-a").unwrap().clone();
+        org.revoke_identity("node-a").unwrap();
+
+        let json = org.export_json().unwrap();
+
+        // The original moves on: another identity consumes a serial.
+        org.issue_identity("after").unwrap();
+
+        let mut restored = Organization::import_json(&json).unwrap();
+
+        // Root CA identity is byte-identical.
+        assert_eq!(restored.root_ca_cert_pem, org.root_ca_cert_pem);
+        // The live member re-presents the same key and cert.
+        let restored_live = restored.get_member("admin-node").unwrap();
+        assert_eq!(
+            restored_live.public_key_bytes(),
+            live.public_key_bytes(),
+            "a restart must re-present the pinned identity key"
+        );
+        assert_eq!(restored_live.certificate_pem, live.certificate_pem);
+        // A possession proof from the restored identity verifies — same key.
+        let proof = restored_live.sign_bytes(b"anything");
+        assert!(crate::possession::verify_ed25519(
+            &live.public_key_bytes(),
+            b"anything",
+            &proof
+        ));
+        // Serial bookkeeping continues from the persisted counter.
+        assert_eq!(restored.next_serial, 3, "two identities were issued");
+        let fresh = restored
+            .issue_identity("fresh-after-import")
+            .unwrap()
+            .clone();
+        assert!(fresh.certificate_pem.is_some());
+        assert!(restored.is_member("fresh-after-import"));
+        // The revocation survived: the CRL lists node-a's serial.
+        let crl = restored.crl_pem().unwrap();
+        assert!(!crl.is_empty());
+        // And staples still mint for the live member.
+        let staple = restored.ocsp_response_der("admin-node").unwrap();
+        let verifier = CertChainVerifier::from_org(&restored).unwrap();
+        assert_eq!(
+            verifier
+                .verify_ocsp_staple(live.certificate_pem.as_ref().unwrap(), &staple)
+                .unwrap(),
+            OcspStatus::Good
+        );
+        // Revoked member's cert still rejects (same serial → same CRL entry).
+        let _ = revoked_identity;
+    }
+
+    /// Malformed snapshots are refused, never silently re-keyed.
+    #[test]
+    fn snapshot_import_rejects_malformed_input() {
+        assert!(Organization::import_json("not json").is_err());
+        assert!(Organization::import_json("{\"name\":\"X\"}").is_err());
+        // A member seed that is not 32 bytes (org issues one first so the
+        // members array is non-empty).
+        let mut org = Organization::new("PharmaCorp").unwrap();
+        org.issue_identity("node-a").unwrap();
+        let mut snapshot: serde_json::Value =
+            serde_json::from_str(&org.export_json().unwrap()).unwrap();
+        snapshot["members"][0]["seed_hex"] = serde_json::Value::String("abcd".into());
+        assert!(Organization::import_json(&snapshot.to_string()).is_err());
+    }
 
     #[test]
     fn test_organization_creates_root_ca() {

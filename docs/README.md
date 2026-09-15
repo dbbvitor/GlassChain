@@ -42,6 +42,10 @@ off options that look attractive from a blank page.
 | [012](adr/adr-012-signature-binding.md) | Capability activations and `state_commitment` records carry fail-closed governance defaults enforced through the endorsement layer |
 | [013](adr/adr-013-certificate-revocation.md) | Revocation is fail-closed CRLs in the trust store, plus intermediate CAs; go-forward only, committed history stays valid |
 | [014](adr/adr-014-bls-aggregated-certificates.md) | One BLS12-381 aggregate signature plus a signer bitmap; compact certificates with proof-of-possession registration |
+| [015](adr/adr-015-audited-c-crypto-backends.md) | Audited `blst` C backend for BLS12-381; audited dependency evidence required before any native-crypto backend |
+| [016](adr/adr-016-quorum-replication-durability.md) | "Committed" means quorum replication; local disk flush is a separate metric, not the durability promise |
+| [017](adr/adr-017-deployment-trust-and-retention.md) | OCSP stapling only (no responder egress), certificate-bound MSP admin RBAC, backup scrubbing for physical retention, #74 deferred |
+| [018](adr/adr-018-node-identity-custody.md) | Node identity material is an operator-owned `--identity-file`, not storage state; the same key re-presents across restarts |
 
 ## Evidence
 

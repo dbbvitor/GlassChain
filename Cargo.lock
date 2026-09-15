@@ -1715,14 +1715,23 @@ name = "glasschain-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
+ "ed25519-dalek 3.0.0",
  "env_logger",
  "glasschain-core",
  "glasschain-identity",
+ "glasschain-network",
+ "glasschain-rpc",
  "glasschain-sdk",
+ "glasschain-storage",
+ "hex",
  "log",
+ "rustls-pki-types",
  "serde",
  "serde_json",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -1771,10 +1780,12 @@ dependencies = [
  "hex",
  "log",
  "rcgen 0.14.7",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
  "time",
  "x509-cert",
@@ -1844,6 +1855,7 @@ dependencies = [
 name = "glasschain-rpc"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "ed25519-dalek 3.0.0",
  "glasschain-core",
  "glasschain-identity",
@@ -1852,6 +1864,7 @@ dependencies = [
  "hex",
  "log",
  "prost",
+ "rustls-pki-types",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",

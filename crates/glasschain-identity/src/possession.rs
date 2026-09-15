@@ -76,12 +76,85 @@ pub fn certificate_organization(cert_pem: &str) -> Option<String> {
     }
 }
 
+/// The certificate subject's Organizational-Unit role, if present — the
+/// certificate-bound operational role (ADR-017).
+///
+/// [`ADMIN_ROLE`][crate::msp::ADMIN_ROLE] marks an operator administrator;
+/// the role is read from the **verified certificate**, never from a
+/// caller-supplied label.
+#[must_use]
+pub fn certificate_admin_role(cert_pem: &str) -> Option<String> {
+    use x509_cert::ext::pkix::name::DirectoryString;
+
+    let der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).ok()?;
+    let cert = Certificate::from_der(der.as_ref()).ok()?;
+    let value = cert
+        .tbs_certificate()
+        .subject()
+        .organization_unit()
+        .ok()
+        .flatten()?;
+    match value {
+        DirectoryString::Utf8String(text) => Some(text),
+        DirectoryString::PrintableString(text) => Some(text.to_string()),
+        _ => None,
+    }
+}
+
+/// The certificate subject's Common Name — the certificate-bound node id a
+/// remote member presents (ticket #47, ADR-017 admin headers).
+#[must_use]
+pub fn certificate_subject_cn(cert_pem: &str) -> Option<String> {
+    use x509_cert::ext::pkix::name::DirectoryString;
+
+    let der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).ok()?;
+    let cert = Certificate::from_der(der.as_ref()).ok()?;
+    let value = cert
+        .tbs_certificate()
+        .subject()
+        .common_name()
+        .ok()
+        .flatten()?;
+    match value {
+        DirectoryString::Utf8String(text) => Some(text),
+        DirectoryString::PrintableString(text) => Some(text.to_string()),
+        _ => None,
+    }
+}
+
+/// The DER form of [`certificate_admin_role`] — the role the gRPC admin gate
+/// reads from a wire-carried certificate (ADR-017).
+#[must_use]
+pub fn certificate_admin_role_der(cert_der: &[u8]) -> Option<String> {
+    use x509_cert::ext::pkix::name::DirectoryString;
+
+    let cert = Certificate::from_der(cert_der).ok()?;
+    let value = cert
+        .tbs_certificate()
+        .subject()
+        .organization_unit()
+        .ok()
+        .flatten()?;
+    match value {
+        DirectoryString::Utf8String(text) => Some(text),
+        DirectoryString::PrintableString(text) => Some(text.to_string()),
+        _ => None,
+    }
+}
+
 /// The raw 32-byte ed25519 public key inside a PEM certificate, if it parses
 /// and carries an ed25519 SPKI. `None` on any parse or shape mismatch.
 #[must_use]
 pub fn certificate_ed25519_public_key(cert_pem: &str) -> Option<[u8; 32]> {
     let der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).ok()?;
-    let cert = Certificate::from_der(der.as_ref()).ok()?;
+    certificate_ed25519_public_key_der(der.as_ref())
+}
+
+/// The DER form of [`certificate_ed25519_public_key`] — the public key the
+/// gRPC admin gate reads from a wire-carried certificate (ADR-017).
+#[must_use]
+pub fn certificate_ed25519_public_key_der(cert_der: &[u8]) -> Option<[u8; 32]> {
+    let cert = Certificate::from_der(cert_der).ok()?;
     let raw = cert
         .tbs_certificate()
         .subject_public_key_info()

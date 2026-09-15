@@ -117,6 +117,7 @@ async fn send_hello(writer: &mut PeerWriter, node_id: &str, listen_addr: &str, f
         certificate_pem: None,
         certificate_proof: None,
         fingerprint_proof: None,
+        ocsp_response_der: None,
         capabilities: glasschain_core::CAPABILITY_V1
             .iter()
             .map(|c| glasschain_core::CapabilityAdvertisement {
@@ -627,6 +628,9 @@ fn verifier_with_crl(org: &Organization) -> CertChainVerifier {
 /// Send a `Hello` advertising `org` (the collection-membership principal) and,
 /// when supplied, the org-issued certificate that must verify against the
 /// receiver's trust store for org-gated paths (#86).
+// The parameters are one Hello's identity claim; a wrapper struct would only
+// move them elsewhere for the tests that build claims.
+#[allow(clippy::too_many_arguments)]
 async fn send_hello_as_org(
     writer: &mut PeerWriter,
     node_id: &str,
@@ -635,6 +639,7 @@ async fn send_hello_as_org(
     org: &str,
     certificate_pem: Option<&str>,
     certificate_proof: Option<&str>,
+    ocsp_response_der: Option<&[u8]>,
 ) {
     let msg = Message::Hello {
         node_id: node_id.to_owned(),
@@ -651,6 +656,9 @@ async fn send_hello_as_org(
         org: org.to_owned(),
         certificate_pem: certificate_pem.map(str::to_owned),
         certificate_proof: certificate_proof.map(str::to_owned),
+        ocsp_response_der: ocsp_response_der
+            .filter(|staple| !staple.is_empty())
+            .map(|staple| BASE64_STANDARD.encode(staple)),
         fingerprint_proof: None,
         listen_addr: listen_addr.to_owned(),
     };
@@ -710,6 +718,7 @@ async fn private_payload_to_non_member_is_rejected() {
         "127.0.0.1:1",
         &sha256(CLIENT_CERT_A),
         "org-writer",
+        None,
         None,
         None,
     )
@@ -808,6 +817,7 @@ async fn private_payload_with_commitment_mismatch_is_rejected() {
         "org-writer",
         Some(&writer_cert_pem),
         Some(&proof),
+        None,
     )
     .await;
     let tampered = Message::PrivatePayload {
@@ -863,6 +873,7 @@ async fn hello_with_old_wire_version_is_disconnected() {
         certificate_pem: None,
         certificate_proof: None,
         fingerprint_proof: None,
+        ocsp_response_der: None,
         listen_addr: "127.0.0.1:3".to_owned(),
     };
     writer.send(&stale).await.unwrap();
@@ -911,6 +922,7 @@ async fn hello_with_unverified_org_certificate_stays_connected_but_unverified() 
         certificate_pem: Some(cert_pem),
         certificate_proof: None,
         fingerprint_proof: None,
+        ocsp_response_der: None,
         listen_addr: "127.0.0.1:4".to_owned(),
     };
     writer.send(&hello).await.unwrap();
@@ -983,6 +995,7 @@ async fn copied_certificate_without_private_key_is_rejected() {
         "org-writer",
         Some(&writer_cert_pem),
         Some(&forged),
+        None,
     )
     .await;
     // A well-formed payload (commitment matches) that only org trust gates.
@@ -1062,5 +1075,145 @@ async fn chain_suffix_folds_through_block_admission() {
         node.ledger_snapshot().await.chain.len(),
         4,
         "a non-chaining suffix block must not be appended"
+    );
+}
+
+// ── OCSP stapling (ADR-017) ───────────────────────────────────────────────────
+
+/// ADR-017: an issuer-signed OCSP staple rides the Hello and a valid staple
+/// keeps the session's org verified — the private-payload path stays open.
+/// (Verification is local; there are no responder network queries.)
+#[tokio::test]
+async fn ocsp_staple_travels_and_keeps_verified_org_on_private_path() {
+    init_log_capture();
+    let addr = free_addr();
+    let mut org = Organization::new("PharmaCorp").unwrap();
+    let writer_identity = org.issue_identity("org-writer").unwrap().clone();
+    let writer_cert_pem = writer_identity
+        .certificate_pem
+        .clone()
+        .expect("issued identity carries a certificate");
+    // The issuer staples its own member's certificate (ADR-017): mint at the
+    // organization that owns the CA key.
+    let staple = org.ocsp_response_der("org-writer").expect("mint staple");
+
+    let member = Node::new("org-member", &addr, 1);
+    member.set_cert_verifier(verifier_with_crl(&org)).await;
+    member.start(vec![]).await.unwrap();
+    member.set_collections(vec![pricing_collection()]).await;
+    let mut events = member.subscribe();
+    // Activate `pdc` so the commitment branch (not the capability gate) runs.
+    member
+        .submit_transaction(glasschain_core::Transaction::with_id(
+            "cap:pdc:2".to_owned(),
+            glasschain_core::TransactionKind::CapabilityActivation(
+                glasschain_core::CapabilityActivation {
+                    capability_id: "pdc".into(),
+                    version: 1,
+                    hash: glasschain_core::capability_hash("pdc", 1),
+                    activation_height: 2,
+                    signatures: vec![glasschain_core::RecordSignature {
+                        algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
+                        signer: "org-gov".into(),
+                        signature_bytes: vec![0x42],
+                    }],
+                },
+            ),
+        ))
+        .await
+        .unwrap();
+    member.mine().await.unwrap();
+
+    let (mut reader, mut writer, _node_cert, binding) = connect_raw(&addr, CLIENT_CERT_B).await;
+    read_node_hello(&mut reader).await;
+    let binding = binding.expect("the raw client derived its session binding");
+    let proof = BASE64_STANDARD.encode(writer_identity.sign_bytes(
+        &glasschain_identity::org_possession_message("org-writer", "org-writer", &binding),
+    ));
+    send_hello_as_org(
+        &mut writer,
+        "org-writer",
+        "127.0.0.1:2",
+        &sha256(CLIENT_CERT_B),
+        "org-writer",
+        Some(&writer_cert_pem),
+        Some(&proof),
+        Some(&staple),
+    )
+    .await;
+    let payload = b"stapled-price";
+    writer
+        .send(&private_payload("pricing", payload))
+        .await
+        .unwrap();
+
+    // The stapled, verified member delivers the payload: held transiently and
+    // evented (the positive counterpart of the copied-certificate test).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match timeout(Duration::from_millis(200), events.recv()).await {
+            Ok(Ok(NodeEvent::PrivatePayloadReceived { .. })) => break,
+            Ok(Ok(_)) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "event stream never settled"
+                );
+            }
+            other => panic!("payload event never arrived: {other:?}"),
+        }
+    }
+    assert_eq!(
+        member
+            .transient_payload("pricing", &glasschain_core::crypto::sha256(payload))
+            .await,
+        Some(payload.to_vec()),
+        "a stapled verified member must deliver private payloads"
+    );
+}
+
+/// ADR-017: an identity-backed node staples its minted OCSP response on its
+/// own Hello — the raw client observes the staple on the wire, and it
+/// verifies against the issuing trust store.
+#[tokio::test]
+async fn node_hello_carries_its_minted_ocsp_staple() {
+    let addr = free_addr();
+    let mut org = Organization::new("PharmaCorp").unwrap();
+    let member_identity = org.issue_identity("org-member").unwrap().clone();
+    let staple = org.ocsp_response_der("org-member").expect("mint staple");
+
+    let member = Node::new_with_identity("org-member", &addr, 1, Arc::new(member_identity.clone()));
+    member.set_ocsp_staple(staple.clone()).await;
+    member.start(vec![]).await.unwrap();
+
+    let (mut reader, _writer, _node_cert, _binding) = connect_raw(&addr, CLIENT_CERT_A).await;
+    let msg = timeout(Duration::from_secs(2), reader.receive())
+        .await
+        .expect("timeout waiting for node Hello")
+        .expect("node Hello missing");
+    let Message::Hello {
+        certificate_pem,
+        ocsp_response_der,
+        ..
+    } = msg
+    else {
+        panic!("expected the node's Hello");
+    };
+    assert!(
+        certificate_pem.is_some(),
+        "an identity-backed node presents its member certificate"
+    );
+    let stapled = ocsp_response_der.expect("the node staples its minted OCSP response");
+    let staple_der = BASE64_STANDARD
+        .decode(&stapled)
+        .expect("the staple is base64 DER");
+    let verifier = verifier_with_crl(&org);
+    assert_eq!(
+        verifier
+            .verify_ocsp_staple(
+                member_identity.certificate_pem.as_ref().expect("cert"),
+                &staple_der
+            )
+            .expect("the staple verifies"),
+        glasschain_identity::OcspStatus::Good
     );
 }

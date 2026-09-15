@@ -27,7 +27,10 @@ measured and reverted. Step 7's in-repo half shipped (validator-set churn across
    Frontier A concluded: `EquivocationProof` carries both dual-signed votes
    and verifies through the #95 context envelope. **Frontier C concluded
    2026-09-13** (ADR-015: audited `blst` backend, sum-of-keys verify,
-   300-validator gate passing); next frontier is **Frontier B**.
+   300-validator gate passing); Frontier B concluded 2026-09-14 via
+   [ADR-017](../../docs/adr/adr-017-deployment-trust-and-retention.md)
+   (OCSP stapling only, MSP admin RBAC, backup scrubbing, #74 deferred);
+   next frontier is **Frontier D**.
 3. Read [zero-trust §8](plans/zero-trust.md) for consensus safety invariants.
 4. Read [source-comment debt](plans/deferred-code-debt.md) for settled D1–D7
    markers and benchmarks.
@@ -38,10 +41,10 @@ measured and reverted. Step 7's in-repo half shipped (validator-set churn across
 
 | Area | Concluded / available | Still pending |
 |---|---|---|
-| Workspace | 12 Rust crates; wire `glasschain/6`; 16 accepted ADRs (ADR-016 durability); D1–D7 settled | No browser package or demo bridge exists |
+| Workspace | 12 Rust crates; wire `glasschain/6`; 17 accepted ADRs (ADR-016 durability, ADR-017 deployment trust); D1–D7 settled | No browser package or demo bridge exists |
 | Ledger/execution | Schema v1, capability/policy history, explicit WASM write sets and replay | Production durability acknowledgement and historical security gates |
 | Consensus | PoW dev/test default; BLS driver with context-authenticated votes (#95, #99), live receipt journal (#96), full historical QC verification on sync/restart (#97, PR #116), absolute phase deadlines/bounded queues/distinct voters (#98), dual-sign `EquivocationProof` (Frontier A concluded) | Production audit/testnet/APIs (ADR-010) |
-| Identity/privacy | TLS/TOFU with durable pins & signed rotation (#88), opt-in verifier with fail-closed private paths (#86), session-bound possession proofs (#110), CRLs/intermediates (ADR-013), cert-bound MSP principals with height authorization (#87, D4), fail-closed governance fallback (D1), issuer-signed recall (D2), restart-safe purge (D5) & triage discovery (D6) | OCSP verification & stapling, deployment access (operator RBAC/channel-management operations), explicit replica/backup retention policy, deferred on-chain revocation (#74) |
+| Identity/privacy | TLS/TOFU with durable pins & signed rotation (#88), opt-in verifier with fail-closed private paths (#86), session-bound possession proofs (#110), CRLs/intermediates (ADR-013), cert-bound MSP principals with height authorization (#87, D4), fail-closed governance fallback (D1), issuer-signed recall (D2), restart-safe purge (D5) & triage discovery (D6); **Frontier B concluded via ADR-017 + code (2026-09-14)**: OCSP staple minted per member, stapled on `Hello` and verified locally (no responder egress, CRL fallback fail-closed); `AdminGate`-gated channel-management RPCs over certificate-bound admin principals; `glasschain backup-scrub` retention sweep for storage copies; per-Hello org reauthorization (downgrade on failed re-verification) | Residual plan **shipped 2026-09-14** ([zero-trust-residual](plans/zero-trust-residual.md)): `--identity-file` durable custody (ADR-018 — the same identity key/cert/Root CA across restarts, pins keep verifying), `glasschain channel-admin` CLI client, `reload-trust-store` REPL hot-reload with `AdminGate` hot-swap, durable equivocation evidence via the state seam; #74 + delegated responders parked by decision |
 | Workflows/read path | Checkpointed flow engine, purchase/recall flows, triage API with restart discovery (D6), provenance/flattener/event bus and RPC queries; D3 baseline measured (#106) | Unattended external integration, durable external indexer adapter, bounded projection costs |
 | Measurements | BFT finality on `blst` (ADR-015): p50 1 145 ms at 100 / 4 612 ms at 300 (2026-09-14) with the per-phase decomposition recorded; the 300 gate passes and verify is no longer the wall (fan-out is). D3 admission bench (~21 ms at 10k); read-path memory baseline (#107); D7 WAN scenarios (proxy #108 + leader-quorum loss + bandwidth budget); Step 0 marked done | Long-run fleet memory; 400/500 sweep is out of scope; slow-CPU/disk WAN scenario |
 | PQ readiness | Discriminants shipped; negotiated X25519MLKEM768 hybrid TLS behind `pq-tls` shipped (#105) | Long-term archive evidence / migration policy; no guaranteed quantum-safe lifetime |
@@ -64,14 +67,27 @@ block-hash`) introduced in #95, so evidence can no longer be assembled from
 votes of different contexts. Residual evidence-path hardening beyond the
 journal is future work (see zero-trust §8).
 
-### B. Deployment trust, privacy and recovery (queued after C)
+### B. Deployment trust, privacy and recovery (concluded 2026-09-14)
 
-Code items D1–D6 and #86–#88 shipped with tests. Frontier B remains open on:
+Code items D1–D6 and #86–#88 shipped with tests. Frontier B concluded via
+[ADR-017](../../docs/adr/adr-017-deployment-trust-and-retention.md) **plus its
+code** (implementation plan: [frontier-b-tail](frontier-b-tail.md)):
+- **OCSP stapling** — the org Root CA mints an issuer-signed OCSP
+  `BasicResponse` per member certificate; the node staples it on every
+  `Hello` (`ocsp_response_der`), receivers verify it **locally**
+  (`CertChainVerifier::verify_ocsp_staple`); a revoked staple fails the
+  session closed, absent/invalid/expired staples fall back to the fail-closed
+  CRL path. No outbound responder queries.
+- **Operator RBAC** — member certs carry the admin role as subject OU;
+  `AdminGate` gates `CreateChannel`/`AddChannelMember`/`RemoveChannelMember`
+  on `NodeService`; without a verifier these fail closed.
+- **Backup scrubbing** — `glasschain backup-scrub` runs the D5 sweep over a
+  copied storage directory before archival.
+- **Reauthorization** — the TOFU `Known` path assigns the fresh Hello's
+  org-verification result (upgrade or downgrade).
+- **On-chain revocation registry (#74)** — remains deferred.
 
-- OCSP (Online Certificate Status Protocol) verification and stapling for live peer authentication.
-- Deployment access (operator RBAC and channel-management operations specification).
-- Explicit replica/backup physical retention and recovery policy.
-- On-chain revocation registry (#74) remains deferred.
+Next active frontier: **Frontier D (Browser Demonstration)**.
 
 ### C. Transport and performance (concluded 2026-09-13)
 

@@ -156,8 +156,11 @@ higher one, define a trait in `glasschain-core` and inject the implementation.
 | Reorder watchers (ECA) | `glasschain-workflows/src/watcher.rs` |
 | Peer wire format / message types | `glasschain-network/src/protocol.rs` |
 | Peer lifecycle, TLS handshake, TOFU registry | `glasschain-network/src/{node,peer}.rs` |
+| OCSP staples, admin roles, MSP certs, identity custody | `glasschain-identity/src/{ocsp,msp,possession}.rs` |
 | gRPC surface | `glasschain-rpc/proto/glasschain/v1/glasschain.proto` **and** `src/server.rs` |
+| gRPC admin authorization (ADR-017) | `glasschain-rpc/src/auth.rs` (`AdminGate`) |
 | CLI REPL commands | `glasschain-node/src/main.rs` |
+| `glasschain` CLI subcommands | `glasschain-cli/src/main.rs` + `src/commands/` |
 
 Adding a gRPC method requires editing the `.proto` **and** the server impl; the
 `build.rs` regenerates bindings on the next build.
@@ -259,14 +262,36 @@ Treat these as invariants, not suggestions:
   `Organization::crl_pem()` after `revoke_identity()`. Intermediate CAs load
   from the same store and are revocation-checked. Revocation is go-forward
   only — committed history stays valid.
+- **Live revocation status is the OCSP staple (ADR-017).** The org Root CA
+  mints an issuer-signed OCSP `BasicResponse` per member certificate;
+  `glasschain-node` staples it on every `Hello` (`ocsp_response_der`), and
+  receivers verify it **locally** (`CertChainVerifier::verify_ocsp_staple`).
+  No outbound responder queries — they are rejected, not allowed. A `revoked`
+  staple fails the session closed; an absent/invalid/expired staple falls
+  back to the CRL result and never upgrades it. Operator channel management
+  (`CreateChannel`/`AddChannelMember`/`RemoveChannelMember` on `NodeService`)
+  is gated by `AdminGate`: certificate-bound admin principals only
+  (`OU=admin` via `issue_identity_with_role`), fail closed without a
+  verifier. Physical backups are scrubbed with `glasschain backup-scrub` on
+  a storage copy. Do not add responder egress or an admin bypass.
+- **Identity material is operator-owned (ADR-018).** `--identity-file`
+  persists the org Root CA key pair, serial bookkeeping, revocation history
+  and member seeds; restarts re-present the same key, so persisted TOFU pins
+  keep verifying. Trust-store/CRL reload is operator-signalled
+  (`reload-trust-store` REPL command), never a timer. Equivocation evidence
+  persists through the state seam (advisory only — never a trust decision,
+  never automatic exclusion).
 - **Known, accepted limitations** (documented in README — do not "fix" them
   silently as part of an unrelated change): TOFU trust is address-bound,
   trust-store distribution between organizations is manual and out-of-band
   (no shared CA; on-chain registry deferred to #74), and a pin whose identity
   key is genuinely lost needs operator recovery (remove the
   `tofu:peer:<addr>` state key) — rotation is signed by the pinned key only.
-- Never commit keys, certificates, or `.pem` files. Identity material is generated
-  at runtime by `glasschain-identity`.
+- Never commit keys, certificates, or `.pem` files. Identity material is
+  generated at runtime by `glasschain-identity`; with `--identity-file <PATH>`
+  it persists into an **operator-owned** file (ADR-018, mode `0600`) — never
+  into the storage seam (storage copies/archives must not carry private
+  keys).
 - Signing is ed25519 (`ed25519-dalek`), hashing is SHA-256. Don't swap primitives
   without an explicit request.
 

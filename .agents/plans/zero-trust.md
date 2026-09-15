@@ -1,8 +1,8 @@
 # Plan — Zero-trust deployment and verification gaps
 
-**Status:** active; §8.1–§8.4 consensus safety shipped (#95–#99, PR #116); Frontier A concluded — `EquivocationProof` carries both dual-signed votes and verifies through the #95 context envelope
+**Status:** active; §8.1–§8.4 consensus safety shipped (#95–#99, PR #116); Frontier A concluded — `EquivocationProof` carries both dual-signed votes and verifies through the #95 context envelope; Frontier B concluded (ADR-017 decisions **and** their code: OCSP stapling, admin RBAC, backup-scrub, per-Hello reauthorization)
 **Reviewed:** 2026-09-12 against `7143c0c`
-**Related:** [ADRs](../../docs/README.md), [performance](performance.md),
+**Related:** [ADRs](../../docs/README.md), [residual work](zero-trust-residual.md), [performance](performance.md),
 [post-quantum](post-quantum.md), [source-comment debt](deferred-code-debt.md).
 
 ## Goal
@@ -19,7 +19,7 @@ mechanisms were “built and correct” was too broad and is withdrawn.
 |---|---|
 | Peer TLS and TOFU | Default transport; address-bound in-memory fingerprints. Does not alone prove claimed organization membership. |
 | Federation chain verification | Node startup installs a verifier with both `--org` and `--trust-store`; otherwise org claims remain unverified. |
-| CRLs, OCSP and intermediate CAs | Verification rejects missing/stale/revoked status when the verifier is configured; startup CRL files are enforced (ADR-013); OCSP responder query / stapling and dynamic refresh are planned for live session lifecycle. |
+| CRLs, OCSP and intermediate CAs | Verification rejects missing/stale/revoked status when the verifier is configured; startup CRL files are enforced (ADR-013); live-session revocation **implemented** (ADR-017) — an issuer-signed OCSP staple rides the `Hello`, verified locally against the trust store, no outbound responder queries, CRL fallback fail-closed |
 | Endorsement provider | Attached under `--org`, initially registering local identity; enforcement also depends on active capability. Not complete remote certificate-derived principal management. |
 | Governance defaults | ADR-012 uses endorsement carriers for capability activations/state commitments. Advisory record signatures do not become independently verified credentials. |
 | BFT votes/certificates | Default-off staged implementation with verification code; context binding, receipt lifetime and historical verification need the checks in §8. |
@@ -108,13 +108,18 @@ not delay unrelated confidentiality improvements.
 - Define trust-store/CRL refresh and established-session reauthorization. A check
   made during Hello cannot promise indefinite membership after expiry/revocation.
   Keep external retrieval off deterministic commit/replay paths and use explicit
-  historical evidence for already-committed authorization.
-- **OCSP (Online Certificate Status Protocol) verification and stapling:**
-  While CRLs provide local fail-closed revocation (ADR-013), they require periodic distribution.
-  Add OCSP to the live session lifecycle plan:
-  1. **OCSP stapling** during the TLS handshake for live peer authentication.
-  2. **OCSP responder queries** for dynamic status validation of peer certificates and intermediate CAs, with bounded timeouts, local caching, and fail-closed behavior for private paths.
-  3. **Strict isolation from consensus:** external OCSP network requests must stay strictly off the consensus loop and block execution paths (local cache only; historical validation remains deterministic and height-bound).
+  historical evidence for already-committed authorization. **Reauthorization
+  shipped (2026-09-14)** — per-Hello/per-connection downgrade on failed
+  re-verification (see the ADR-017 item below); **trust-store/CRL hot-reload
+  stays deferred** — CRL refresh is a restart with re-read files, documented
+  in ADR-011/ADR-013.
+- **OCSP and Deployment Trust (Implemented, ADR-017 — 2026-09-14):**
+  1. **OCSP stapling at session establishment** — the org Root CA mints an issuer-signed `BasicResponse` per member (`Organization::ocsp_response_der`); `glasschain-node` staples it on every `Hello` (`ocsp_response_der`, base64 DER). Receiving nodes verify locally against the trust store (`CertChainVerifier::verify_ocsp_staple`); the org certificate rides the Hello (TLS transport certs are self-signed), so the staple rides the Hello too — no TLS-extension surgery, no responder egress.
+  2. **No live responder network queries** — outbound OCSP queries are rejected (consensus isolation / egress). A `revoked` staple fails the session's org verification closed; malformed/mismatched/expired staples fall back to the fail-closed CRL path (ADR-013) and never upgrade or block it.
+  3. **Operator RBAC** — member certs carry an admin role as subject OU (`issue_identity_with_role`, `ADMIN_ROLE`); `NodeService`'s `CreateChannel`/`AddChannelMember`/`RemoveChannelMember`   are gated by `AdminGate` (chain+CRL fail-closed verify, CN == caller, possession via header signature, admin OU). No verifier configured ⇒ fail closed. Multi-org channel endorsement policy stays authoritative in committed `PolicyUpdate` records (ADR-008/ADR-012).
+  4. **Physical retention** — `glasschain backup-scrub --storage <PATH>` runs the D5 sweep over a copied store before archival; volume backups need encryption-key destruction.
+  5. **Established-session reauthorization** — the TOFU registry's `Known` path now *assigns* the fresh Hello's `org_verified` (upgrade or downgrade) instead of only upgrading: a failed re-verification downgrades the pin's session evidence while identity/fingerprint pins stay. Reauthorization is per-Hello/per-connection.
+  6. **On-chain revocation (#74)** — remains deferred.
 
 ## 6. Cryptographic backend review
 
@@ -226,9 +231,11 @@ hardening beyond the journal is future work.
 
 ## Validation and next steps
 
-Plan the §8 regressions first, then the remaining D1/D2 decisions and the
-independently testable TLS negotiation work (D4–D6, #86, #88 and #110 are
-shipped). Use current APIs/test harnesses; preserve default/all-feature
+The §8 regressions, the D1/D2 decisions and the TLS negotiation work are
+shipped. Remaining zero-trust threads are tracked in
+[zero-trust-residual.md](zero-trust-residual.md) (identity/key custody, admin
+CLI client, CRL hot-reload, durable equivocation evidence). Use current
+APIs/test harnesses; preserve default/all-feature
 behaviour until an explicit adoption decision. Every implementation runs the
 workspace gates and adds its named failure-case test. WAN/resource scenarios
 and honest metric labels are specified in the performance and browser demo plans.
