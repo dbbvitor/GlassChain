@@ -22,6 +22,10 @@
 #                    statuses duplicating the top-level gate, so the flag is
 #                    declared bespoke. It labels the upload kind; the
 #                    per-crate dimension comes from components below.
+#                    Three advisory weekly flags (`coverage-insights.yml`)
+#                    are declared `joined: false` — the fuzz-harness and
+#                    feature-sensitivity views stay out of the master
+#                    report, so they can never move this gate.
 # * components     — per-crate views computed from that same single upload:
 #                    components are virtual path filters defined entirely
 #                    here, no upload-time separation required. Component
@@ -51,6 +55,14 @@ flags:
     paths:
       - crates/**
     carryforward: false
+  # Advisory weekly views (coverage-insights.yml); `joined: false` keeps
+  # them out of the master report so the pinned 90% gate is untouched.
+  fuzz:
+    joined: false
+  no-bft:
+    joined: false
+  no-pq-tls:
+    joined: false
 
 component_management:
   default_rules:
