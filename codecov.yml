@@ -1,16 +1,13 @@
 # Codecov configuration.
 #
-# Coverage gate (Gold target: >= 90% line coverage). Measured reality
-# (tarpaulin, 2026-09-14): 82.4%. A hard 90% gate fails every PR until that
-# gap is closed — so the blocking check is a **ratchet**: `target: auto`
-# compares head against the base commit and a small threshold blocks
-# regressions, while the dashboard keeps showing the distance to 90%. Once
-# measured coverage reaches 90%, pin `target: 90%` here (and in AGENTS.md).
-# Branch coverage is tracked on the Codecov dashboard but is not a status
-# check (tarpaulin measures line coverage; a branch gate would need a second
-# engine). Patch coverage is informational — new code is encouraged, not
-# blocked. Repository branch protection should require the `codecov/project`
-# status check alongside the workflow jobs.
+# Coverage gate: the Gold >= 90% project (line) coverage target was measured
+# at 90.02% on 2026-09-16 and is now pinned (`target: 90%`). A 0.5% threshold
+# absorbs measurement noise without reopening the floor. Branch coverage is
+# tracked on the Codecov dashboard but is not a status check (tarpaulin
+# measures line coverage; a branch gate would need a second engine). Patch
+# coverage is informational — new code is encouraged, not blocked.
+# Repository branch protection should require the `codecov/project` status
+# check alongside the workflow jobs.
 #
 # Configuration surface (docs.codecov.com):
 # * codecov-yaml   — this repository-level file; validate before deploying:
@@ -37,7 +34,7 @@ coverage:
   status:
     project:
       default:
-        target: auto
+        target: 90%
         threshold: 0.5%
         informational: false
         if_ci_failed: error
