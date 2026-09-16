@@ -5396,9 +5396,19 @@ mod tests {
     fn restore_ledger_falls_back_on_invalid_chain_link() {
         let storage: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
         let mut chain = seed_storage(&storage, 2, 2);
-        // Corrupt block 1 so it no longer satisfies the PoW target.
-        chain[1].nonce = chain[1].nonce.wrapping_add(12345);
-        chain[1].hash = chain[1].calculate_hash();
+        // Corrupt block 1 so it no longer satisfies the PoW target: advance
+        // the nonce until the recomputed hash misses the difficulty target
+        // (a fixed bump still passes one time in 256).
+        let mut nonce = chain[1].nonce.wrapping_add(1);
+        loop {
+            chain[1].nonce = nonce;
+            chain[1].hash = chain[1].calculate_hash();
+            if !chain[1].has_valid_pow(2) {
+                break;
+            }
+            nonce = nonce.wrapping_add(1);
+        }
+        assert!(!chain[1].has_valid_pow(2));
         storage.put_block(&chain[1]).unwrap();
 
         let ledger = Node::restore_ledger(&storage, 2);
