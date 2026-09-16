@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Anvisa SNCM Compliance Validation Suite
 //!
 //! This test suite simulates a complete pharmaceutical supply-chain shipment

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! `channel-admin` sub-command — drive the ADR-017 channel-management RPCs
 //! (`NodeService.CreateChannel` / `AddChannelMember` /
 //! `RemoveChannelMember`) as a certificate-bound MSP admin principal.

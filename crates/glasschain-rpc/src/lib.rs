@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! gRPC service layer for `GlassChain` (Phase 1 — Tonic + Prost).
 //!
 //! This crate exposes a fully type-safe gRPC API for:

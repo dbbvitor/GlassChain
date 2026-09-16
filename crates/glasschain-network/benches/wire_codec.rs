@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Wire codec cost at the current BLS shape (performance plan Step 1).
 //!
 //! Measures JSON encode/decode wall time and byte size for the `Message`

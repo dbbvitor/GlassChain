@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! `contract-deploy` sub-command — deploy a smart contract to a `GlassChain` node.
 //!
 //! Builds a [`SmartContractDef`] from the provided CLI flags, wraps it in a

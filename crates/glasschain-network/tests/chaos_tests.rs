@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Network Chaos Testing Suite (Phase 6).
 //!
 //! These tests simulate adverse network conditions to verify that `GlassChain`

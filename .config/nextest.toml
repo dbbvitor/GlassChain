@@ -1,0 +1,10 @@
+# Nextest CI profile: the test job runs with `--profile ci`, which writes
+# JUnit XML for Codecov test analytics (flaky-test detection). The path is
+# relative to `target/nextest/<profile>/`, so the file lands at
+# target/nextest/ci/junit.xml.
+[profile.ci]
+failure-output = "immediate-final"
+fail-fast = false
+
+[profile.ci.junit]
+path = "junit.xml"

@@ -22,9 +22,16 @@ watcher automation engine, a TLS-encrypted TCP/libp2p P2P layer, and a gRPC API.
 - **Toolchain:** Rust **1.98.1** (pinned in `rust-toolchain.toml`), edition 2021.
 - **Runtime:** Tokio async, `tonic`/`prost` for gRPC, `wasmtime` for contract execution.
 - **CI:** `.github/workflows/ci.yml` runs strict rustfmt and clippy gates, a
+  DCO sign-off check (every PR commit needs `git commit -s`), a
   check/test matrix on Ubuntu, macOS, and Windows, code coverage, and a RustSec
   dependency audit on every push and PR. Coverage uploads require the
-  `CODECOV_TOKEN` repository secret. It is a safety net, not a substitute — run
+  `CODECOV_TOKEN` repository secret, and `codecov.yml` enforces ≥90% project
+  coverage as a status check. Additional scheduled/tagged workflows:
+  `fuzz.yml` (cargo-fuzz smoke on PRs touching core/network, weekly deep runs
+  over `fuzz_wire` and `fuzz_transactions`), `reproducible.yml` (weekly
+  Linux-only build-twice hash verification), and `release.yml` (on `v*` tags:
+  cargo-auditable build, CycloneDX SBOMs, git-cliff notes, Cosign keyless
+  signing). It is a safety net, not a substitute — run
   the checks below locally before declaring work done, because a cold CI build
   takes minutes.
 
@@ -190,6 +197,9 @@ Most style is enforced mechanically — read `Cargo.toml`'s `[workspace.lints]` 
 - **Serialization:** `serde` with `derive` everywhere; the wire protocol is JSON.
 - **Money:** prices are integers in **minor currency units** (`1500` = `$15.00`).
   Never introduce floats for currency.
+- **File headers:** every source file under `crates/` starts with
+  `// SPDX-License-Identifier: Apache-2.0` + `// Copyright 2026 dbbvitor`
+  (Gold `license_per_file`/`copyright_per_file`). Keep them on new files.
 - **Naming:** identifiers must be ≥2 characters (`min-ident-chars-threshold = 2`);
   `id`, `tx`, `rx` are fine, `x` is not.
 - **Public API:** `avoid-breaking-exported-api = false`, so clippy will suggest

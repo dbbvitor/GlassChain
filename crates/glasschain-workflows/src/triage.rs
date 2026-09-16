@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! The flow triage view: surfaces stuck flows.
 //!
 //! The runner records every durable point here; an operator polls

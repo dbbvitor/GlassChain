@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! BFT round state and the vote-round driver (ADR-002 adoption gate, ADR-009
 //! churn, ADR-014 aggregation).
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Verifiable Data Lineage — Provenance API.
 //!
 //! The [`ProvenanceIndex`] tracks every custody transfer event for every

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Typed execution results and scoped persistent write sets (ADR-007).
 //!
 //! An execution produces two distinct outputs:

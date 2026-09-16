@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 use crate::asset::TraceableAsset;
 use crate::canonical::CanonicalRecord;
 use crate::capability::CapabilityActivation;

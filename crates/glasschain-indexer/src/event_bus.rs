@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Event Bus — stream validated transactions to downstream services.
 //!
 //! The [`EventBusProvider`] trait abstracts over message brokers.  The

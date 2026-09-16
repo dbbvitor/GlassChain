@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 use thiserror::Error;
 
 /// The budget that was exhausted during contract execution.

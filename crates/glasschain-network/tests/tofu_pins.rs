@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Durable TOFU pins (#88): the peer registry survives restarts, a
 //! transport-fingerprint change requires a signed rotation by the pinned
 //! identity key, and a corrupt persisted pin fails closed.

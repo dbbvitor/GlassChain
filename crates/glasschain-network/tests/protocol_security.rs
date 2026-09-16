@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Integration tests for the protocol/security branches of `process_message`
 //! in `src/node.rs` that the high-level node-pair tests do not exercise.
 //!

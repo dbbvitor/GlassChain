@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! `ledger-inspect` subcommand — query the `GlassChain` ledger state.
 //!
 //! This command documents the gRPC calls that *would* be issued against a live

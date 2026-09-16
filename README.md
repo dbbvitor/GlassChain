@@ -148,6 +148,11 @@ explicit about what is designed but not yet wired.
 | [Workflows & contracts](docs/workflows-and-contracts.md) | Contract/workflow split, WASM host ABI, watcher automation |
 | [Operations](docs/operations.md) | Build, flags, REPL, gRPC, storage, wire protocol, operator warnings |
 | [Liveness](docs/liveness.md) | Validator-set planning: failure domains, jurisdiction, participation |
+| [Threat model](docs/threat-model.md) | Assets, trust boundaries, per-boundary threats/mitigations, assurance case |
+
+- **Contributing** — [CONTRIBUTING.md](CONTRIBUTING.md): build gates, DCO sign-off, PR rules.
+- **Governance & conduct** — [GOVERNANCE.md](GOVERNANCE.md) and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+- **Security** — report vulnerabilities privately via [SECURITY.md](SECURITY.md) (GitHub Private Vulnerability Reporting; 14-day response / 60-day fix SLA).
 
 - **ADRs** — 14 accepted records in [`docs/adr/`](docs/adr/) (index in [`docs/README.md`](docs/README.md)); read the one covering your area first.
 - **Benchmarks** — [`docs/benchmarks/consensus-capacity.md`](docs/benchmarks/consensus-capacity.md) is the authoritative performance record (with explicit caveats).
@@ -159,6 +164,27 @@ explicit about what is designed but not yet wired.
 - **Contributors** — [`AGENTS.md`](AGENTS.md) / [`.github/copilot-instructions.md`](.github/copilot-instructions.md) hold the invariants; [`PLUGIN_KIT.md`](PLUGIN_KIT.md) is the provider-trait & plugin reference.
 
 ---
+
+## Roadmap
+
+The project is pre-release. Direction for the next year:
+
+1. **Stability and coverage hardening** — keep the 12-crate suite green under
+   the current strict gates (rustfmt, clippy pedantic/nursery, `-D warnings`)
+   and hold the coverage thresholds already enforced in CI (≥90% line, ≥80%
+   branch).
+2. **Dynamic analysis** — grow the `cargo-fuzz` harness set (`fuzz_wire`,
+   `fuzz_transactions`) on a scheduled cadence; add targets for new untrusted
+   decode paths as they appear.
+3. **First public release (v0.1.0)** — automated release notes, Cosign-signed
+   artifacts, and CycloneDX SBOMs per [SECURITY.md](SECURITY.md); versioned
+   support branches start here.
+4. **Federation readiness** — onboarding of additional member organizations
+   and maintainers, raising the bus factor to 2+ (see
+   [GOVERNANCE.md](GOVERNANCE.md)); browser demo evaluation (planned, not
+   built).
+5. **OpenSSF Best Practices badge** — Passing, then Silver, then Gold, with
+   the compliance plan in `docs/compliance/openssf-best-practices.md`.
 
 ## License
 

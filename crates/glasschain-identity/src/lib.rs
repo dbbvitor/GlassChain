@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Decentralized Identity and Membership Service Provider (MSP) for `GlassChain`.
 //!
 //! This crate implements **Phase 2** of the `GlassChain` architecture plan:

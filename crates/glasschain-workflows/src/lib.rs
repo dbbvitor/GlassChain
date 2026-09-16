@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! # `GlassChain` workflows
 //!
 //! A Corda-style state-machine workflow framework (ticket #40), in the

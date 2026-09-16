@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! The flow runner: drives `(state, event)` pairs through a transition table,
 //! persisting checkpoints and delivering the produced actions to the caller.
 //!

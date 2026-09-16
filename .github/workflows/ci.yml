@@ -40,6 +40,35 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # DCO (Silver `1.dco`): every PR commit must carry a `Signed-off-by` line
+  # matching its author. Contributors run `git commit -s`; a missing sign-off
+  # is fixed with `git commit --amend -s`.
+  dco:
+    name: DCO sign-off
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify sign-offs on every commit
+        run: |
+          range="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          fail=0
+          while IFS= read -r sha; do
+            name=$(git log -1 --format='%an' "$sha")
+            email=$(git log -1 --format='%ae' "$sha")
+            if ! git log -1 --format='%(trailers:key=Signed-off-by,valueonly)' "$sha" | grep -qF "$email"; then
+              echo "Commit $sha ($name <$email>) lacks a matching 'Signed-off-by' line."
+              echo "  Fix with: git commit --amend -s"
+              fail=1
+            fi
+          done < <(git log --format='%H' "$range")
+          exit "$fail"
+
   fmt:
     name: Format
     runs-on: ubuntu-latest
@@ -100,6 +129,7 @@ jobs:
     env:
       RUSTFLAGS: -D warnings
       RUSTDOCFLAGS: -D warnings
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
     steps:
       - uses: actions/checkout@v7
@@ -128,8 +158,23 @@ jobs:
       # test-mode setup mines a 10k-block history in debug and dominated the
       # job (~20+ min per OS). Benches stay compile-checked via clippy
       # --all-targets and run for real through `make bench` / `cargo bench`.
+      # cargo-nextest runs each test in its own process (the shared port-band
+      # allocator is per-process, so no collisions) and emits JUnit XML for
+      # Codecov test analytics via the `ci` profile (.config/nextest.toml).
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
       - name: Run all tests
-        run: cargo test --workspace --lib --bins --tests --all-features --locked
+        run: cargo nextest run --profile ci --workspace --lib --bins --tests --all-features --locked
+
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() && env.CODECOV_TOKEN != '' }}
+        uses: codecov/test-results-action@v1
+        with:
+          token: ${{ env.CODECOV_TOKEN }}
+          files: target/nextest/ci/junit.xml
 
   coverage:
     name: Code coverage

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! The `Action` half of the Corda Action/Event/TransitionResult algebra.
 //!
 //! A [`Transition`](crate::Transition) produces [`Action`]s; the

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! AC4: the existing offer→PO automation, inventory triggers, and approval
 //! gates remain fully functional and are exercised by the framework's tests.
 //!

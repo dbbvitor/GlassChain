@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Identity-neutral endorsement policy seam (ADR-008).
 //!
 //! The v1 policy language is a deterministic Fabric-style signature-policy

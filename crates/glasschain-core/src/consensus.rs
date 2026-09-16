@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Quorum-certificate types for the consensus seam (ADR-002, ADR-014).
 //!
 //! A [`QuorumCertificate`] is a BLS12-381 aggregate signature over the block

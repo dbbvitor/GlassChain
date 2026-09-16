@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 use crate::approval_gate::{ApprovalGate, ApprovalGatePolicy, GateDecision};
 use crate::contract::{Contract, ContractStatus};
 use crate::error::ContractError;

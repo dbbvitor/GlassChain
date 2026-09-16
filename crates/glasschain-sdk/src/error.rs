@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Error types for the `glasschain-sdk` crate.
 
 #![allow(clippy::module_name_repetitions)]

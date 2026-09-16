@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Node-level purchase-to-settlement scenario (ticket #43): the full
 //! RFQ → Quote → PO → Acceptance → Shipment → Receipt → Dispute → Settlement
 //! chain, plus certification and audit flows, end-to-end across two

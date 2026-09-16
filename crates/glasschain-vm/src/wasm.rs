@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Wasmtime-backed [`ExecutionProvider`] implementation.
 
 use crate::gas::GasCounter;

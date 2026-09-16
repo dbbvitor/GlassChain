@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Issuer-signed OCSP responses stapled at session establishment (ADR-017).
 //!
 //! An organization's Root CA mints a signed status response for one member

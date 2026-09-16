@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Sled-backed implementation of [`StorageProvider`].
 //!
 //! [`SledStorageProvider`] uses two separate sled trees:

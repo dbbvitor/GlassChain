@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! High-level `GlassChain` client and related configuration types.
 //!
 //! This module is the primary entry point of the SDK.  All transaction

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 pub mod asset;
 pub mod bft;
 pub mod block;

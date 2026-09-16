@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Pluggable provider traits for `GlassChain`'s core protocol layers.
 //!
 //! These traits define the abstract interfaces for the three pillars of the

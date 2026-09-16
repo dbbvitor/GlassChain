@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Ed25519 identity and signed-transaction wrappers.
 
 use crate::error::IdentityError;

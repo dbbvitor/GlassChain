@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Policy-based endorsement engine for `GlassChain`.
 //!
 //! This module implements the Phase 2 endorsement workflow that enables

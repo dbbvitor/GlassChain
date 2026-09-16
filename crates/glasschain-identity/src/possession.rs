@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Session-bound organization possession proofs (#110).
 //!
 //! A verified certificate proves issuance, not possession: the PEM bytes are

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Wire-encoding helpers for signature-adjacent byte fields (#62 Step 1).
 //!
 //! `serde_json` renders `Vec<u8>` as an array of decimal numbers — a 96-byte

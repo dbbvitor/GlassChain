@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 use crate::consensus::QuorumCertificate;
 use crate::crypto::sha256;
 use crate::error::CoreError;

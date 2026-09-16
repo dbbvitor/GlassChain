@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! MSP-backed [`EndorsementProvider`]: verifies endorsement signatures and
 //! derives principals from a registered key directory (ADR-008 handoff 2).
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Deterministic contract layer for `GlassChain` (ticket #49's packaging
 //! split): verification-only, deterministic contract code — the contract
 //! registry, condition matching, and the WASM approval gate.

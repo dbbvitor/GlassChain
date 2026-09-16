@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Capability registry and height-based activation (ADR-010).
 //!
 //! Capabilities gate every consensus-visible or validation-affecting behavior.

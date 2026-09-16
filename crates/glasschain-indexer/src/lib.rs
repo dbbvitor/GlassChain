@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Block indexer, Provenance API, and Event Bus for `GlassChain` (Phase 5).
 //!
 //! ## Components

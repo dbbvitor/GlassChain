@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Channel abstraction — sub-ledgers for specific clients/suppliers.
 //!
 //! A [`Channel`] is a named sub-ledger that restricts which participants may

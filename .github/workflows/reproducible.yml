@@ -1,0 +1,59 @@
+name: Reproducible build
+
+# Reproducible-builds.org verification (Gold `build_reproducible`), scoped
+# honestly: Linux x86_64 only. Cross-runner (macOS/Windows) determinism is
+# not claimed; the compliance plan documents this limitation.
+
+on:
+  schedule:
+    - cron: "0 5 * * 1" # Weekly, Monday 05:00 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Build twice, compare hashes
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ github.job }}
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      - name: Build twice in isolated target dirs
+        env:
+          SOURCE_DATE_EPOCH: "946684800" # 2000-01-01T00:00:00Z
+        run: |
+          CARGO_TARGET_DIR=target-a cargo build --release --locked
+          CARGO_TARGET_DIR=target-b cargo build --release --locked
+
+      - name: Compare artifact hashes
+        run: |
+          (cd target-a/release && find . -maxdepth 1 -type f | sort | xargs sha256sum) > /tmp/hashes-a
+          (cd target-b/release && find . -maxdepth 1 -type f | sort | xargs sha256sum) > /tmp/hashes-b
+          if ! diff -u /tmp/hashes-a /tmp/hashes-b; then
+            echo "::error::Release artifacts are not bit-for-bit reproducible; see the hash diff above."
+            exit 1
+          fi
+          echo "All release artifacts reproduced bit-for-bit."

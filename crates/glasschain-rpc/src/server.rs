@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Tonic gRPC server implementations for `LedgerService` and `NodeService`.
 
 use crate::auth::{AdminGate, MspAuthInterceptor, TrustedKeyRegistry};
@@ -19,7 +21,7 @@ use glasschain_core::{Transaction, TransactionKind};
 use glasschain_identity::SignedTransaction;
 use glasschain_network::{Node, NodeEvent};
 use std::sync::Arc;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{transport::Server, Request, Response, Status};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -788,6 +790,27 @@ impl GlasschainServer {
     /// }
     /// ```
     pub async fn serve(self, addr: std::net::SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        self.serve_listener(listener).await
+    }
+
+    /// Serve on a listener the caller has already bound.
+    ///
+    /// Use this when the address must be held from allocation to service —
+    /// port allocators that pre-bind (the test suites do, to close the
+    /// probe→drop→rebind window that fails with `AddrInUse` on Windows CI)
+    /// hand their socket over instead of letting the server re-bind.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server encounters a fatal error while serving.
+    pub async fn serve_listener(
+        self,
+        listener: tokio::net::TcpListener,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let addr = listener
+            .local_addr()
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
         let state = ServerState {
             provenance: self.node.provenance_index(),
             flattener: self.node.analytical_flattener(),
@@ -797,6 +820,7 @@ impl GlasschainServer {
 
         log::info!("GlassChain gRPC server listening on {addr}");
 
+        let incoming = TcpListenerStream::new(listener);
         if let Some(auth) = self.auth {
             Server::builder()
                 .add_service(LedgerServiceServer::with_interceptor(
@@ -808,14 +832,14 @@ impl GlasschainServer {
                     auth.clone(),
                 ))
                 .add_service(IdentityServiceServer::with_interceptor(state, auth))
-                .serve(addr)
+                .serve_with_incoming(incoming)
                 .await?;
         } else {
             Server::builder()
                 .add_service(LedgerServiceServer::new(state.clone()))
                 .add_service(NodeServiceServer::new(state.clone()))
                 .add_service(IdentityServiceServer::new(state))
-                .serve(addr)
+                .serve_with_incoming(incoming)
                 .await?;
         }
 

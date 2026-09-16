@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Watcher service for inventory-threshold-based contract triggering.
 //!
 //! I/O-driven automation (ticket #49's packaging split): the watcher observes
