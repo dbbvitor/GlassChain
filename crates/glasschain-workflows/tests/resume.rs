@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Resume/checkpoint/triage tests for the workflow framework (ticket #40
 //! AC1–AC3): determinism, no-loss/no-duplication resume, canonical-record
 //! reference chains, and the stuck-flow triage view.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 #![allow(clippy::module_name_repetitions)]
 //! MSP (Membership Service Provider) authentication interceptor for `GlassChain` gRPC services.
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use glasschain_core::{ExecutionLimits, ExecutionProvider};
 use std::collections::HashMap;

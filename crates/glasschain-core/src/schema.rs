@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! SNCM Asset Schema Validation.
 //!
 //! This module implements **Phase 3** of the `GlassChain` plan: a deterministic

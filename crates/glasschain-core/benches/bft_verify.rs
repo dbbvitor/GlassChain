@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Quorum-certificate verification cost (performance plan Step 4, ADR-015).
 //!
 //! Three variants of the IETF `PopScheme` same-message multisig check at quorum

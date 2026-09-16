@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Integration tests for the `GlassChain` gRPC server.
 //!
 //! These tests start a real [`Node`] with in-memory storage (the same way

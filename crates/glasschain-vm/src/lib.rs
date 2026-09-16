@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! WebAssembly contract runtime for `GlassChain` (Phase 4).
 //!
 //! This crate implements the [`ExecutionProvider`] trait using **Wasmtime**,

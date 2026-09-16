@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! The `Event` half of the Corda Action/Event/TransitionResult algebra: the
 //! inputs a flow reacts to.
 

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Node-level no-fork, final-at-commit scenario with the Tendermint-class BFT
 //! implementation enabled (ticket #42, ADR-002 / ADR-010).
 //!

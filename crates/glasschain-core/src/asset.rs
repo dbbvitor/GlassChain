@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Traceable asset model for regulatory compliance and supply-chain transparency.
 //!
 //! This module implements the **Phase 3 "Traceability-First" data model**,

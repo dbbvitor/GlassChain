@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 use sha2::{Digest, Sha256};
 
 /// Returns the hex-encoded SHA-256 digest of the supplied bytes.

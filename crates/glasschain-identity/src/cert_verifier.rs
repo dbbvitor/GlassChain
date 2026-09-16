@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! CA-backed certificate chain verifier for `GlassChain`.
 //!
 //! [`CertChainVerifier`] replaces the `AcceptAnyCert` model for org-mode nodes:

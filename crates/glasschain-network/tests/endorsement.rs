@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Node-level endorsement enforcement tests (ADR-008 §4, ticket #45).
 //!
 //! Every scenario runs through the real commit path: submit → mine → assert

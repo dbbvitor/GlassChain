@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Flow state: the data a flow carries between events, through checkpoints.
 
 use serde::de::DeserializeOwned;

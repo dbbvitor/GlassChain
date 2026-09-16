@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Cross-validator BFT vote rounds on the wire (ADR-002 adoption gate,
 //! ADR-009 on-chain validator registry, ADR-014 aggregation).
 //!

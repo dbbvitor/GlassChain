@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Tonic gRPC server implementations for `LedgerService` and `NodeService`.
 
 use crate::auth::{AdminGate, MspAuthInterceptor, TrustedKeyRegistry};

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Analytical Flattener — transforms nested JSON asset data into flat
 //! SQL / ClickHouse-compatible records.
 //!

@@ -40,6 +40,35 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # DCO (Silver `1.dco`): every PR commit must carry a `Signed-off-by` line
+  # matching its author. Contributors run `git commit -s`; a missing sign-off
+  # is fixed with `git commit --amend -s`.
+  dco:
+    name: DCO sign-off
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify sign-offs on every commit
+        run: |
+          range="${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+          fail=0
+          while IFS= read -r sha; do
+            name=$(git log -1 --format='%an' "$sha")
+            email=$(git log -1 --format='%ae' "$sha")
+            if ! git log -1 --format='%(trailers:key=Signed-off-by,valueonly)' "$sha" | grep -qF "$email"; then
+              echo "Commit $sha ($name <$email>) lacks a matching 'Signed-off-by' line."
+              echo "  Fix with: git commit --amend -s"
+              fail=1
+            fi
+          done < <(git log --format='%H' "$range")
+          exit "$fail"
+
   fmt:
     name: Format
     runs-on: ubuntu-latest

@@ -1,0 +1,86 @@
+name: Release
+
+# Release automation (Silver `signed_releases`, Gold `release_automation`,
+# `osps_bom_01`): on a `v*` tag this workflow builds auditable release
+# binaries, generates CycloneDX SBOMs, produces the changelog and release
+# notes from conventional commits (git-cliff), signs everything with Sigstore
+# keyless (OIDC — no long-lived keys), and publishes the GitHub release.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Build, sign, publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write # publish the GitHub release
+      id-token: write # Sigstore keyless signing via OIDC
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # full history for git-cliff
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+
+      - name: Install release tooling
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-auditable,cargo-cyclonedx,git-cliff
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Build auditable binaries
+        run: cargo auditable build --release --locked
+
+      - name: Generate CycloneDX SBOMs
+        run: cargo cyclonedx --format json --output-path sbom
+
+      - name: Generate changelog and release notes
+        run: |
+          git-cliff --output CHANGELOG.md
+          git-cliff --latest --strip header > release-notes.md
+
+      - name: Sign artifacts (Sigstore keyless)
+        run: |
+          sign() {
+            cosign sign-blob --yes \
+              --output-signature "$1.sig" --output-certificate "$1.cert" "$1"
+          }
+          sign target/release/glasschain-node
+          sign target/release/glasschain
+          sign CHANGELOG.md
+          while IFS= read -r f; do sign "$f"; done < <(find sbom -type f -name "*.json")
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md \
+            target/release/glasschain-node \
+            target/release/glasschain \
+            target/release/glasschain-node.sig target/release/glasschain-node.cert \
+            target/release/glasschain.sig target/release/glasschain.cert \
+            CHANGELOG.md CHANGELOG.md.sig CHANGELOG.md.cert \
+            sbom/*

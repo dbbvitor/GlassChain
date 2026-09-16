@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! TCP-level fault injection via an in-process proxy layer (#70, D7).
 //!
 //! Instead of patching the async runtime (the madsim-tokio route, blocked on

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! High-level Rust-native SDK for `GlassChain`.
 //!
 //! # Quick Start

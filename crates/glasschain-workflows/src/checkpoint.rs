@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Flow checkpoints: durable points that let an interrupted flow resume.
 //!
 //! Checkpoints persist through the existing [`StorageProvider`] state seam

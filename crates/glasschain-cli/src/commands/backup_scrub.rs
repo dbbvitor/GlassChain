@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! `backup-scrub` sub-command — prune expired private payloads from a storage
 //! copy before archiving it (ADR-017).
 //!

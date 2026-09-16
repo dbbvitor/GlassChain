@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Example flow: shipment → receipt over canonical v1 records.
 //!
 //! Demonstrates the framework's canonical-record contract (ticket #40 AC3):

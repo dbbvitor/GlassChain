@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! # `GlassChain` libp2p Swarm
 //!
 //! This module implements an **experimental** Kademlia DHT + Gossipsub

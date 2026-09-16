@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 use crate::block::Block;
 use crate::capability::{validate_record_under, CapabilityHistory};
 use crate::endorsement::PolicyHistory;

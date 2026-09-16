@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Node-level recall scenario (ticket #44): recall, quarantine, and dispute
 //! as first-class flows over three organizations (manufacturer, distributor,
 //! pharmacy) on three connected nodes.

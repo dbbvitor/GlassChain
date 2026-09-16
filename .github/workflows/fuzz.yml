@@ -1,0 +1,72 @@
+name: Fuzz
+
+# Dynamic analysis (Gold `dynamically_analysis`): two libFuzzer harnesses over
+# the untrusted decode surfaces — `fuzz_wire` (network `Message` JSON) and
+# `fuzz_transactions` (core `Transaction` JSON). PRs get a short smoke run;
+# the weekly scheduled run digs deeper. OSS-Fuzz integration is intentionally
+# out of scope pre-release.
+
+on:
+  schedule:
+    - cron: "0 4 * * 1" # Weekly, Monday 04:00 UTC
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/glasschain-core/**"
+      - "crates/glasschain-network/**"
+      - ".github/workflows/fuzz.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: cargo-fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust nightly (required by cargo-fuzz/libFuzzer)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ github.job }}
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      # libFuzzer coverage instrumentation without an address sanitizer:
+      # the sanitizer would fight ring/libp2p C code; panic/overflow crash
+      # detection is what this decode surface needs.
+      - name: Smoke fuzz on PRs, deep fuzz on schedule
+        run: |
+          secs=60
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            secs=300
+          fi
+          (cd crates/glasschain-network && cargo fuzz run -s none fuzz_wire -- -max_total_time=$secs)
+          (cd crates/glasschain-core && cargo fuzz run -s none fuzz_transactions -- -max_total_time=$secs)

@@ -1,0 +1,22 @@
+[package]
+name = "glasschain-network-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+glasschain-network = { path = ".." }
+serde_json = "1.0"
+
+[[bin]]
+name = "fuzz_wire"
+path = "fuzz_targets/fuzz_wire.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

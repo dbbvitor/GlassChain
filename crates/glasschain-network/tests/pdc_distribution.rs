@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Node-level private-payload distribution scenarios (ticket #47, ADR-003):
 //! offline catch-up via pull reconciliation, retention/purge, and
 //! certificate-verified delivery.

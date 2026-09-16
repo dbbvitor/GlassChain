@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! D3 admission-cost benchmark ([source-comment debt plan], performance Step 3
 //! prerequisite).
 //!

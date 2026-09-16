@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Transient pre-commit store for private data collections (ADR-003,
 //! tickets #46/#47).
 //!

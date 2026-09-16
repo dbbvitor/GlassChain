@@ -159,3 +159,19 @@ pass is not remote green. Remote statuses belong on the PR, not a permanent
 On resumption, read the PR's live checks and compare its base to `origin/main`.
 If GitHub's external analysis service fails, record its exact run/error and stop
 short of claiming merge readiness. Keep the PR open; merge only on explicit request.
+
+## OpenSSF compliance track (2026-09-15)
+
+Implemented the unblocked OpenSSF tickets (#125–#128) on the working tree —
+uncommitted, see `.agents/plans/openssf-compliance-implementation.md` for the
+full list. Per-file SPDX+copyright headers landed on all 108 `crates/**/*.rs`;
+new workflows: `fuzz.yml`, `reproducible.yml`, `release.yml`, plus
+`codecov.yml` (≥90% blocking) and a DCO check job in `ci.yml`. GitHub issue
+writes are blocked on a valid oauth token (current one 401s) — resolution
+comments/closures and the #123 map update are pending that.
+
+**Update (2026-09-15, later):** `gh` re-authenticated — all pending tracker
+writes done: #125–#128 claimed + resolved + closed, map #123 updated,
+`main` branch protection enabled with required checks (Format, Clippy,
+Test ×3, Code coverage, DCO sign-off, Security audit, `codecov/project`).
+Remaining: #129 (synthesis) is now unblocked.

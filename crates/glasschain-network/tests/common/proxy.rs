@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Shared real-TCP fault proxy for the network integration tests (#70, D7).
 //!
 //! Nodes run over **real loopback TCP** with an in-process proxy between

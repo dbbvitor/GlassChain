@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! The consensus capacity gate (ticket #48, ADR-010 §7): an in-process
 //! compact-workload benchmark at 200 and 300 validators.
 //!

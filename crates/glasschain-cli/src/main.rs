@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! `glasschain` — command-line interface for the `GlassChain` distributed ledger.
 //!
 //! # Subcommands

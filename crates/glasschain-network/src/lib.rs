@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 pub mod error;
 pub mod libp2p_swarm;
 pub mod node;

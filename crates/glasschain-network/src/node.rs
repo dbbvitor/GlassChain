@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 use crate::error::NetworkError;
 use crate::peer::{PeerReader, PeerWriter};
 use crate::protocol::{Message, PROTOCOL_VERSION};

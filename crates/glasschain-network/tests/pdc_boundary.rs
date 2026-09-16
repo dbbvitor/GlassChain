@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Node-level private-data-collection boundary scenarios (ticket #46, ADR-003).
 //!
 //! Three nodes: a writer (mines), a member peer, and an outsider — all share

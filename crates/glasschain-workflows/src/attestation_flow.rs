@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Certification and audit flows (ticket #43): a committed, anchored lot is
 //! attested by a certifier or auditor, emitting a `quality_certification` or
 //! `audit_attestation` record that references the immutable lot commitment.

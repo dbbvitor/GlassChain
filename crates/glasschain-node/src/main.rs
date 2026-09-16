@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 use glasschain_core::{
     endorsement::Principal, InventoryUpdate, PurchaseConditions, PurchaseOrder, SmartContractDef,
     SupplyOffer, TraceableAsset, TraceableAssetRegistration, Transaction, TransactionKind,

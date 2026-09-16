@@ -1,0 +1,23 @@
+# Codecov configuration.
+#
+# Gold thresholds: >= 90% project (line) coverage is a blocking status check;
+# branch coverage is tracked on the Codecov dashboard but is not a status
+# check (tarpaulin measures line coverage; a branch gate would need a second
+# engine). Patch coverage is informational — new code is encouraged, not
+# blocked. Repository branch protection should require the `codecov/project`
+# status check alongside the workflow jobs.
+codecov:
+  require_ci_to_pass: true
+
+coverage:
+  status:
+    project:
+      default:
+        target: 90%
+    patch:
+      default:
+        informational: true
+        target: 90%
+
+comment:
+  layout: "reach, diff, flags, files"

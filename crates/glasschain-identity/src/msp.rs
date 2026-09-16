@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Organizational Membership Service Provider (MSP).
 //!
 //! Each [`Organization`] acts as a Root CA: it generates a self-signed X.509

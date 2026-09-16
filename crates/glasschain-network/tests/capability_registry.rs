@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 /// Node-level scenarios for the capability registry (ticket #36): future-height
 /// activation commits and flips the effective set exactly at the declared
 /// height, old blocks keep their meaning, same-block transitions are rejected,

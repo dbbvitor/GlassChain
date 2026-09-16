@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Shared test fixtures: WASM gate modules used by engine and watcher tests.
 //!
 //! Both automation paths approve a purchase only when the executed module

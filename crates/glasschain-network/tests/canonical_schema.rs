@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 /// Node-level scenarios for canonical schema v1 (ticket #34): valid records
 /// commit, invalid records are rejected at admission, unknown namespaces and
 /// private cleartext never reach the chain, legacy asset-shaped inputs hit the

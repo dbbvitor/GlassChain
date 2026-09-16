@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Recall, quarantine, and dispute flows (ticket #44): a public recall
 //! lifecycle over the `recall` record family and custodian responses over the
 //! `inventory_transformation` family, all referencing the immutable lot

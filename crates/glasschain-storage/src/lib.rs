@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Pluggable storage backends for `GlassChain`.
 //!
 //! This crate provides concrete implementations of the

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! The purchase-to-settlement flow (ticket #43): RFQ → Quote → PO →
 //! Acceptance → Shipment → Receipt → Dispute → Settlement as stateful
 //! multi-party flows over canonical v1 records.

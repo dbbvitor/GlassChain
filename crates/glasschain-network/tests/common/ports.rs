@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Shared loopback-port allocator for the network integration tests.
 //!
 //! Probing `bind(":0")` and dropping the listener races with sibling tests:

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Deterministic chaos tests using the [Madsim](https://github.com/madsim-rs/madsim) framework.
 //!
 //! ## Running

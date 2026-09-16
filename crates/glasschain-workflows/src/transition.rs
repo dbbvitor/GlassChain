@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! The `TransitionResult` half of the Corda Action/Event/TransitionResult
 //! algebra, and the [`Transition`] contract: one type per transition.
 

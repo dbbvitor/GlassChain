@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! CLI sub-command modules for the `glasschain` binary.
 //!
 //! Each module corresponds to one top-level subcommand and exposes:

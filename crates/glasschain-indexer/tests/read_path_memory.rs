@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 dbbvitor
 //! Read-path memory and ingestion-cost scenario (performance plan §5).
 //!
 //! Measures the retained read-path projections — `InMemoryIndexer`,
