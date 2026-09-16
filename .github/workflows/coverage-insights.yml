@@ -89,12 +89,15 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: nightly
         run: |
-          triple=x86_64-unknown-linux-gnu
-          export PATH="$HOME/.rustup/toolchains/nightly-$triple/lib/rustlib/$triple/bin:$PATH"
+          export PATH="$HOME/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/lib/rustlib/x86_64-unknown-linux-gnu/bin:$PATH"
           for spec in "glasschain-network fuzz_wire" "glasschain-core fuzz_transactions"; do
             set -- $spec
             crate=$1; target=$2
-            bin="crates/$crate/target/$triple/coverage/$triple/release/$target"
+            # cargo-fuzz builds under the *prebuilt binary's* host triple
+            # (musl for the taiki-e install), not the fuzz target triple —
+            # locate the coverage binary instead of hardcoding the path.
+            bin=$(find "crates/$crate/target" -type f -path "*coverage*" -name "$target" | head -n1)
+            [ -n "$bin" ] || { echo "coverage binary for $target not found"; exit 1; }
             prof="crates/$crate/fuzz/coverage/$target/coverage.profdata"
             llvm-cov export -instr-profile="$prof" "$bin" -format=lcov \
               --ignore-filename-regex='(rustlib|registry|\.cargo)' \
