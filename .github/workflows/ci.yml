@@ -15,6 +15,7 @@ on:
       - "rust-toolchain.toml"
       - "clippy.toml"
       - ".cargo/**"
+      - "codecov.yml"
       - ".github/**"
   pull_request:
     branches: [main]
@@ -25,6 +26,7 @@ on:
       - "rust-toolchain.toml"
       - "clippy.toml"
       - ".cargo/**"
+      - "codecov.yml"
       - ".github/**"
   workflow_dispatch:
 
@@ -228,5 +230,7 @@ jobs:
         uses: codecov/codecov-action@v7
         with:
           files: cobertura.xml
+          # The flag defined in codecov.yml; one report → one flag.
+          flags: tarpaulin
           fail_ci_if_error: true
           token: ${{ env.CODECOV_TOKEN }}

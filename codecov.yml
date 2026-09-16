@@ -6,6 +6,21 @@
 # engine). Patch coverage is informational — new code is encouraged, not
 # blocked. Repository branch protection should require the `codecov/project`
 # status check alongside the workflow jobs.
+#
+# Configuration surface (docs.codecov.com):
+# * codecov-yaml   — this repository-level file; validate before deploying:
+#                    `curl --data-binary @codecov.yml https://codecov.io/validate`
+# * commit-status  — `coverage.status` below: `codecov/project` is the single
+#                    blocking gate (>= 90%); `codecov/patch` is informational.
+# * flags          — CI uploads exactly one tarpaulin report, flagged
+#                    `tarpaulin` in the uploader step. A single report must
+#                    map to exactly one flag (many-to-one uploads attribute
+#                    the whole report's coverage to every flag).
+# * components     — per-crate views computed from that same single upload:
+#                    components are virtual path filters defined entirely
+#                    here, no upload-time separation required. Component
+#                    statuses are informational so the twelve crates do not
+#                    add twelve new blocking checks.
 codecov:
   require_ci_to_pass: true
 
@@ -14,10 +29,74 @@ coverage:
     project:
       default:
         target: 90%
+        informational: false
+        if_ci_failed: error
     patch:
       default:
         informational: true
         target: 90%
 
 comment:
-  layout: "reach, diff, flags, files"
+  layout: "reach, diff, flags, components, files"
+
+flags:
+  tarpaulin:
+    paths:
+      - crates/**
+    carryforward: false
+
+component_management:
+  default_rules:
+    statuses:
+      - type: project
+        target: auto
+        informational: true
+  individual_components:
+    - component_id: crate_core
+      name: glasschain-core
+      paths:
+        - crates/glasschain-core/**
+    - component_id: crate_contracts
+      name: glasschain-contracts
+      paths:
+        - crates/glasschain-contracts/**
+    - component_id: crate_network
+      name: glasschain-network
+      paths:
+        - crates/glasschain-network/**
+    - component_id: crate_node
+      name: glasschain-node
+      paths:
+        - crates/glasschain-node/**
+    - component_id: crate_storage
+      name: glasschain-storage
+      paths:
+        - crates/glasschain-storage/**
+    - component_id: crate_identity
+      name: glasschain-identity
+      paths:
+        - crates/glasschain-identity/**
+    - component_id: crate_vm
+      name: glasschain-vm
+      paths:
+        - crates/glasschain-vm/**
+    - component_id: crate_indexer
+      name: glasschain-indexer
+      paths:
+        - crates/glasschain-indexer/**
+    - component_id: crate_rpc
+      name: glasschain-rpc
+      paths:
+        - crates/glasschain-rpc/**
+    - component_id: crate_sdk
+      name: glasschain-sdk
+      paths:
+        - crates/glasschain-sdk/**
+    - component_id: crate_cli
+      name: glasschain-cli
+      paths:
+        - crates/glasschain-cli/**
+    - component_id: crate_workflows
+      name: glasschain-workflows
+      paths:
+        - crates/glasschain-workflows/**

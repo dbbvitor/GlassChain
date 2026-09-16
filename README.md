@@ -5,7 +5,7 @@
 [![CI](https://github.com/dbbvitor/GlassChain/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/dbbvitor/GlassChain/actions/workflows/ci.yml)
 [![Security audit](https://github.com/dbbvitor/GlassChain/actions/workflows/audit.yml/badge.svg?branch=main)](https://github.com/dbbvitor/GlassChain/actions/workflows/audit.yml)
 [![Benchmarks](https://github.com/dbbvitor/GlassChain/actions/workflows/bench.yml/badge.svg?branch=main)](https://github.com/dbbvitor/GlassChain/actions/workflows/bench.yml)
-[![codecov](https://codecov.io/gh/dbbvitor/GlassChain/branch/main/graph/badge.svg)](https://codecov.io/gh/dbbvitor/GlassChain)
+[![codecov](https://codecov.io/gh/dbbvitor/GlassChain/graph/badge.svg?token=J2LFaOLt06)](https://codecov.io/gh/dbbvitor/GlassChain)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust 1.98.1](https://img.shields.io/badge/rust-1.98.1-orange.svg)](https://www.rust-lang.org)
 
