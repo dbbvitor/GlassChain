@@ -1527,4 +1527,123 @@ mod tests {
         anchor(&mut record);
         assert!(validate_record(&record).is_ok());
     }
+    #[test]
+    fn schema_version_zero_is_rejected() {
+        let mut record = valid_record("lot");
+        record.schema_version = 0;
+        assert!(matches!(
+            validate_record(&record),
+            Err(CoreError::InvalidTransaction(msg)) if msg.contains("schema version 0")
+        ));
+    }
+
+    #[test]
+    fn legacy_asset_shaped_payloads_are_rejected() {
+        // A TraceableAsset-shaped payload is rejected with migration guidance.
+        let payload: BTreeMap<String, Value> = serde_json::from_value(json!({
+            "product_name": "Drug A",
+            "custodian_id": "plant-1",
+            "quantity": 10,
+            "gtin": "07891234100016",
+            "batch_number": "BATCH-1",
+            "expiry_date": "2027-01-01",
+            "serial_number": "SN-1"
+        }))
+        .unwrap();
+        let mut record = CanonicalRecord::new(0, "lot", payload, "org-issuer");
+        sign(&mut record);
+        assert!(matches!(
+            validate_record(&record),
+            Err(CoreError::InvalidTransaction(msg)) if msg.contains("legacy")
+        ));
+    }
+
+    #[test]
+    fn delivery_receipt_requires_a_valid_received_at_date() {
+        let mut record = valid_record("delivery_receipt");
+        record
+            .payload
+            .insert("received_at".to_owned(), json!("not-a-date"));
+        assert!(matches!(
+            validate_record(&record),
+            Err(CoreError::InvalidTransaction(msg)) if msg.contains("ISO-8601")
+        ));
+    }
+
+    #[test]
+    fn state_commitment_counterparties_must_be_a_nonempty_string_array() {
+        // Not an array.
+        let mut record = valid_record("state_commitment");
+        record
+            .payload
+            .insert("counterparties".to_owned(), json!("org-a"));
+        assert!(matches!(
+            validate_record(&record),
+            Err(CoreError::InvalidTransaction(msg)) if msg.contains("counterparties")
+        ));
+
+        // Array of non-string entries.
+        let mut record = valid_record("state_commitment");
+        record
+            .payload
+            .insert("counterparties".to_owned(), json!([1, 2]));
+        assert!(validate_record(&record).is_err());
+    }
+
+    #[test]
+    fn extensions_reject_unknown_namespaces() {
+        let mut record = valid_record("lot");
+        record.extensions.insert(
+            "unknown-namespace".to_owned(),
+            ExtensionValue {
+                schema_version: 1,
+                value: BTreeMap::new(),
+            },
+        );
+        // Extensions participate in the anchor: re-compute it after mutation.
+        record.commitment = record.commitment().ok();
+        assert!(matches!(
+            validate_record(&record),
+            Err(CoreError::InvalidTransaction(msg)) if msg.contains("unknown extension namespace")
+        ));
+    }
+
+    #[test]
+    fn anvisa_extension_accepts_typed_properties() {
+        // The public `anvisa` namespace accepts typed property values.
+        let mut record = valid_record("lot");
+        record.extensions.insert(
+            "anvisa".to_owned(),
+            ExtensionValue {
+                schema_version: 1,
+                value: BTreeMap::from([
+                    ("registration".to_owned(), json!("12345")),
+                    ("count".to_owned(), json!(7)),
+                    ("amount".to_owned(), json!(7.5)),
+                    ("active".to_owned(), json!(true)),
+                    ("details".to_owned(), json!({"a": 1})),
+                    ("history".to_owned(), json!([1, 2])),
+                ]),
+            },
+        );
+        record.commitment = record.commitment().ok();
+        assert!(validate_record(&record).is_ok(), "{record:?}");
+    }
+
+    #[test]
+    fn extension_version_mismatch_is_rejected() {
+        let mut record = valid_record("lot");
+        record.extensions.insert(
+            "anvisa".to_owned(),
+            ExtensionValue {
+                schema_version: 2,
+                value: BTreeMap::new(),
+            },
+        );
+        record.commitment = record.commitment().ok();
+        assert!(matches!(
+            validate_record(&record),
+            Err(CoreError::InvalidTransaction(msg)) if msg.contains("unsupported version")
+        ));
+    }
 }

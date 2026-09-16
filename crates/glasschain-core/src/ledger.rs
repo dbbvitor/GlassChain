@@ -1145,4 +1145,104 @@ mod tests {
 
         assert!(!ledger.try_replace_chain(vec![genesis, b1, b2]));
     }
+    #[test]
+    fn ledger_default_uses_the_workspace_difficulty() {
+        let ledger = Ledger::default();
+        assert_eq!(ledger.difficulty, DEFAULT_DIFFICULTY);
+    }
+
+    #[test]
+    fn policy_update_rejects_empty_channel_and_accepts_valid_metadata() {
+        use crate::endorsement::{PolicyExpression, PolicyUpdate, ScopedPolicies};
+
+        let mut ledger = Ledger::new(1);
+        let mut empty = PolicyUpdate {
+            channel: String::new(),
+            contract: String::new(),
+            policies: ScopedPolicies {
+                channel_default: PolicyExpression::signed_by("gov"),
+                contract_default: None,
+                collection_policy: None,
+                key_policies: Vec::new(),
+            },
+        };
+        assert!(matches!(
+            ledger.add_transaction(Transaction::new(TransactionKind::PolicyUpdate(empty.clone()))),
+            Err(CoreError::InvalidTransaction(msg)) if msg.contains("channel")
+        ));
+
+        empty.channel = "supply".to_owned();
+        assert!(ledger
+            .add_transaction(Transaction::new(TransactionKind::PolicyUpdate(empty)))
+            .is_ok());
+    }
+
+    #[test]
+    fn latest_block_tracks_the_tip() {
+        let mut ledger = Ledger::new(1);
+        // The genesis block exists from construction.
+        assert_eq!(ledger.latest_block().unwrap().index, 0);
+        ledger.add_transaction(inventory_tx("o1")).unwrap();
+        ledger.mine_pending_transactions().unwrap();
+        let latest = ledger.latest_block().unwrap();
+        assert_eq!(latest.index, 1);
+    }
+
+    #[test]
+    fn try_replace_chain_rejects_a_genesis_without_valid_pow() {
+        let mut ledger = Ledger::new(1);
+        ledger.add_transaction(inventory_tx("o1")).unwrap();
+        ledger.mine_pending_transactions().unwrap();
+
+        let mut candidate = ledger.chain.clone();
+        // Recompute the genesis hash with nonce 0: self-consistent content
+        // (`is_valid` holds) but the stored PoW no longer meets difficulty.
+        candidate[0].nonce = 0;
+        candidate[0].hash = candidate[0].calculate_hash();
+        assert!(!candidate[0].has_valid_pow(ledger.difficulty));
+        assert!(!ledger.try_replace_chain(candidate));
+    }
+
+    #[test]
+    fn try_replace_chain_rejects_invalid_candidates() {
+        let mut ledger = Ledger::new(1);
+        ledger.add_transaction(inventory_tx("o1")).unwrap();
+        ledger.mine_pending_transactions().unwrap();
+
+        // Candidate whose block content is invalid under the capability
+        // validation (a canonical record without signatures).
+        let mut bad_content = ledger.chain.clone();
+        bad_content.push(Block::new(
+            2,
+            vec![canonical_tx(false)],
+            ledger.chain[1].hash.clone(),
+        ));
+        bad_content.last_mut().unwrap().mine(1);
+        assert!(!ledger.try_replace_chain(bad_content));
+
+        // Genesis that is not a valid block.
+        let mut bad_genesis = ledger.chain.clone();
+        bad_genesis[0].timestamp = 999;
+        bad_genesis.last_mut().unwrap().hash = "0".repeat(4);
+        // Genesis that is no longer self-consistent: its stored hash stops
+        // matching its content, so `is_valid` fails for the genesis even
+        // though the rest of the candidate still chains structurally.
+        let mut bad_genesis = ledger.chain.clone();
+        bad_genesis[0].timestamp = 999;
+        assert!(!ledger.try_replace_chain(bad_genesis));
+    }
+
+    #[test]
+    fn committed_supply_offers_ignores_other_kinds() {
+        let mut ledger = Ledger::new(1);
+        ledger.add_transaction(inventory_tx("o1")).unwrap();
+        ledger
+            .add_transaction(supply_offer_tx("acme", "p1", 10, 100, 3))
+            .unwrap();
+        ledger.mine_pending_transactions().unwrap();
+
+        let offers: Vec<_> = ledger.committed_supply_offers().collect();
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].seller_id, "acme");
+    }
 }

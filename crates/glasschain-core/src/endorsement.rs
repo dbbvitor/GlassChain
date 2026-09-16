@@ -1555,4 +1555,101 @@ mod tests {
             PolicyExpression::SignedBy { .. }
         ));
     }
+    #[test]
+    fn n_out_of_with_no_rules_never_satisfied() {
+        let expression = PolicyExpression::NOutOf {
+            required: 1,
+            rules: Vec::new(),
+        };
+        assert!(!expression.evaluate(&set(&["org-a"])));
+    }
+
+    #[test]
+    fn scoped_policies_validate_checks_every_layer() {
+        // Contract default and collection policy are validated when present;
+        // an empty key name is rejected; a valid set passes.
+        let mut policies = ScopedPolicies {
+            channel_default: PolicyExpression::signed_by("gov"),
+            contract_default: Some(PolicyExpression::NOutOf {
+                required: 1,
+                rules: Vec::new(), // invalid: empty rules
+            }),
+            collection_policy: Some(PolicyExpression::signed_by("auditor")),
+            key_policies: Vec::new(),
+        };
+        assert!(policies.validate().is_err(), "invalid contract default");
+
+        policies.contract_default = Some(PolicyExpression::signed_by("gov"));
+        policies.collection_policy = Some(PolicyExpression::NOutOf {
+            required: 1,
+            rules: Vec::new(),
+        });
+        assert!(policies.validate().is_err(), "invalid collection policy");
+
+        policies.collection_policy = Some(PolicyExpression::signed_by("auditor"));
+        policies.key_policies = vec![(String::new(), PolicyExpression::signed_by("gov"))];
+        assert!(policies.validate().is_err(), "empty key name");
+
+        policies.key_policies = vec![(
+            "supply:inventory:SKU-1".to_owned(),
+            PolicyExpression::signed_by("gov"),
+        )];
+        assert!(policies.validate().is_ok());
+    }
+
+    fn record_with(schema_id: &str, mut payload: serde_json::Value) -> CanonicalRecord {
+        use std::collections::BTreeMap;
+        let map: BTreeMap<String, serde_json::Value> =
+            serde_json::from_value(payload.take()).unwrap();
+        CanonicalRecord::new(1, schema_id, map, "issuer-1")
+    }
+
+    #[test]
+    fn operation_default_fails_closed_on_missing_authority_fields() {
+        use crate::transaction::{Transaction, TransactionKind};
+
+        // delivery_receipt without receiver_id.
+        let record = record_with("delivery_receipt", serde_json::json!({}));
+        let tx = Transaction::new(TransactionKind::CanonicalRecord(record));
+        assert!(matches!(
+            operation_default(&tx),
+            Err(CoreError::InvalidTransaction(msg)) if msg.contains("receiver_id")
+        ));
+
+        // quality_certification without issuer.
+        let record = record_with("quality_certification", serde_json::json!({}));
+        let tx = Transaction::new(TransactionKind::CanonicalRecord(record));
+        assert!(matches!(
+            operation_default(&tx),
+            Err(CoreError::InvalidTransaction(msg)) if msg.contains("issuer")
+        ));
+
+        // state_commitment without counterparties.
+        let record = record_with("state_commitment", serde_json::json!({}));
+        let tx = Transaction::new(TransactionKind::CanonicalRecord(record));
+        assert!(matches!(
+            operation_default(&tx),
+            Err(CoreError::InvalidTransaction(msg)) if msg.contains("counterparties")
+        ));
+
+        // state_commitment with an empty counterparty name.
+        let record = record_with(
+            "state_commitment",
+            serde_json::json!({"counterparties": [""]}),
+        );
+        let tx = Transaction::new(TransactionKind::CanonicalRecord(record));
+        assert!(matches!(
+            operation_default(&tx),
+            Err(CoreError::InvalidTransaction(msg)) if msg.contains("non-empty")
+        ));
+
+        // A non-record transaction carries no record default.
+        let tx = Transaction::new(TransactionKind::InventoryUpdate(crate::InventoryUpdate {
+            product_id: "p".to_owned(),
+            owner_id: "o".to_owned(),
+            quantity_delta: 1,
+            reason: "r".to_owned(),
+        }));
+        assert!(operation_default(&tx).unwrap().is_none());
+    }
 }

@@ -845,6 +845,43 @@ async fn admin_channel_ops_manage_collections_end_to_end() {
     // membership is checked through the node's own gate.
     let names = node_for_check.collection_names().await;
     assert_eq!(names, vec!["pricing".to_owned()]);
+
+    // The admin error mappings: a duplicate create is `already_exists`,
+    // members of unknown collections are `not_found`.
+    let mut duplicate = tonic::Request::new(CreateChannelRequest {
+        name: "pricing".into(),
+        description: "second create must fail".into(),
+        member_ids: vec![],
+        retention_secs: 0,
+    });
+    stamp_admin_headers(&admin, "admin-node", &mut duplicate);
+    let err = client
+        .create_channel(duplicate)
+        .await
+        .expect_err("duplicate create must fail");
+    assert_eq!(err.code(), tonic::Code::AlreadyExists, "{err}");
+
+    let mut unknown_add = tonic::Request::new(AddChannelMemberRequest {
+        name: "no-such-collection".into(),
+        member_id: "org-member".into(),
+    });
+    stamp_admin_headers(&admin, "admin-node", &mut unknown_add);
+    let err = client
+        .add_channel_member(unknown_add)
+        .await
+        .expect_err("unknown collection must fail");
+    assert_eq!(err.code(), tonic::Code::NotFound, "{err}");
+
+    let mut unknown_remove = tonic::Request::new(RemoveChannelMemberRequest {
+        name: "no-such-collection".into(),
+        member_id: "org-member".into(),
+    });
+    stamp_admin_headers(&admin, "admin-node", &mut unknown_remove);
+    let err = client
+        .remove_channel_member(unknown_remove)
+        .await
+        .expect_err("unknown collection must fail");
+    assert_eq!(err.code(), tonic::Code::NotFound, "{err}");
 }
 
 /// A member certificate without the admin role cannot create a collection.
@@ -878,4 +915,80 @@ async fn admin_channel_ops_reject_a_non_admin_certificate() {
         .await
         .expect_err("a non-admin must be refused");
     assert!(err.message().contains("admin role"), "{err:?}");
+}
+
+// ── with_auth: the MSP interceptor branch of serve_listener ──────────────────
+
+/// A server built through `with_auth` (permissive mode) serves the ledger
+/// service and passes headerless requests — the `auth: Some` branch of
+/// `serve_listener` is exercised end to end.
+#[tokio::test]
+async fn with_auth_lenient_mode_serves_the_ledger_api() {
+    let node = start_node().await;
+    let addr = free_addr();
+    let endpoint = format!("http://{addr}");
+    let listener = adopted_listener(&addr);
+    let handle = tokio::spawn(async move {
+        let server =
+            GlasschainServer::with_auth(node, glasschain_rpc::TrustedKeyRegistry::new(), false);
+        let _ = server.serve_listener(listener).await;
+    });
+    let channel = connect(&endpoint).await;
+    std::mem::forget(handle);
+    let mut client = LedgerClient::new(channel);
+
+    let status = client
+        .get_chain_status(tonic::Request::new(GetChainStatusRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(status.chain_length >= 1, "genesis must be reported");
+}
+
+/// `serve` (the convenience wrapper that binds its own listener) starts
+/// serving: the address becomes reachable via the RPC.
+#[tokio::test]
+async fn serve_convenience_wrapper_binds_and_serves() {
+    let node = start_node().await;
+    // `:0` binds a fresh ephemeral port — no pre-bound window to hold.
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = GlasschainServer::new(node);
+    let handle = tokio::spawn(async move {
+        let _ = server.serve(addr).await;
+    });
+    // Give the server a moment to bind; the test only proves it started
+    // (the accept loop is covered by the serve_listener tests above).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!handle.is_finished(), "serve must not exit early");
+    handle.abort();
+}
+
+/// Streaming from an index beyond the tip skips replay entirely: no block
+/// below `start_index` is ever sent, and live blocks keep flowing.
+#[tokio::test]
+async fn test_stream_blocks_beyond_tip_skips_old_blocks() {
+    let node = start_node().await;
+    let (channel, _handle) = start_server(node.clone()).await;
+    let mut ledger = LedgerClient::new(channel.clone());
+
+    let first = inventory_tx("owner-beyond");
+    submit_tx(&mut ledger, &first).await;
+    node.mine().await.unwrap();
+
+    // Start at index 99 — beyond the tip (block 1). The replay loop sends
+    // nothing; a block mined at index 1 stays below `start_index` too.
+    let mut stream = ledger
+        .stream_blocks(StreamBlocksRequest { start_index: 99 })
+        .await
+        .unwrap()
+        .into_inner();
+
+    let second = inventory_tx("owner-beyond");
+    submit_tx(&mut ledger, &second).await;
+    node.mine().await.unwrap();
+
+    // No block arrives: index 1 < start 99, nothing else exists. The stream
+    // stays open (no replay), so a short read window times out.
+    let nothing = tokio::time::timeout(Duration::from_millis(400), stream.message()).await;
+    assert!(nothing.is_err(), "unexpected block: {nothing:?}");
 }

@@ -1249,4 +1249,45 @@ mod tests {
         assert!(verifier.verify_cert_pem(&member_b).is_ok());
         std::fs::remove_file(&path).ok();
     }
+    #[test]
+    fn empty_trust_store_files_fail_with_precise_errors() {
+        let dir = std::env::temp_dir().join(format!(
+            "glasschain-empty-store-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let org = Organization::new("PharmaCorp").unwrap();
+        let mut verifier = CertChainVerifier::from_org(&org).unwrap();
+
+        // A PEM file without any CERTIFICATE block.
+        let no_cert = dir.join("empty.pem");
+        std::fs::write(&no_cert, "not a certificate\n").unwrap();
+        let err = verifier
+            .add_federation_root_file(&no_cert)
+            .expect_err("no anchors");
+        assert!(err.to_string().contains("no CERTIFICATE block"), "{err}");
+
+        // A PEM file with no CRL block.
+        let no_crl = dir.join("nocrl.pem");
+        std::fs::write(&no_crl, &org.root_ca_cert_pem).unwrap();
+        let err = verifier.add_crl_file(&no_crl).expect_err("no CRLs");
+        assert!(err.to_string().contains("no X509 CRL block"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn root_ca_der_is_exposed_for_redistribution() {
+        let org = Organization::new("PharmaCorp").unwrap();
+        let verifier = CertChainVerifier::from_org(&org).unwrap();
+        let root_der = verifier.root_ca_der();
+        let root_from_pem =
+            rustls_pki_types::CertificateDer::from_pem_slice(org.root_ca_cert_pem.as_bytes())
+                .unwrap();
+        assert_eq!(root_der.to_vec(), root_der.as_ref().to_vec());
+        assert_eq!(root_der, root_from_pem.as_ref(), "root CA DER round-trips");
+    }
 }

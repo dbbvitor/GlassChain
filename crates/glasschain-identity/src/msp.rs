@@ -985,4 +985,38 @@ mod tests {
         assert!(signed.verify().is_ok());
         assert!(org.is_member(&signed.signer_node_id));
     }
+    #[test]
+    fn revoke_and_ocsp_fail_closed_for_unknown_nodes() {
+        let mut org = Organization::new("PharmaCorp").expect("org");
+        assert!(matches!(
+            org.revoke_identity("never-issued"),
+            Err(IdentityError::CertGen(msg)) if msg.contains("never-issued")
+        ));
+        assert!(matches!(
+            org.ocsp_response_der("never-issued"),
+            Err(IdentityError::CertGen(msg)) if msg.contains("never-issued")
+        ));
+    }
+
+    #[test]
+    fn revocation_reason_codes_round_trip_and_default_safely() {
+        // Every enumerated code maps to itself; unassigned 7 falls back to
+        // Unspecified with a warning.
+        assert_eq!(
+            revocation_reason_from_code(revocation_reason_code(RevocationReason::KeyCompromise)),
+            RevocationReason::KeyCompromise
+        );
+        assert_eq!(
+            revocation_reason_from_code(revocation_reason_code(RevocationReason::AaCompromise)),
+            RevocationReason::AaCompromise
+        );
+        assert_eq!(
+            revocation_reason_from_code(7),
+            RevocationReason::Unspecified
+        );
+        assert_eq!(
+            revocation_reason_from_code(255),
+            RevocationReason::Unspecified
+        );
+    }
 }

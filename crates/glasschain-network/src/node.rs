@@ -4942,6 +4942,52 @@ mod tests {
         assert!(TcpStream::connect(&addr).await.is_ok());
     }
 
+    #[tokio::test]
+    async fn private_payload_rejects_an_unconfigured_collection() {
+        let node = Node::new("pdc-unconfigured", "127.0.0.1:0", 1);
+        node.start(vec![]).await.unwrap();
+
+        // Without a verifier the trust gate fails closed first (zero-trust
+        // #86): install one to reach the collection-membership check.
+        let org = glasschain_identity::Organization::new("PharmaCorp").unwrap();
+        let mut verifier = CertChainVerifier::from_org(&org).unwrap();
+        verifier.add_crl_pem(&org.crl_pem().unwrap()).unwrap();
+        node.set_cert_verifier(verifier).await;
+
+        let err = node
+            .submit_private_payload("no-such-collection", b"payload".to_vec())
+            .await
+            .expect_err("unconfigured collection must fail");
+        assert!(err.to_string().contains("not a member"), "{err}");
+
+        // The verifier getter reports the installed chain.
+        assert!(node.cert_verifier().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn pending_pool_stats_reports_count_and_wire_bytes() {
+        let node = Node::new("pool-stats", "127.0.0.1:0", 1);
+        node.start(vec![]).await.unwrap();
+
+        let empty = node.pending_pool_stats().await;
+        assert_eq!(empty.count, 0);
+        assert_eq!(empty.bytes, 0);
+
+        node.submit_transaction(Transaction::new(TransactionKind::InventoryUpdate(
+            InventoryUpdate {
+                product_id: "SKU-1".into(),
+                owner_id: "owner-1".into(),
+                quantity_delta: 1,
+                reason: "stats".into(),
+            },
+        )))
+        .await
+        .unwrap();
+        let stats = node.pending_pool_stats().await;
+        assert_eq!(stats.count, 1);
+        assert!(stats.bytes > 0, "the serialized tx contributes bytes");
+    }
+
     #[test]
     fn tofu_first_contact_records_identity() {
         let mut reg = PeerRegistry::new();
@@ -5350,9 +5396,19 @@ mod tests {
     fn restore_ledger_falls_back_on_invalid_chain_link() {
         let storage: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
         let mut chain = seed_storage(&storage, 2, 2);
-        // Corrupt block 1 so it no longer satisfies the PoW target.
-        chain[1].nonce = chain[1].nonce.wrapping_add(12345);
-        chain[1].hash = chain[1].calculate_hash();
+        // Corrupt block 1 so it no longer satisfies the PoW target: advance
+        // the nonce until the recomputed hash misses the difficulty target
+        // (a fixed bump still passes one time in 256).
+        let mut nonce = chain[1].nonce.wrapping_add(1);
+        loop {
+            chain[1].nonce = nonce;
+            chain[1].hash = chain[1].calculate_hash();
+            if !chain[1].has_valid_pow(2) {
+                break;
+            }
+            nonce = nonce.wrapping_add(1);
+        }
+        assert!(!chain[1].has_valid_pow(2));
         storage.put_block(&chain[1]).unwrap();
 
         let ledger = Node::restore_ledger(&storage, 2);

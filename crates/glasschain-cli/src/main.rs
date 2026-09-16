@@ -93,13 +93,67 @@ fn main() -> anyhow::Result<()> {
 
     log::debug!("glasschain CLI starting — command: {:?}", cli.command);
 
-    match cli.command {
-        Commands::IdentityGen(args) => commands::identity::run(args, &mut std::io::stdout())?,
-        Commands::ContractDeploy(args) => commands::contract::run(args, &mut std::io::stdout())?,
-        Commands::LedgerInspect(args) => commands::inspect::run(&args, &mut std::io::stdout())?,
-        Commands::BackupScrub(args) => commands::backup_scrub::run(args, &mut std::io::stdout())?,
-        Commands::ChannelAdmin(args) => commands::channel_admin::run(args, &mut std::io::stdout())?,
-    }
+    dispatch(cli.command, &mut std::io::stdout())
+}
 
+/// Route one parsed subcommand to its implementation. Separated from `main`
+/// so the dispatch arms stay unit-testable without spawning the binary.
+fn dispatch(command: Commands, out: &mut dyn std::io::Write) -> anyhow::Result<()> {
+    match command {
+        Commands::IdentityGen(args) => commands::identity::run(args, out)?,
+        Commands::ContractDeploy(args) => commands::contract::run(args, out)?,
+        Commands::LedgerInspect(args) => commands::inspect::run(&args, out)?,
+        Commands::BackupScrub(args) => commands::backup_scrub::run(args, out)?,
+        Commands::ChannelAdmin(args) => commands::channel_admin::run(args, out)?,
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_runs_the_offline_subcommands() {
+        let mut sink: Vec<u8> = Vec::new();
+
+        // LedgerInspect with no server touched: prints the call it would make.
+        let cli = Cli::parse_from([
+            "glasschain",
+            "ledger-inspect",
+            "--endpoint",
+            "http://127.0.0.1:1",
+            "--gtin",
+            "07891234567890",
+        ]);
+        dispatch(cli.command, &mut sink).expect("offline inspect");
+
+        // Identity generation is fully offline.
+        let cli = Cli::parse_from(["glasschain", "identity-gen", "--node-id", "cov-node"]);
+        dispatch(cli.command, &mut sink).expect("offline identity-gen");
+
+        // Contract deploy with --dry-run never touches the network.
+        let cli = Cli::parse_from([
+            "glasschain",
+            "contract-deploy",
+            "--contract-id",
+            "C-001",
+            "--buyer-id",
+            "buyer-1",
+            "--product-id",
+            "SKU-001",
+            "--max-price",
+            "5000",
+            "--min-qty",
+            "100",
+            "--max-qty",
+            "1000",
+            "--max-lead-days",
+            "14",
+            "--dry-run",
+        ]);
+        dispatch(cli.command, &mut sink).expect("offline contract deploy");
+
+        assert!(!sink.is_empty(), "the subcommands must have printed");
+    }
 }

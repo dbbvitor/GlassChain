@@ -15,5 +15,5 @@ pub use node::{
     adopt_prebound_listener, stash_prebound_listener, ContractSummary, Node, NodeEvent,
     PendingPoolStats,
 };
-pub use peer::{PeerConnection, PeerReader, PeerWriter};
+pub use peer::{PeerReader, PeerWriter};
 pub use protocol::{Message, PROTOCOL_VERSION};

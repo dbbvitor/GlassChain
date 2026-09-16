@@ -426,4 +426,10 @@ mod tests {
             assert_eq!(kind_name(&tx), expected);
         }
     }
+    #[test]
+    fn default_provider_is_empty() {
+        let default = InMemoryIndexer::default();
+        assert_eq!(default.name(), "in-memory");
+        assert!(default.get_block(0).unwrap().is_none());
+    }
 }

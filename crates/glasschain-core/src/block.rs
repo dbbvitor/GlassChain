@@ -287,4 +287,14 @@ mod tests {
         b2.mine(1);
         assert!(b2.chains_to(&genesis).is_err());
     }
+    #[test]
+    fn mine_refreshes_timestamp_when_nonce_wraps() {
+        let mut block = Block::new(1, vec![], "0".to_owned());
+        // Plant the nonce at its ceiling: the very first loop iteration wraps
+        // and refreshes the timestamp before continuing the search.
+        block.nonce = u64::MAX;
+        block.mine(2);
+        assert!(block.hash.starts_with("00"));
+        assert!(block.is_valid());
+    }
 }

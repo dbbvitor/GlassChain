@@ -25,10 +25,14 @@ watcher automation engine, a TLS-encrypted TCP/libp2p P2P layer, and a gRPC API.
   DCO sign-off check (every PR commit needs `git commit -s`), a
   check/test matrix on Ubuntu, macOS, and Windows, code coverage, and a RustSec
   dependency audit on every push and PR. Coverage uploads require the
-  `CODECOV_TOKEN` repository secret, and `codecov.yml` enforces ≥90% project
-  coverage as a status check. Additional scheduled/tagged workflows:
+  `CODECOV_TOKEN` repository secret; `codecov.yml` gates project coverage at
+  **≥90%** (Gold target met 2026-09-16, `target: 90%` + 0.5% threshold —
+  regressions beyond noise fail). New code should keep patch coverage high. Additional scheduled/tagged workflows:
   `fuzz.yml` (cargo-fuzz smoke on PRs touching core/network, weekly deep runs
-  over `fuzz_wire` and `fuzz_transactions`), `reproducible.yml` (weekly
+  over `fuzz_wire` and `fuzz_transactions`), `coverage-insights.yml` (weekly
+  advisory coverage uploads, all `joined: false` so they never move the gate:
+  `fuzz` = what the libFuzzer harnesses reach, `no-bft`/`no-pq-tls` =
+  feature-sensitivity views), `reproducible.yml` (weekly
   Linux-only build-twice hash verification), and `release.yml` (on `v*` tags:
   cargo-auditable build, CycloneDX SBOMs, git-cliff notes, Cosign keyless
   signing). It is a safety net, not a substitute — run

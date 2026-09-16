@@ -1,0 +1,203 @@
+name: Coverage insights
+
+# Advisory, non-gating coverage views for questions the master report
+# cannot answer (Gold-quality automation; nothing here affects the pinned
+# `codecov/project` gate — every upload below is flagged `joined: false`).
+#
+# * `fuzz` — what the two libFuzzer harnesses actually reach across the
+#   wire/transaction codec surfaces (`cargo fuzz coverage`, weekly, 3 min
+#   each). Complements `fuzz.yml`'s dynamic runs.
+# * `no-bft` / `no-pq-tls` — how much of the workspace is feature-gated:
+#   the same test surface with the Tendermint BFT stack or the
+#   X25519MLKEM768 hybrid TLS dropped, so feature-coupled coverage gaps
+#   (e.g. the PoW-only paths in `node.rs`) are visible in the dashboard.
+#
+# Scheduled weekly (after `fuzz.yml`) and on demand; never on push/PR.
+
+on:
+  schedule:
+    - cron: "30 5 * * 1" # Weekly, Monday 05:30 UTC (after fuzz.yml 04:00)
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-insights-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    name: Fuzz harness coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust nightly (cargo-fuzz requirement)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: llvm-tools-preview, rust-src
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ github.job }}
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      # Same sanitizer posture as fuzz.yml (`-s none`, native gnu triple —
+      # see that workflow for why). Validated shape (cargo-fuzz 0.13):
+      # 1. fuzz for a time budget so the corpus dir fills (coverage over an
+      #    empty corpus aborts),
+      # 2. replay the corpus under `cargo fuzz coverage` (needs the
+      #    llvm-tools-preview component for llvm-profdata/llvm-cov),
+      # 3. export the profdata as lcov for the uploader.
+      - name: Fuzz to build a corpus
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+        run: |
+          (cd crates/glasschain-network && cargo fuzz run -s none --target x86_64-unknown-linux-gnu fuzz_wire -- -max_total_time=180)
+          (cd crates/glasschain-core && cargo fuzz run -s none --target x86_64-unknown-linux-gnu fuzz_transactions -- -max_total_time=180)
+
+      - name: Replay the corpus under coverage instrumentation
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+        run: |
+          (cd crates/glasschain-network && cargo fuzz coverage -s none --target x86_64-unknown-linux-gnu fuzz_wire)
+          (cd crates/glasschain-core && cargo fuzz coverage -s none --target x86_64-unknown-linux-gnu fuzz_transactions)
+
+      - name: Export lcov from the merged profdata
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+        run: |
+          triple=x86_64-unknown-linux-gnu
+          export PATH="$HOME/.rustup/toolchains/nightly-$triple/lib/rustlib/$triple/bin:$PATH"
+          for spec in "glasschain-network fuzz_wire" "glasschain-core fuzz_transactions"; do
+            set -- $spec
+            crate=$1; target=$2
+            bin="crates/$crate/target/$triple/coverage/$triple/release/$target"
+            prof="crates/$crate/fuzz/coverage/$target/coverage.profdata"
+            llvm-cov export -instr-profile="$prof" "$bin" -format=lcov \
+              --ignore-filename-regex='(rustlib|registry|\.cargo)' \
+              > "crates/$crate/fuzz/coverage/$target/lcov.info"
+          done
+          ls -la crates/*/fuzz/coverage/*/lcov.info
+
+      - name: Upload fuzz-harness coverage
+        if: ${{ env.CODECOV_TOKEN != '' }}
+        uses: codecov/codecov-action@v7
+        with:
+          files: crates/glasschain-network/fuzz/coverage/fuzz_wire/lcov.info,crates/glasschain-core/fuzz/coverage/fuzz_transactions/lcov.info
+          # Advisory: the flag does not join the master report, so this
+          # upload never moves the pinned project gate.
+          flags: fuzz
+          fail_ci_if_error: true
+          token: ${{ env.CODECOV_TOKEN }}
+
+  no-bft:
+    name: Coverage without the bft feature
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cargo-tarpaulin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ github.job }}
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      # Every feature except `bft` (which pulls `glasschain-core/bft`):
+      # quantifies the Tendermint-coupled surface that the master report
+      # (all-features) blends in.
+      - name: Generate coverage report (no bft)
+        run: |
+          cargo tarpaulin --verbose --workspace --locked \
+            --features glasschain-network/insecure-tls,glasschain-network/pq-tls \
+            --lib --bins --tests --timeout 120 --engine llvm --out xml
+
+      - name: Upload no-bft coverage
+        if: ${{ env.CODECOV_TOKEN != '' }}
+        uses: codecov/codecov-action@v7
+        with:
+          files: cobertura.xml
+          flags: no-bft
+          fail_ci_if_error: true
+          token: ${{ env.CODECOV_TOKEN }}
+
+  no-pq-tls:
+    name: Coverage without the pq-tls feature
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cargo-tarpaulin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ github.job }}
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      # Every feature except `pq-tls`: the classical-X25519-only TLS
+      # provider path, quantified against the master report.
+      - name: Generate coverage report (no pq-tls)
+        run: |
+          cargo tarpaulin --verbose --workspace --locked \
+            --features glasschain-network/bft,glasschain-network/insecure-tls \
+            --lib --bins --tests --timeout 120 --engine llvm --out xml
+
+      - name: Upload no-pq-tls coverage
+        if: ${{ env.CODECOV_TOKEN != '' }}
+        uses: codecov/codecov-action@v7
+        with:
+          files: cobertura.xml
+          flags: no-pq-tls
+          fail_ci_if_error: true
+          token: ${{ env.CODECOV_TOKEN }}

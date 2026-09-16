@@ -23,9 +23,12 @@ blocked until all four close.
   policy), `docs/threat-model.md` (assets, 5 trust boundaries, STRIDE-lite
   tables, accepted limitations, claims→evidence assurance map).
 - **Quality (#127):** `codecov.yml` — ≥90% project coverage blocking status
-  check (current badge reads 100%, so gate bites immediately); branch
-  coverage informational (tarpaulin line-coverage limitation documented in
-  the file). `fuzz.yml` — PR smoke (60s) + weekly deep (300s) runs of
+  check. The plan-era note "badge reads 100%" was wrong (the gate passed
+  vacuously: "no report found to compare against"); real measurement started
+  2026-09-14 at 82.4%. Coverage work across the REPL/flows/RPC/core/identity/
+  VM/network tests lifted it to **90.02% (2026-09-16)** and the gate is now
+  pinned at `target: 90%` (+0.5% noise threshold); patch coverage stays
+  informational. `fuzz.yml` — PR smoke (60s) + weekly deep (300s) runs of
   `fuzz_wire` and `fuzz_transactions`; harnesses in
   `crates/{core,network}/fuzz/` (standalone workspaces, not main-workspace
   members). `reproducible.yml` — weekly Linux-only build-twice hash compare,

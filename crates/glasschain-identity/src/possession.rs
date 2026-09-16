@@ -268,4 +268,66 @@ mod tests {
             "a proof from a different key must not verify"
         );
     }
+    #[test]
+    fn certificate_accessors_read_the_verified_subject() {
+        let mut org = Organization::new("PharmaCorp").expect("org");
+        let admin = org
+            .issue_identity_with_role("admin-node", Some(crate::msp::ADMIN_ROLE))
+            .expect("identity")
+            .clone();
+        let cert_pem = admin.certificate_pem.expect("cert");
+
+        assert_eq!(
+            certificate_subject_cn(&cert_pem).as_deref(),
+            Some("admin-node")
+        );
+        assert_eq!(
+            certificate_organization(&cert_pem).as_deref(),
+            Some("PharmaCorp")
+        );
+        assert_eq!(
+            certificate_admin_role(&cert_pem).as_deref(),
+            Some(crate::msp::ADMIN_ROLE)
+        );
+
+        // The DER forms agree with the PEM forms.
+        let der =
+            rustls_pki_types::CertificateDer::from_pem_slice(cert_pem.as_bytes()).expect("der");
+        assert_eq!(
+            certificate_admin_role_der(der.as_ref()),
+            Some(crate::msp::ADMIN_ROLE.to_owned())
+        );
+        assert!(certificate_ed25519_public_key_der(der.as_ref()).is_some());
+
+        // Garbage PEMs fail closed on every accessor.
+        assert_eq!(certificate_subject_cn("not a pem"), None);
+        assert_eq!(certificate_organization("not a pem"), None);
+        assert_eq!(certificate_admin_role("not a pem"), None);
+        assert_eq!(certificate_admin_role_der(b"not der"), None);
+        assert_eq!(certificate_ed25519_public_key("not a pem"), None);
+        assert_eq!(certificate_ed25519_public_key_der(b"not der"), None);
+        assert!(!verify_org_possession(
+            "not a pem",
+            "o",
+            "n",
+            &[0u8; 32],
+            &[0u8; 64]
+        ));
+    }
+
+    #[test]
+    fn verify_ed25519_fails_closed_on_malformed_inputs() {
+        let mut org = Organization::new("PharmaCorp").expect("org");
+        let identity = org.issue_identity("node-x").expect("identity").clone();
+        let key = identity.public_key_bytes();
+        let message = b"payload";
+        let proof = identity.sign_bytes(message);
+
+        assert!(verify_ed25519(&key, message, &proof));
+        // Wrong key length, wrong proof length.
+        assert!(!verify_ed25519(&key[..31], message, &proof));
+        assert!(!verify_ed25519(&key, message, &proof[..63]));
+        // Valid shape, wrong signature.
+        assert!(!verify_ed25519(&key, b"other", &proof));
+    }
 }

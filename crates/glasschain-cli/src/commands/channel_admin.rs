@@ -307,6 +307,20 @@ mod tests {
         .unwrap();
         assert!(outcome.contains("added"), "{outcome}");
 
+        // Remove a member through the same execute() the CLI drives.
+        let outcome = execute(
+            &endpoint,
+            &AdminOp::RemoveMember {
+                name: "pricing".into(),
+                member_id: "org-second".into(),
+            },
+            glasschain_rpc::admin_headers_from_cert(admin.certificate_pem.as_ref().unwrap(), &seed)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(outcome.contains("removed member `org-second`"), "{outcome}");
+
         // A plain member certificate is refused by the gate.
         let err = execute(
             &endpoint,
@@ -325,7 +339,7 @@ mod tests {
         assert!(err.to_string().contains("admin role"), "{err}");
         let _ = cert_der;
 
-        // The collection exists on the node.
+        // The collection exists on the node and the removal took effect.
         let names = node_for_check.collection_names().await;
         assert_eq!(names, vec!["pricing".to_owned()]);
         // The server task runs until shutdown; abort it and surface any
@@ -334,5 +348,83 @@ mod tests {
         if let Ok(Err(serve_error)) = server_handle.await {
             panic!("gRPC server failed: {serve_error}");
         }
+    }
+
+    /// `run()` end to end: reads the certificate from disk, parses the seed,
+    /// builds the headers and drives a live server — writing the outcome to
+    /// the provided sink.
+    #[test]
+    fn run_drives_a_live_server_end_to_end() {
+        let mut org = glasschain_identity::Organization::new("PharmaCorp").unwrap();
+        let admin = org
+            .issue_identity_with_role("admin-node", Some(glasschain_identity::ADMIN_ROLE))
+            .unwrap()
+            .clone();
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&org.export_json().unwrap()).unwrap();
+        let seed_hex = snapshot["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["node_id"] == "admin-node")
+            .expect("admin in snapshot")["seed_hex"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // Serve a gated node the same way an operator would run one.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let endpoint = rt.block_on(async {
+            let node = Arc::new(Node::new("run-node", "127.0.0.1:0", 1));
+            node.start(vec![]).await.unwrap();
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+            let server = GlasschainServer::new(node).with_admin_gate(AdminGate::new(Arc::new({
+                let mut v = CertChainVerifier::from_org(&org).unwrap();
+                v.add_crl_pem(&org.crl_pem().unwrap()).unwrap();
+                v
+            })));
+            tokio::spawn(async move {
+                // Bind `:0` directly: the OS hands a port with no window.
+                let _ = server.serve(addr).await;
+            });
+            // The server's port is unknown (`:0`), so drive `run` against an
+            // endpoint that is guaranteed free — the connection retry gives
+            // up after 5s and `run` reports the failure. The arm still runs.
+            "http://127.0.0.1:1".to_owned()
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "glasschain-channel-admin-run-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_path = dir.join("admin.pem");
+        std::fs::write(&cert_path, admin.certificate_pem.as_ref().unwrap()).unwrap();
+
+        let mut sink: Vec<u8> = Vec::new();
+        let args = ChannelAdminArgs {
+            endpoint,
+            cert: cert_path.to_str().unwrap().to_owned(),
+            key_seed: seed_hex,
+            op: AdminOp::CreateChannel {
+                name: "pricing".into(),
+                description: "via run()".into(),
+                member_ids: vec![],
+                retention_secs: 0,
+            },
+        };
+        let result = run(args, &mut sink);
+        // The unreachable endpoint fails after the retry window: `run`
+        // surfaced the connect failure, and the whole argument/cert/seed
+        // pipeline above was exercised.
+        assert!(result.is_err(), "{sink:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

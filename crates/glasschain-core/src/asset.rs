@@ -371,4 +371,13 @@ mod tests {
         assert!(!super::is_valid_iso8601_date(""));
         assert!(!super::is_valid_iso8601_date("not-a-date"));
     }
+    #[test]
+    fn iso8601_date_rejects_unparsable_components() {
+        assert!(is_valid_iso8601_date("2026-01-15"));
+        // Each component failing to parse is rejected, not just the format.
+        assert!(!is_valid_iso8601_date("20x6-01-01"), "bad year");
+        assert!(!is_valid_iso8601_date("2026-0x-01"), "bad month");
+        assert!(!is_valid_iso8601_date("2026-01-0x"), "bad day");
+        assert!(!is_valid_iso8601_date("2026-13-01"), "month out of range");
+    }
 }
