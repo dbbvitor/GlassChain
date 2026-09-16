@@ -129,6 +129,7 @@ jobs:
     env:
       RUSTFLAGS: -D warnings
       RUSTDOCFLAGS: -D warnings
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
     steps:
       - uses: actions/checkout@v7
@@ -157,8 +158,23 @@ jobs:
       # test-mode setup mines a 10k-block history in debug and dominated the
       # job (~20+ min per OS). Benches stay compile-checked via clippy
       # --all-targets and run for real through `make bench` / `cargo bench`.
+      # cargo-nextest runs each test in its own process (the shared port-band
+      # allocator is per-process, so no collisions) and emits JUnit XML for
+      # Codecov test analytics via the `ci` profile (.config/nextest.toml).
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
       - name: Run all tests
-        run: cargo test --workspace --lib --bins --tests --all-features --locked
+        run: cargo nextest run --profile ci --workspace --lib --bins --tests --all-features --locked
+
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() && env.CODECOV_TOKEN != '' }}
+        uses: codecov/test-results-action@v1
+        with:
+          token: ${{ env.CODECOV_TOKEN }}
+          files: target/nextest/ci/junit.xml
 
   coverage:
     name: Code coverage
