@@ -1225,4 +1225,21 @@ mod tests {
             "{err}"
         );
     }
+    /// A certificate-bound admin whose header node-id does not match the
+    /// certificate's CN is refused — the CN is the identity, not the header.
+    #[test]
+    fn admin_gate_rejects_a_cn_mismatch() {
+        let mut org = Organization::new("PharmaCorp").unwrap();
+        let admin = org
+            .issue_identity_with_role("admin-node", Some(glasschain_identity::ADMIN_ROLE))
+            .unwrap()
+            .clone();
+        let gate = AdminGate::new(Arc::new(test_verifier(&org)));
+        let metadata = admin_metadata(&admin, "other-node", &test_verifier(&org));
+        let error = gate.authorize(&metadata).expect_err("CN mismatch");
+        assert!(
+            error.to_string().contains("does not match node id"),
+            "{error}"
+        );
+    }
 }

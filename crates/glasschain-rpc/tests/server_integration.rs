@@ -962,3 +962,33 @@ async fn serve_convenience_wrapper_binds_and_serves() {
     assert!(!handle.is_finished(), "serve must not exit early");
     handle.abort();
 }
+
+/// Streaming from an index beyond the tip skips replay entirely: no block
+/// below `start_index` is ever sent, and live blocks keep flowing.
+#[tokio::test]
+async fn test_stream_blocks_beyond_tip_skips_old_blocks() {
+    let node = start_node().await;
+    let (channel, _handle) = start_server(node.clone()).await;
+    let mut ledger = LedgerClient::new(channel.clone());
+
+    let first = inventory_tx("owner-beyond");
+    submit_tx(&mut ledger, &first).await;
+    node.mine().await.unwrap();
+
+    // Start at index 99 — beyond the tip (block 1). The replay loop sends
+    // nothing; a block mined at index 1 stays below `start_index` too.
+    let mut stream = ledger
+        .stream_blocks(StreamBlocksRequest { start_index: 99 })
+        .await
+        .unwrap()
+        .into_inner();
+
+    let second = inventory_tx("owner-beyond");
+    submit_tx(&mut ledger, &second).await;
+    node.mine().await.unwrap();
+
+    // No block arrives: index 1 < start 99, nothing else exists. The stream
+    // stays open (no replay), so a short read window times out.
+    let nothing = tokio::time::timeout(Duration::from_millis(400), stream.message()).await;
+    assert!(nothing.is_err(), "unexpected block: {nothing:?}");
+}

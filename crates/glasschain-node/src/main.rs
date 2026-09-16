@@ -1166,8 +1166,8 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_trust_store_verifier, execute_repl_command, log_event, parse_args, parse_command,
-        parse_price, CliArgs, ReplCommand, ReplContext,
+        build_trust_store_verifier, execute_repl_command, load_or_create_identity_file, log_event,
+        parse_args, parse_command, parse_price, CliArgs, ReplCommand, ReplContext,
     };
     use glasschain_identity::Organization;
     use glasschain_network::Node;
@@ -1784,5 +1784,84 @@ mod tests {
         for evt in &events {
             log_event(evt);
         }
+    }
+    #[test]
+    fn identity_file_create_then_load_round_trips() {
+        let dir = std::env::temp_dir().join(format!(
+            "glasschain-identity-file-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("org.json");
+
+        // First start creates the file (0600) and issues the identity.
+        let (organization, identity, created) =
+            load_or_create_identity_file(&dir.join("org.json"), "PharmaCorp", "node-a").unwrap();
+        assert!(created);
+        assert_eq!(organization.name, "PharmaCorp");
+        assert!(identity.certificate_pem.is_some());
+        assert!(path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the custody file is owner-only");
+        }
+
+        // A restart re-presents the same key.
+        let (reloaded, same_identity, created_again) =
+            load_or_create_identity_file(&path, "PharmaCorp", "node-a").unwrap();
+        assert!(!created_again);
+        assert_eq!(reloaded.name, "PharmaCorp");
+        assert_eq!(
+            same_identity.public_key_bytes(),
+            identity.public_key_bytes()
+        );
+        let _ = &organization;
+
+        // A file holding another organization's material is refused.
+        let mut foreign = Organization::new("MedCorp").unwrap();
+        foreign.issue_identity("med-node").unwrap();
+        let foreign_path = dir.join("foreign.json");
+        std::fs::write(&foreign_path, foreign.export_json().unwrap()).unwrap();
+        let Err(foreign_err) =
+            load_or_create_identity_file(&foreign_path, "PharmaCorp", "med-node")
+        else {
+            panic!("a foreign custody file must be refused");
+        };
+        assert!(foreign_err.contains("does not match"), "{foreign_err}");
+
+        // An identity file without the requested member is refused.
+        let Err(ghost_err) = load_or_create_identity_file(&path, "PharmaCorp", "ghost") else {
+            panic!("a missing member must be refused");
+        };
+        assert!(ghost_err.contains("no member"), "{ghost_err}");
+
+        // Corrupt material fails closed.
+        let corrupt = dir.join("corrupt.json");
+        std::fs::write(&corrupt, "{not json").unwrap();
+        let Err(corrupt_err) = load_or_create_identity_file(&corrupt, "PharmaCorp", "node-a")
+        else {
+            panic!("corrupt material must be refused");
+        };
+        assert!(corrupt_err.contains("corrupt"), "{corrupt_err}");
+
+        let _ = identity;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_command_reload_requires_exactly_one_path() {
+        assert_eq!(
+            parse_command("reload-trust-store"),
+            Err("Usage: reload-trust-store <PATH>".to_owned())
+        );
+        assert_eq!(
+            parse_command("reload-trust-store a b"),
+            Err("Usage: reload-trust-store <PATH>".to_owned())
+        );
     }
 }

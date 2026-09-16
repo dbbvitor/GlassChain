@@ -1091,4 +1091,42 @@ mod tests {
             lineage.trust_score_avg
         );
     }
+    #[test]
+    fn non_asset_transactions_are_refused() {
+        let inventory = Transaction::new(TransactionKind::InventoryUpdate(
+            glasschain_core::InventoryUpdate {
+                product_id: "SKU-1".into(),
+                owner_id: "o1".into(),
+                quantity_delta: 1,
+                reason: "not an asset".into(),
+            },
+        ));
+        let indexed = IndexedTransaction {
+            id: inventory.id.clone(),
+            kind: "InventoryUpdate".into(),
+            payload_json: serde_json::to_string(&inventory).unwrap(),
+            block_index: 1,
+            timestamp: 0,
+        };
+        assert!(matches!(
+            AnalyticalFlattener::flatten_transaction(&indexed, 1, "hash", 0),
+            Err(FlattenerError::NotAssetRegistration)
+        ));
+
+        // A kind labelled AssetRegistration whose payload parses to another
+        // kind is refused as well.
+        let mislabelled = IndexedTransaction {
+            kind: "AssetRegistration".into(),
+            ..indexed
+        };
+        assert!(matches!(
+            AnalyticalFlattener::flatten_transaction(&mislabelled, 1, "hash", 0),
+            Err(FlattenerError::NotAssetRegistration)
+        ));
+    }
+
+    #[test]
+    fn flattener_default_matches_new() {
+        let _flattener = AnalyticalFlattener::default();
+    }
 }

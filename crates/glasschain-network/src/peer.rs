@@ -156,4 +156,16 @@ mod tests {
             Err(NetworkError::PeerDisconnected(_))
         ));
     }
+    #[tokio::test]
+    async fn oversized_payload_send_is_refused() {
+        let (client, _server) = duplex(MAX_MESSAGE_SIZE + 1);
+        let mut writer = PeerWriter::new(client, "peer:8000".into());
+        let message = Message::Goodbye {
+            reason: "x".repeat(MAX_MESSAGE_SIZE + 1),
+        };
+        assert!(matches!(
+            writer.send(&message).await,
+            Err(NetworkError::MessageTooLarge { .. })
+        ));
+    }
 }
