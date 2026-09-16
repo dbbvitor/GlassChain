@@ -29,7 +29,7 @@ blocked until all four close.
   VM/network tests lifted it to **90.02% (2026-09-16)** and the gate is now
   pinned at `target: 90%` (+0.5% noise threshold); patch coverage stays
   informational. `fuzz.yml` — PR smoke (60s) + weekly deep (300s) runs of
-  `fuzz_wire` and `fuzz_transactions`; harnesses in
+  `fuzz-wire` and `fuzz-transactions`; harnesses in
   `crates/{core,network}/fuzz/` (standalone workspaces, not main-workspace
   members). `reproducible.yml` — weekly Linux-only build-twice hash compare,
   cross-runner determinism honestly out of scope.

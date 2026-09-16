@@ -13,8 +13,8 @@ glasschain-core = { path = ".." }
 serde_json = "1.0"
 
 [[bin]]
-name = "fuzz_transactions"
-path = "fuzz_targets/fuzz_transactions.rs"
+name = "fuzz-transactions"
+path = "fuzz_targets/fuzz-transactions.rs"
 test = false
 doc = false
 bench = false

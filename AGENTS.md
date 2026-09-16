@@ -29,7 +29,7 @@ watcher automation engine, a TLS-encrypted TCP/libp2p P2P layer, and a gRPC API.
   **≥90%** (Gold target met 2026-09-16, `target: 90%` + 0.5% threshold —
   regressions beyond noise fail). New code should keep patch coverage high. Additional scheduled/tagged workflows:
   `fuzz.yml` (cargo-fuzz smoke on PRs touching core/network, weekly deep runs
-  over `fuzz_wire` and `fuzz_transactions`), `coverage-insights.yml` (weekly
+  over `fuzz-wire` and `fuzz-transactions`), `coverage-insights.yml` (weekly
   advisory coverage uploads, all `joined: false` so they never move the gate:
   `fuzz` = what the libFuzzer harnesses reach, `no-bft`/`no-pq-tls` =
   feature-sensitivity views), `reproducible.yml` (weekly

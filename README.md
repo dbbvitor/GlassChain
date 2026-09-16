@@ -173,8 +173,8 @@ The project is pre-release. Direction for the next year:
    the current strict gates (rustfmt, clippy pedantic/nursery, `-D warnings`)
    and hold the coverage thresholds already enforced in CI (≥90% line, ≥80%
    branch).
-2. **Dynamic analysis** — grow the `cargo-fuzz` harness set (`fuzz_wire`,
-   `fuzz_transactions`) on a scheduled cadence; add targets for new untrusted
+2. **Dynamic analysis** — grow the `cargo-fuzz` harness set (`fuzz-wire`,
+   `fuzz-transactions`) on a scheduled cadence; add targets for new untrusted
    decode paths as they appear.
 3. **First public release (v0.1.0)** — automated release notes, Cosign-signed
    artifacts, and CycloneDX SBOMs per [SECURITY.md](SECURITY.md); versioned
