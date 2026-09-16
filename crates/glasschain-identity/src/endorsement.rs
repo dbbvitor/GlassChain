@@ -646,4 +646,14 @@ mod tests {
             "debug should contain reason"
         );
     }
+    #[test]
+    fn signer_accessors_list_ids_and_org_names_in_order() {
+        let mut proposal = EndorsementProposal::new(sample_tx());
+        proposal.add_signature(make_sig("node-a", "PharmaCorp", sample_tx()));
+        proposal.add_signature(make_sig("node-b", "MedCorp", sample_tx()));
+
+        assert_eq!(proposal.signer_node_ids(), vec!["node-a", "node-b"]);
+        assert_eq!(proposal.signer_org_names(), vec!["PharmaCorp", "MedCorp"]);
+        assert_eq!(proposal.signature_count(), 2);
+    }
 }

@@ -213,6 +213,9 @@ impl Channel {
     /// member (regulators stay members — they are not listed in
     /// `member_ids` and cannot be removed this way).
     pub fn remove_member(&mut self, node_id: &str) -> bool {
+        if DEFAULT_REGULATOR_ORGS.contains(&node_id) {
+            return false;
+        }
         let was_member = self.member_set.remove(node_id);
         self.config.member_ids.retain(|id| id != node_id);
         was_member
@@ -322,5 +325,24 @@ mod tests {
         let mut ch = test_channel();
         ch.add_member("new-node");
         assert!(ch.is_member("new-node"));
+    }
+    #[test]
+    fn remove_member_drops_only_listed_members() {
+        let mut channel = test_channel();
+        channel.add_member("org-new-member".to_owned());
+
+        assert!(channel.is_member("org-new-member"));
+        assert!(channel.remove_member("org-new-member"));
+        assert!(!channel.is_member("org-new-member"));
+
+        // Regulators are implicit members (not listed in member_ids) and
+        // cannot be removed through `remove_member`.
+        let regulator = "anvisa";
+        assert!(channel.is_member(regulator));
+        assert!(!channel.remove_member(regulator));
+        assert!(channel.is_member(regulator));
+
+        // Removing an unknown member is a no-op.
+        assert!(!channel.remove_member("never-was-a-member"));
     }
 }

@@ -1122,4 +1122,46 @@ mod tests {
             "rejected operations must not produce writes"
         );
     }
+    /// WAT that pokes every host function with malformed pointers: bad
+    /// pointers, overflowing lengths and out-of-bounds ranges must all be
+    /// rejected silently by the host guards instead of trapping.
+    fn malformed_host_calls_wat() -> &'static str {
+        r#"
+(module
+  (import "env" "set_state" (func $set_state (param i32 i32 i32 i32)))
+  (import "env" "get_state_len" (func $get_state_len (param i32 i32) (result i32)))
+  (import "env" "get_state" (func $get_state (param i32 i32 i32 i32) (result i32)))
+  (import "env" "persist_state" (func $persist_state (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "execute")
+    ;; Negative pointers and lengths (results are dropped).
+    (drop (call $get_state_len (i32.const -1) (i32.const 4)))
+    (drop (call $get_state (i32.const -1) (i32.const 4) (i32.const -1) (i32.const 4)))
+    ;; Overflowing pointer arithmetic.
+    (drop (call $get_state_len (i32.const 2147483647) (i32.const 100)))
+    ;; Out-of-bounds (past the 1-page memory).
+    (drop (call $get_state (i32.const 1000000) (i32.const 4) (i32.const 0) (i32.const 4)))
+    ;; Void host calls must not be dropped: call them bare.
+    (call $set_state (i32.const -1) (i32.const 4) (i32.const -1) (i32.const 4))
+    (call $set_state (i32.const 2147483647) (i32.const 100) (i32.const 0) (i32.const 0))
+    (call $set_state (i32.const 1000000) (i32.const 4) (i32.const 1000000) (i32.const 4))
+    ;; Unknown op (2) and empty pdc for PDC visibility (1): 12 params
+    ;; (channel, ch_len, contract, c_len, key, k_len, val, v_len, op, vis, pdc, pdc_len).
+    (drop (call $persist_state (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 2) (i32.const 0) (i32.const 0) (i32.const 0)))
+    (drop (call $persist_state (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 0) (i32.const 0)))
+  )
+)
+"#
+    }
+
+    #[test]
+    fn host_functions_reject_malformed_guest_pointers_silently() {
+        let provider = WasmExecutionProvider::new().unwrap();
+        let wasm = compile_wat(malformed_host_calls_wat());
+        let result = provider
+            .execute("malformed-guest", &wasm, limits(u64::MAX))
+            .expect("malformed host calls are ignored, not fatal");
+        assert!(result.writes.is_empty());
+        assert!(result.ephemeral.is_empty());
+    }
 }

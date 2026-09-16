@@ -664,4 +664,70 @@ mod tests {
         // Unknown keys cannot be revoked.
         assert!(!provider.revoke(&[9u8; 32], 20));
     }
+    #[test]
+    fn evaluate_fails_closed_on_malformed_signers() {
+        let mut org = Organization::new("PharmaCorp").unwrap();
+        let member = org.issue_identity("node-a").unwrap().clone();
+        let mut provider = MspEndorsementProvider::new();
+        provider.register_identity(&member, Principal::new("PharmaCorp"));
+
+        let expression = PolicyExpression::signed_by("PharmaCorp");
+        let payload = b"payload".to_vec();
+        let payload2 = b"payload".to_vec();
+
+        // A signer whose key was never registered.
+        let impostor = crate::identity::Identity::generate("impostor");
+        let unknown = EndorsementRequest {
+            target: request(&payload, Vec::new()).target,
+            payload: payload.clone(),
+            signers: vec![EndorserIdentity {
+                algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
+                claimed_principal: Principal::new("PharmaCorp"),
+                public_key: impostor.public_key_bytes().to_vec(),
+                signature: impostor.sign_bytes(b"payload"),
+            }],
+        };
+        let err = EndorsementProvider::evaluate(&provider, &expression, &unknown, AT)
+            .expect_err("unknown key");
+        assert!(err.to_string().contains("unknown signing key"), "{err}");
+
+        // A registered key claiming a principal it does not verify under.
+        let mismatched = EndorsementRequest {
+            target: request(&payload, Vec::new()).target,
+            payload: payload.clone(),
+            signers: vec![EndorserIdentity {
+                algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
+                claimed_principal: Principal::new("OtherOrg"),
+                public_key: member.public_key_bytes().to_vec(),
+                signature: member.sign_bytes(b"payload"),
+            }],
+        };
+        let err = EndorsementProvider::evaluate(&provider, &expression, &mismatched, AT)
+            .expect_err("principal conflict");
+        assert!(err.to_string().contains("conflicts"), "{err}");
+
+        // The correctly claimed signer is authorized (the same shape as the
+        // mismatched request, with the honest principal).
+        let authorized = EndorsementRequest {
+            target: request(&payload2, Vec::new()).target,
+            payload,
+            signers: vec![EndorserIdentity {
+                algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
+                claimed_principal: Principal::new("PharmaCorp"),
+                public_key: member.public_key_bytes().to_vec(),
+                signature: member.sign_bytes(b"payload"),
+            }],
+        };
+        assert!(
+            EndorsementProvider::evaluate(&provider, &expression, &authorized, AT)
+                .expect("authorized at the registration height")
+                .satisfied
+        );
+
+        // After revocation the key stops being valid at the revocation height.
+        provider.revoke(&member.public_key_bytes(), AT + 1);
+        let err = EndorsementProvider::evaluate(&provider, &expression, &authorized, AT + 5)
+            .expect_err("revoked key");
+        assert!(err.to_string().contains("revoked"), "{err}");
+    }
 }
