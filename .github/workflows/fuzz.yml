@@ -1,8 +1,8 @@
 name: Fuzz
 
 # Dynamic analysis (Gold `dynamically_analysis`): two libFuzzer harnesses over
-# the untrusted decode surfaces — `fuzz_wire` (network `Message` JSON) and
-# `fuzz_transactions` (core `Transaction` JSON). PRs get a short smoke run;
+# the untrusted decode surfaces — `fuzz-wire` (network `Message` JSON) and
+# `fuzz-transactions` (core `Transaction` JSON). PRs get a short smoke run;
 # the weekly scheduled run digs deeper. OSS-Fuzz integration is intentionally
 # out of scope pre-release.
 
@@ -78,5 +78,5 @@ jobs:
           if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             secs=300
           fi
-          (cd crates/glasschain-network && cargo fuzz run -s none --target x86_64-unknown-linux-gnu fuzz_wire -- -max_total_time=$secs)
-          (cd crates/glasschain-core && cargo fuzz run -s none --target x86_64-unknown-linux-gnu fuzz_transactions -- -max_total_time=$secs)
+          (cd crates/glasschain-network && cargo fuzz run -s none --target x86_64-unknown-linux-gnu fuzz-wire -- -max_total_time=$secs)
+          (cd crates/glasschain-core && cargo fuzz run -s none --target x86_64-unknown-linux-gnu fuzz-transactions -- -max_total_time=$secs)

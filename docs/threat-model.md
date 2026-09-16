@@ -47,7 +47,7 @@ section of the README before trusting any claim.
 | Copied-certificate impersonation (org claims) | **Session-bound possession proof**: ed25519 signature over the RFC 5705 TLS exporter of the *live* session (#110) — a stolen PEM proves nothing | [CONTEXT.md](../CONTEXT.md) "Session-bound possession proof" |
 | Revoked or bogus org certificate | `CertChainVerifier` performs real `rustls-webpki` chain checks against own-org Root CA + federation anchors (ADR-011); **fail-closed CRL** (ADR-013) — missing/expired/revoked all reject; OCSP staple verified locally, `revoked` fails the session closed, absent staples never upgrade the CRL result (ADR-017) | `crates/glasschain-identity`, `docs/privacy-and-identity.md` §1.1–1.4 |
 | TLS downgrade / insecure mode abuse | `GLASSCHAIN_INSECURE_TLS=1` is a documented local-debugging escape hatch only; adding new kill switches is forbidden | [AGENTS.md](../AGENTS.md) security invariants |
-| Malicious/oversized frames | 16 MiB `MAX_MESSAGE_SIZE` frame cap; serde deserialization rejects unknown algorithm discriminants and unknown fields | `protocol.rs`; fuzz targets `fuzz_wire` (§5) |
+| Malicious/oversized frames | 16 MiB `MAX_MESSAGE_SIZE` frame cap; serde deserialization rejects unknown algorithm discriminants and unknown fields | `protocol.rs`; fuzz targets `fuzz-wire` (§5) |
 | Trust-store poisoning | Anchors/CRLs/intermediates load only from the operator-supplied `--trust-store`; reload is operator-signalled (`reload-trust-store` REPL), never a timer | ADR-011, ADR-017 |
 
 ### 3.2 gRPC API
@@ -106,7 +106,7 @@ These are **not** mitigated and must not be silently "fixed":
 | Committed history is tamper-evident | SHA-256 chain; replay rebuild; adversarial sync paths covered by network integration and chaos tests |
 | Finality is achieved by ⅔+ of distinct validator keys over context-bound votes | BFT round machine + context-authenticated votes + BLS aggregate certificates (ADR-002/014, `crates/glasschain-core/src/bft.rs`) |
 | Untrusted code cannot exceed granted resources | wasmtime + fuel metering, contract tests in `glasschain-vm` |
-| Automated regression security | CI gates: rustfmt, clippy `-D warnings` (all/pedantic/nursery), full test matrix on 3 OSes, coverage thresholds ≥90% line / ≥80% branch, weekly `cargo audit` (RustSec), Dependabot, fuzz smoke on PRs (`fuzz_wire`, `fuzz_transactions`) |
+| Automated regression security | CI gates: rustfmt, clippy `-D warnings` (all/pedantic/nursery), full test matrix on 3 OSes, coverage thresholds ≥90% line / ≥80% branch, weekly `cargo audit` (RustSec), Dependabot, fuzz smoke on PRs (`fuzz-wire`, `fuzz-transactions`) |
 | Untrusted decode surfaces resist malformed input | `cargo-fuzz` harnesses over `Message` and `Transaction` decode, run on schedule + PR smoke |
 
 Verification pointers for reviewers: the per-claim verification map in

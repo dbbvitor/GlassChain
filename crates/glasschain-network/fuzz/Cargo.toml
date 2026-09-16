@@ -13,8 +13,8 @@ glasschain-network = { path = ".." }
 serde_json = "1.0"
 
 [[bin]]
-name = "fuzz_wire"
-path = "fuzz_targets/fuzz_wire.rs"
+name = "fuzz-wire"
+path = "fuzz_targets/fuzz-wire.rs"
 test = false
 doc = false
 bench = false
