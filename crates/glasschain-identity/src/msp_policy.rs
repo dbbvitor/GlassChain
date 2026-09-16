@@ -730,4 +730,57 @@ mod tests {
             .expect_err("revoked key");
         assert!(err.to_string().contains("revoked"), "{err}");
     }
+    #[test]
+    fn evaluate_fails_closed_on_malformed_signer_material() {
+        let mut org = Organization::new("PharmaCorp").unwrap();
+        let member = org.issue_identity("node-m").unwrap().clone();
+        let mut provider = MspEndorsementProvider::new();
+        provider.register_identity(&member, Principal::new("PharmaCorp"));
+
+        let expression = PolicyExpression::signed_by("PharmaCorp");
+        let build = |signers: Vec<EndorserIdentity>| EndorsementRequest {
+            target: request(b"p", Vec::new()).target,
+            payload: b"p".to_vec(),
+            signers,
+        };
+
+        // Registered key but a 63-byte signature: malformed signatures are
+        // skipped, never counted — the evaluation runs to completion.
+        let malformed_sig = build(vec![EndorserIdentity {
+            algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
+            claimed_principal: Principal::new("PharmaCorp"),
+            public_key: member.public_key_bytes().to_vec(),
+            signature: vec![0u8; 63],
+        }]);
+        let evaluation = EndorsementProvider::evaluate(&provider, &expression, &malformed_sig, AT)
+            .expect("malformed signature is skipped, not an error");
+        assert!(!evaluation.satisfied, "0 valid signers cannot satisfy");
+
+        // A registered principal presenting a non-32-byte key fails closed.
+        // The key itself must be registered first (the directory lookup
+        // happens before the length check).
+        provider.register(vec![1u8; 31], Principal::new("PharmaCorp"));
+        let short_key = build(vec![EndorserIdentity {
+            algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
+            claimed_principal: Principal::new("PharmaCorp"),
+            public_key: vec![1u8; 31],
+            signature: vec![0u8; 64],
+        }]);
+        let err = EndorsementProvider::evaluate(&provider, &expression, &short_key, AT)
+            .expect_err("wrong key length");
+        assert!(err.to_string().contains("not 32 bytes"), "{err}");
+
+        // A registered 32-byte key whose bytes do not form the registered
+        // ed25519 point fails signature verification and is skipped.
+        provider.register(vec![0u8; 32], Principal::new("PharmaCorp"));
+        let wrong_bytes = build(vec![EndorserIdentity {
+            algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
+            claimed_principal: Principal::new("PharmaCorp"),
+            public_key: [0u8; 32].to_vec(),
+            signature: vec![0u8; 64],
+        }]);
+        let evaluation = EndorsementProvider::evaluate(&provider, &expression, &wrong_bytes, AT)
+            .expect("an unparseable signature is skipped, not an error");
+        assert!(!evaluation.satisfied);
+    }
 }

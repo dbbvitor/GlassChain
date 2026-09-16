@@ -1148,7 +1148,25 @@ mod tests {
     ;; Unknown op (2) and empty pdc for PDC visibility (1): 12 params
     ;; (channel, ch_len, contract, c_len, key, k_len, val, v_len, op, vis, pdc, pdc_len).
     (drop (call $persist_state (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 2) (i32.const 0) (i32.const 0) (i32.const 0)))
-    (drop (call $persist_state (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 0) (i32.const 0)))
+    ;; Unknown op (2) with valid strings first so the op arm is reached.
+    (drop (call $persist_state (i32.const 0) (i32.const 4) (i32.const 0) (i32.const 4) (i32.const 0) (i32.const 4) (i32.const 0) (i32.const 0) (i32.const 2) (i32.const 0) (i32.const 0) (i32.const 0)))
+    ;; PDC visibility (1) with malformed pdc pointer.
+    (drop (call $persist_state (i32.const 0) (i32.const 4) (i32.const 0) (i32.const 4) (i32.const 0) (i32.const 4) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 1) (i32.const -1) (i32.const 4)))
+    ;; Per-field malformed pointers on persist_state.
+    (drop (call $persist_state (i32.const -1) (i32.const 4) (i32.const 0) (i32.const 4) (i32.const 0) (i32.const 4) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+    (drop (call $persist_state (i32.const 0) (i32.const 4) (i32.const -1) (i32.const 4) (i32.const 0) (i32.const 4) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+    (drop (call $persist_state (i32.const 0) (i32.const 4) (i32.const 0) (i32.const 4) (i32.const -1) (i32.const 4) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+    ;; Unknown visibility (2).
+    (drop (call $persist_state (i32.const 0) (i32.const 4) (i32.const 0) (i32.const 4) (i32.const 0) (i32.const 4) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 2) (i32.const 0) (i32.const 0)))
+    ;; get_state_len / get_state per-field negative lengths.
+    (drop (call $get_state_len (i32.const 0) (i32.const -1)))
+    (drop (call $get_state (i32.const 0) (i32.const -1) (i32.const 0) (i32.const 4)))
+    (drop (call $get_state (i32.const 0) (i32.const 4) (i32.const -1) (i32.const 4)))
+    (drop (call $get_state (i32.const 0) (i32.const 4) (i32.const 0) (i32.const -1)))
+    ;; set_state per-field negative lengths.
+    (call $set_state (i32.const 0) (i32.const -1) (i32.const 0) (i32.const 0))
+    (call $set_state (i32.const 0) (i32.const 0) (i32.const -1) (i32.const 0))
+    (call $set_state (i32.const 0) (i32.const 0) (i32.const 0) (i32.const -1))
   )
 )
 "#

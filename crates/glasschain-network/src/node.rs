@@ -4942,6 +4942,30 @@ mod tests {
         assert!(TcpStream::connect(&addr).await.is_ok());
     }
 
+    #[tokio::test]
+    async fn pending_pool_stats_reports_count_and_wire_bytes() {
+        let node = Node::new("pool-stats", "127.0.0.1:0", 1);
+        node.start(vec![]).await.unwrap();
+
+        let empty = node.pending_pool_stats().await;
+        assert_eq!(empty.count, 0);
+        assert_eq!(empty.bytes, 0);
+
+        node.submit_transaction(Transaction::new(TransactionKind::InventoryUpdate(
+            InventoryUpdate {
+                product_id: "SKU-1".into(),
+                owner_id: "owner-1".into(),
+                quantity_delta: 1,
+                reason: "stats".into(),
+            },
+        )))
+        .await
+        .unwrap();
+        let stats = node.pending_pool_stats().await;
+        assert_eq!(stats.count, 1);
+        assert!(stats.bytes > 0, "the serialized tx contributes bytes");
+    }
+
     #[test]
     fn tofu_first_contact_records_identity() {
         let mut reg = PeerRegistry::new();
