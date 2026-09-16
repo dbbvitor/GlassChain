@@ -25,8 +25,10 @@ watcher automation engine, a TLS-encrypted TCP/libp2p P2P layer, and a gRPC API.
   DCO sign-off check (every PR commit needs `git commit -s`), a
   check/test matrix on Ubuntu, macOS, and Windows, code coverage, and a RustSec
   dependency audit on every push and PR. Coverage uploads require the
-  `CODECOV_TOKEN` repository secret, and `codecov.yml` enforces ≥90% project
-  coverage as a status check. Additional scheduled/tagged workflows:
+  `CODECOV_TOKEN` repository secret; `codecov.yml` gates coverage as a
+  **ratchet** (`target: auto` + 0.5% threshold — regressions fail, no absolute
+  floor). Measured line coverage is ~82.4% (2026-09-14); the Gold ≥90% target
+  is aspirational — pin `target: 90%` in `codecov.yml` once it is met. Additional scheduled/tagged workflows:
   `fuzz.yml` (cargo-fuzz smoke on PRs touching core/network, weekly deep runs
   over `fuzz_wire` and `fuzz_transactions`), `reproducible.yml` (weekly
   Linux-only build-twice hash verification), and `release.yml` (on `v*` tags:

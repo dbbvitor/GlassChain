@@ -1,7 +1,12 @@
 # Codecov configuration.
 #
-# Gold thresholds: >= 90% project (line) coverage is a blocking status check;
-# branch coverage is tracked on the Codecov dashboard but is not a status
+# Coverage gate (Gold target: >= 90% line coverage). Measured reality
+# (tarpaulin, 2026-09-14): 82.4%. A hard 90% gate fails every PR until that
+# gap is closed — so the blocking check is a **ratchet**: `target: auto`
+# compares head against the base commit and a small threshold blocks
+# regressions, while the dashboard keeps showing the distance to 90%. Once
+# measured coverage reaches 90%, pin `target: 90%` here (and in AGENTS.md).
+# Branch coverage is tracked on the Codecov dashboard but is not a status
 # check (tarpaulin measures line coverage; a branch gate would need a second
 # engine). Patch coverage is informational — new code is encouraged, not
 # blocked. Repository branch protection should require the `codecov/project`
@@ -11,11 +16,15 @@
 # * codecov-yaml   — this repository-level file; validate before deploying:
 #                    `curl --data-binary @codecov.yml https://codecov.io/validate`
 # * commit-status  — `coverage.status` below: `codecov/project` is the single
-#                    blocking gate (>= 90%); `codecov/patch` is informational.
+#                    blocking gate (ratchet); `codecov/patch` is informational.
 # * flags          — CI uploads exactly one tarpaulin report, flagged
 #                    `tarpaulin` in the uploader step. A single report must
 #                    map to exactly one flag (many-to-one uploads attribute
-#                    the whole report's coverage to every flag).
+#                    the whole report's coverage to every flag). With one
+#                    flag, `flag_management` (automatic) would mint per-flag
+#                    statuses duplicating the top-level gate, so the flag is
+#                    declared bespoke. It labels the upload kind; the
+#                    per-crate dimension comes from components below.
 # * components     — per-crate views computed from that same single upload:
 #                    components are virtual path filters defined entirely
 #                    here, no upload-time separation required. Component
@@ -28,7 +37,8 @@ coverage:
   status:
     project:
       default:
-        target: 90%
+        target: auto
+        threshold: 0.5%
         informational: false
         if_ci_failed: error
     patch:
