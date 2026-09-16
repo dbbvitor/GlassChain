@@ -4943,6 +4943,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn private_payload_rejects_an_unconfigured_collection() {
+        let node = Node::new("pdc-unconfigured", "127.0.0.1:0", 1);
+        node.start(vec![]).await.unwrap();
+
+        // Without a verifier the trust gate fails closed first (zero-trust
+        // #86): install one to reach the collection-membership check.
+        let org = glasschain_identity::Organization::new("PharmaCorp").unwrap();
+        let mut verifier = CertChainVerifier::from_org(&org).unwrap();
+        verifier.add_crl_pem(&org.crl_pem().unwrap()).unwrap();
+        node.set_cert_verifier(verifier).await;
+
+        let err = node
+            .submit_private_payload("no-such-collection", b"payload".to_vec())
+            .await
+            .expect_err("unconfigured collection must fail");
+        assert!(err.to_string().contains("not a member"), "{err}");
+
+        // The verifier getter reports the installed chain.
+        assert!(node.cert_verifier().await.is_some());
+    }
+
+    #[tokio::test]
     async fn pending_pool_stats_reports_count_and_wire_bytes() {
         let node = Node::new("pool-stats", "127.0.0.1:0", 1);
         node.start(vec![]).await.unwrap();

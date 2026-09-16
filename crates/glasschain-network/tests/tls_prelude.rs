@@ -146,3 +146,84 @@ async fn garbage_tls_handshake_is_refused_by_the_acceptor() {
         .expect("timeout")
         .expect("node alive after garbage TLS");
 }
+
+// ── Dial-side prelude: the node connecting to a fake peer ────────────────────
+
+/// A TCP listener that accepts and answers the certificate prelude in a
+/// deliberately broken way.
+enum FakePeer {
+    /// Accepts and drops the stream: the node's read of the peer-certificate
+    /// length hits EOF.
+    SilentDrop,
+    /// Answers a zero-length certificate advertisement.
+    ZeroLength,
+    /// Advertises a length and truncates the certificate body.
+    Truncated,
+}
+
+fn spawn_fake_peer(kind: FakePeer) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt as _;
+        use tokio::io::AsyncWriteExt as _;
+        let (std_stream, _) = listener.accept().unwrap();
+        let stream = tokio::net::TcpStream::from_std(std_stream).unwrap();
+        let mut stream = tokio::io::BufReader::new(stream);
+        // Read the node's advertised certificate (length + body) so the node
+        // proceeds to reading ours.
+        let mut len_buf = [0u8; 4];
+        if stream.read_exact(&mut len_buf).await.is_err() {
+            return;
+        }
+        let node_len = u32::from_be_bytes(len_buf) as usize;
+        let mut cert = vec![0u8; node_len];
+        if stream.read_exact(&mut cert).await.is_err() {
+            return;
+        }
+        match kind {
+            FakePeer::SilentDrop => drop(stream),
+            FakePeer::ZeroLength => {
+                let _ = stream.write_all(&0u32.to_be_bytes()).await;
+            }
+            FakePeer::Truncated => {
+                let _ = stream.write_all(&16u32.to_be_bytes()).await;
+                let _ = stream.write_all(&[9u8; 3]).await;
+                drop(stream);
+            }
+        }
+        // Hold the task open briefly so the socket lingers.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    });
+    addr
+}
+
+async fn dial_node_with_seed(seed: &str) -> Node {
+    let addr = free_addr();
+    let node = Node::new("dial-node", &addr, 1);
+    node.start(vec![seed.to_owned()]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    node
+}
+
+/// A dial target that accepts TCP and then vanishes fails the pre-TLS
+/// exchange without crashing the node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dial_to_silent_peer_fails_cleanly() {
+    let seed = spawn_fake_peer(FakePeer::SilentDrop);
+    let _node = dial_node_with_seed(&seed).await;
+}
+
+/// A zero-length peer certificate advertisement is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dial_rejects_zero_length_peer_certificate() {
+    let seed = spawn_fake_peer(FakePeer::ZeroLength);
+    let _node = dial_node_with_seed(&seed).await;
+}
+
+/// A truncated peer certificate body is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dial_rejects_truncated_peer_certificate() {
+    let seed = spawn_fake_peer(FakePeer::Truncated);
+    let _node = dial_node_with_seed(&seed).await;
+}
