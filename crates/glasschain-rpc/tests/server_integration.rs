@@ -35,21 +35,28 @@ type NodeClient = NodeServiceClient<tonic::transport::Channel>;
 
 /// Allocate a unique loopback port for this test process.
 ///
-/// Band-based allocator (same pattern as
+/// Asks the OS for an ephemeral port and **keeps the socket**, parked via
+/// `glasschain_network::stash_prebound_listener` for the node or gRPC
+/// server that will use it (same pattern as
 /// `glasschain-network/tests/common/ports.rs`, which this file cannot
-/// reach): parallel probes in this process each get a distinct port instead
-/// of racing on the bind→drop→rebind window.
+/// reach). The old probe→drop→rebind allocator leaves the port free for
+/// seconds in a long test, in which the OS can hand it to an unrelated
+/// outbound connection or a `TIME_WAIT` residue blocks the rebind — both
+/// surface as `AddrInUse` on Windows CI (`chaos_tests` 2026-09-16).
+/// Holding the socket closes that window.
 fn free_addr() -> String {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    let band = u16::try_from(std::process::id() % 32).expect("pid mod 32 fits u16");
-    loop {
-        let offset = NEXT.fetch_add(1, Ordering::Relaxed) % 300;
-        let port = 22_000 + band * 300 + offset;
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return format!("127.0.0.1:{port}");
-        }
-    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+    let addr = listener.local_addr().expect("bound address").to_string();
+    glasschain_network::stash_prebound_listener(&addr, listener);
+    addr
+}
+
+/// Take the listener parked by [`free_addr`] back out, converting it to a
+/// tokio listener for a server that adopts instead of re-binds.
+fn adopted_listener(addr: &str) -> tokio::net::TcpListener {
+    let std_listener = glasschain_network::adopt_prebound_listener(addr)
+        .unwrap_or_else(|| panic!("free_addr must park a listener for {addr}"));
+    tokio::net::TcpListener::from_std(std_listener).expect("tokio listener")
 }
 
 /// Start a bare node with a temporary in-memory ledger.
@@ -81,9 +88,10 @@ async fn connect(endpoint: &str) -> tonic::transport::Channel {
 async fn start_server(node: Arc<Node>) -> (tonic::transport::Channel, tokio::task::JoinHandle<()>) {
     let addr = free_addr();
     let endpoint = format!("http://{addr}");
+    let listener = adopted_listener(&addr);
     let server = GlasschainServer::new(node);
     let handle = tokio::spawn(async move {
-        let _ = server.serve(addr.parse().unwrap()).await;
+        let _ = server.serve_listener(listener).await;
     });
     let channel = connect(&endpoint).await;
     (channel, handle)
@@ -794,10 +802,11 @@ async fn admin_channel_ops_manage_collections_end_to_end() {
     let node_for_check = Arc::clone(&node);
     let addr = free_addr();
     let endpoint = format!("http://{addr}");
+    let listener = adopted_listener(&addr);
     let gate = glasschain_rpc::AdminGate::new(std::sync::Arc::new(gate_verifier(&org)));
     let handle = tokio::spawn(async move {
         let server = glasschain_rpc::GlasschainServer::new(node).with_admin_gate(gate);
-        let _ = server.serve(addr.parse().unwrap()).await;
+        let _ = server.serve_listener(listener).await;
     });
     let channel = connect(&endpoint).await;
     let mut client = NodeServiceClient::new(channel);
@@ -846,10 +855,11 @@ async fn admin_channel_ops_reject_a_non_admin_certificate() {
     let node = start_node().await;
     let addr = free_addr();
     let endpoint = format!("http://{addr}");
+    let listener = adopted_listener(&addr);
     let gate = glasschain_rpc::AdminGate::new(std::sync::Arc::new(gate_verifier(&org)));
     let handle = tokio::spawn(async move {
         let server = glasschain_rpc::GlasschainServer::new(node).with_admin_gate(gate);
-        let _ = server.serve(addr.parse().unwrap()).await;
+        let _ = server.serve_listener(listener).await;
     });
     let channel = connect(&endpoint).await;
     std::mem::forget(handle);

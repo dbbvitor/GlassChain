@@ -2,30 +2,47 @@
 // Copyright 2026 dbbvitor
 //! Shared loopback-port allocator for the network integration tests.
 //!
-//! Probing `bind(":0")` and dropping the listener races with sibling tests:
-//! the kernel can hand the same just-freed ephemeral port to two probes
-//! before either node binds it (`AddrInUse` under parallel test threads —
-//! `sncm_compliance`, 2026-09-03). Ports are reserved from a per-process band
-//! below the OS ephemeral range (which starts at 32768 on Linux, 49152 on
-//! macOS/Windows): the counter hands every caller in this process a distinct
-//! port, and the bind probe skips ports held by anything else (other test
-//! binaries run in their own process, hence the pid-seeded band). With no
-//! shared window left, `cargo test`/tarpaulin run the harnesses in parallel.
+//! `free_addr` asks the OS for an ephemeral port (`127.0.0.1:0`) and **keeps
+//! the socket**, parked in the node crate's pre-bound registry;
+//! `Node::start` adopts that exact socket instead of re-binding.
+//!
+//! The probe→drop→rebind pattern this replaces is the classic Windows CI
+//! flake (`AddrInUse`, WSAEADDRINUSE 10048, `chaos_tests` 2026-09-16): a
+//! port probed free and then dropped stays free for seconds in a long test,
+//! and in that window the OS can hand it to an unrelated outbound
+//! connection as its source port, or a `TIME_WAIT` residue blocks the rebind
+//! outright. Windows refuses both; Linux and macOS mask them. Holding the
+//! socket closes the window — the address is continuously in use from
+//! allocation until the node adopts it, and the OS never assigns a held
+//! port to anything else.
 //!
 //! `glasschain-rpc/tests/server_integration.rs` keeps an identical local
 //! copy (it cannot reach this file); mirror any change there.
 
-/// Allocate a unique loopback port for this test process.
+/// Allocate a unique loopback address, keeping the bound socket parked for
+/// the node that will use it.
 #[must_use]
 pub fn free_addr() -> String {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    let band = u16::try_from(std::process::id() % 32).expect("pid mod 32 fits u16");
-    loop {
-        let offset = NEXT.fetch_add(1, Ordering::Relaxed) % 300;
-        let port = 22_000 + band * 300 + offset;
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return format!("127.0.0.1:{port}");
-        }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+    let addr = listener.local_addr().expect("bound address").to_string();
+    glasschain_network::stash_prebound_listener(&addr, listener);
+    addr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sequential_calls_return_distinct_addrs() {
+        assert_ne!(free_addr(), free_addr());
+    }
+
+    #[test]
+    fn stashed_addr_stays_bound_until_adopted() {
+        let addr = free_addr();
+        // The held socket *is* the allocation: the port cannot fall to
+        // anyone else in between (the Windows probe→drop→rebind flake).
+        assert!(std::net::TcpListener::bind(&addr).is_err());
     }
 }

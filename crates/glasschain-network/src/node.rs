@@ -37,7 +37,8 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::net::TcpListener as StdTcpListener;
+use std::sync::{Arc, OnceLock};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{broadcast, Mutex};
@@ -1834,7 +1835,13 @@ impl Node {
             }
         }
 
-        let listener = TcpListener::bind(&self.listen_addr).await?;
+        // Adopt a parked listener when the address was allocated with one
+        // (see `stash_prebound_listener`): re-binding a just-probed address
+        // is the `AddrInUse` window Windows refuses to paper over.
+        let listener = match adopt_prebound_listener(&self.listen_addr) {
+            Some(std_listener) => TcpListener::from_std(std_listener)?,
+            None => TcpListener::bind(&self.listen_addr).await?,
+        };
         log::info!("Node {} listening on {}", self.node_id, self.listen_addr);
 
         let (dial_tx, dial_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -4841,6 +4848,61 @@ async fn process_message(
     }
 }
 
+// ── Pre-bound listener registry ──────────────────────────────────────────────
+
+/// Listeners parked by port allocators, keyed by their bound address.
+///
+/// Binding a port, dropping the probe socket, and re-binding it later leaves
+/// a window in which the port is free: the OS can hand it to an unrelated
+/// outbound connection as its source port, or a `TIME_WAIT` residue can block
+/// the rebind outright. Linux and macOS mask both; Windows does not — a
+/// stolen or lingering port fails the node's bind with `AddrInUse`
+/// (WSAEADDRINUSE 10048), which is how the integration suites flaked on
+/// Windows CI. Holding the socket from allocation until the node adopts it
+/// closes that window, so [`Node::start`] never re-binds a stashed address.
+static PREBOUND_LISTENERS: OnceLock<std::sync::Mutex<HashMap<String, StdTcpListener>>> =
+    OnceLock::new();
+
+fn prebound_listeners() -> &'static std::sync::Mutex<HashMap<String, StdTcpListener>> {
+    PREBOUND_LISTENERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Park a listener that is already bound at `addr` so [`Node::start`] adopts
+/// it instead of binding the address again.
+///
+/// Port allocators (test suites, socket-activated deployments) bind the
+/// socket first and must not drop it: the node takes over the *same* socket,
+/// so the address is continuously in use from allocation to service. Keys
+/// are the exact address string (`"127.0.0.1:<port>"`); a listener parked
+/// for an address no node ever adopts stays parked for the process lifetime.
+pub fn stash_prebound_listener(addr: impl Into<String>, listener: StdTcpListener) {
+    prebound_listeners()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(addr.into(), listener);
+}
+
+/// Take the listener parked for `addr`, if any. Adoption consumes the stash.
+///
+/// The adopted socket is flipped to non-blocking: tokio refuses to register
+/// a blocking fd (`TcpListener::from_std` panics on tokio ≥ 1.53,
+/// tokio-rs/tokio#7172), and allocators hand the listener over in the
+/// std-default blocking mode.
+#[must_use]
+pub fn adopt_prebound_listener(addr: &str) -> Option<StdTcpListener> {
+    let listener = prebound_listeners()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(addr)?;
+    if listener.set_nonblocking(true).is_err() {
+        // Handing tokio a blocking fd would panic in `from_std`; fall back to
+        // the rebind path instead (the socket is consumed either way).
+        log::warn!("prebound listener for {addr}: nonblocking flip failed; rebinding");
+        return None;
+    }
+    Some(listener)
+}
+
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 /// Map the negotiated key exchange group to a comparable [`rustls::NamedGroup`].
@@ -4862,6 +4924,23 @@ mod tests {
     };
     use glasschain_identity::SignedTransaction;
     use glasschain_vm::WasmExecutionProvider;
+
+    #[tokio::test]
+    async fn start_adopts_a_stashed_prebound_listener() {
+        let std_listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = std_listener.local_addr().unwrap().to_string();
+        stash_prebound_listener(&addr, std_listener);
+
+        let node = Node::new("adopt-node", &addr, 1);
+        node.start(vec![]).await.unwrap();
+
+        // The node owns the parked socket: adoption consumed the stash and
+        // the address is still bound exactly once — reachable by peers, but
+        // no one else can take the port in between.
+        assert!(adopt_prebound_listener(&addr).is_none());
+        assert!(StdTcpListener::bind(&addr).is_err());
+        assert!(TcpStream::connect(&addr).await.is_ok());
+    }
 
     #[test]
     fn tofu_first_contact_records_identity() {
