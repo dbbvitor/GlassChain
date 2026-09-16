@@ -319,3 +319,477 @@ fn unix_now() -> Result<u64, WorkflowError> {
         .map(|duration| duration.as_secs())
         .map_err(|_| WorkflowError::Clock)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checkpoint::{Checkpoint, CheckpointStore};
+    use crate::receipt_flow::{shipment_receipt_flow, ReceiptFlowState};
+    use crate::receipt_flow::{AnchorLotTransition, ShipmentToReceiptTransition};
+    use crate::transition::Transition;
+    use glasschain_core::providers::in_memory::InMemoryStorageProvider;
+    use glasschain_core::{CanonicalRecord, RecordSignature, StorageProvider};
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn storage() -> Arc<dyn StorageProvider> {
+        Arc::new(InMemoryStorageProvider::new())
+    }
+
+    fn anchored() -> ReceiptFlowState {
+        ReceiptFlowState::LotAnchored {
+            lot_ref: "lot-1".to_owned(),
+            lot_commitment: "c".to_owned(),
+        }
+    }
+
+    fn completed(receipt_ref: &str) -> ReceiptFlowState {
+        ReceiptFlowState::Completed {
+            receipt_ref: receipt_ref.to_owned(),
+        }
+    }
+
+    fn completed_receipt() -> ReceiptFlowState {
+        completed("receipt:x")
+    }
+
+    fn signed(record: &mut CanonicalRecord, signer: &str) {
+        record.signatures.push(RecordSignature {
+            algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
+            signer: signer.to_owned(),
+            signature_bytes: b"sig".to_vec(),
+        });
+    }
+
+    fn lot_record(occurred_at: u64) -> CanonicalRecord {
+        let payload = BTreeMap::from([
+            ("lot_id".to_owned(), json!("LOT-1")),
+            ("product_id".to_owned(), json!("SKU-1")),
+            ("batch_number".to_owned(), json!("BATCH-1")),
+        ]);
+        let mut lot = CanonicalRecord::new(occurred_at, "lot", payload, "plant-1");
+        let commitment = lot.commitment().unwrap();
+        lot.commitment = Some(commitment);
+        signed(&mut lot, "plant-1");
+        lot
+    }
+
+    fn shipment_record(lot_ref: &str, occurred_at: u64) -> CanonicalRecord {
+        let payload = BTreeMap::from([
+            ("lot_ref".to_owned(), json!(lot_ref)),
+            ("from_org".to_owned(), json!("plant-1")),
+            ("to_org".to_owned(), json!("receiver-1")),
+        ]);
+        let mut shipment = CanonicalRecord::new(occurred_at, "shipment", payload, "shipper-1");
+        signed(&mut shipment, "shipper-1");
+        shipment
+    }
+
+    fn runner() -> FlowRunner<ReceiptFlowState> {
+        shipment_receipt_flow("receiver-1", "issuer-1", "2026-09-16")
+    }
+
+    /// `kind()` is the stable flow name used by triage and logging.
+    #[test]
+    fn runner_kind_matches_flow_definition() {
+        assert_eq!(runner().kind(), "shipment_receipt");
+        assert_eq!(
+            FlowRunner::<ReceiptFlowState>::new("other", vec![]).kind(),
+            "other"
+        );
+    }
+
+    #[test]
+    fn action_kind_names_both_variants() {
+        use crate::action::Action;
+        let tx = glasschain_core::Transaction::new(
+            glasschain_core::TransactionKind::InventoryUpdate(glasschain_core::InventoryUpdate {
+                product_id: "p".to_owned(),
+                owner_id: "o".to_owned(),
+                quantity_delta: 1,
+                reason: "r".to_owned(),
+            }),
+        );
+        assert_eq!(Action::EmitTransaction(tx).kind(), "EmitTransaction");
+        assert_eq!(Action::EmitRecord(lot_record(1)).kind(), "EmitRecord");
+    }
+
+    #[test]
+    fn receipt_flow_step_names_every_state() {
+        assert_eq!(ReceiptFlowState::AwaitingLot.step(), "awaiting_lot");
+        assert_eq!(
+            ReceiptFlowState::LotAnchored {
+                lot_ref: "lot-1".to_owned(),
+                lot_commitment: "c".to_owned(),
+            }
+            .step(),
+            "lot_anchored"
+        );
+        assert_eq!(
+            ReceiptFlowState::Completed {
+                receipt_ref: "receipt:lot-1".to_owned(),
+            }
+            .step(),
+            "completed"
+        );
+    }
+
+    #[test]
+    fn transition_names_are_stable() {
+        assert_eq!(AnchorLotTransition.name(), "AnchorLot");
+        assert_eq!(
+            ShipmentToReceiptTransition {
+                receiver_id: "r".to_owned(),
+                issuer: "i".to_owned(),
+                received_on: "d".to_owned(),
+            }
+            .name(),
+            "ShipmentToReceipt"
+        );
+    }
+
+    /// Defensive arms: `apply` called with an event that `matches` would have
+    /// rejected returns the state unchanged with no actions.
+    #[test]
+    fn receipt_transitions_defensive_apply_arms_are_noops() {
+        let anchored = ReceiptFlowState::LotAnchored {
+            lot_ref: "lot-1".to_owned(),
+            lot_commitment: "c".to_owned(),
+        };
+        let resumed = Event::Resumed("test".to_owned());
+
+        let anchor = AnchorLotTransition.apply(&ReceiptFlowState::AwaitingLot, &resumed);
+        assert_eq!(anchor.state, ReceiptFlowState::AwaitingLot);
+        assert!(anchor.actions.is_empty());
+        assert!(!anchor.completed);
+
+        let no_commitment = CanonicalRecord::new(1, "lot", BTreeMap::new(), "plant-1");
+        let anchor = AnchorLotTransition.apply(
+            &ReceiptFlowState::AwaitingLot,
+            &Event::RecordCommitted(no_commitment),
+        );
+        assert_eq!(anchor.state, ReceiptFlowState::AwaitingLot);
+
+        let ship = ShipmentToReceiptTransition {
+            receiver_id: "r".to_owned(),
+            issuer: "i".to_owned(),
+            received_on: "d".to_owned(),
+        };
+        let out = ship.apply(&anchored, &resumed);
+        assert_eq!(out.state, anchored);
+    }
+
+    /// Resume on a flow with no checkpoint is a no-op (`Ok(None)`), and `ack`
+    /// on an unknown flow or a waiting checkpoint is a no-op too.
+    #[test]
+    fn resume_and_ack_without_pending_work_are_noops() {
+        let store = storage();
+        let triage = FlowTriage::new();
+        let flow = runner();
+
+        let fresh = flow
+            .handle(
+                &store,
+                &triage,
+                "f1",
+                &ReceiptFlowState::AwaitingLot,
+                &Event::Resumed("restart".into()),
+            )
+            .unwrap();
+        assert!(fresh.is_none());
+
+        flow.ack(&store, &triage, "unknown", 1).unwrap();
+
+        // Waiting checkpoint (no pending event): ack does nothing.
+        flow.handle(
+            &store,
+            &triage,
+            "f2",
+            &ReceiptFlowState::AwaitingLot,
+            &Event::RecordCommitted(lot_record(1)),
+        )
+        .unwrap()
+        .unwrap();
+        flow.ack(&store, &triage, "f2", 1).unwrap();
+    }
+
+    /// An interruption where every action was executed and acknowledged:
+    /// resume finalizes without re-delivering — completed or not — and a
+    /// follow-up real event still drives the flow.
+    #[test]
+    fn interrupted_transition_fully_acked_resumes_without_redelivery() {
+        let store = storage();
+        let triage = FlowTriage::new();
+        let flow = runner();
+        let lot = Event::RecordCommitted(lot_record(1));
+        let shipment = Event::RecordCommitted(shipment_record("lot-1", 2));
+
+        // Interrupted transition that completes on resume: a pending shipment
+        // with every action acknowledged (next_action == actions.len()).
+        let store_c = CheckpointStore::new(Arc::clone(&store));
+        store_c
+            .save(&Checkpoint {
+                flow_id: "f".to_owned(),
+                flow_kind: "shipment_receipt".to_owned(),
+                state: serde_json::to_value(anchored()).unwrap(),
+                pending_event: Some(shipment),
+                next_action: 1,
+                step: "lot_anchored".to_owned(),
+                updated_at: 1,
+            })
+            .unwrap();
+        let out = flow
+            .handle(
+                &store,
+                &triage,
+                "f",
+                &ReceiptFlowState::AwaitingLot,
+                &Event::Resumed("r".into()),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(out.completed);
+        assert!(out.actions.is_empty());
+        // The receipt id derives from the shipment record's (random) id.
+        assert!(
+            matches!(out.state, ReceiptFlowState::Completed { receipt_ref } if receipt_ref.starts_with("receipt:"))
+        );
+
+        // Interrupted, fully acked, but NOT terminal: the resume finalizes
+        // the pending transition and returns the state; a `Resumed` event
+        // stops there, a real event continues driving the flow.
+        let store_c = CheckpointStore::new(Arc::clone(&store));
+        store_c
+            .save(&Checkpoint {
+                flow_id: "g".to_owned(),
+                flow_kind: "shipment_receipt".to_owned(),
+                state: serde_json::to_value(ReceiptFlowState::AwaitingLot).unwrap(),
+                pending_event: Some(lot),
+                next_action: 0, // AnchorLot emits no actions: 0 >= 0
+                step: "awaiting_lot".to_owned(),
+                updated_at: 1,
+            })
+            .unwrap();
+        let resumed_out = flow
+            .handle(
+                &store,
+                &triage,
+                "g",
+                &ReceiptFlowState::AwaitingLot,
+                &Event::Resumed("r".into()),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!resumed_out.completed);
+        assert!(resumed_out.actions.is_empty());
+        // The resume re-applies the pending event deterministically, so the
+        // state is re-derived from the lot record (fresh UUID per construct).
+        assert!(matches!(
+            resumed_out.state,
+            ReceiptFlowState::LotAnchored { .. }
+        ));
+
+        // A real event on top of the finalized-but-uncompleted flow proceeds.
+        let next = flow
+            .handle(
+                &store,
+                &triage,
+                "g",
+                &ReceiptFlowState::AwaitingLot,
+                &Event::Woken("x".into()),
+            )
+            .unwrap();
+        assert!(next.is_none()); // Woken matches nothing in the receipt flow
+    }
+
+    #[test]
+    fn interrupted_transition_redelivers_unacked_actions() {
+        let store = storage();
+        let triage = FlowTriage::new();
+        let flow = runner();
+        let store_c = CheckpointStore::new(Arc::clone(&store));
+
+        // Interrupted with zero actions acknowledged: the resume re-delivers
+        // the full remaining action list (at-least-once).
+        store_c
+            .save(&Checkpoint {
+                flow_id: "f".to_owned(),
+                flow_kind: "shipment_receipt".to_owned(),
+                state: serde_json::to_value(anchored()).unwrap(),
+                pending_event: Some(Event::RecordCommitted(shipment_record("lot-1", 2))),
+                next_action: 0,
+                step: "lot_anchored".to_owned(),
+                updated_at: 1,
+            })
+            .unwrap();
+        let out = flow
+            .handle(
+                &store,
+                &triage,
+                "f",
+                &ReceiptFlowState::AwaitingLot,
+                &Event::Resumed("r".into()),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!out.completed);
+        assert_eq!(out.actions.len(), 1);
+        assert!(matches!(out.actions[0], Action::EmitRecord(_)));
+
+        // Partial acknowledgement skips the executed prefix.
+        let store_c = CheckpointStore::new(Arc::clone(&store));
+        store_c
+            .save(&Checkpoint {
+                flow_id: "f".to_owned(),
+                flow_kind: "shipment_receipt".to_owned(),
+                state: serde_json::to_value(anchored()).unwrap(),
+                pending_event: Some(Event::RecordCommitted(shipment_record("lot-1", 2))),
+                next_action: 1,
+                step: "lot_anchored".to_owned(),
+                updated_at: 1,
+            })
+            .unwrap();
+        let out = flow
+            .handle(
+                &store,
+                &triage,
+                "f",
+                &ReceiptFlowState::AwaitingLot,
+                &Event::Resumed("r".into()),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(out.completed);
+        assert!(out.actions.is_empty());
+    }
+
+    /// A pending event the current transition table no longer accepts fails
+    /// the checkpoint closed — in `handle` and in `ack`.
+    #[test]
+    fn stale_pending_event_fails_closed_everywhere() {
+        let store = storage();
+        let triage = FlowTriage::new();
+        let flow = runner();
+        let store_c = CheckpointStore::new(Arc::clone(&store));
+
+        // Completed state cannot match a pending lot event (AnchorLot only
+        // fires on AwaitingLot).
+        let mismatch = Checkpoint {
+            flow_id: "f".to_owned(),
+            flow_kind: "shipment_receipt".to_owned(),
+            state: serde_json::to_value(completed_receipt()).unwrap(),
+            pending_event: Some(Event::RecordCommitted(lot_record(1))),
+            next_action: 0,
+            step: "completed".to_owned(),
+            updated_at: 1,
+        };
+        store_c.save(&mismatch).unwrap();
+        assert!(matches!(
+            flow.handle(
+                &store,
+                &triage,
+                "f",
+                &ReceiptFlowState::AwaitingLot,
+                &Event::Resumed("r".into())
+            ),
+            Err(WorkflowError::CheckpointMismatch { .. })
+        ));
+        assert!(matches!(
+            flow.ack(&store, &triage, "f", 1),
+            Err(WorkflowError::CheckpointMismatch { .. })
+        ));
+
+        // AwaitingLot state cannot match a pending shipment event either.
+        store_c
+            .save(&Checkpoint {
+                flow_id: "g".to_owned(),
+                flow_kind: "shipment_receipt".to_owned(),
+                state: serde_json::to_value(ReceiptFlowState::AwaitingLot).unwrap(),
+                pending_event: Some(Event::RecordCommitted(shipment_record("lot-1", 2))),
+                next_action: 0,
+                step: "awaiting_lot".to_owned(),
+                updated_at: 1,
+            })
+            .unwrap();
+        assert!(matches!(
+            flow.ack(&store, &triage, "g", 1),
+            Err(WorkflowError::CheckpointMismatch { .. })
+        ));
+    }
+
+    /// A stored state the flow definition no longer fits fails the checkpoint
+    /// closed with a deserialization error — in `handle`, `ack` and
+    /// `current_state`.
+    #[test]
+    fn corrupt_checkpoint_state_fails_closed_everywhere() {
+        let store = storage();
+        let triage = FlowTriage::new();
+        let flow = runner();
+        let store_c = CheckpointStore::new(Arc::clone(&store));
+
+        let corrupt = Checkpoint {
+            flow_id: "f".to_owned(),
+            flow_kind: "shipment_receipt".to_owned(),
+            state: json!("not a receipt state"),
+            // `ack` checks for pending work before deserializing the state,
+            // so a pending event is required to reach the state parse.
+            pending_event: Some(Event::Resumed("r".to_owned())),
+            next_action: 0,
+            step: String::new(),
+            updated_at: 1,
+        };
+        store_c.save(&corrupt).unwrap();
+        assert!(matches!(
+            flow.handle(
+                &store,
+                &triage,
+                "f",
+                &ReceiptFlowState::AwaitingLot,
+                &Event::Resumed("r".into())
+            ),
+            Err(WorkflowError::CheckpointDeserialization(_))
+        ));
+        assert!(matches!(
+            flow.ack(&store, &triage, "f", 0),
+            Err(WorkflowError::CheckpointDeserialization(_))
+        ));
+        assert!(matches!(
+            flow.current_state(&store, "f"),
+            Err(WorkflowError::CheckpointDeserialization(_))
+        ));
+        assert!(flow.current_state(&store, "unknown").unwrap().is_none());
+    }
+
+    /// `ack` with a partially-executed pending transition advances
+    /// `next_action` without finalizing.
+    #[test]
+    fn ack_advances_partial_progress() {
+        let store = storage();
+        let triage = FlowTriage::new();
+        let flow = runner();
+
+        // Produce a pending shipment transition (1 action, unacked).
+        let out = flow
+            .handle(
+                &store,
+                &triage,
+                "f",
+                &anchored(),
+                &Event::RecordCommitted(shipment_record("lot-1", 2)),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(out.actions.len(), 1);
+
+        // Executed 0 of 1 (clamped below the pending length): the checkpoint
+        // stays with the same pending event.
+        flow.ack(&store, &triage, "f", 0).unwrap();
+        let state = flow.current_state(&store, "f").unwrap().unwrap();
+        assert_eq!(state, anchored());
+
+        // Executing everything finalizes the completed flow (checkpoint gone).
+        flow.ack(&store, &triage, "f", 5).unwrap();
+        let state = flow.current_state(&store, "f").unwrap();
+        assert!(state.is_none());
+    }
+}

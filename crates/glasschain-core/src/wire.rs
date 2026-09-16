@@ -126,4 +126,10 @@ mod tests {
         let result = serde_json::from_str::<Carrier>(future);
         assert!(result.is_err(), "unknown discriminant must be rejected");
     }
+    #[test]
+    fn base64_decode_roundtrip_and_rejects_garbage() {
+        assert_eq!(base64_decode("aGVsbG8="), Some(b"hello".to_vec()));
+        assert_eq!(base64_decode("not base64!"), None);
+        assert_eq!(base64_decode(""), Some(Vec::new()));
+    }
 }

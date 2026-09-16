@@ -544,4 +544,21 @@ mod tests {
         assert_eq!(decoded.capability_id, "pdc");
         assert_eq!(decoded.activation_height, 10);
     }
+    #[test]
+    fn capability_set_len_and_is_empty() {
+        let mut set = CapabilitySet::default();
+        assert!(set.is_empty());
+        assert_eq!(set.len(), 0);
+
+        let activation = CapabilityActivation {
+            capability_id: "endorsement".to_owned(),
+            version: 1,
+            hash: crate::capability::capability_hash("endorsement", 1),
+            activation_height: 1,
+            signatures: Vec::new(),
+        };
+        set.insert_activation(&activation);
+        assert!(!set.is_empty());
+        assert_eq!(set.len(), 1);
+    }
 }

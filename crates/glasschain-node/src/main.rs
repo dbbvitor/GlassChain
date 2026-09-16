@@ -464,6 +464,391 @@ fn parse_command(line: &str) -> Result<Option<ReplCommand>, String> {
     }
 }
 
+/// CLI arguments, in the order they appear in `usage()`. Extracted from
+/// `main` so flag parsing is unit-testable without spawning the binary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CliArgs {
+    node_id: String,
+    listen_addr: String,
+    seed_peers: Vec<String>,
+    difficulty: usize,
+    storage_path: Option<String>,
+    org_name: Option<String>,
+    identity_node_id: Option<String>,
+    trust_store: Option<String>,
+    identity_file: Option<String>,
+    rpc_addr: Option<String>,
+}
+
+impl CliArgs {
+    fn defaults() -> Self {
+        Self {
+            node_id: "node-1".to_owned(),
+            listen_addr: "0.0.0.0:8000".to_owned(),
+            seed_peers: Vec::new(),
+            difficulty: 2,
+            storage_path: None,
+            org_name: None,
+            identity_node_id: None,
+            trust_store: None,
+            identity_file: None,
+            rpc_addr: None,
+        }
+    }
+}
+
+/// Parse `--flag value` pairs. Unknown flags are ignored (forward
+/// compatibility); a missing value keeps the current one.
+fn parse_args(args: &[String]) -> CliArgs {
+    let mut parsed = CliArgs::defaults();
+    let mut i = 1;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        i += 1;
+        if i >= args.len() {
+            break;
+        }
+        let value = &args[i];
+        i += 1;
+        match flag {
+            "--id" => parsed.node_id.clone_from(value),
+            "--listen" => parsed.listen_addr.clone_from(value),
+            "--peer" => parsed.seed_peers.push(value.clone()),
+            "--difficulty" => parsed.difficulty = value.parse().unwrap_or(2),
+            "--storage-path" => parsed.storage_path = Some(value.clone()),
+            "--org" => parsed.org_name = Some(value.clone()),
+            "--identity-node-id" => parsed.identity_node_id = Some(value.clone()),
+            "--trust-store" => parsed.trust_store = Some(value.clone()),
+            "--identity-file" => parsed.identity_file = Some(value.clone()),
+            "--rpc-addr" => parsed.rpc_addr = Some(value.clone()),
+            _ => {}
+        }
+    }
+    parsed
+}
+
+/// Log one node event in the REPL's `[event]` format. Extracted from the
+/// spawned logger task so the arm coverage is unit-testable.
+#[allow(clippy::too_many_lines)]
+fn log_event(evt: &NodeEvent) {
+    match evt {
+        NodeEvent::TransactionAccepted(tx) => {
+            log::info!("[event] Transaction accepted: {}", tx.id);
+        }
+        // The payload itself is never in the event stream (ADR-003).
+        NodeEvent::PrivatePayloadReceived {
+            collection,
+            commitment,
+        } => {
+            log::info!(
+                "[event] Private payload received: collection={collection} \
+                 commitment={}",
+                &commitment[..8]
+            );
+        }
+        NodeEvent::BlockMined {
+            index,
+            hash,
+            certificate: quorum,
+        } => {
+            let quorum_signers = quorum
+                .signers_bitmap
+                .iter()
+                .map(|b| b.count_ones())
+                .sum::<u32>();
+            log::info!(
+                "[event] Block mined: index={index} hash={} quorum_signers={quorum_signers}",
+                &hash[..8],
+            );
+        }
+        NodeEvent::BlockReceived {
+            index,
+            hash,
+            certificate: quorum,
+        } => {
+            let quorum_signers = quorum
+                .signers_bitmap
+                .iter()
+                .map(|b| b.count_ones())
+                .sum::<u32>();
+            log::info!(
+                "[event] Block received from peer: index={index} hash={} quorum_signers={quorum_signers}",
+                &hash[..8],
+            );
+        }
+        NodeEvent::PeerConnected(addr) => {
+            log::info!("[event] Peer connected: {addr}");
+        }
+        NodeEvent::EquivocationDetected { height, .. } => {
+            log::warn!(
+                "[event] EQUIVOCATION detected at height {height} - proof recorded for governance (ADR-009 section 4)"
+            );
+        }
+        NodeEvent::PeerDisconnected(addr) => {
+            log::info!("[event] Peer disconnected: {addr}");
+        }
+        NodeEvent::ContractExecuted {
+            contract_id,
+            quantity,
+        } => {
+            log::info!("[event] Contract {contract_id} auto-executed, qty={quantity}");
+        }
+        NodeEvent::AutonomousTransactionGenerated {
+            trigger_id,
+            transaction_id,
+        } => {
+            log::info!("[event] Watcher trigger {trigger_id} generated tx={transaction_id}");
+        }
+    }
+}
+
+/// REPL-scope identity material that `reload-trust-store` needs (ZT-R3).
+struct ReplContext {
+    org_name: Option<String>,
+    org_root_pem: Option<String>,
+    admin_gate: Option<AdminGate>,
+}
+
+/// Execute one parsed REPL command against the running node.
+///
+/// Returns `false` when the command was `Quit` (the REPL loop must stop).
+/// Extracted from `main` so every arm is unit-testable against a real node.
+#[allow(clippy::too_many_lines)]
+async fn execute_repl_command(node: &Node, cmd: ReplCommand, ctx: &ReplContext) -> bool {
+    match cmd {
+        ReplCommand::Help => usage(),
+        ReplCommand::Supply {
+            seller,
+            product_id,
+            product_name,
+            qty,
+            price,
+            lead_days,
+            currency,
+        } => {
+            let tx = Transaction::new(TransactionKind::SupplyOffer(SupplyOffer {
+                product_id,
+                product_name,
+                seller_id: seller,
+                quantity_available: qty,
+                price_per_unit: price,
+                lead_time_days: lead_days,
+                currency,
+            }));
+            match node.submit_transaction(tx).await {
+                Ok(()) => println!("Supply offer submitted."),
+                Err(e) => eprintln!("Error: {e}"),
+            }
+        }
+        ReplCommand::Order {
+            buyer,
+            seller,
+            product,
+            qty,
+            price,
+            currency,
+        } => {
+            let tx = Transaction::new(TransactionKind::PurchaseOrder(PurchaseOrder {
+                product_id: product,
+                buyer_id: buyer,
+                seller_id: seller,
+                quantity: qty,
+                agreed_price_per_unit: price,
+                currency,
+                contract_id: None,
+            }));
+            match node.submit_transaction(tx).await {
+                Ok(()) => println!("Purchase order submitted."),
+                Err(e) => eprintln!("Error: {e}"),
+            }
+        }
+        ReplCommand::Contract {
+            contract_id,
+            buyer,
+            product,
+            max_price,
+            min_qty,
+            max_qty,
+            max_lead,
+            currency,
+        } => {
+            let tx = Transaction::new(TransactionKind::ContractCreation(SmartContractDef {
+                contract_id,
+                buyer_id: buyer,
+                product_id: product,
+                conditions: PurchaseConditions {
+                    max_price_per_unit: max_price,
+                    min_quantity: min_qty,
+                    max_quantity: max_qty,
+                    max_lead_time_days: max_lead,
+                    preferred_seller_id: None,
+                    currency,
+                    auto_execute: true,
+                },
+                wasm_code_b64: None,
+            }));
+            match node.submit_transaction(tx).await {
+                Ok(()) => println!("Smart contract created."),
+                Err(e) => eprintln!("Error: {e}"),
+            }
+        }
+        ReplCommand::Inventory {
+            owner,
+            product,
+            delta,
+            reason,
+        } => {
+            let tx = Transaction::new(TransactionKind::InventoryUpdate(InventoryUpdate {
+                owner_id: owner,
+                product_id: product,
+                quantity_delta: delta,
+                reason,
+            }));
+            match node.submit_transaction(tx).await {
+                Ok(()) => println!("Inventory update submitted."),
+                Err(e) => eprintln!("Error: {e}"),
+            }
+        }
+        ReplCommand::Asset {
+            originator,
+            product_name,
+            gtin,
+            batch,
+            expiry,
+            serial,
+            qty,
+            event_type,
+        } => {
+            let asset = TraceableAsset {
+                gtin,
+                batch_number: batch,
+                expiry_date: expiry,
+                serial_number: serial,
+                anvisa_registration: None,
+                manufacturer_id: None,
+                product_name,
+                custodian_id: originator.clone(),
+                country_of_origin: None,
+                storage_temp_celsius: None,
+                quantity: qty,
+            };
+            let score = glasschain_core::MetadataTrustScore::compute(&asset);
+            println!(
+                "Metadata Trust Score: {} (fee multiplier: {:.0}%)",
+                score,
+                score.fee_multiplier() * 100.0
+            );
+            let tx = Transaction::new(TransactionKind::AssetRegistration(
+                TraceableAssetRegistration {
+                    asset,
+                    event_type,
+                    originator_id: originator,
+                    purchase_order_ref: None,
+                },
+            ));
+            match node.submit_transaction(tx).await {
+                Ok(()) => println!("Asset registration submitted."),
+                Err(e) => eprintln!("Error: {e}"),
+            }
+        }
+        ReplCommand::Chain => {
+            let ledger = node.ledger_snapshot().await;
+            println!("Chain length: {} blocks", ledger.chain.len());
+            for block in &ledger.chain {
+                println!(
+                    "  [{:>4}] {} | txns={} | prev={}…",
+                    block.index,
+                    &block.hash[..12],
+                    block.transactions.len(),
+                    &block.previous_hash[..8.min(block.previous_hash.len())]
+                );
+            }
+        }
+        ReplCommand::Pending => {
+            let ledger = node.ledger_snapshot().await;
+            println!(
+                "Pending transactions: {}",
+                ledger.pending_transactions.len()
+            );
+            for tx in &ledger.pending_transactions {
+                let kind = match &tx.kind {
+                    TransactionKind::SupplyOffer(_) => "SupplyOffer",
+                    TransactionKind::PurchaseOrder(_) => "PurchaseOrder",
+                    TransactionKind::ContractCreation(_) => "ContractCreation",
+                    TransactionKind::ContractExecution(_) => "ContractExecution",
+                    TransactionKind::InventoryUpdate(_) => "InventoryUpdate",
+                    TransactionKind::AssetRegistration(_) => "AssetRegistration",
+                    TransactionKind::CanonicalRecord(_) => "CanonicalRecord",
+                    TransactionKind::CapabilityActivation(_) => "CapabilityActivation",
+                    TransactionKind::PolicyUpdate(_) => "PolicyUpdate",
+                };
+                println!("  {} [{}]", tx.id, kind);
+            }
+        }
+        ReplCommand::Peers => {
+            let peers = node.known_peers().await;
+            if peers.is_empty() {
+                println!("No connected peers.");
+            } else {
+                println!("Known peers ({}):", peers.len());
+                for p in peers {
+                    println!("  {p}");
+                }
+            }
+        }
+        ReplCommand::Contracts => {
+            let summaries = node.contract_summaries().await;
+            if summaries.is_empty() {
+                println!("No contracts registered.");
+            } else {
+                println!("Contracts ({}):", summaries.len());
+                for s in &summaries {
+                    println!(
+                        "  [{}] buyer={} product={} status={} purchased={}/{}",
+                        s.id,
+                        s.buyer_id,
+                        s.product_id,
+                        s.status,
+                        s.quantity_purchased,
+                        s.max_quantity
+                    );
+                }
+            }
+        }
+        ReplCommand::ReloadTrustStore { path } => {
+            match (ctx.org_name.as_deref(), ctx.org_root_pem.as_deref()) {
+                (Some(org), Some(root_pem)) => {
+                    match build_trust_store_verifier(org, root_pem, &path) {
+                        Ok((verifier, files, crls)) => {
+                            node.set_cert_verifier(verifier.clone()).await;
+                            // The admin gate shares the swap (ZT-R3):
+                            // it verifies against the new chain/CRLs
+                            // from the next authorization on.
+                            if let Some(gate) = ctx.admin_gate.as_ref() {
+                                gate.update_verifier(Arc::new(verifier));
+                            }
+                            println!(
+                                "Trust store reloaded from {path}: {files} file(s), {crls} CRL(s) — the next Hello verifies against it."
+                            );
+                        }
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+                }
+                _ => {
+                    eprintln!(
+                        "reload-trust-store requires --org (there is no own Root CA to verify against)"
+                    );
+                }
+            }
+        }
+        ReplCommand::Quit => {
+            println!("Shutting down.");
+            return false;
+        }
+    }
+    true
+}
+
 #[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() {
@@ -477,84 +862,19 @@ async fn main() {
     }
 
     // Parse CLI arguments.
-    let mut node_id = "node-1".to_owned();
-    let mut listen_addr = "0.0.0.0:8000".to_owned();
-    let mut seed_peers: Vec<String> = Vec::new();
-    let mut difficulty = 2usize;
-    let mut storage_path: Option<String> = None;
-    let mut org_name: Option<String> = None;
-    let mut identity_node_id: Option<String> = None;
-    let mut trust_store: Option<String> = None;
-    let mut identity_file: Option<String> = None;
-    let mut rpc_addr: Option<String> = None;
-
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--id" => {
-                i += 1;
-                if let Some(v) = args.get(i) {
-                    node_id = v.clone();
-                }
-            }
-            "--listen" => {
-                i += 1;
-                if let Some(v) = args.get(i) {
-                    listen_addr = v.clone();
-                }
-            }
-            "--peer" => {
-                i += 1;
-                if let Some(v) = args.get(i) {
-                    seed_peers.push(v.clone());
-                }
-            }
-            "--difficulty" => {
-                i += 1;
-                if let Some(v) = args.get(i) {
-                    difficulty = v.parse().unwrap_or(2);
-                }
-            }
-            "--storage-path" => {
-                i += 1;
-                if let Some(v) = args.get(i) {
-                    storage_path = Some(v.clone());
-                }
-            }
-            "--org" => {
-                i += 1;
-                if let Some(v) = args.get(i) {
-                    org_name = Some(v.clone());
-                }
-            }
-            "--identity-node-id" => {
-                i += 1;
-                if let Some(v) = args.get(i) {
-                    identity_node_id = Some(v.clone());
-                }
-            }
-            "--trust-store" => {
-                i += 1;
-                if let Some(v) = args.get(i) {
-                    trust_store = Some(v.clone());
-                }
-            }
-            "--identity-file" => {
-                i += 1;
-                if let Some(v) = args.get(i) {
-                    identity_file = Some(v.clone());
-                }
-            }
-            "--rpc-addr" => {
-                i += 1;
-                if let Some(v) = args.get(i) {
-                    rpc_addr = Some(v.clone());
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
+    let args = parse_args(&args);
+    let CliArgs {
+        node_id,
+        listen_addr,
+        seed_peers,
+        difficulty,
+        storage_path,
+        org_name,
+        identity_node_id,
+        trust_store,
+        identity_file,
+        rpc_addr,
+    } = args;
 
     log::info!(
         "Starting GlassChain node id={node_id}  listen={listen_addr}  difficulty={difficulty}"
@@ -769,77 +1089,7 @@ async fn main() {
     let mut events = node.subscribe();
     tokio::spawn(async move {
         while let Ok(evt) = events.recv().await {
-            match &evt {
-                NodeEvent::TransactionAccepted(tx) => {
-                    log::info!("[event] Transaction accepted: {}", tx.id);
-                }
-                // The payload itself is never in the event stream (ADR-003).
-                NodeEvent::PrivatePayloadReceived {
-                    collection,
-                    commitment,
-                } => {
-                    log::info!(
-                        "[event] Private payload received: collection={collection} \
-                         commitment={}",
-                        &commitment[..8]
-                    );
-                }
-                NodeEvent::BlockMined {
-                    index,
-                    hash,
-                    certificate: quorum,
-                } => {
-                    let quorum_signers = quorum
-                        .signers_bitmap
-                        .iter()
-                        .map(|b| b.count_ones())
-                        .sum::<u32>();
-                    log::info!(
-                        "[event] Block mined: index={index} hash={} quorum_signers={quorum_signers}",
-                        &hash[..8],
-                    );
-                }
-                NodeEvent::BlockReceived {
-                    index,
-                    hash,
-                    certificate: quorum,
-                } => {
-                    let quorum_signers = quorum
-                        .signers_bitmap
-                        .iter()
-                        .map(|b| b.count_ones())
-                        .sum::<u32>();
-                    log::info!(
-                        "[event] Block received from peer: index={index} hash={} quorum_signers={quorum_signers}",
-                        &hash[..8],
-                    );
-                }
-                NodeEvent::PeerConnected(addr) => {
-                    log::info!("[event] Peer connected: {addr}");
-                }
-                NodeEvent::EquivocationDetected { height, .. } => {
-                    log::warn!(
-                        "[event] EQUIVOCATION detected at height {height} - proof recorded for governance (ADR-009 section 4)"
-                    );
-                }
-                NodeEvent::PeerDisconnected(addr) => {
-                    log::info!("[event] Peer disconnected: {addr}");
-                }
-                NodeEvent::ContractExecuted {
-                    contract_id,
-                    quantity,
-                } => {
-                    log::info!("[event] Contract {contract_id} auto-executed, qty={quantity}");
-                }
-                NodeEvent::AutonomousTransactionGenerated {
-                    trigger_id,
-                    transaction_id,
-                } => {
-                    log::info!(
-                        "[event] Watcher trigger {trigger_id} generated tx={transaction_id}"
-                    );
-                }
-            }
+            log_event(&evt);
         }
     });
 
@@ -876,10 +1126,13 @@ async fn main() {
     println!("GlassChain node `{node_id}` is running on {listen_addr}");
     println!("Type 'help' for available commands.\n");
 
-    // Interactive REPL. REPL-scope copies of the identity material the
-    // `reload-trust-store` command needs (ZT-R3).
-    let org_name_for_repl = org_name.clone();
-    let org_root_pem_for_repl = org_root_pem.clone();
+    // REPL-scope copies of the identity material the `reload-trust-store`
+    // command needs (ZT-R3).
+    let ctx = ReplContext {
+        org_name: org_name.clone(),
+        org_root_pem: org_root_pem.clone(),
+        admin_gate: admin_gate_handle,
+    };
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
     let mut line = String::new();
@@ -902,250 +1155,8 @@ async fn main() {
             }
         };
 
-        match cmd {
-            ReplCommand::Help => usage(),
-
-            ReplCommand::Supply {
-                seller,
-                product_id,
-                product_name,
-                qty,
-                price,
-                lead_days,
-                currency,
-            } => {
-                let tx = Transaction::new(TransactionKind::SupplyOffer(SupplyOffer {
-                    product_id,
-                    product_name,
-                    seller_id: seller,
-                    quantity_available: qty,
-                    price_per_unit: price,
-                    lead_time_days: lead_days,
-                    currency,
-                }));
-                match node.submit_transaction(tx).await {
-                    Ok(()) => println!("Supply offer submitted."),
-                    Err(e) => eprintln!("Error: {e}"),
-                }
-            }
-
-            ReplCommand::Order {
-                buyer,
-                seller,
-                product,
-                qty,
-                price,
-                currency,
-            } => {
-                let tx = Transaction::new(TransactionKind::PurchaseOrder(PurchaseOrder {
-                    product_id: product,
-                    buyer_id: buyer,
-                    seller_id: seller,
-                    quantity: qty,
-                    agreed_price_per_unit: price,
-                    currency,
-                    contract_id: None,
-                }));
-                match node.submit_transaction(tx).await {
-                    Ok(()) => println!("Purchase order submitted."),
-                    Err(e) => eprintln!("Error: {e}"),
-                }
-            }
-
-            ReplCommand::Contract {
-                contract_id,
-                buyer,
-                product,
-                max_price,
-                min_qty,
-                max_qty,
-                max_lead,
-                currency,
-            } => {
-                let tx = Transaction::new(TransactionKind::ContractCreation(SmartContractDef {
-                    contract_id,
-                    buyer_id: buyer,
-                    product_id: product,
-                    conditions: PurchaseConditions {
-                        max_price_per_unit: max_price,
-                        min_quantity: min_qty,
-                        max_quantity: max_qty,
-                        max_lead_time_days: max_lead,
-                        preferred_seller_id: None,
-                        currency,
-                        auto_execute: true,
-                    },
-                    wasm_code_b64: None,
-                }));
-                match node.submit_transaction(tx).await {
-                    Ok(()) => println!("Smart contract created."),
-                    Err(e) => eprintln!("Error: {e}"),
-                }
-            }
-
-            ReplCommand::Inventory {
-                owner,
-                product,
-                delta,
-                reason,
-            } => {
-                let tx = Transaction::new(TransactionKind::InventoryUpdate(InventoryUpdate {
-                    owner_id: owner,
-                    product_id: product,
-                    quantity_delta: delta,
-                    reason,
-                }));
-                match node.submit_transaction(tx).await {
-                    Ok(()) => println!("Inventory update submitted."),
-                    Err(e) => eprintln!("Error: {e}"),
-                }
-            }
-
-            ReplCommand::Asset {
-                originator,
-                product_name,
-                gtin,
-                batch,
-                expiry,
-                serial,
-                qty,
-                event_type,
-            } => {
-                let asset = TraceableAsset {
-                    gtin,
-                    batch_number: batch,
-                    expiry_date: expiry,
-                    serial_number: serial,
-                    anvisa_registration: None,
-                    manufacturer_id: None,
-                    product_name,
-                    custodian_id: originator.clone(),
-                    country_of_origin: None,
-                    storage_temp_celsius: None,
-                    quantity: qty,
-                };
-                let score = glasschain_core::MetadataTrustScore::compute(&asset);
-                println!(
-                    "Metadata Trust Score: {} (fee multiplier: {:.0}%)",
-                    score,
-                    score.fee_multiplier() * 100.0
-                );
-                let tx = Transaction::new(TransactionKind::AssetRegistration(
-                    TraceableAssetRegistration {
-                        asset,
-                        event_type,
-                        originator_id: originator,
-                        purchase_order_ref: None,
-                    },
-                ));
-                match node.submit_transaction(tx).await {
-                    Ok(()) => println!("Asset registration submitted."),
-                    Err(e) => eprintln!("Error: {e}"),
-                }
-            }
-
-            ReplCommand::Chain => {
-                let ledger = node.ledger_snapshot().await;
-                println!("Chain length: {} blocks", ledger.chain.len());
-                for block in &ledger.chain {
-                    println!(
-                        "  [{:>4}] {} | txns={} | prev={}…",
-                        block.index,
-                        &block.hash[..12],
-                        block.transactions.len(),
-                        &block.previous_hash[..8.min(block.previous_hash.len())]
-                    );
-                }
-            }
-
-            ReplCommand::Pending => {
-                let ledger = node.ledger_snapshot().await;
-                println!(
-                    "Pending transactions: {}",
-                    ledger.pending_transactions.len()
-                );
-                for tx in &ledger.pending_transactions {
-                    let kind = match &tx.kind {
-                        TransactionKind::SupplyOffer(_) => "SupplyOffer",
-                        TransactionKind::PurchaseOrder(_) => "PurchaseOrder",
-                        TransactionKind::ContractCreation(_) => "ContractCreation",
-                        TransactionKind::ContractExecution(_) => "ContractExecution",
-                        TransactionKind::InventoryUpdate(_) => "InventoryUpdate",
-                        TransactionKind::AssetRegistration(_) => "AssetRegistration",
-                        TransactionKind::CanonicalRecord(_) => "CanonicalRecord",
-                        TransactionKind::CapabilityActivation(_) => "CapabilityActivation",
-                        TransactionKind::PolicyUpdate(_) => "PolicyUpdate",
-                    };
-                    println!("  {} [{}]", tx.id, kind);
-                }
-            }
-
-            ReplCommand::Peers => {
-                let peers = node.known_peers().await;
-                if peers.is_empty() {
-                    println!("No connected peers.");
-                } else {
-                    println!("Known peers ({}):", peers.len());
-                    for p in peers {
-                        println!("  {p}");
-                    }
-                }
-            }
-
-            ReplCommand::Contracts => {
-                let summaries = node.contract_summaries().await;
-                if summaries.is_empty() {
-                    println!("No contracts registered.");
-                } else {
-                    println!("Contracts ({}):", summaries.len());
-                    for s in &summaries {
-                        println!(
-                            "  [{}] buyer={} product={} status={} purchased={}/{}",
-                            s.id,
-                            s.buyer_id,
-                            s.product_id,
-                            s.status,
-                            s.quantity_purchased,
-                            s.max_quantity
-                        );
-                    }
-                }
-            }
-
-            ReplCommand::ReloadTrustStore { path } => {
-                match (
-                    org_name_for_repl.as_deref(),
-                    org_root_pem_for_repl.as_deref(),
-                ) {
-                    (Some(org), Some(root_pem)) => {
-                        match build_trust_store_verifier(org, root_pem, &path) {
-                            Ok((verifier, files, crls)) => {
-                                node.set_cert_verifier(verifier.clone()).await;
-                                // The admin gate shares the swap (ZT-R3):
-                                // it verifies against the new chain/CRLs
-                                // from the next authorization on.
-                                if let Some(gate) = admin_gate_handle.as_ref() {
-                                    gate.update_verifier(Arc::new(verifier));
-                                }
-                                println!(
-                                    "Trust store reloaded from {path}: {files} file(s), {crls} CRL(s) — the next Hello verifies against it."
-                                );
-                            }
-                            Err(e) => eprintln!("Error: {e}"),
-                        }
-                    }
-                    _ => {
-                        eprintln!(
-                            "reload-trust-store requires --org (there is no own Root CA to verify against)"
-                        );
-                    }
-                }
-            }
-
-            ReplCommand::Quit => {
-                println!("Shutting down.");
-                break;
-            }
+        if !execute_repl_command(&node, cmd, &ctx).await {
+            break;
         }
     }
 }
@@ -1154,8 +1165,30 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_trust_store_verifier, parse_command, parse_price, ReplCommand};
+    use super::{
+        build_trust_store_verifier, execute_repl_command, log_event, parse_args, parse_command,
+        parse_price, CliArgs, ReplCommand, ReplContext,
+    };
     use glasschain_identity::Organization;
+    use glasschain_network::Node;
+    use std::sync::Arc;
+
+    /// Same held-socket allocation as the network suite's `free_addr`
+    /// (probe→drop→rebind is a Windows CI flake — see
+    /// `glasschain-network/tests/common/ports.rs`).
+    fn free_addr() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("bound address").to_string();
+        glasschain_network::stash_prebound_listener(&addr, listener);
+        addr
+    }
+
+    async fn repl_node(id: &str) -> (Node, String) {
+        let addr = free_addr();
+        let node = Node::new(id, &addr, 1);
+        node.start(vec![]).await.unwrap();
+        (node, addr)
+    }
 
     /// ZT-R3: the shared loader produces a verifier that (a) loads `*.pem`
     /// anchors and `*.crl` files from a directory, (b) accepts a single-file
@@ -1462,6 +1495,294 @@ mod tests {
             ("asset acme Widget 789 42 2026 1 x RECEIVED", "Invalid qty"),
         ] {
             assert_eq!(parse_command(line), Err(msg.to_owned()));
+        }
+    }
+
+    #[test]
+    fn parse_args_defaults_without_flags() {
+        assert_eq!(parse_args(&["bin".to_owned()]), CliArgs::defaults());
+    }
+
+    #[test]
+    fn parse_args_reads_every_flag() {
+        let args = [
+            "bin".to_owned(),
+            "--id".to_owned(),
+            "node-9".to_owned(),
+            "--listen".to_owned(),
+            "0.0.0.0:9000".to_owned(),
+            "--peer".to_owned(),
+            "127.0.0.1:8000".to_owned(),
+            "--peer".to_owned(),
+            "127.0.0.1:8001".to_owned(),
+            "--difficulty".to_owned(),
+            "4".to_owned(),
+            "--storage-path".to_owned(),
+            "/tmp/glasschain".to_owned(),
+            "--org".to_owned(),
+            "PharmaCorp".to_owned(),
+            "--identity-node-id".to_owned(),
+            "cert-node".to_owned(),
+            "--trust-store".to_owned(),
+            "/etc/trust".to_owned(),
+            "--identity-file".to_owned(),
+            "/var/lib/id.json".to_owned(),
+            "--rpc-addr".to_owned(),
+            "0.0.0.0:50051".to_owned(),
+        ];
+        let parsed = parse_args(&args);
+        assert_eq!(parsed.node_id, "node-9");
+        assert_eq!(parsed.listen_addr, "0.0.0.0:9000");
+        assert_eq!(parsed.seed_peers, vec!["127.0.0.1:8000", "127.0.0.1:8001"]);
+        assert_eq!(parsed.difficulty, 4);
+        assert_eq!(parsed.storage_path.as_deref(), Some("/tmp/glasschain"));
+        assert_eq!(parsed.org_name.as_deref(), Some("PharmaCorp"));
+        assert_eq!(parsed.identity_node_id.as_deref(), Some("cert-node"));
+        assert_eq!(parsed.trust_store.as_deref(), Some("/etc/trust"));
+        assert_eq!(parsed.identity_file.as_deref(), Some("/var/lib/id.json"));
+        assert_eq!(parsed.rpc_addr.as_deref(), Some("0.0.0.0:50051"));
+    }
+
+    #[test]
+    fn parse_args_ignores_unknown_flags_and_bad_difficulty() {
+        // Unknown flags are skipped with their values; an unparsable
+        // difficulty falls back to the default 2.
+        let args = [
+            "bin".to_owned(),
+            "--wat".to_owned(),
+            "x".to_owned(),
+            "--difficulty".to_owned(),
+            "not-a-number".to_owned(),
+            "--id".to_owned(),
+            "n".to_owned(),
+        ];
+        let parsed = parse_args(&args);
+        assert_eq!(parsed.node_id, "n");
+        assert_eq!(parsed.difficulty, 2);
+    }
+
+    #[test]
+    fn parse_args_tolerates_trailing_flag_without_value() {
+        let parsed = parse_args(&["bin".to_owned(), "--listen".to_owned()]);
+        assert_eq!(parsed.listen_addr, "0.0.0.0:8000");
+    }
+
+    fn no_ctx() -> ReplContext {
+        ReplContext {
+            org_name: None,
+            org_root_pem: None,
+            admin_gate: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn repl_submits_every_transaction_kind() {
+        let (node, _) = repl_node("repl-tx").await;
+        let ctx = no_ctx();
+
+        let supply = parse_command("supply acme p1 Widget 100 12.50 3 USD")
+            .unwrap()
+            .unwrap();
+        let order = parse_command("order buyer acme p1 5 9.99 USD")
+            .unwrap()
+            .unwrap();
+        let contract = parse_command("contract c1 buyer p1 12.50 10 50 7 USD")
+            .unwrap()
+            .unwrap();
+        let inventory = parse_command("inventory acme p1 -5 damaged")
+            .unwrap()
+            .unwrap();
+        let asset = parse_command("asset acme Widget 789012345678 42 2026-01-01 SN-1 5 RECEIVED")
+            .unwrap()
+            .unwrap();
+
+        assert!(execute_repl_command(&node, supply, &ctx).await);
+        assert!(execute_repl_command(&node, order, &ctx).await);
+        assert!(execute_repl_command(&node, contract, &ctx).await);
+        assert!(execute_repl_command(&node, inventory, &ctx).await);
+        assert!(execute_repl_command(&node, asset, &ctx).await);
+
+        let ledger = node.ledger_snapshot().await;
+        let kinds: Vec<&str> = ledger
+            .pending_transactions
+            .iter()
+            .map(|tx| match &tx.kind {
+                glasschain_core::TransactionKind::SupplyOffer(_) => "supply",
+                glasschain_core::TransactionKind::PurchaseOrder(_) => "order",
+                glasschain_core::TransactionKind::ContractCreation(_) => "contract",
+                glasschain_core::TransactionKind::InventoryUpdate(_) => "inventory",
+                glasschain_core::TransactionKind::AssetRegistration(_) => "asset",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["supply", "order", "contract", "inventory", "asset"]
+        );
+    }
+
+    #[tokio::test]
+    async fn repl_chain_shows_blocks_after_mining() {
+        let (node, _) = repl_node("repl-chain").await;
+        let ctx = no_ctx();
+
+        assert!(execute_repl_command(&node, ReplCommand::Chain, &ctx).await);
+        node.mine().await.unwrap();
+        assert!(execute_repl_command(&node, ReplCommand::Chain, &ctx).await);
+
+        let ledger = node.ledger_snapshot().await;
+        assert_eq!(ledger.chain.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn repl_pending_and_peers_and_contracts() {
+        let (node, addr_a) = repl_node("repl-lists").await;
+        let ctx = no_ctx();
+
+        // Pending: empty, then with one transaction.
+        assert!(execute_repl_command(&node, ReplCommand::Pending, &ctx).await);
+        let tx = parse_command("order buyer acme p1 5 9.99 USD")
+            .unwrap()
+            .unwrap();
+        execute_repl_command(&node, tx, &ctx).await;
+        assert!(execute_repl_command(&node, ReplCommand::Pending, &ctx).await);
+        assert_eq!(node.ledger_snapshot().await.pending_transactions.len(), 1);
+
+        // Peers: empty first (the "No connected peers." arm).
+        assert!(execute_repl_command(&node, ReplCommand::Peers, &ctx).await);
+
+        // Contracts: empty, then one registered.
+        assert!(execute_repl_command(&node, ReplCommand::Contracts, &ctx).await);
+        let contract = parse_command("contract c1 buyer p1 12.50 10 50 7 USD")
+            .unwrap()
+            .unwrap();
+        execute_repl_command(&node, contract, &ctx).await;
+        assert!(execute_repl_command(&node, ReplCommand::Contracts, &ctx).await);
+        assert_eq!(node.contract_summaries().await.len(), 1);
+
+        // Peers again, now with a real connection.
+        let peer_addr = free_addr();
+        let peer = Node::new("repl-peer", &peer_addr, 1);
+        peer.start(vec![addr_a.clone()]).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(execute_repl_command(&node, ReplCommand::Peers, &ctx).await);
+        assert!(!node.known_peers().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn repl_help_and_quit() {
+        let (node, _) = repl_node("repl-help").await;
+        assert!(execute_repl_command(&node, ReplCommand::Help, &no_ctx()).await);
+        assert!(!execute_repl_command(&node, ReplCommand::Quit, &no_ctx()).await);
+    }
+
+    #[tokio::test]
+    async fn repl_reload_trust_store_requires_org() {
+        let (node, _) = repl_node("repl-reload").await;
+        let reload = parse_command("reload-trust-store /tmp/somewhere")
+            .unwrap()
+            .unwrap();
+        // Without --org there is no own Root CA to verify against: the
+        // command errors but the REPL continues.
+        assert!(execute_repl_command(&node, reload, &no_ctx()).await);
+    }
+
+    #[tokio::test]
+    async fn repl_reload_trust_store_swaps_verifier_and_gate() {
+        let (node, _) = repl_node("repl-reload-ok").await;
+
+        let org = Organization::new("PharmaCorp").unwrap();
+        let peer_org = Organization::new("MedCorp").unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "glasschain-repl-reload-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("peer-root.pem"), &peer_org.root_ca_cert_pem).unwrap();
+        std::fs::write(dir.join("peer-root.crl"), peer_org.crl_pem().unwrap()).unwrap();
+        // Single-file store for the initial admin-gate verifier.
+        let single = dir.join("single.pem");
+        std::fs::write(&single, &peer_org.root_ca_cert_pem).unwrap();
+
+        let (gate_verifier, _, _) = build_trust_store_verifier(
+            "PharmaCorp",
+            &org.root_ca_cert_pem,
+            single.to_str().unwrap(),
+        )
+        .unwrap();
+        let ctx = ReplContext {
+            org_name: Some("PharmaCorp".to_owned()),
+            org_root_pem: Some(org.root_ca_cert_pem.clone()),
+            admin_gate: Some(glasschain_rpc::AdminGate::new(Arc::new(gate_verifier))),
+        };
+
+        // A bad path hits the `Err` branch and the REPL keeps going.
+        let reload = parse_command("reload-trust-store /tmp/bad-path")
+            .unwrap()
+            .unwrap();
+        assert!(execute_repl_command(&node, reload, &ctx).await);
+
+        // The directory store reload succeeds: files and CRLs counted,
+        // verifier and admin gate swapped.
+        let reload = parse_command(&format!("reload-trust-store {}", dir.to_str().unwrap()))
+            .unwrap()
+            .unwrap();
+        assert!(execute_repl_command(&node, reload, &ctx).await);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_event_covers_every_variant_without_panicking() {
+        use glasschain_core::{
+            Block, InventoryUpdate, QuorumCertificate, Transaction, TransactionKind,
+        };
+        use glasschain_network::NodeEvent;
+        let cert_block = Block::new(1, vec![], "0".to_owned());
+        let events = vec![
+            NodeEvent::TransactionAccepted(Transaction::new(TransactionKind::InventoryUpdate(
+                InventoryUpdate {
+                    product_id: "p1".to_owned(),
+                    owner_id: "o1".to_owned(),
+                    quantity_delta: 1,
+                    reason: "r".to_owned(),
+                },
+            ))),
+            NodeEvent::PeerConnected("127.0.0.1:1".to_owned()),
+            NodeEvent::PeerDisconnected("127.0.0.1:1".to_owned()),
+            NodeEvent::EquivocationDetected {
+                height: 3,
+                public_key: vec![1, 2, 3],
+            },
+            NodeEvent::ContractExecuted {
+                contract_id: "c1".to_owned(),
+                quantity: 5,
+            },
+            NodeEvent::AutonomousTransactionGenerated {
+                trigger_id: "t1".to_owned(),
+                transaction_id: "tx1".to_owned(),
+            },
+            NodeEvent::PrivatePayloadReceived {
+                collection: "orders".to_owned(),
+                commitment: "abcdef12rest".to_owned(),
+            },
+            NodeEvent::BlockMined {
+                index: 1,
+                hash: "abc123deadbeef99".to_owned(),
+                certificate: QuorumCertificate::pow(&cert_block),
+            },
+            NodeEvent::BlockReceived {
+                index: 2,
+                hash: "abc123deadbeef88".to_owned(),
+                certificate: QuorumCertificate::pow(&cert_block),
+            },
+        ];
+        for evt in &events {
+            log_event(evt);
         }
     }
 }

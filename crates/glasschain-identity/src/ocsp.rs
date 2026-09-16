@@ -648,4 +648,142 @@ mod tests {
             .expect_err("malformed");
         assert_eq!(error, OcspError::Malformed);
     }
+    #[test]
+    fn der_tlv_parser_rejects_malformed_encodings() {
+        let malformed = |input: &[u8]| {
+            assert!(
+                matches!(read_tlv(input), Err(OcspError::Malformed)),
+                "{input:?}"
+            );
+        };
+        // Too short to hold any TLV.
+        malformed(&[0x30]);
+        malformed(&[]);
+        // Indefinite length (0x80 without the high bit set) is non-minimal.
+        malformed(&[0x30, 0x80]);
+        // One-byte long form declaring a short (<0x80) length.
+        malformed(&[0x30, 0x81, 0x05]);
+        // Two-byte long form declaring a short (<0x100) length.
+        malformed(&[0x30, 0x82, 0x00, 0x05]);
+        // Long-form length byte >= 4 (unsupported).
+        malformed(&[0x30, 0x83, 0x00, 0x00, 0x05]);
+        // Truncated contents.
+        malformed(&[0x30, 0x05, 0x01]);
+
+        // A well-formed minimal TLV parses; trailing garbage must be
+        // consumed by `sequence_body`.
+        let (element, end) = read_tlv(&[0x30, 0x02, 0xAA, 0xBB]).unwrap();
+        assert_eq!(element.tag, 0x30);
+        assert_eq!(element.contents, &[0xAA, 0xBB]);
+        assert_eq!(end, 4);
+
+        assert_eq!(
+            sequence_body(&[0x30, 0x02, 0xAA, 0xBB]),
+            Ok(&[0xAAu8, 0xBB][..])
+        );
+        // Wrong tag.
+        assert_eq!(
+            sequence_body(&[0x31, 0x02, 0xAA, 0xBB]),
+            Err(OcspError::Malformed)
+        );
+        // Trailing bytes after the sequence.
+        assert_eq!(
+            sequence_body(&[0x30, 0x02, 0xAA, 0xBB, 0xFF]),
+            Err(OcspError::Malformed)
+        );
+
+        // Zero-length contents still decode (empty sequence body).
+        assert_eq!(read_sequence(&[]).unwrap().len(), 0);
+    }
+
+    /// The DER INTEGER encoder emits minimal, sign-padded encodings.
+    #[test]
+    fn der_integer_is_minimal_and_sign_padded() {
+        assert_eq!(integer(&[0x00, 0x00, 0x00, 0x01]), vec![0x02, 0x01, 0x01]);
+        // A leading 0x81 needs the zero pad (would otherwise look negative).
+        assert_eq!(integer(&[0x80]), vec![0x02, 0x02, 0x00, 0x80]);
+        // All-zero input encodes as 0.
+        assert_eq!(integer(&[0x00, 0x00]), vec![0x02, 0x01, 0x00]);
+    }
+    #[test]
+    fn generalized_time_is_strict() {
+        // Well-formed.
+        assert_eq!(read_generalized(b"20260916120000Z").unwrap(), 1_789_560_000);
+        // Non-digit / wrong length / missing Z.
+        assert!(matches!(
+            read_generalized(b"2026091612000Z"),
+            Err(OcspError::Malformed)
+        ));
+        assert!(matches!(
+            read_generalized(b"20260916120000X"),
+            Err(OcspError::Malformed)
+        ));
+        assert!(matches!(
+            read_generalized(b"202X0916120000Z"),
+            Err(OcspError::Malformed)
+        ));
+        // Out-of-range components.
+        assert!(matches!(
+            read_generalized(b"20261316120000Z"),
+            Err(OcspError::Malformed)
+        ));
+        assert!(matches!(
+            read_generalized(b"20260932120000Z"),
+            Err(OcspError::Malformed)
+        ));
+        assert!(matches!(
+            read_generalized(b"20260916250000Z"),
+            Err(OcspError::Malformed)
+        ));
+        assert!(matches!(
+            read_generalized(b"20260916126000Z"),
+            Err(OcspError::Malformed)
+        ));
+        assert!(matches!(
+            read_generalized(b"20260916120060Z"),
+            Err(OcspError::Malformed)
+        ));
+    }
+
+    /// Malformed staples fail closed, never panic.
+    #[test]
+    fn parse_staple_rejects_malformed_envelopes() {
+        assert!(matches!(parse_staple(&[]), Err(OcspError::Malformed)));
+        assert!(matches!(parse_staple(&[0xFF]), Err(OcspError::Malformed)));
+        // responseStatus other than successful (0).
+        let not_successful = [0x30u8, 0x03, 0x0A, 0x01, 0x01];
+        assert!(matches!(
+            parse_staple(&not_successful),
+            Err(OcspError::Malformed)
+        ));
+        // Successful status but no responseBytes.
+        let missing_response_bytes = [0x30u8, 0x03, 0x0A, 0x01, 0x00];
+        assert!(matches!(
+            parse_staple(&missing_response_bytes),
+            Err(OcspError::Malformed)
+        ));
+    }
+
+    /// The staple's serial and responder identity must match the issuer:
+    /// a staple minted for another org's certificate is `CertMismatch`.
+    #[test]
+    fn staples_are_bound_to_their_issuer_and_serial() {
+        let mut org = Organization::new("PharmaCorp").unwrap();
+        let admin = admin_org_with_admin(&mut org, "admin-node");
+        let staple = org.ocsp_response_der("admin-node").expect("staple");
+        let mut verifier = CertChainVerifier::from_org(&org).expect("verifier");
+        verifier.add_crl_pem(&org.crl_pem().unwrap()).expect("crl");
+
+        match verifier.verify_ocsp_staple(admin.certificate_pem.as_ref().unwrap(), &staple) {
+            Ok(OcspStatus::Good) => {}
+            other => panic!("own staple must attest good: {other:?}"),
+        }
+
+        // The staple does not attest a certificate from another org.
+        let mut foreign = Organization::new("MedCorp").unwrap();
+        let outsider = foreign.issue_identity("med-node").unwrap().clone();
+        let status =
+            verifier.verify_ocsp_staple(outsider.certificate_pem.as_ref().unwrap(), &staple);
+        assert!(status.is_err(), "a foreign certificate must not match");
+    }
 }

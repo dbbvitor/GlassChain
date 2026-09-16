@@ -997,4 +997,115 @@ mod tests {
             .expect_err("mismatched-context votes must fail aggregation");
         assert!(error.to_string().contains("does not verify"), "{error}");
     }
+    #[test]
+    fn provider_rejects_malformed_validator_material() {
+        let signing = PrivateKey::new([9; 64]);
+        let valid = ValidatorInfo {
+            name: "v".to_owned(),
+            public_key: signing.public_key().as_bytes(),
+            pop: signing.sign(b"glasschain-bls-pop").as_bytes(),
+        };
+
+        // Wrong key length is named in the error.
+        let mut bad_len = valid.clone();
+        bad_len.public_key = vec![1; 47];
+        let Err(err) = BftConsensusProvider::new(vec![bad_len], signing) else {
+            panic!("bad length must be rejected");
+        };
+        assert!(err.to_string().contains("expected 48"), "{err}");
+
+        // A 48-byte value that is not a valid BLS key.
+        let mut bad_key = valid.clone();
+        bad_key.public_key = vec![7; 48];
+        assert!(BftConsensusProvider::new(vec![bad_key], signing).is_err());
+
+        // An unparseable proof of possession.
+        let mut bad_pop = valid;
+        bad_pop.pop = vec![7; 96];
+        assert!(BftConsensusProvider::new(vec![bad_pop], signing).is_err());
+    }
+
+    #[test]
+    fn provider_accessors_expose_the_validator_view() {
+        let (provider, keys) = provider(3);
+        assert_eq!(provider.validator_count(), 3);
+        assert_eq!(provider.validators().len(), 3);
+        assert_eq!(provider.public_key(), keys[0].public_key().as_bytes());
+        assert_eq!(provider.signing_key(), &keys[0]);
+    }
+
+    #[test]
+    fn verify_vote_rejects_a_validator_outside_the_set() {
+        let (provider, _keys) = provider(2);
+
+        // An outsider's vote never matches a registered public key.
+        let outsider = PrivateKey::new([77; 64]);
+        let vote = BftVote {
+            height: 1,
+            round: 0,
+            phase: VotePhase::Prevote,
+            block_hash: "abc".to_owned(),
+            chain_id: String::new(),
+            public_key: outsider.public_key().as_bytes(),
+            signature: outsider.sign(b"vote").as_bytes(),
+            algorithm: crate::wire::SignatureAlgorithm::Bls12381,
+            context_signature: Vec::new(),
+        };
+        assert!(provider.verify_vote(&vote).is_err());
+    }
+
+    #[test]
+    fn verify_certificate_rejects_a_degenerate_quorum() {
+        let (provider, keys) = provider(3);
+        let mut ledger = Ledger::new(1);
+        let genesis = ledger.mine_pending_transactions().unwrap().clone();
+        let block = Block::new(1, vec![], genesis.hash);
+
+        let degenerate = QuorumCertificate {
+            block_index: 1,
+            block_hash: block.hash.clone(),
+            signers_bitmap: vec![0u8; 1],
+            aggregate_signature: Vec::new(),
+            algorithm: crate::wire::SignatureAlgorithm::Bls12381,
+        };
+        let err = provider
+            .verify_certificate(&degenerate, &block)
+            .expect_err("degenerate certificates are not final");
+        assert!(err.to_string().contains("degenerate"), "{err}");
+
+        // A genuine certificate signed by all validators verifies.
+        let real = aggregated_certificate(&block, &keys, &[0, 1, 2]);
+        provider.verify_certificate(&real, &block).unwrap();
+
+        // The same certificate against a different block fails.
+        let mut other = block.clone();
+        other.nonce += 1;
+        other.hash = other.calculate_hash();
+        assert!(provider.verify_certificate(&real, &other).is_err());
+
+        // A bitmap naming a validator beyond the set is malformed.
+        let mut oversized = real;
+        oversized.signers_bitmap = Vec::new();
+        assert!(provider.verify_certificate(&oversized, &block).is_err());
+    }
+
+    #[test]
+    fn consensus_provider_trait_validates_chaining_only() {
+        let (provider, _keys) = provider(1);
+        let ledger = Ledger::new(1);
+        let genesis = ledger.chain[0].clone();
+        let mut chained = Block::new(1, vec![], genesis.hash.clone());
+        chained.mine(1);
+        if let Err(e) = provider.validate_block(&chained, &genesis) {
+            panic!("chained block must validate: {e}");
+        }
+
+        let mut orphan = Block::new(2, vec![], "unrelated".to_owned());
+        orphan.mine(1);
+        let err = provider
+            .validate_block(&orphan, &chained)
+            .expect_err("orphan must fail");
+        assert!(err.to_string().contains("does not chain"), "{err}");
+        assert_eq!(provider.name(), "bft");
+    }
 }

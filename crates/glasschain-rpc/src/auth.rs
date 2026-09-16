@@ -1097,4 +1097,132 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), tonic::Code::Unauthenticated);
     }
+
+    /// Only some auth headers present: each missing one is named precisely.
+    #[test]
+    fn test_partial_headers_name_each_missing_one() {
+        let interceptor = MspAuthInterceptor::new_strict(TrustedKeyRegistry::new());
+
+        // Only the signature header: node-id and then ts are reported missing.
+        let mut map = tonic::metadata::MetadataMap::new();
+        map.insert("x-glasschain-auth-sig", "00".parse().unwrap());
+        let err = interceptor.verify_request(&map).unwrap_err();
+        assert!(err.to_string().contains("x-glasschain-node-id"), "{err}");
+
+        let mut map = tonic::metadata::MetadataMap::new();
+        map.insert("x-glasschain-node-id", "n1".parse().unwrap());
+        let err = interceptor.verify_request(&map).unwrap_err();
+        assert!(err.to_string().contains("x-glasschain-auth-ts"), "{err}");
+
+        let mut map = tonic::metadata::MetadataMap::new();
+        map.insert("x-glasschain-node-id", "n1".parse().unwrap());
+        map.insert(
+            "x-glasschain-auth-ts",
+            now_secs().to_string().parse().unwrap(),
+        );
+        let err = interceptor.verify_request(&map).unwrap_err();
+        assert!(err.to_string().contains("x-glasschain-auth-sig"), "{err}");
+    }
+
+    /// `Interceptor::call` delegates to `verify_request` (the tonic wiring).
+    #[test]
+    fn test_interceptor_call_delegates_to_verify_request() {
+        let mut interceptor = MspAuthInterceptor::new_strict(TrustedKeyRegistry::new());
+        let err = <MspAuthInterceptor as tonic::service::Interceptor>::call(
+            &mut interceptor,
+            tonic::Request::new(()),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    /// The `AdminGate` debug view names the type without leaking the verifier.
+    #[test]
+    fn test_admin_gate_debug() {
+        let gate = AdminGate::new(Arc::new(test_verifier(
+            &Organization::new("PharmaCorp").unwrap(),
+        )));
+        assert!(format!("{gate:?}").contains("AdminGate"));
+    }
+
+    /// `update_verifier` hot-swaps the trust store (ZT-R3): after the swap the
+    /// gate admits only the new organization's principals.
+    #[test]
+    fn test_admin_gate_update_verifier_swaps_the_trust_store() {
+        let mut old = Organization::new("PharmaCorp").unwrap();
+        let admin_old = old
+            .issue_identity_with_role("admin-node", Some(glasschain_identity::ADMIN_ROLE))
+            .unwrap()
+            .clone();
+        let mut new_org = Organization::new("MedCorp").unwrap();
+        let admin_new = new_org
+            .issue_identity_with_role("med-admin", Some(glasschain_identity::ADMIN_ROLE))
+            .unwrap()
+            .clone();
+
+        let gate = AdminGate::new(Arc::new(test_verifier(&old)));
+        gate.authorize(&admin_metadata(
+            &admin_old,
+            "admin-node",
+            &test_verifier(&old),
+        ))
+        .expect("old org admitted");
+
+        gate.update_verifier(Arc::new(test_verifier(&new_org)));
+        assert!(gate
+            .authorize(&admin_metadata(
+                &admin_old,
+                "admin-node",
+                &test_verifier(&old)
+            ))
+            .is_err());
+        gate.authorize(&admin_metadata(
+            &admin_new,
+            "med-admin",
+            &test_verifier(&new_org),
+        ))
+        .expect("new org admitted after the swap");
+    }
+
+    /// Missing admin headers each produce a precise denial.
+    #[test]
+    fn test_admin_gate_missing_headers_fail_precisely() {
+        let org = Organization::new("PharmaCorp").unwrap();
+        let gate = AdminGate::new(Arc::new(test_verifier(&org)));
+
+        // node-id present only → ts, sig, cert reported missing in order.
+        let mut map = tonic::metadata::MetadataMap::new();
+        map.insert("x-glasschain-node-id", "n1".parse().unwrap());
+        assert!(gate
+            .authorize(&map)
+            .unwrap_err()
+            .to_string()
+            .contains("x-glasschain-auth-ts"));
+
+        let mut map = tonic::metadata::MetadataMap::new();
+        map.insert("x-glasschain-node-id", "n1".parse().unwrap());
+        map.insert(
+            "x-glasschain-auth-ts",
+            now_secs().to_string().parse().unwrap(),
+        );
+        assert!(gate
+            .authorize(&map)
+            .unwrap_err()
+            .to_string()
+            .contains("x-glasschain-auth-sig"));
+
+        let mut map = tonic::metadata::MetadataMap::new();
+        map.insert("x-glasschain-node-id", "n1".parse().unwrap());
+        map.insert(
+            "x-glasschain-auth-ts",
+            now_secs().to_string().parse().unwrap(),
+        );
+        map.insert("x-glasschain-auth-sig", "0".repeat(128).parse().unwrap());
+        let err = gate.authorize(&map).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires an organization certificate"),
+            "{err}"
+        );
+    }
 }

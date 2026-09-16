@@ -849,7 +849,7 @@ impl GlasschainServer {
 
 #[cfg(test)]
 mod tests {
-    use super::event_to_response;
+    use super::{build_transaction_protos, event_to_response};
     use glasschain_core::{InventoryUpdate, Transaction, TransactionKind};
     use glasschain_network::NodeEvent;
 
@@ -944,5 +944,76 @@ mod tests {
             "autonomous_tx_generated",
             &serde_json::json!({ "trigger_id": "trig-1", "transaction_id": "tx-2" }),
         );
+    }
+
+    #[test]
+    fn test_event_mapping_payload_and_equivocation_variants() {
+        assert_maps(
+            &NodeEvent::PrivatePayloadReceived {
+                collection: "orders".into(),
+                commitment: "abc123".into(),
+            },
+            "private_payload_received",
+            &serde_json::json!({ "collection": "orders", "commitment": "abc123" }),
+        );
+        assert_maps(
+            &NodeEvent::EquivocationDetected {
+                height: 7,
+                public_key: vec![9, 9],
+            },
+            "equivocation_detected",
+            &serde_json::json!({ "height": 7, "public_key": [9, 9] }),
+        );
+    }
+
+    /// Every transaction kind renders its label into the proto payload.
+    #[test]
+    fn test_build_transaction_protos_labels_every_kind() {
+        use glasschain_core::endorsement::{PolicyExpression, PolicyUpdate, ScopedPolicies};
+        use glasschain_core::{
+            capability::{capability_hash, CapabilityActivation},
+            CanonicalRecord,
+        };
+        use std::collections::BTreeMap;
+
+        let mut payload = BTreeMap::new();
+        payload.insert("k".to_owned(), serde_json::json!("v"));
+        let kinds = vec![
+            TransactionKind::CanonicalRecord(CanonicalRecord::new(
+                1,
+                "lot",
+                payload.clone(),
+                "issuer",
+            )),
+            TransactionKind::CapabilityActivation(CapabilityActivation {
+                capability_id: "endorsement".to_owned(),
+                version: 1,
+                hash: capability_hash("endorsement", 1),
+                activation_height: 10,
+                signatures: Vec::new(),
+            }),
+            TransactionKind::PolicyUpdate(PolicyUpdate {
+                channel: "supply".to_owned(),
+                contract: String::new(),
+                policies: ScopedPolicies {
+                    channel_default: PolicyExpression::SignedBy(
+                        glasschain_core::endorsement::Principal::new("gov".to_owned()),
+                    ),
+                    contract_default: None,
+                    collection_policy: None,
+                    key_policies: Vec::new(),
+                },
+            }),
+        ];
+        let transactions: Vec<Transaction> = kinds.into_iter().map(Transaction::new).collect();
+        let block = glasschain_core::Block::new(1, transactions, "0".to_owned());
+        let protos = build_transaction_protos(&block);
+        assert_eq!(protos.len(), 3);
+        for label in ["CanonicalRecord", "CapabilityActivation", "PolicyUpdate"] {
+            assert!(
+                protos.iter().any(|p| p.kind == label),
+                "missing label {label}"
+            );
+        }
     }
 }

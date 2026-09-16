@@ -770,3 +770,167 @@ mod consensus_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod default_impl_tests {
+    use super::*;
+    use crate::block::Block;
+    use crate::providers::in_memory::InMemoryStorageProvider;
+    use crate::write_set::{PersistentWrite, WriteOp, WriteVisibility};
+    use std::sync::Arc;
+
+    fn genesis() -> Block {
+        let mut b = Block::new(0, vec![], "0".into());
+        b.mine(1);
+        b
+    }
+
+    fn write(channel: &str, contract: &str, key: &str, value: &[u8]) -> PersistentWrite {
+        PersistentWrite {
+            channel: channel.into(),
+            contract: contract.into(),
+            key: key.into(),
+            op: WriteOp::Set(value.to_vec()),
+            visibility: WriteVisibility::Public,
+        }
+    }
+
+    #[test]
+    fn validate_tip_chain_rejects_mismatched_links() {
+        let genesis = genesis();
+        let mut block = Block::new(1, vec![], genesis.hash.clone());
+        block.mine(1);
+
+        // Empty store accepts only block 0.
+        assert!(validate_tip_chain(&block, None).is_err());
+        assert!(validate_tip_chain(&genesis, None).is_ok());
+
+        // Chained tip accepts the next block only when hash and index match.
+        assert!(validate_tip_chain(&block, Some(&genesis)).is_ok());
+        let stale = Block::new(3, vec![], genesis.hash.clone());
+        assert!(validate_tip_chain(&stale, Some(&genesis)).is_err());
+        let wrong_hash = Block::new(1, vec![], "wrong".to_owned());
+        assert!(validate_tip_chain(&wrong_hash, Some(&genesis)).is_err());
+    }
+
+    /// A storage provider that does not override `apply_block`: the
+    /// default non-atomic implementation must commit the block and its
+    /// write set (Set and Delete) through the plain state seam.
+    #[derive(Default)]
+    struct DefaultApplyProvider {
+        inner: InMemoryStorageProvider,
+    }
+
+    impl StorageProvider for DefaultApplyProvider {
+        fn put_block(&self, block: &Block) -> Result<(), CoreError> {
+            self.inner.put_block(block)
+        }
+        fn get_block(&self, index: u64) -> Result<Option<Block>, CoreError> {
+            self.inner.get_block(index)
+        }
+        fn latest_block_index(&self) -> Result<Option<u64>, CoreError> {
+            self.inner.latest_block_index()
+        }
+        fn put_state(&self, key: &str, value: &[u8]) -> Result<(), CoreError> {
+            self.inner.put_state(key, value)
+        }
+        fn get_state(&self, key: &str) -> Result<Option<Vec<u8>>, CoreError> {
+            self.inner.get_state(key)
+        }
+        fn delete_state(&self, key: &str) -> Result<(), CoreError> {
+            self.inner.delete_state(key)
+        }
+        fn list_state_keys(&self, prefix: &str) -> Result<Vec<String>, CoreError> {
+            self.inner.list_state_keys(prefix)
+        }
+        fn name(&self) -> &'static str {
+            "default-apply"
+        }
+    }
+
+    #[test]
+    fn default_apply_block_chains_and_applies_write_sets() {
+        let store: Arc<dyn StorageProvider> = Arc::new(DefaultApplyProvider::default());
+        let genesis = genesis();
+        store.apply_block(&genesis).unwrap();
+        assert!(store.get_block(0).unwrap().is_some());
+
+        let mut block = Block::new(1, vec![], genesis.hash.clone());
+        block.write_set = vec![
+            write("supply", "inventory", "SKU-1", b"10"),
+            PersistentWrite {
+                channel: "supply".into(),
+                contract: "inventory".into(),
+                key: "SKU-2".into(),
+                op: WriteOp::Delete,
+                visibility: WriteVisibility::Public,
+            },
+        ];
+        block.mine(1);
+        store.apply_block(&block).unwrap();
+
+        assert_eq!(
+            store
+                .get_state("ws:supply:inventory:SKU-1")
+                .unwrap()
+                .as_deref(),
+            Some(&b"10"[..])
+        );
+        assert!(store
+            .get_state("ws:supply:inventory:SKU-2")
+            .unwrap()
+            .is_none());
+        // Applying a stale candidate is rejected by the tip check.
+        let stale = Block::new(1, vec![], genesis.hash);
+        assert!(store.apply_block(&stale).is_err());
+    }
+
+    #[test]
+    fn list_state_keys_lists_prefixed_keys_in_order() {
+        let store = InMemoryStorageProvider::new();
+        store.put_state("supply:inventory:b", b"1").unwrap();
+        store.put_state("supply:inventory:a", b"2").unwrap();
+        store.put_state("orders:inventory:a", b"3").unwrap();
+        let keys = store.list_state_keys("supply:inventory:").unwrap();
+        assert_eq!(keys, vec!["supply:inventory:a", "supply:inventory:b"]);
+    }
+
+    /// An execution provider that keeps the default `execute_with_state`
+    /// passthrough: the initial state is dropped and the plain `execute`
+    /// runs.
+    #[derive(Default)]
+    struct DefaultExecuteProvider;
+
+    impl ExecutionProvider for DefaultExecuteProvider {
+        fn execute(
+            &self,
+            _contract_id: &str,
+            payload: &[u8],
+            _limits: ExecutionLimits,
+        ) -> Result<ExecutionResult, CoreError> {
+            Ok(ExecutionResult {
+                ephemeral: vec![(String::from_utf8_lossy(payload).into_owned(), Vec::new())],
+                writes: Vec::new(),
+            })
+        }
+        fn name(&self) -> &'static str {
+            "default-execute"
+        }
+    }
+
+    #[test]
+    fn default_execute_with_state_passthrough_ignores_initial_state() {
+        let provider = DefaultExecuteProvider;
+        let limits = ExecutionLimits::new(1_000, 1_000);
+        let result = provider
+            .execute_with_state(
+                "c1",
+                b"payload",
+                std::collections::HashMap::default(),
+                limits,
+            )
+            .unwrap();
+        assert_eq!(result.ephemeral, vec![("payload".to_owned(), Vec::new())]);
+        assert_eq!(ExecutionLimits::new(7, 8).fuel_limit, 7);
+    }
+}
