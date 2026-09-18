@@ -1,0 +1,200 @@
+/* GlassChain demo — design system: Linear's dark precision meets Apple's
+   typography and spacing. Dark chassis, hairline borders, one accent. */
+
+:root {
+  --bg: #08090a;
+  --fg: #f7f8f8;
+  --muted: #8a8f98;
+  --hairline: rgba(255, 255, 255, 0.08);
+  --hairline-strong: rgba(255, 255, 255, 0.14);
+  --card: rgba(255, 255, 255, 0.03);
+  --card-solid: #131516;
+  --accent: #6e79e4;            /* Linear indigo */
+  --accent-soft: rgba(110, 121, 228, 0.16);
+  --good: #4cb782;
+  --good-soft: rgba(76, 183, 130, 0.14);
+  --warn: #eb5757;
+  --warn-soft: rgba(235, 87, 87, 0.14);
+  --gold: #d3b354;
+  --radius: 8px;
+  --radius-lg: 12px;
+  --shadow: 0 0 0 1px var(--hairline), 0 4px 24px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 12px 48px rgba(0, 0, 0, 0.55);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  padding: 0 1.4rem 4rem;
+  font: 15px/1.5 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  color: var(--fg);
+  background:
+    radial-gradient(1200px 500px at 50% -10%, rgba(110, 121, 228, 0.09), transparent 60%),
+    var(--bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1 {
+  font-size: 1.3rem; font-weight: 660; letter-spacing: -0.02em; margin: 0;
+  background: linear-gradient(180deg, #ffffff 0%, #b9bec9 100%);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+h2 {
+  font-size: 1.05rem; font-weight: 640; letter-spacing: -0.01em;
+  margin: 2.4rem 0 .55rem;
+}
+section { margin-bottom: 1.4rem; }
+h3 { font-size: .95rem; font-weight: 620; margin: 0 0 .3rem; }
+h4 { font-size: .85rem; font-weight: 620; margin: 1rem 0 .3rem; color: var(--muted); }
+
+a { color: var(--accent); }
+
+/* ── Light theme (toggle via html[data-theme="light"]) ──────────────────── */
+html[data-theme="light"] {
+  --bg: #f5f5f7;
+  --fg: #1d1d1f;
+  --muted: #6e6e73;
+  --hairline: rgba(0, 0, 0, 0.09);
+  --hairline-strong: rgba(0, 0, 0, 0.18);
+  --card: #ffffff;
+  --card-solid: #ffffff;
+  --accent: #3e4bd8;
+  --accent-soft: rgba(62, 75, 216, 0.1);
+  --good: #1f8a4d;
+  --good-soft: rgba(31, 138, 77, 0.12);
+  --warn: #c93838;
+  --warn-soft: rgba(201, 56, 56, 0.1);
+  --gold: #8f762d;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.05), 0 4px 16px rgba(0, 0, 0, 0.06);
+  --shadow-lg: 0 12px 48px rgba(0, 0, 0, 0.16);
+}
+html[data-theme="light"] body {
+  background:
+    radial-gradient(1200px 500px at 50% -10%, rgba(62, 75, 216, 0.06), transparent 60%),
+    var(--bg);
+}
+html[data-theme="light"] header {
+  background: rgba(245, 245, 247, 0.82);
+  border-bottom: 1px solid var(--hairline);
+}
+html[data-theme="light"] h1 {
+  background: linear-gradient(180deg, #1d1d1f 0%, #48484d 100%);
+  -webkit-background-clip: text; background-clip: text;
+}
+html[data-theme="light"] canvas {
+  background:
+    radial-gradient(900px 320px at 50% 0%, rgba(62, 75, 216, 0.1), transparent 70%),
+    #101418;
+}
+#member-drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; z-index: 50;
+  width: min(30em, 100vw);
+  background: var(--card-solid);
+  border-left: 1px solid var(--hairline);
+  box-shadow: var(--shadow-lg);
+  transform: translateX(102%);
+  transition: transform .3s cubic-bezier(.32,.72,.29,1);
+  padding: 0;
+  overflow: hidden;
+  display: flex; flex-direction: column;
+}
+#drawer-scroll-outer {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+}
+#drawer-content { padding: 1.8rem 2.4rem; }
+#member-drawer.open { transform: none; }
+#drawer-close {
+  position: absolute; top: .8rem; right: .8rem;
+  border: none; background: rgba(255, 255, 255, 0.08); color: var(--muted);
+  width: 2em; height: 2em; border-radius: 50%;
+  font-size: .85rem;
+  display: grid; place-items: center; padding: 0; line-height: 1;
+}
+#drawer-close:hover { background: rgba(255, 255, 255, 0.14); color: var(--fg); }
+.badge {
+  display: inline-block; padding: .08rem .55rem; border-radius: 6px;
+  font-size: .72rem; font-weight: 600;
+}
+.badge.evil { background: var(--warn-soft); color: var(--warn); }
+.badge.member { background: var(--good-soft); color: var(--good); }
+.badge.outsider { background: rgba(255, 255, 255, 0.06); color: var(--muted); }
+
+/* ── Parameters form (dense, Linear-style) ──────────────────────────────── */
+form.params, form#params-form {
+  display: flex; flex-wrap: wrap; gap: .6rem; align-items: center;
+  background: var(--card); border: 1px solid var(--hairline);
+  border-radius: var(--radius-lg); padding: .6rem .8rem;
+}
+form#params-form label {
+  display: flex; flex-direction: column; font-size: .72rem; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .04em;
+}
+form#params-form input { width: 4.5em; margin-top: .2rem; }
+
+@media (prefers-reduced-motion: reduce) {
+  button, #member-drawer, #drawer-backdrop, .bar > span { transition: none; }
+}
+
+/* ── Viewing-as banner ──────────────────────────────────────────────────── */
+#view-banner {
+  display: flex; gap: .6rem; align-items: center; flex-wrap: wrap;
+  background: var(--accent-soft); border: 1px solid rgba(110, 121, 228, 0.35);
+  border-radius: var(--radius); padding: .5rem .9rem; margin: 1rem 0 0;
+  font-size: .84rem;
+}
+#view-banner button {
+  margin-left: auto; font-size: .78rem; padding: .2rem .7rem;
+  background: transparent; border-color: var(--accent);
+  color: var(--accent);
+}
+tr.selected td { background: var(--accent-soft) !important; }
+
+/* Offers side by side in the Trade section */
+.offers-columns { display: flex; gap: 1.4rem; align-items: stretch; }
+.offers-columns > .chart-card {
+  flex: 1 1 0; min-width: 0;
+  display: flex; flex-direction: column;
+}
+.offers-columns .offer-stack { flex: 1 1 auto; }
+@media (max-width: 60em) { .offers-columns { flex-direction: column; } }
+
+.offers-column { min-width: 0; }
+.offer-stack { display: grid; gap: .6rem; }
+
+/* ── Member drawer as a mini orders overview ────────────────────────────── */
+.drawer-kpis { display: grid; grid-template-columns: repeat(2, 1fr); gap: .6rem; margin: .6rem 0; }
+.drawer-kpis .kpi {
+  background: rgba(255, 255, 255, 0.03); border: 1px solid var(--hairline);
+  border-radius: var(--radius); padding: .55rem .7rem;
+}
+html[data-theme="light"] .drawer-kpis .kpi { background: #fff; }
+.drawer-kpis .kpi dt { color: var(--muted); font-size: .68rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+.drawer-kpis .kpi dd { margin: .05rem 0 0; font-size: 1.15rem; font-weight: 640; font-variant-numeric: tabular-nums; }
+.drawer-kpis .kpi .sub { display: block; color: var(--muted); font-size: .68rem; font-weight: 400; letter-spacing: 0; text-transform: none; }
+.drawer-donut-wrap { display: flex; gap: 1rem; align-items: center; margin: .4rem 0 .8rem; }
+.drawer-donut {
+  width: 7em; height: 7em; border-radius: 50%; flex: none;
+  -webkit-mask: radial-gradient(circle at 50% 50%, transparent 0 2.2em, #000 2.3em);
+  mask: radial-gradient(circle at 50% 50%, transparent 0 2.2em, #000 2.3em);
+}
+.drawer-legend { list-style: none; margin: 0; padding: 0; font-size: .76rem; display: grid; gap: .2rem; }
+.drawer-orders table { font-size: .8rem; }
+.drawer-orders th, .drawer-orders td { padding: .35rem .55rem; }
+
+/* PDC inspection as a table */
+.pdc-table { font-size: .8rem; margin: .4rem 0 .6rem; }
+.pdc-table td, .pdc-table th { padding: .35rem .55rem; }
+
+/* Drawer elements fit the drawer's horizontal size */
+#drawer-content table { width: 100%; table-layout: auto; }
+#drawer-content td, #drawer-content th { overflow-wrap: break-word; word-break: break-word; }
+#drawer-content .metrics { grid-template-columns: 1fr 1fr; }
+
+/* Drawer tables keep readable column widths; overflow scrolls inside the
+   wrapper instead of crushing columns. */
+#drawer-content .pdc-table,
+#drawer-content .drawer-orders { min-width: 24em; }

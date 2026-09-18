@@ -99,6 +99,18 @@ cargo test  --workspace --all-targets --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
+### Watch the browser demo
+
+A standalone web app runs a synthetic supply-chain federation (six in-process
+nodes, PoW dev/test) in your browser — custody chains, certifications, PDC
+member views, and measured metrics. Presentation, not evidence:
+
+```bash
+cargo run --manifest-path demo/Cargo.toml   # then open http://127.0.0.1:18850/
+```
+
+Details and the honest boundary: [`docs/demo.md`](docs/demo.md).
+
 ---
 
 ## Read this before trusting it with real data

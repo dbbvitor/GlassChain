@@ -1,11 +1,73 @@
 # Plan — `glasschain-demo`: browser demo and benchmark web app
 
-**Status:** planned — no frontend, HTTP bridge or demo runner implemented
-**Reviewed:** 2026-09-05 against `f7b434e`
+**Status:** steps 1–3 + zero-trust/multi-company slice + docs-half of 6 shipped (2026-09-16/17); steps 4–5 pending
+**Reviewed:** 2026-09-05 against `f7b434e`; decisions settled by grill 2026-09-16 (below)
 **Tracking:** [Visual demo and benchmark harness](https://github.com/dbbvitor/GlassChain/issues/61)
 **Decision update:** the owner requested a **web app instead of the gpui desktop
 app** on 2026-09-05. The previous gpui pin, native-window/toolchain spike and
 “no web build” restriction are superseded. Keep this plan's path for existing links.
+
+## Settled decisions (grill 2026-09-16, supersedes step-0 detail)
+
+- **Scope:** steps 1–5 in the first build (no throwaway spike phase; the
+  spike's deliverables became settled decisions below) plus the docs half of
+  step 6. CI browser-smoke stays out.
+- **HTTP stack:** `axum` + SSE — already in the tree via tonic; a manifest
+  line, not a new compile unit.
+- **Frontend:** vanilla ES modules, plain CSS, `<canvas>`. No htmx (wants
+  HTML fragments, bridge is JSON), no Tailwind (build step / Play CDN), no
+  Leptos/Yew (wasm toolchain). Named fallback if the table/SSE code turns
+  gnarly: htmx as a single build-free file.
+- **WebGPU adoption bar:** p95 frame ≤ 16.7 ms at ~500 visible moving
+  elements on a mid-range iGPU; the same gate applies at step 0 and step 5.
+  The result (browser/version/device/failed-or-met) is recorded in
+  `docs/demo.md`; WebGPU code ships only if the bar is met, with Canvas2D
+  as the automatic fallback for missing adapters/device loss/reduced motion.
+- **Federation (expanded 2026-09-17):** multiple real companies per role
+  (3 manufacturers, 2 distributors, 2 logistics, 3 pharmacies, regulator,
+  2 certifiers = 13 honest nodes) **plus two evil companies** — `QuimicaFalsa`
+  (verified, not a `pricing` member: membership-gate + strict-schema
+  rejections) and `DipFakeCerts` (no verifier: fail-closed #86 rejection;
+  under-metadata registration admitted with a flagged trust score). Every
+  rejection shown is a real code path; equivocation evidence surfaces only
+  if the staged BFT engine emits it and is labelled unavailable otherwise.
+  Scenario arc per lot: asset registration → custody transfer → quality
+  certification → audit attestation, with a member-only pricing payload.
+- **Visibility (added 2026-09-17):** per-member views (`?as=<company>`) are
+  served from each member's OWN node — its chain height and transient store,
+  not the leader's state laundered through a filter — and the UI renders a
+  who-sees-what matrix.
+- **Manual transactions (added 2026-09-17):** a second real contract
+  (`manual-review`, `auto_execute=false`) holds offers priced above the
+  `auto-replenish` cap for a human buyer; `POST /api/purchase` completes one
+  as the viewing pharmacy. The offers sidebar shows every advertised offer;
+  graph dots are per-transaction (click → details drawer).
+- **WMS + explained interactions (added 2026-09-17):** a WMS dashboard
+  derived from committed custody chains (who holds what, movement totals);
+  every adversary row carries a human explanation of the gate that answered,
+  expandable on click and mirrored in the member drawer; Apple-grade CSS
+  design system with reduced-motion support.
+- **Parameters + contract flow (added 2026-09-17):** companies per role,
+  evil count, lots/round and interval are live-editable (`POST /api/params`,
+  sanitized, topology-affecting changes rebuild mid run); the real contract
+  engine matches SupplyOffers into PurchaseOrders (`auto-replenish`,
+  auto-execute) and the UI shows offer → match rows; canvas edges thicken
+  with per-pair traffic; the graph is interactive (click = view as that
+  member, drag = rearrange, hover = tooltip).
+- **Star-center mining:** the wire engine relays transactions one hop, so the
+  demo's block producer is the star center every company dials; documented in
+  `docs/demo.md`. Never construct demo nodes with `127.0.0.1:0` — reserve
+  concrete ports via `stash_prebound_listener`.
+- **Security slice:** loopback-only bind; `Origin` check on state-changing
+  commands; random per-run capability token issued at page serve, passed
+  back in a header for commands (the CSRF defense; no cookies), never a
+  query param; PDC filtering enforced server-side before serialization.
+- **PoW, uniform, difficulty 1:** the staged BFT engine's attested blocks
+  can be rejected at peers' PoW admission (consensus_capacity.rs); the demo
+  stays uniform PoW and labels commit latency as PoW.
+- **Docs:** `docs/demo.md` + README entry when runnable. No ADR (the
+  web-over-gpui call is recorded here and in the issue; the rest is cheap
+  to reverse).
 
 ## Goal
 
@@ -19,6 +81,7 @@ installing a native GUI; hosted multi-user access is a separate security scope.
 consensus mode, synthetic workload and in-process topology, and link the
 [benchmark record](../../docs/benchmarks/consensus-capacity.md). A local animated
 federation cannot establish the ADR-010 testnet, security or scalability gates.
+(See the **synthetic demo run** glossary term, `CONTEXT.md`.)
 
 ## 1. What exists, what does not
 
@@ -154,28 +217,41 @@ limits explicitly rather than drawing successful security or recovery guarantees
 
 ## 6. Implementation order and completion gates
 
-- [ ] **0 — Browser/bridge spike.** One static page reads a bounded synthetic
+- [x] **0 — Browser/bridge spike.** One static page reads a bounded synthetic
   snapshot from a local Rust service and starts/stops a run through validated
   commands. Record the HTTP/tooling choice, session boundary and browser support
   matrix. Compare Canvas2D with a small WebGPU view; settle renderer scope from
-  evidence, not a framework preference.
-- [ ] **1 — Package and shared fixtures.** Add the excluded demo package/static
+  evidence, not a framework preference. *(Settled by grill 2026-09-16 instead of
+  a throwaway spike: axum + SSE, vanilla ES modules, session-token commands;
+  the Canvas2D/WebGPU comparison runs against the shipped app with the p95 ≤
+  16.7 ms gate, still pending a real-device measurement.)*
+- [x] **1 — Package and shared fixtures.** Add the excluded demo package/static
   assets, extract only the workload code both tests and runner use, and preserve
   existing harness results. Pin any new tooling in the demo, not core crates.
-- [ ] **2 — Headless real-node runner.** Seed/start/stop/reset, bounded resources,
+  *(Shipped: `demo/` excluded from the workspace; scenario fixtures distilled
+  from the consensus-capacity/SNCM harnesses in `demo/src/scenario.rs`.)*
+- [x] **2 — Headless real-node runner.** Seed/start/stop/reset, bounded resources,
   cleanup and authoritative metrics; tests run without a browser/GPU.
-- [ ] **3 — Functional web slice.** DOM controls, scenario state and a custody
+  *(Shipped: `spawn_run`/`run_one_round` over real `Node`s; bounded snapshot,
+  rolling metrics, stop = task abort, reset = state wipe.)*
+- [x] **3 — Functional web slice.** DOM controls, scenario state and a custody
   table/graph; authorized public/commitment views are visibly distinct. A user
   traces a synthetic lot from shelf to origin without reading Rust.
+  *(Shipped: `demo/static/` — start/stop/reset, custody + cert tables, metrics
+  grid, activity feed, per-org view selector; server-side PDC filtering.)*
 - [ ] **4 — Metrics and faults.** Same metric contract as performance plan;
   seeded WAN/partition controls when those harness capabilities exist. Show
   missing instrumentation as unavailable, not fabricated measurements.
 - [ ] **5 — Optional WebGPU acceleration.** Land only with the spike's measurable
   benefit, renderer equivalence and fallback/device-loss tests. No core dependency.
-- [ ] **6 — CI and documentation.** Dedicated demo Rust checks plus browser smoke/
+  *(Experiment code exists behind the measured-budget gate; the real-device
+  comparison is pending.)*
+- [x] **6 — CI and documentation.** Dedicated demo Rust checks plus browser smoke/
   accessibility tests in fallback mode; optional GPU-capable smoke separately.
   Add `docs/demo.md` when runnable and a short README entry. Explain synthetic
   scope and how to reproduce headless versus rendered measurements.
+  *(Docs half shipped: `docs/demo.md` + README + docs index entries. Browser
+  smoke/accessibility CI is out of scope for this pass.)*
 
 ## Validation
 

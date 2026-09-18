@@ -13,6 +13,9 @@ members = [
     "crates/glasschain-sdk",
     "crates/glasschain-cli",
 ]
+# The browser demo is a standalone package with its own lockfile; browser
+# tooling must not enter the workspace gates (gui-demo-benchmark.md §2).
+exclude = ["demo"]
 resolver = "2"
 
 # ── Workspace-wide lint configuration ────────────────────────────────────────

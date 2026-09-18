@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GlassChain demo — synthetic supply chain</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="shell">
+    <aside id="side">
+      <div class="brand"><span class="brand-mark">◆</span> GlassChain</div>
+      <nav class="side-nav" aria-label="Sections">
+        <a href="#sec-federation">Federation</a>
+        <a href="#sec-wms">Inventory</a>
+        <a href="#sec-lots">Lots &amp; custody</a>
+        <a href="#sec-trade">Trade</a>
+        <a href="#sec-security">Zero trust</a>
+      </nav>
+      <div class="side-block">
+        <h4>Viewing as</h4>
+        <select id="view-org" title="See the whole page through this member's eyes">
+          <option value="">Public view</option>
+        </select>
+        <button id="btn-clear-view" class="side-btn" title="Back to the public view">Return to public view</button>
+      </div>
+      <div class="side-foot">
+        <button id="btn-theme" title="Toggle light / dark appearance" aria-label="Toggle light or dark appearance">◐</button>
+      </div>
+    </aside>
+
+    <main id="main">
+      <header>
+        <div class="head-title">
+          <h1>GlassChain demo</h1>
+          <span id="mode-label" class="mode" title="Consensus mode and scope of this demo — synthetic only, never production evidence"></span>
+        </div>
+        <div class="controls">
+          <button id="btn-start" title="Start the synthetic supply-chain rounds — real nodes, real blocks">Start</button>
+          <button id="btn-stop" title="Abort the runner; nodes are dropped, state keeps for inspection">Stop</button>
+          <button id="btn-reset" class="danger" title="Abort the run and wipe the shared view state">Reset</button>
+          <span id="run-status" class="status-pill" title="Runner state: idle / running / rebuilding / stopped">idle</span>
+          <span id="connection" class="status-pill" data-live="reconnecting" title="Live snapshot stream — reconnects refetch the authoritative snapshot">disconnected</span>
+        </div>
+      </header>
+
+      <div id="view-banner" class="hidden">
+        Viewing as <b id="view-banner-name"></b> — <span id="view-banner-text"></span>
+        <button id="btn-banner-clear" title="Back to the public view">Return to public view</button>
+      </div>
+
+      <section id="sec-federation">
+        <canvas id="federation" width="900" height="460" role="img"
+          aria-label="Interactive diagram of member companies exchanging transactions. Click a node to open that member's view; drag to rearrange; hover for details."></canvas>
+        <p id="renderer-info" class="renderer-info"></p>
+        <p class="hint">Line thickness = transactions moved. Click any node to open its member view. Nodes are colored by role; evil companies are red.</p>
+
+        <h2>Simulation parameters</h2>
+        <p class="hint">Edit any value and apply — changes take effect immediately; topology changes rebuild the federation mid run without losing your counters.</p>
+        <form id="params-form" autocomplete="off">
+          <label title="How many manufacturer companies exist in the federation">Manufacturers <input type="number" name="manufacturers" min="1" max="6" value="3"></label>
+          <label title="Distribution centers">Distributors <input type="number" name="distributors" min="1" max="5" value="2"></label>
+          <label title="Logistics carriers">Logistics <input type="number" name="logistics" min="1" max="5" value="2"></label>
+          <label title="Retail pharmacies — they buy through the contract">Pharmacies <input type="number" name="pharmacies" min="1" max="6" value="3"></label>
+          <label title="Regulators see every private payload">Regulators <input type="number" name="regulators" min="0" max="3" value="1"></label>
+          <label title="Certification bodies — issue quality certifications and audit attestations">Certifiers <input type="number" name="certifiers" min="1" max="4" value="2"></label>
+          <label title="Adversary nodes attacking every round: payload smuggling, forged records, bad metadata">Evil nodes <input type="number" name="evil_nodes" min="0" max="5" value="2"></label>
+          <label title="How many lots each round produces">Lots/round <input type="number" name="lots_per_round" min="1" max="20" value="3"></label>
+          <label title="Pause between rounds">Interval (ms) <input type="number" name="round_interval_ms" min="100" max="10000" step="50" value="400"></label>
+          <button type="submit" title="Apply now — rejections are clamped to safe bounds">Apply</button>
+          <span id="params-status" class="hint"></span>
+        </form>
+      </section>
+
+      <section id="sec-wms">
+        <h2 title="Warehouse Management Systems view — where every lot physically sits right now, derived from the committed custody chains">Inventory</h2>
+        <p class="hint">Where the goods are right now — read from committed custody events on the chain, not from memory. Value is on-hand × the $15.00 retail price (demo bookkeeping).</p>
+        <dl id="wms-summary" class="metrics"></dl>
+        <div class="wms-charts">
+          <div class="chart-card">
+            <div class="chart-head">
+              <h3>Stock Level by Member</h3>
+              <span class="chart-note">on-hand units · committed custody</span>
+            </div>
+            <div id="wms-bars" class="wms-bars"></div>
+          </div>
+          <div class="chart-card">
+            <div class="chart-head">
+              <h3>Inventory Value Share</h3>
+              <span class="chart-note">of total value</span>
+            </div>
+            <div class="donut-wrap">
+              <div id="wms-donut" class="donut" role="img" aria-label="Inventory value share per member"></div>
+              <ul id="wms-legend" class="donut-legend"></ul>
+            </div>
+          </div>
+        </div>
+        <div class="chart-card">
+          <div class="chart-head">
+            <h3>Inventory Directory</h3>
+            <span class="chart-note">click a member to manage it</span>
+          </div>
+          <div class="table-scroll">
+        <table id="wms-directory">
+            <thead><tr><th>Member</th><th>Type</th><th>Lots</th><th>Total Units</th><th>Stock Value</th><th>Retail Sold</th></tr></thead>
+            <tbody id="wms-directory-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="sec-lots">
+        <h2>Lots and custody chains</h2>
+        <div class="table-scroll">
+          <table id="lots" class="fixed" aria-describedby="lots-desc">
+            <colgroup><col class="c-lot"><col class="c-status"><col class="c-maker"><col class="c-trust"><col></colgroup>
+            <thead>
+              <tr>
+                <th title="Synthetic lot identifier">Lot</th>
+                <th title="complete = the lot's custody chain reached the pharmacy on-chain">Status</th>
+                <th title="The company that manufactured the lot">Maker</th>
+                <th title="MetadataTrustScore of the origin registration — missing core fields drop the score">Trust</th>
+                <th title="Committed custody events: event → custodian @ block">Custody chain</th>
+              </tr>
+            </thead>
+            <tbody id="lots-body"></tbody>
+          </table>
+        </div>
+        <div id="lots-resize" class="resize-handle" title="Drag to resize the table height"></div>
+        <p class="hint">Click a lot for its full history, PDC info and graph path.</p>
+      </section>
+
+      <section id="sec-trade">
+        <h2>Trade</h2>
+        <div class="offers-columns">
+          <div class="chart-card">
+            <div class="chart-head">
+              <h3>Pending — awaiting buyer</h3>
+              <span class="chart-note">premium offers only; Buy with a quantity</span>
+            </div>
+            <div id="offers-pending" class="offer-stack"></div>
+          </div>
+          <div class="chart-card">
+            <div class="chart-head">
+              <h3>Executed</h3>
+              <span class="chart-note">committed purchases + filled offers</span>
+            </div>
+            <div id="offers-executed" class="offer-stack"></div>
+          </div>
+        </div>
+        <h3 title="Every purchase the contract engine or a human buyer committed">Purchases</h3>
+        <div class="table-scroll">
+        <table id="purchases">
+          <thead><tr><th>Product</th><th>Seller</th><th>Buyer</th><th>Qty</th><th>Price</th><th>Note</th></tr></thead>
+          <tbody id="purchases-body"></tbody>
+        </table>
+        </div>
+        <h3>Certifications and audits</h3>
+        <div class="table-scroll">
+        <table id="certs">
+          <thead><tr><th>Record</th><th>Type</th><th>Lot</th><th>Issuer</th><th>Status</th></tr></thead>
+          <tbody id="certs-body"></tbody>
+        </table>
+        </div>
+      </section>
+
+      <section id="sec-security">
+        <h2>Zero trust — adversary outcomes</h2>
+        <p class="hint">Evil companies attack every round. Every rejection is a real GlassChain code path. <strong>Click a row</strong> to see exactly why it happened and which gate answered.</p>
+        <div class="table-scroll">
+        <table id="security">
+          <thead><tr><th>Actor</th><th>Action</th><th>Outcome</th><th>Enforced by</th></tr></thead>
+          <tbody id="security-body"></tbody>
+        </table>
+        </div>
+        <ul id="equivocations" class="hidden"></ul>
+
+        <h2>Who sees what — visibility matrix</h2>
+        <p class="hint">Same chain, different views: the matrix is filled from each member's own node. Members hold the private `pricing` payloads; non-members hold only their on-chain commitments.</p>
+        <div class="table-scroll">
+        <table id="visibility">
+          <thead><tr><th>Company</th><th>Role</th><th>Chain</th><th>PDC `pricing`</th></tr></thead>
+          <tbody id="visibility-body"></tbody>
+        </table>
+        </div>
+      </section>
+
+      <section>
+        <h2>Run metrics</h2>
+        <dl id="metrics" class="metrics"></dl>
+
+        <h2>Activity (last events)</h2>
+        <ul id="feed" aria-label="Recent runner activity"></ul>
+      </section>
+    </main>
+  </div>
+
+  <footer>
+    <p>
+      Synthetic demo run: seeded transactions through real local GlassChain nodes.
+      Admission is not finality and nothing here establishes ADR-010 security or
+      scalability gates. See
+      <a href="https://github.com/dbbvitor/GlassChain/blob/main/docs/benchmarks/consensus-capacity.md">the benchmark record</a>.
+    </p>
+  </footer>
+
+  <div id="drawer-backdrop"></div>
+  <aside id="member-drawer" aria-label="Member view">
+    <div id="drawer-scroll-outer">
+      <div id="drawer-content"></div>
+    </div>
+    <button id="drawer-close" title="Close">✕</button>
+  </aside>
+
+  <noscript><p>This demo needs JavaScript and a same-origin connection.</p></noscript>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
