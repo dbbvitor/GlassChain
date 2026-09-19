@@ -29,7 +29,7 @@ bls-signatures = { version = "0.15", default-features = false, features = [
 # directly (ADR-015). `group`/`pairing` are blstrs' version-matched algebraic
 # trait crates.
 blstrs = { version = "0.7", default-features = false, optional = true }
-group = { version = "0.13", default-features = false, optional = true }
+group = { version = "0.14", default-features = false, optional = true }
 pairing = { version = "0.23", default-features = false, optional = true }
 
 [features]
@@ -47,7 +47,7 @@ criterion = "0.8"
 bls12_381 = { version = "0.8", features = ["experimental"] }
 bls-signatures = { version = "0.15", default-features = false, features = ["blst"] }
 blstrs = { version = "0.7", default-features = false }
-group = { version = "0.13", default-features = false }
+group = { version = "0.14", default-features = false }
 pairing = { version = "0.23", default-features = false }
 
 [[bench]]
