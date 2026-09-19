@@ -23,10 +23,12 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Static assets, embedded: the page, the app, the styles.
+/// Static assets, embedded: the page, the app modules, the styles.
 mod statics {
     pub const HTML: &str = include_str!("../static/index.html");
     pub const APP_JS: &str = include_str!("../static/app.js");
+    pub const VIEWS_JS: &str = include_str!("../static/views.js");
+    pub const GRAPH_JS: &str = include_str!("../static/graph.js");
     pub const STYLES: &str = include_str!("../static/style.css");
 }
 
@@ -311,6 +313,14 @@ async fn main() {
         .route(
             "/app.js",
             get(|| async { asset_response(statics::APP_JS, "text/javascript; charset=utf-8") }),
+        )
+        .route(
+            "/views.js",
+            get(|| async { asset_response(statics::VIEWS_JS, "text/javascript; charset=utf-8") }),
+        )
+        .route(
+            "/graph.js",
+            get(|| async { asset_response(statics::GRAPH_JS, "text/javascript; charset=utf-8") }),
         )
         .route(
             "/style.css",

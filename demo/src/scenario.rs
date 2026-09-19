@@ -7,11 +7,12 @@
 //! Presentation only — never production evidence.
 
 use glasschain_core::{
-    capability_hash, CanonicalRecord, CapabilityActivation, InventoryUpdate, MetadataTrustScore,
-    PurchaseConditions, PurchaseOrder, RecordSignature, SmartContractDef, SupplyOffer,
-    TraceableAsset, TraceableAssetRegistration, Transaction, TransactionKind,
+    capability_hash, validate_asset, CanonicalRecord, CapabilityActivation, InventoryUpdate,
+    MetadataTrustScore, PurchaseConditions, PurchaseOrder, RecordSignature, SmartContractDef,
+    SupplyOffer, TraceableAsset, TraceableAssetRegistration, Transaction, TransactionKind,
+    SCHEMA_VERSION_V1,
 };
-use glasschain_identity::{CertChainVerifier, Channel, ChannelConfig, Organization};
+use glasschain_identity::{CertChainVerifier, Channel, ChannelConfig, OcspStatus, Organization};
 use glasschain_network::{Node, NodeEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -27,15 +28,30 @@ pub const MODE_LABEL: &str =
 const COLLECTION: &str = "pricing";
 const GTIN: &str = "07891234100016";
 const CONTRACT_ID: &str = "auto-replenish";
-/// Conditions-only contract (auto_execute=false): offers priced above the
-/// auto cap match only this one and wait for a human buyer decision.
+/// Conditions-only contracts (auto_execute=false): offers priced above the
+/// auto cap match exactly one of them by price band and wait for the human
+/// buyer named by the contract. Each pharmacy owns one.
 const MANUAL_CONTRACT_ID: &str = "manual-review";
+const VALUE_CONTRACT_ID: &str = "value-review";
+const PREMIUM_CONTRACT_ID: &str = "premium-review";
 /// Demo starting cash per company (minor units: $100 000). Presentation
 /// bookkeeping — the chain itself carries no currency balance.
 const CASH_START: u64 = 10_000_000;
+/// Manual price bands (minor units): the band picks the contract and buyer,
+/// so a premium offer only ever matches one conditions-only contract.
 const MANUAL_MAX_PRICE: u64 = 2_000;
+const VALUE_MAX_PRICE: u64 = 1_600;
+const PREMIUM_MAX_PRICE: u64 = 2_400;
+/// The one auto-executing contract's cap: this is the only band that can
+/// produce an automatic `PurchaseOrder`, so caps must not overlap autos.
 const CONTRACT_MAX_PRICE: u64 = 1_200;
-const CONTRACT_MAX_QTY: u64 = 1_000_000;
+/// Offer quantity tiers: cheap (auto) offers cover a varied slice of the
+/// 500-unit lot; premium (manual) offers are larger so a human has something
+/// worth reviewing.
+const AUTO_QUANTITY_TIERS: [u64; 10] = [100, 125, 150, 200, 250, 300, 350, 400, 450, 500];
+const MANUAL_QUANTITY_TIERS: [u64; 5] = [250, 300, 350, 400, 500];
+const AUTO_PRICE_TIERS: [u64; 8] = [850, 900, 950, 1_000, 1_050, 1_100, 1_150, 1_200];
+const MANUAL_PRICE_TIERS: [u64; 6] = [1_350, 1_500, 1_700, 1_900, 2_100, 2_300];
 /// Retail drain: units a stocked pharmacy sells to customers per round
 /// (deliberately slow — inventories accumulate and only sustained rounds
 /// empty them). Scales with the pharmacy's own stock so the system can
@@ -103,8 +119,8 @@ impl SimParams {
         self.regulators = self.regulators.clamp(0, 3);
         self.certifiers = self.certifiers.clamp(1, 4);
         self.evil_nodes = self.evil_nodes.clamp(0, 5);
-        self.lots_per_round = self.lots_per_round.clamp(1, 20);
-        self.round_interval_ms = self.round_interval_ms.clamp(100, 10_000);
+        self.lots_per_round = self.lots_per_round.clamp(1, 50);
+        self.round_interval_ms = self.round_interval_ms.clamp(0, 10_000);
         self
     }
 }
@@ -167,13 +183,19 @@ fn companies_of_role<'a>(companies: &'a [Company], role: &str) -> Vec<&'a str> {
 
 // ── Snapshot structs (the JSON the bridge serves) ──────────────────────────
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug)]
 pub struct OrgView {
     pub id: String,
     pub role: String,
     pub evil: bool,
     /// Collections this org is a member of; empty for certifiers and evils.
     pub member_of: Vec<String>,
+    /// Average MetadataTrustScore over the asset registrations this org
+    /// originated (0 with no records — trust is then simply undefined here,
+    /// not assumed good).
+    pub trust_score: u8,
+    /// Committed asset registrations this org originated.
+    pub records: u64,
 }
 
 #[derive(Serialize, Clone)]
@@ -191,6 +213,15 @@ pub struct LotView {
     /// Trust score of the originating registration (evil metadata scores low).
     pub trust_score: u8,
     pub chain: Vec<LotStage>,
+    /// Every committed custody event has a matching flat analytical record
+    /// for the lot's batch (`ProvenanceIndex::verify_lineage`).
+    pub lineage_complete: bool,
+    /// Average trust score across the lot's flat analytical records.
+    pub trust_avg: u8,
+    /// Flat analytical records committed for this lot's batch.
+    pub flat_records: u64,
+    /// The lot's registration passes strict SNCM schema validation.
+    pub schema_compliant: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -270,6 +301,8 @@ pub struct OfferEvent {
     /// Units already bought off this offer (partial manual buys).
     pub sold: u64,
     pub price_per_unit: u64,
+    /// Round the offer was advertised in (0 for setup-time events).
+    pub round: u64,
     pub note: String,
 }
 
@@ -297,6 +330,7 @@ pub struct Metrics {
     pub last_commit_ms: u64,
     pub commit_p50_ms: u64,
     pub commit_p95_ms: u64,
+    pub commit_p99_ms: u64,
     pub pool_count: u64,
     pub pool_bytes: u64,
 }
@@ -305,6 +339,108 @@ pub struct Metrics {
 pub struct FeedItem {
     pub label: String,
     pub height: u64,
+}
+
+/// One committed block, in the tamper-evident chain view: the hash links to
+/// the previous block, so changing any committed transaction breaks the chain.
+#[derive(Serialize, Clone, Default)]
+pub struct BlockView {
+    pub height: u64,
+    pub hash: String,
+    pub previous_hash: String,
+    pub tx_count: u64,
+    pub timestamp: u64,
+    /// A BFT quorum certificate is attached when the staged BFT driver is
+    /// active; the dev/test driver is PoW, so this is honestly `false`.
+    pub certified: bool,
+}
+
+/// One member's security posture, read from its own node at federation build
+/// time: certificate verifier, OCSP staple verification (ADR-017), channel
+/// membership and live peer sessions.
+#[derive(Serialize, Clone, Default)]
+pub struct PostureRow {
+    pub company: String,
+    pub role: String,
+    pub evil: bool,
+    /// The node carries a certificate verifier (fail-closed org paths).
+    pub verifier: bool,
+    /// An X.509 member certificate was issued by the demo Root CA.
+    pub certificate: bool,
+    /// OCSP staple outcome: issuer-signed and verified locally, or why not.
+    pub ocsp: String,
+    pub collections: Vec<String>,
+    pub peers: u64,
+}
+
+/// One registered contract with its real conditions and committed activity.
+#[derive(Serialize, Clone, Default)]
+pub struct ContractView {
+    pub id: String,
+    pub buyer: String,
+    pub product: String,
+    pub max_price_per_unit: u64,
+    pub max_quantity: u64,
+    pub auto_execute: bool,
+    pub executions: u64,
+    pub quantity_purchased: u64,
+    pub status: String,
+}
+
+/// One flat analytical record (the compliance projection of a committed
+/// asset registration) for the recent-records table.
+#[derive(Serialize, Clone, Default)]
+pub struct FlatRecordView {
+    pub block: u64,
+    pub gtin: String,
+    pub batch: String,
+    pub serial: String,
+    pub custodian: String,
+    pub event: String,
+    pub trust: u64,
+    pub standard: bool,
+    pub missing: String,
+}
+
+/// Fleet compliance rollup from the leader's projections: schema coverage,
+/// standard-compliant vs flagged records, and verifiable-lineage completeness.
+#[derive(Serialize, Clone, Default)]
+pub struct ComplianceView {
+    pub schema_version: String,
+    pub fields_present: u64,
+    pub fields_total: u64,
+    pub compliant: u64,
+    pub non_compliant: u64,
+    pub critical: u64,
+    pub warnings: u64,
+    pub flat_records: u64,
+    pub standard_records: u64,
+    pub low_trust_records: u64,
+    pub lineages_checked: u64,
+    pub lineages_complete: u64,
+    pub avg_trust: u8,
+    pub recent: Vec<FlatRecordView>,
+}
+
+/// One round's measured point for the performance charts.
+#[derive(Serialize, Clone, Default)]
+pub struct RoundPoint {
+    pub round: u64,
+    pub submitted: u64,
+    pub rejected: u64,
+    pub commit_ms: u64,
+    pub pool_count: u64,
+    pub tx_per_sec: u64,
+    /// Where the round's wall-clock went, in milliseconds: local scenario
+    /// production, private-payload dissemination, node submission, pool
+    /// settle, PoW mining, chain projections, retail sales.
+    pub produce_ms: u64,
+    pub payload_ms: u64,
+    pub submit_ms: u64,
+    pub settle_ms: u64,
+    pub project_ms: u64,
+    pub retail_ms: u64,
+    pub round_ms: u64,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -338,12 +474,38 @@ pub struct RunState {
     /// sold on. Retail sales drain it slowly — nobody sells through their
     /// whole stock immediately, and draining it fully is possible.
     pub inventory: BTreeMap<String, u64>,
+    /// Recent committed blocks — the tamper-evident hash chain.
+    pub blocks: Vec<BlockView>,
+    /// Per-member security posture (verifier, OCSP staple, channels, peers).
+    pub posture: Vec<PostureRow>,
+    /// Registered contracts with their real conditions and committed activity.
+    pub contracts: Vec<ContractView>,
+    /// Compliance rollup: schema coverage, trust distribution, lineage checks.
+    pub compliance: ComplianceView,
+    /// Per-round measured points for the performance charts (rolling window).
+    pub history: Vec<RoundPoint>,
     /// Run start (ms since epoch) for throughput math. Not shown raw.
     #[serde(skip)]
     started_ms: Option<u64>,
     /// Rolling commit latencies (percentile source, not shown raw).
     #[serde(skip)]
     commit_times: Vec<u64>,
+    /// Highest block index already folded into the compliance/trust
+    /// aggregates (incremental projections; not shown raw).
+    #[serde(skip)]
+    last_projected_block: u64,
+    /// Highest block index already folded into the contract registry.
+    #[serde(skip)]
+    last_contract_block: u64,
+    /// Cumulative trust per originating org: (sum of scores, records).
+    #[serde(skip)]
+    trust_totals: BTreeMap<String, (u64, u64)>,
+    /// Cumulative trust per lot batch: (sum of scores, records).
+    #[serde(skip)]
+    batch_totals: BTreeMap<u64, (u64, u64)>,
+    /// Fleet-wide trust accumulator: (sum of scores, records).
+    #[serde(skip)]
+    trust_total: (u64, u64),
 }
 
 impl RunState {
@@ -415,6 +577,7 @@ impl RunState {
         }
         self.metrics.commit_p50_ms = percentile(&self.commit_times, 50);
         self.metrics.commit_p95_ms = percentile(&self.commit_times, 95);
+        self.metrics.commit_p99_ms = percentile(&self.commit_times, 99);
     }
 
     /// Bump one WMS movement counter, creating the row if needed.
@@ -781,11 +944,13 @@ async fn verifier_for(org: &Organization) -> CertChainVerifier {
 /// issues every identity (the demo simplification of ADR-011), every
 /// verifier-carrying node verifies certificates fail-closed, and each node
 /// holds the `pricing` collection config. The star center (the first
-/// company) is the block producer; everyone dials it.
-async fn build_federation(companies: &[Company], leader: &str) -> Nodes {
+/// company) is the block producer; everyone dials it. Returns the nodes and
+/// the per-member security posture read from each node once connected.
+async fn build_federation(companies: &[Company], leader: &str) -> (Nodes, Vec<PostureRow>) {
     let mut org = Organization::new("GlassChain Demo").expect("demo root org builds");
     let verifier = verifier_for(&org).await;
     let mut nodes: Nodes = BTreeMap::new();
+    let mut certificates: BTreeMap<String, String> = BTreeMap::new();
 
     // Concrete loopback ports: `listen_addr()` echoes the *configured*
     // string, so a wildcard `:0` would make peers dial port 0. Reserve each
@@ -796,6 +961,10 @@ async fn build_federation(companies: &[Company], leader: &str) -> Nodes {
             .issue_identity(company.id.clone())
             .expect("demo identity mints")
             .clone();
+        certificates.insert(
+            company.id.clone(),
+            identity.certificate_pem.clone().unwrap_or_default(),
+        );
         let addr = if company.id == leader {
             leader_addr.clone()
         } else {
@@ -819,12 +988,45 @@ async fn build_federation(companies: &[Company], leader: &str) -> Nodes {
         }
         nodes.insert(company.id.clone(), node);
     }
+    // Every node carries the `pricing` collection config, so the posture read
+    // below reports real membership.
+    for node in nodes.values() {
+        node.set_collections(vec![pricing_collection(companies)])
+            .await;
+    }
     // Allow the handshake wave + first sync; scale the settle with the fleet.
     tokio::time::sleep(Duration::from_millis(
         500 + 80 * u64::from(companies.len() as u32),
     ))
     .await;
-    nodes
+
+    // Real security posture: mint an issuer-signed OCSP staple per member and
+    // verify it locally against the shared verifier (ADR-017), read the
+    // node's channel membership and live peer sessions.
+    let mut posture = Vec::new();
+    for company in companies {
+        let cert_pem = certificates.get(&company.id).cloned().unwrap_or_default();
+        let ocsp = match org.ocsp_response_der(&company.id) {
+            Ok(staple) => match verifier.verify_ocsp_staple(&cert_pem, &staple) {
+                Ok(OcspStatus::Good) => "issuer-signed · verified locally".to_owned(),
+                Ok(OcspStatus::Revoked) => "revoked — session fails closed".to_owned(),
+                Err(error) => format!("unverified: {error}"),
+            },
+            Err(error) => format!("not minted: {error}"),
+        };
+        let node = nodes.get(&company.id).expect("node just inserted");
+        posture.push(PostureRow {
+            company: company.id.clone(),
+            role: company.role.clone(),
+            evil: company.evil,
+            verifier: company.has_verifier,
+            certificate: !cert_pem.is_empty(),
+            ocsp,
+            collections: node.collection_names().await,
+            peers: node.known_peers().await.len() as u64,
+        });
+    }
+    (nodes, posture)
 }
 
 /// Reserve a concrete loopback address with its socket parked so `Node::start`
@@ -888,42 +1090,91 @@ fn activation_tx(height: u64) -> Transaction {
     )
 }
 
-fn replenish_contract(buyer: &str) -> Transaction {
+/// A contract definition with its buyer, price ceiling, lifetime cap and
+/// execution mode. One auto contract plus one conditions-only contract per
+/// pharmacy: price bands never overlap between autos, so a single offer can
+/// only ever produce one automatic purchase.
+fn contract_tx(
+    id: &str,
+    buyer: &str,
+    max_price: u64,
+    max_quantity: u64,
+    auto_execute: bool,
+    max_lead_time_days: u32,
+) -> Transaction {
     Transaction::new(TransactionKind::ContractCreation(SmartContractDef {
-        contract_id: CONTRACT_ID.into(),
+        contract_id: id.into(),
         buyer_id: buyer.into(),
         product_id: "SKU-DEMO".into(),
         conditions: PurchaseConditions {
-            max_price_per_unit: CONTRACT_MAX_PRICE,
+            max_price_per_unit: max_price,
             min_quantity: 1,
-            max_quantity: CONTRACT_MAX_QTY,
-            max_lead_time_days: 30,
+            max_quantity,
+            max_lead_time_days,
             preferred_seller_id: None,
             currency: "USD".into(),
-            auto_execute: true,
+            auto_execute,
         },
         wasm_code_b64: None,
     }))
 }
 
-/// The offer price ladder: two ordinary rungs under the `auto-replenish`
-/// cap, one premium rung above it (manual buyers only).
+/// The offer price ladder: cheap rungs under the auto cap, and every third
+/// offer a premium rung on one of the three manual bands (each owned by a
+/// different pharmacy). Prices and quantities vary per lot.
 fn offer_price(seq: u64) -> u64 {
     if seq.is_multiple_of(3) {
-        1_400
+        MANUAL_PRICE_TIERS[((seq / 3) % MANUAL_PRICE_TIERS.len() as u64) as usize]
     } else {
-        900 + (seq % 3) * 100
+        AUTO_PRICE_TIERS[((seq.wrapping_mul(5) + seq / 4) % AUTO_PRICE_TIERS.len() as u64) as usize]
     }
 }
 
-/// Each lot is 500 units; the ladder (300 / 400 / 500) makes auto
-/// purchases partial lot buys with the remainder in the warehouse. The
-/// multiplier is the stock-driven buy pressure: scarce stock keeps the
-/// ladder partial, piled-up stock buys full lots so goods reach the
-/// retail drain faster.
+/// Each lot is 500 units; the offer covers a varied slice of it. The
+/// stock-driven buy pressure adds a step, so scarce stock keeps partial
+/// offers and piled-up stock approaches full lots.
 fn offer_quantity(seq: u64, pressure: u64) -> u64 {
-    let base = 300 + (seq % 3) * 100;
-    (base * pressure).min(500)
+    let tiers: &[u64] = if offer_price(seq) > CONTRACT_MAX_PRICE {
+        &MANUAL_QUANTITY_TIERS
+    } else {
+        &AUTO_QUANTITY_TIERS
+    };
+    let base = tiers[((seq.wrapping_mul(7) + seq / 5) % tiers.len() as u64) as usize];
+    (base + pressure * 50).min(500)
+}
+
+/// The conditions-only contract an offer above the auto cap matches, by
+/// price band. Bands are disjoint, so a premium offer never matches more
+/// than one contract.
+fn manual_contract_for_price(price: u64) -> &'static str {
+    if price > MANUAL_MAX_PRICE {
+        PREMIUM_CONTRACT_ID
+    } else if price > VALUE_MAX_PRICE {
+        MANUAL_CONTRACT_ID
+    } else {
+        VALUE_CONTRACT_ID
+    }
+}
+
+/// The buyer that owns the conditions-only contract for a price band (or the
+/// auto contract's buyer under the cap).
+fn offer_buyer(price: u64) -> &'static str {
+    match manual_contract_for_price(price) {
+        PREMIUM_CONTRACT_ID => "pharmacy-3",
+        MANUAL_CONTRACT_ID => "pharmacy-1",
+        VALUE_CONTRACT_ID => "pharmacy-2",
+        _ => "pharmacy-1",
+    }
+}
+
+/// The conditions-only contract a manual purchase as `buyer` completes
+/// against: each pharmacy's own.
+fn manual_contract_for_buyer(buyer: &str) -> &'static str {
+    match buyer {
+        "pharmacy-2" => VALUE_CONTRACT_ID,
+        "pharmacy-3" => PREMIUM_CONTRACT_ID,
+        _ => MANUAL_CONTRACT_ID,
+    }
 }
 
 /// Absolute system stock: every company's sellable inventory summed.
@@ -1029,7 +1280,9 @@ fn custody_tx(seq: u64, event_type: &str, custodian: &str, evil_metadata: bool) 
         TraceableAssetRegistration {
             asset: asset(custodian, seq, evil_metadata),
             event_type: event_type.into(),
-            originator_id: "manufacturer-1".into(),
+            // The registering member is the originator, so per-org trust can
+            // be judged from committed registrations (evil metadata scores low).
+            originator_id: custodian.into(),
             purchase_order_ref: None,
         },
     ))
@@ -1227,7 +1480,7 @@ pub async fn complete_purchase(
         quantity,
         agreed_price_per_unit: offer.price_per_unit,
         currency: "USD".into(),
-        contract_id: Some(MANUAL_CONTRACT_ID.into()),
+        contract_id: Some(manual_contract_for_buyer(buyer).into()),
     }));
     let order_id = order.id.clone();
     let node = node_for(shared, buyer).await;
@@ -1235,9 +1488,7 @@ pub async fn complete_purchase(
         .await
         .map_err(|error| format!("admission rejected: {error}"))?;
     {
-        eprintln!("debug: purchase state lock");
         let mut state = shared.state.lock().await;
-        eprintln!("debug: purchase state locked");
         state.cash_move(
             buyer,
             &seller,
@@ -1264,6 +1515,7 @@ pub async fn complete_purchase(
             row.sold = sold;
             row.note = note;
         }
+        let round = state.round;
         state.push_offer(OfferEvent {
             kind: "purchase".into(),
             tx_id: order_id.clone(),
@@ -1273,8 +1525,10 @@ pub async fn complete_purchase(
             quantity,
             sold: 0,
             price_per_unit: offer.price_per_unit,
+            round,
             note: format!(
-                "manually completed by {buyer} against {MANUAL_CONTRACT_ID} (committing next                  block)"
+                "manually completed by {buyer} against {contract} (committing next block)",
+                contract = manual_contract_for_buyer(buyer)
             ),
         });
         state.record_tx(
@@ -1329,44 +1583,134 @@ async fn params_snapshot(shared: &SharedRun) -> SimParams {
 /// extra traffic), bounded so a slow relay delays the block instead of
 /// losing it.
 async fn wait_for_ids(leader: &Arc<Node>, ids: &[String]) {
-    let pending: std::collections::HashSet<String> = {
-        let ledger = leader.shared_ledger();
-        let ledger = ledger.lock().await;
-        ledger
-            .pending_transactions
-            .iter()
-            .map(|tx| tx.id.clone())
-            .collect()
-    };
-    let missing: Vec<&String> = ids.iter().filter(|id| !pending.contains(*id)).collect();
-    if missing.is_empty() {
+    if ids.is_empty() {
         return;
     }
+    let mut missing: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
     let deadline = Instant::now() + Duration::from_millis(2_500);
     loop {
-        let ledger = leader.shared_ledger();
-        let ledger = ledger.lock().await;
-        let present: std::collections::HashSet<String> = ledger
-            .pending_transactions
-            .iter()
-            .map(|tx| tx.id.clone())
-            .collect();
-        drop(ledger);
-        if ids.iter().all(|id| present.contains(id)) || Instant::now() > deadline {
+        let present: std::collections::HashSet<String> = {
+            let ledger = leader.shared_ledger();
+            let ledger = ledger.lock().await;
+            ledger
+                .pending_transactions
+                .iter()
+                .map(|tx| tx.id.clone())
+                .collect()
+        };
+        missing.retain(|id| !present.contains(*id));
+        if missing.is_empty() || Instant::now() > deadline {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        // Tight poll: the relay hop is local loopback, so settle latency is
+        // measured in single-digit milliseconds, not ticks.
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
-async fn submit(node: &Arc<Node>, tx: Transaction, state: &mut RunState) {
-    match node.submit_transaction(tx).await {
-        Ok(()) => state.metrics.submitted += 1,
-        Err(error) => {
-            state.metrics.rejected += 1;
-            state.push_feed(format!("admission rejected: {error}"));
+fn ms_since(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Submit a round's transactions concurrently (bounded): admission is
+/// independent per transaction, so the runner fans it out and folds the
+/// counters once from the aggregated results.
+const SUBMIT_CONCURRENCY: usize = 24;
+
+async fn submit_round(shared: &SharedRun, txs: Vec<(Arc<Node>, Transaction)>) {
+    if txs.is_empty() {
+        return;
+    }
+    let mut set = tokio::task::JoinSet::new();
+    let mut submitted = 0u64;
+    let mut rejected = 0u64;
+    let mut failures: Vec<String> = Vec::new();
+    for (node, tx) in txs {
+        set.spawn(async move { node.submit_transaction(tx).await });
+        if set.len() >= SUBMIT_CONCURRENCY {
+            if let Some(joined) = set.join_next().await {
+                match joined {
+                    Ok(Ok(())) => submitted += 1,
+                    Ok(Err(error)) => {
+                        rejected += 1;
+                        failures.push(error.to_string());
+                    }
+                    Err(_) => rejected += 1,
+                }
+            }
         }
     }
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(Ok(())) => submitted += 1,
+            Ok(Err(error)) => {
+                rejected += 1;
+                failures.push(error.to_string());
+            }
+            Err(_) => rejected += 1,
+        }
+    }
+    let mut state = shared.state.lock().await;
+    state.metrics.submitted += submitted;
+    state.metrics.rejected += rejected;
+    for error in failures {
+        state.push_feed(format!("admission rejected: {error}"));
+    }
+}
+
+/// Disseminate the round's private payloads concurrently (bounded) and mirror
+/// only the ones that actually left the node in the demo ledger — the ledger
+/// holds real dissemination, not attempts. Returns `(kind, commitment,
+/// cleartext, author)` per accepted payload, in round order.
+async fn disseminate_payloads(
+    leader: &Arc<Node>,
+    payloads: Vec<(String, String)>,
+) -> Vec<(String, String, String, String)> {
+    const DISSEMINATION_CONCURRENCY: usize = 16;
+    let mut accepted = Vec::new();
+    for chunk in payloads.chunks(DISSEMINATION_CONCURRENCY) {
+        let mut handles = Vec::with_capacity(chunk.len());
+        for (offset, (cleartext, author)) in chunk.iter().enumerate() {
+            let node = Arc::clone(leader);
+            let cleartext = cleartext.clone();
+            let author = author.clone();
+            handles.push(tokio::spawn(async move {
+                let ok = node
+                    .submit_private_payload(COLLECTION, cleartext.as_bytes().to_vec())
+                    .await
+                    .is_ok();
+                (offset, cleartext, author, ok)
+            }));
+        }
+        let mut results = Vec::with_capacity(chunk.len());
+        for handle in handles {
+            if let Ok(result) = handle.await {
+                results.push(result);
+            }
+        }
+        results.sort_by_key(|(offset, _, _, _)| *offset);
+        for (_, cleartext, author, ok) in results {
+            if !ok {
+                continue;
+            }
+            let kind = serde_json::from_str::<Value>(&cleartext)
+                .ok()
+                .and_then(|terms| {
+                    terms
+                        .get("kind")
+                        .and_then(|kind| kind.as_str())
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| "terms".to_owned());
+            accepted.push((
+                kind,
+                glasschain_core::crypto::sha256(cleartext.as_bytes()).to_string(),
+                cleartext,
+                author,
+            ));
+        }
+    }
+    accepted
 }
 
 async fn node_for(shared: &SharedRun, id: &str) -> Arc<Node> {
@@ -1386,16 +1730,26 @@ async fn setup_run(shared: &SharedRun) -> Arc<Node> {
     let params = params_snapshot(shared).await;
     let companies = build_companies(&params);
     let leader_id = companies[0].id.clone();
-    let nodes = build_federation(&companies, &leader_id).await;
-    for node in nodes.values() {
-        node.set_collections(vec![pricing_collection(&companies)])
-            .await;
-    }
+    let (nodes, posture) = build_federation(&companies, &leader_id).await;
     {
         let mut state = shared.state.lock().await;
         state.status = "running".into();
         state.started_ms = Some(now_millis());
         state.params = params.clone();
+        state.posture = posture;
+        // A rebuilt federation starts from a fresh chain, so the projection
+        // cursor and its cumulative aggregates restart with it.
+        state.compliance = ComplianceView {
+            schema_version: format!("v{SCHEMA_VERSION_V1}"),
+            fields_total: 6,
+            ..ComplianceView::default()
+        };
+        state.last_projected_block = 0;
+        state.last_contract_block = 0;
+        state.trust_totals.clear();
+        state.batch_totals.clear();
+        state.trust_total = (0, 0);
+        state.contracts.clear();
         state.orgs = companies
             .iter()
             .map(|company| OrgView {
@@ -1407,6 +1761,8 @@ async fn setup_run(shared: &SharedRun) -> Arc<Node> {
                 } else {
                     vec![COLLECTION.into()]
                 },
+                trust_score: 0,
+                records: 0,
             })
             .collect();
     }
@@ -1414,21 +1770,46 @@ async fn setup_run(shared: &SharedRun) -> Arc<Node> {
     let leader = node_for(shared, &leader_id).await;
     let activation = activation_tx(2);
     let _ = leader.submit_transaction(activation).await;
-    // The buyer side of the contracts: the first pharmacy. Two contracts on
-    // the same product — `auto-replenish` (auto-execute up to the price
-    // cap) and `manual-review` (conditions-only, auto_execute=false): offers
-    // above the auto cap match only the manual contract and wait for a
-    // human buyer.
-    let buyer = "pharmacy-1".to_owned();
-    let _ = leader.submit_transaction(replenish_contract(&buyer)).await;
-    let mut manual = replenish_contract(&buyer);
-    if let TransactionKind::ContractCreation(ref mut def) = manual.kind {
-        def.contract_id = MANUAL_CONTRACT_ID.into();
-        def.conditions.max_price_per_unit = MANUAL_MAX_PRICE;
-        def.conditions.auto_execute = false;
+    // The buy side: one auto-executing contract under the auto cap, plus one
+    // conditions-only contract per pharmacy, each with its own price band —
+    // a premium offer matches exactly one of them and waits for that buyer.
+    for contract in [
+        contract_tx(
+            CONTRACT_ID,
+            "pharmacy-1",
+            CONTRACT_MAX_PRICE,
+            100_000,
+            true,
+            14,
+        ),
+        contract_tx(
+            MANUAL_CONTRACT_ID,
+            "pharmacy-1",
+            MANUAL_MAX_PRICE,
+            4_000,
+            false,
+            30,
+        ),
+        contract_tx(
+            VALUE_CONTRACT_ID,
+            "pharmacy-2",
+            VALUE_MAX_PRICE,
+            3_000,
+            false,
+            21,
+        ),
+        contract_tx(
+            PREMIUM_CONTRACT_ID,
+            "pharmacy-3",
+            PREMIUM_MAX_PRICE,
+            5_000,
+            false,
+            45,
+        ),
+    ] {
+        let _ = leader.submit_transaction(contract).await;
     }
-    let _ = leader.submit_transaction(manual).await;
-    // Both must be committed before private payloads are legal, so settle
+    // They must be committed before private payloads are legal, so settle
     // them in their own block here.
     let _ = leader.mine().await;
     leader
@@ -1454,9 +1835,10 @@ async fn drive_round(shared: &SharedRun, leader: &Arc<Node>, round: u64) {
     let logistics_list = companies_of_role(&companies, "logistics");
     let pharmacies = companies_of_role(&companies, "pharmacy");
     let certifiers = companies_of_role(&companies, "certifier");
-    let buyer = "pharmacy-1".to_owned();
     let round_start = Instant::now();
+    let produce_start = Instant::now();
     let mut round_txs: Vec<(Arc<Node>, Transaction)> = Vec::new();
+    let mut round_payloads: Vec<(String, String)> = Vec::new();
 
     // ── 1. Certification + audit for lots already on the chain: the GxP
     // batch certification applies to the MANUFACTURED batch — it is not
@@ -1489,14 +1871,14 @@ async fn drive_round(shared: &SharedRun, leader: &Arc<Node>, round: u64) {
                 state.certs.push(CertView {
                     record_id: format!("cert-{}", entry.seq),
                     schema: "quality_certification".into(),
-                    lot_ref: format!("lot-{}", entry.seq),
+                    lot_ref: format!("LOT-{}", entry.seq),
                     issuer: entry.certifier.clone(),
                     status: "valid".into(),
                 });
                 state.certs.push(CertView {
                     record_id: format!("audit-{}", entry.seq),
                     schema: "audit_attestation".into(),
-                    lot_ref: format!("lot-{}", entry.seq),
+                    lot_ref: format!("LOT-{}", entry.seq),
                     issuer: entry.certifier.clone(),
                     status: "valid".into(),
                 });
@@ -1506,27 +1888,12 @@ async fn drive_round(shared: &SharedRun, leader: &Arc<Node>, round: u64) {
                 // The certifier's private evidence and the regulator's
                 // private compliance notes ride the same round, each
                 // authored by its org.
-                let evidence = certifier_evidence(entry.seq, &entry.certifier);
-                let _ = Arc::clone(leader)
-                    .submit_private_payload(COLLECTION, evidence.as_bytes().to_vec())
-                    .await;
-                shared.payloads.lock().await.push((
-                    COLLECTION.into(),
-                    glasschain_core::crypto::sha256(evidence.as_bytes()).to_string(),
-                    evidence,
+                round_payloads.push((
+                    certifier_evidence(entry.seq, &entry.certifier),
                     entry.certifier.clone(),
                 ));
                 if params.regulators > 0 {
-                    let notes = regulator_notes(entry.seq);
-                    let _ = Arc::clone(leader)
-                        .submit_private_payload(COLLECTION, notes.as_bytes().to_vec())
-                        .await;
-                    shared.payloads.lock().await.push((
-                        COLLECTION.into(),
-                        glasschain_core::crypto::sha256(notes.as_bytes()).to_string(),
-                        notes,
-                        "regulator-1".to_owned(),
-                    ));
+                    round_payloads.push((regulator_notes(entry.seq), "regulator-1".to_owned()));
                 }
                 entry.certified = true;
             }
@@ -1572,15 +1939,7 @@ async fn drive_round(shared: &SharedRun, leader: &Arc<Node>, round: u64) {
                 ],
             };
             for terms in terms_payloads {
-                let _ = Arc::clone(leader)
-                    .submit_private_payload(COLLECTION, terms.as_bytes().to_vec())
-                    .await;
-                shared.payloads.lock().await.push((
-                    COLLECTION.into(),
-                    glasschain_core::crypto::sha256(terms.as_bytes()).to_string(),
-                    terms,
-                    to.to_owned(),
-                ));
+                round_payloads.push((terms, to.to_owned()));
             }
             {
                 let mut state = shared.state.lock().await;
@@ -1655,13 +2014,8 @@ async fn drive_round(shared: &SharedRun, leader: &Arc<Node>, round: u64) {
                 reason: format!("manufacturing step: {step} (lot {seq})"),
             }));
             {
+                round_txs.push((node_for(shared, manufacturer).await, step_tx.clone()));
                 let mut state = shared.state.lock().await;
-                submit(
-                    &node_for(shared, manufacturer).await,
-                    step_tx.clone(),
-                    &mut state,
-                )
-                .await;
                 state.record_tx(
                     step_tx.id.clone(),
                     "process",
@@ -1672,24 +2026,21 @@ async fn drive_round(shared: &SharedRun, leader: &Arc<Node>, round: u64) {
             }
         }
         // The maker's private process payload joins the pricing terms.
-        let process_payload = process_terms(seq, manufacturer);
-        if Arc::clone(leader)
-            .submit_private_payload(COLLECTION, process_payload.as_bytes().to_vec())
-            .await
-            .is_ok()
-        {
-            shared.payloads.lock().await.push((
-                COLLECTION.into(),
-                glasschain_core::crypto::sha256(process_payload.as_bytes()).to_string(),
-                process_payload,
-                manufacturer.to_owned(),
-            ));
-        }
+        round_payloads.push((process_terms(seq, manufacturer), manufacturer.to_owned()));
 
         // The sell side: a SupplyOffer submitted by the manufacturer; the
-        // buyer-side contract engine on that node matches it. Offers under
-        // the `auto-replenish` cap auto-execute; premium offers (above the
-        // cap, inside `manual-review`) are advertised and wait for a human.
+        // buyer-side contract engine on that node matches it. Cheap offers
+        // auto-execute under the cap; every third is premium, matches exactly
+        // one pharmacy's conditions-only contract by its price band, and
+        // waits for that human buyer.
+        let price = offer_price(seq);
+        let quantity = offer_quantity(seq, pressure);
+        let seller_buyer = offer_buyer(price);
+        let contract = if price > CONTRACT_MAX_PRICE {
+            manual_contract_for_price(price)
+        } else {
+            CONTRACT_ID
+        };
         let offer_tx = supply_offer(seq, manufacturer, pressure);
         let offer_tx_id = offer_tx.id.clone();
         round_txs.push((node_for(shared, manufacturer).await, offer_tx));
@@ -1699,21 +2050,19 @@ async fn drive_round(shared: &SharedRun, leader: &Arc<Node>, round: u64) {
                 kind: "offer".into(),
                 tx_id: offer_tx_id.clone(),
                 seller: manufacturer.to_owned(),
-                buyer: buyer.clone(),
+                buyer: seller_buyer.to_owned(),
                 product: "SKU-DEMO".into(),
-                quantity: offer_quantity(seq, pressure),
+                quantity,
                 sold: 0,
-                price_per_unit: offer_price(seq),
-                note: if offer_price(seq) > CONTRACT_MAX_PRICE {
+                price_per_unit: price,
+                round,
+                note: if price > CONTRACT_MAX_PRICE {
                     format!(
-                        "matched manual-review — {} of the lot's 500 units on offer, \\
-                         awaiting a buyer decision",
-                        offer_quantity(seq, pressure)
+                        "matched {contract} for {seller_buyer} — {quantity} of the lot's 500 units on offer, awaiting a buyer decision"
                     )
                 } else {
                     format!(
-                        "partial lot offer: {} of the lot's 500 units (auto contract)",
-                        offer_quantity(seq, pressure)
+                        "partial lot offer: {quantity} of the lot's 500 units (auto contract)"
                     )
                 },
             });
@@ -1721,51 +2070,20 @@ async fn drive_round(shared: &SharedRun, leader: &Arc<Node>, round: u64) {
                 offer_tx_id,
                 "offer",
                 manufacturer,
-                &buyer,
+                seller_buyer,
                 format!("SupplyOffer {seq} from {manufacturer}"),
             );
-            state.count_edge(manufacturer, &buyer);
+            state.count_edge(manufacturer, seller_buyer);
         }
 
         // Member-only pricing payload from the star center — the block
         // holds only its commitment, the cleartext is disseminated to the
         // collection members. (The engine relays dissemination one hop, so
         // the star center is the writer that reaches every member.)
-        let leader_node = Arc::clone(leader);
-        let payload = pricing_terms(seq, pressure, manufacturer);
-        if leader_node
-            .submit_private_payload(COLLECTION, payload.as_bytes().to_vec())
-            .await
-            .is_ok()
-        {
-            let commitment = glasschain_core::crypto::sha256(payload.as_bytes());
-            shared.payloads.lock().await.push((
-                COLLECTION.into(),
-                commitment.clone(),
-                payload,
-                manufacturer.to_owned(),
-            ));
-            let mut state = shared.state.lock().await;
-            if state.pdc.iter().all(|entry| entry.collection != COLLECTION) {
-                state.pdc.push(PdcEntry {
-                    collection: COLLECTION.into(),
-                    commitments: Vec::new(),
-                });
-            }
-            let entry = state
-                .pdc
-                .iter_mut()
-                .find(|entry| entry.collection == COLLECTION)
-                .expect("entry just ensured");
-            entry.commitments.push(commitment);
-            // The dissemination hop, drawn so the private path is visible
-            // even though its cleartext is not.
-            for member in pricing_member_ids(&companies) {
-                if member != manufacturer {
-                    state.count_edge(manufacturer, &member);
-                }
-            }
-        }
+        round_payloads.push((
+            pricing_terms(seq, pressure, manufacturer),
+            manufacturer.to_owned(),
+        ));
 
         {
             let mut state = shared.state.lock().await;
@@ -1776,6 +2094,10 @@ async fn drive_round(shared: &SharedRun, leader: &Arc<Node>, round: u64) {
                 manufacturer: manufacturer.to_owned(),
                 trust_score: trust.score,
                 chain: Vec::new(),
+                lineage_complete: false,
+                trust_avg: trust.score,
+                flat_records: 0,
+                schema_compliant: true,
             });
             state.metrics.lots += 1;
         }
@@ -1792,28 +2114,67 @@ async fn drive_round(shared: &SharedRun, leader: &Arc<Node>, round: u64) {
     }
 
     // ── 4. Evil attempts: recorded outcomes, whatever the node decides.
-    let mut expected_ids: Vec<String> = {
-        let pipeline = shared.pipeline.lock().await;
-        pipeline
-            .iter()
-            .map(|entry| format!("lot-{}", entry.seq))
-            .collect()
-    };
-    expected_ids.extend(evil_attacks(shared, &companies, round).await);
+    // Only THIS round's submissions are awaited in the settle step — waiting
+    // on pipeline anchor ids from earlier rounds pinned every round to the
+    // 2.5 s deadline (they were committed long ago and can never be pending).
+    let mut expected_ids: Vec<String> = evil_attacks(shared, &companies, round).await;
+    let scenario_ms = ms_since(produce_start);
 
+    // Disseminate this round's private payloads concurrently: dissemination
+    // is the dominant produce cost and is independent per payload.
+    let payload_start = Instant::now();
+    let accepted = disseminate_payloads(leader, std::mem::take(&mut round_payloads)).await;
+    let payload_ms = ms_since(payload_start);
+    let mut pricing: Vec<(String, String)> = Vec::new();
+    {
+        let mut ledger = shared.payloads.lock().await;
+        for (kind, commitment, cleartext, author) in accepted {
+            if kind == "pricing" {
+                pricing.push((commitment.clone(), author.clone()));
+            }
+            ledger.push((COLLECTION.into(), commitment, cleartext, author));
+        }
+    }
+    if !pricing.is_empty() {
+        let mut state = shared.state.lock().await;
+        for (commitment, author) in pricing {
+            if state.pdc.iter().all(|entry| entry.collection != COLLECTION) {
+                state.pdc.push(PdcEntry {
+                    collection: COLLECTION.into(),
+                    commitments: Vec::new(),
+                });
+            }
+            if let Some(entry) = state
+                .pdc
+                .iter_mut()
+                .find(|entry| entry.collection == COLLECTION)
+            {
+                entry.commitments.push(commitment);
+            }
+            // The dissemination hop, drawn so the private path is visible
+            // even though its cleartext is not.
+            for member in pricing_member_ids(&companies) {
+                if member != author {
+                    state.count_edge(&author, &member);
+                }
+            }
+        }
+    }
     // ── 5. Relay + mine: wait until every submission of this round reached
     // the star center's pool (contract-generated PurchaseOrders may trail
     // and land in the next block — admission vs commit stays honest).
     let batch_ids: Vec<String> = round_txs.iter().map(|(_, tx)| tx.id.clone()).collect();
-    for (node, tx) in round_txs.drain(..) {
-        let mut state = shared.state.lock().await;
-        submit(&node, tx, &mut state).await;
-    }
+    let submit_start = Instant::now();
+    submit_round(shared, std::mem::take(&mut round_txs)).await;
+    let submit_ms = ms_since(submit_start);
     expected_ids.extend(batch_ids);
+    let settle_start = Instant::now();
     wait_for_ids(leader, &expected_ids).await;
+    let settle_ms = ms_since(settle_start);
     let mine_start = Instant::now();
     let _ = leader.mine().await;
-    let commit_ms = u64::try_from(mine_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let commit_ms = ms_since(mine_start);
+    let project_start = Instant::now();
 
     // ── 6. Honest receipt: contract-generated PurchaseOrders that landed
     // in the committed block.
@@ -1833,7 +2194,10 @@ async fn drive_round(shared: &SharedRun, leader: &Arc<Node>, round: u64) {
                         .offers
                         .iter()
                         .any(|event| event.kind == "purchase" && event.tx_id == tx.id);
-                    let manual = order.contract_id.as_deref() == Some(MANUAL_CONTRACT_ID);
+                    let manual = order
+                        .contract_id
+                        .as_deref()
+                        .is_some_and(|contract| contract != CONTRACT_ID);
                     state.cash_move(
                         &order.buyer_id,
                         &order.seller_id,
@@ -1876,10 +2240,13 @@ async fn drive_round(shared: &SharedRun, leader: &Arc<Node>, round: u64) {
                         quantity: order.quantity,
                         sold: 0,
                         price_per_unit: order.agreed_price_per_unit,
+                        round,
                         note: if manual {
                             format!(
-                                "manually completed by {} against {MANUAL_CONTRACT_ID}, tx {}",
-                                order.buyer_id, tx.id
+                                "manually completed by {} against {}, tx {}",
+                                order.buyer_id,
+                                order.contract_id.as_deref().unwrap_or(MANUAL_CONTRACT_ID),
+                                tx.id
                             )
                         } else {
                             format!(
@@ -1906,8 +2273,9 @@ async fn drive_round(shared: &SharedRun, leader: &Arc<Node>, round: u64) {
         }
     }
 
-    // ── 7. Custody chain receipt: where every in-flight lot physically
-    // sits, staged.
+    // ── 7. Chain receipt: custody stages, the tamper-evident block window,
+    // the contract registry, the compliance projections and this round's
+    // measured performance point.
     let (stage_by_seq, chains) = {
         let index = leader.provenance_index();
         let index = index.lock().await;
@@ -1929,6 +2297,102 @@ async fn drive_round(shared: &SharedRun, leader: &Arc<Node>, round: u64) {
             .collect();
         (stage_by_seq, chains)
     };
+
+    // Compliance projections, folded incrementally: only flat records from
+    // blocks newer than the projection cursor are aggregated, so sustained
+    // stress runs stay O(new records) per round instead of O(all history).
+    let last_projected = shared.state.lock().await.last_projected_block;
+    let (new_records, lineage_reports) = {
+        let provenance = leader.provenance_index();
+        let provenance = provenance.lock().await;
+        let flattener = leader.analytical_flattener();
+        let flattener = flattener.lock().await;
+        let pipeline = shared.pipeline.lock().await;
+        let new_records: Vec<glasschain_indexer::FlatAssetRecord> = flattener
+            .records()
+            .iter()
+            .filter(|record| record.block_index > last_projected)
+            .cloned()
+            .collect();
+        let mut lineage_reports = Vec::new();
+        for entry in pipeline.iter() {
+            let report = validate_asset(&asset(&entry.manufacturer, entry.seq, false));
+            // Per-asset lineage: the provenance index verifies the mandatory
+            // custody events appear in order for THIS asset id (a GTIN-wide
+            // flat-record match cannot prove one lot's chain).
+            let lineage = provenance.verify_lineage(
+                &asset_id(entry.seq, false),
+                &["manufacture", "dispatch", "receive"],
+            );
+            lineage_reports.push((
+                entry.seq,
+                lineage,
+                report.is_compliant,
+                report.critical_count() as u64,
+                report.warning_count() as u64,
+                u64::try_from(report.field_count_present).unwrap_or(0),
+            ));
+        }
+        (new_records, lineage_reports)
+    };
+
+    let blocks: Vec<BlockView> = {
+        let ledger = leader.shared_ledger();
+        let ledger = ledger.lock().await;
+        ledger
+            .chain
+            .iter()
+            .rev()
+            .take(12)
+            .map(|block| BlockView {
+                height: block.index,
+                hash: block.hash.chars().take(16).collect(),
+                previous_hash: block.previous_hash.chars().take(16).collect(),
+                tx_count: block.transactions.len() as u64,
+                timestamp: block.timestamp,
+                certified: block.certificate.is_some(),
+            })
+            .collect()
+    };
+
+    // Real contract registry, folded incrementally: definitions and committed
+    // orders from blocks newer than the contract cursor, status and lifetime
+    // purchases from the engine's summary.
+    let last_contract_block = shared.state.lock().await.last_contract_block;
+    let (new_contract_defs, new_orders, chain_tip) = {
+        let ledger = leader.shared_ledger();
+        let ledger = ledger.lock().await;
+        let tip = ledger.chain.last().map_or(0, |block| block.index);
+        let mut definitions = Vec::new();
+        let mut executed: BTreeMap<String, u64> = BTreeMap::new();
+        for block in ledger
+            .chain
+            .iter()
+            .filter(|block| block.index > last_contract_block)
+        {
+            for tx in &block.transactions {
+                match &tx.kind {
+                    TransactionKind::ContractCreation(def) => definitions.push((
+                        def.contract_id.clone(),
+                        def.conditions.max_price_per_unit,
+                        def.conditions.auto_execute,
+                        def.conditions.max_quantity,
+                        def.buyer_id.clone(),
+                        def.product_id.clone(),
+                    )),
+                    TransactionKind::PurchaseOrder(order) => {
+                        if let Some(contract_id) = &order.contract_id {
+                            *executed.entry(contract_id.clone()).or_insert(0) += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (definitions, executed, tip)
+    };
+    let contract_summaries = leader.contract_summaries().await;
+
     {
         let mut state = shared.state.lock().await;
         let stats = leader.pending_pool_stats().await;
@@ -1940,14 +2404,24 @@ async fn drive_round(shared: &SharedRun, leader: &Arc<Node>, round: u64) {
             u64::try_from(stats.count).unwrap_or(u64::MAX),
             u64::try_from(stats.bytes).unwrap_or(u64::MAX),
         );
+        // One index build per round instead of a linear lot lookup per
+        // pipeline entry — sustained runs must not be O(lots × pipeline).
+        let lot_index: BTreeMap<u64, usize> = state
+            .lots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, lot)| {
+                lot.lot_ref
+                    .strip_prefix("LOT-")
+                    .and_then(|seq| seq.parse::<u64>().ok())
+                    .map(|seq| (seq, index))
+            })
+            .collect();
         for (seq, events) in chains {
-            let Some(view) = state
-                .lots
-                .iter_mut()
-                .find(|lot| lot.lot_ref == format!("LOT-{seq}"))
-            else {
+            let Some(&index) = lot_index.get(&seq) else {
                 continue;
             };
+            let view = &mut state.lots[index];
             view.chain = events
                 .iter()
                 .map(|event| LotStage {
@@ -1968,14 +2442,157 @@ async fn drive_round(shared: &SharedRun, leader: &Arc<Node>, round: u64) {
             }
             .into();
         }
+        // Fold the new flat records into the cumulative compliance/trust
+        // aggregates. The cursor only advances to the newest block actually
+        // folded, so a late-ingested record is never missed.
+        for record in &new_records {
+            state.compliance.flat_records += 1;
+            if record.is_standard_compliant {
+                state.compliance.standard_records += 1;
+            } else {
+                state.compliance.low_trust_records += 1;
+            }
+            let trust = u64::from(record.trust_score);
+            state.trust_total.0 += trust;
+            state.trust_total.1 += 1;
+            let org = state
+                .trust_totals
+                .entry(record.originator_id.clone())
+                .or_default();
+            org.0 += trust;
+            org.1 += 1;
+            if let Some(seq) = record
+                .batch_number
+                .as_deref()
+                .and_then(|batch| batch.strip_prefix("B-"))
+                .and_then(|digits| digits.parse::<u64>().ok())
+            {
+                let batch = state.batch_totals.entry(seq).or_default();
+                batch.0 += trust;
+                batch.1 += 1;
+            }
+            state.compliance.recent.insert(
+                0,
+                FlatRecordView {
+                    block: record.block_index,
+                    gtin: record.gtin.clone().unwrap_or_default(),
+                    batch: record.batch_number.clone().unwrap_or_default(),
+                    serial: record.serial_number.clone().unwrap_or_default(),
+                    custodian: record.custodian_id.clone(),
+                    event: record.event_type.clone(),
+                    trust,
+                    standard: record.is_standard_compliant,
+                    missing: record.missing_core_fields.clone(),
+                },
+            );
+        }
+        state.compliance.recent.truncate(12);
+        if let Some(newest) = new_records.iter().map(|record| record.block_index).max() {
+            state.last_projected_block = state.last_projected_block.max(newest);
+        }
+        state.compliance.schema_version = format!("v{SCHEMA_VERSION_V1}");
+        state.compliance.fields_total = 6;
+        state.compliance.avg_trust = state
+            .trust_total
+            .0
+            .checked_div(state.trust_total.1)
+            .map_or(0, |avg| u8::try_from(avg).unwrap_or(u8::MAX));
+        // Current-pipeline validation stats (recomputed every round).
+        state.compliance.compliant = lineage_reports
+            .iter()
+            .filter(|(_, _, compliant, ..)| *compliant)
+            .count() as u64;
+        state.compliance.non_compliant = lineage_reports.len() as u64 - state.compliance.compliant;
+        state.compliance.critical = lineage_reports
+            .iter()
+            .map(|(_, _, _, critical, ..)| critical)
+            .sum();
+        state.compliance.warnings = lineage_reports
+            .iter()
+            .map(|(_, _, _, _, warnings, _)| warnings)
+            .sum();
+        state.compliance.lineages_checked = lineage_reports.len() as u64;
+        state.compliance.lineages_complete = lineage_reports
+            .iter()
+            .filter(|(_, lineage, ..)| *lineage)
+            .count() as u64;
+        for (seq, lineage, schema_compliant, ..) in &lineage_reports {
+            let Some(&index) = lot_index.get(seq) else {
+                continue;
+            };
+            let (sum, count) = state.batch_totals.get(seq).copied().unwrap_or((0, 0));
+            let view = &mut state.lots[index];
+            view.lineage_complete = *lineage;
+            view.trust_avg = sum
+                .checked_div(count)
+                .map_or(0, |avg| u8::try_from(avg).unwrap_or(u8::MAX));
+            view.flat_records = count;
+            view.schema_compliant = *schema_compliant;
+        }
+        if let Some((_, _, _, _, _, fields)) = lineage_reports.last() {
+            state.compliance.fields_present = *fields;
+        }
+        state.blocks = blocks;
+        for (id, max_price, auto_execute, max_quantity, buyer, product) in new_contract_defs {
+            if state.contracts.iter().all(|contract| contract.id != id) {
+                state.contracts.push(ContractView {
+                    executions: 0,
+                    quantity_purchased: 0,
+                    status: "Active".into(),
+                    id,
+                    buyer,
+                    product,
+                    max_price_per_unit: max_price,
+                    max_quantity,
+                    auto_execute,
+                });
+            }
+        }
+        for (id, count) in new_orders {
+            if let Some(contract) = state
+                .contracts
+                .iter_mut()
+                .find(|contract| contract.id == id)
+            {
+                contract.executions += count;
+            }
+        }
+        for contract in &mut state.contracts {
+            if let Some(summary) = contract_summaries
+                .iter()
+                .find(|summary| summary.id == contract.id)
+            {
+                contract.quantity_purchased = summary.quantity_purchased;
+                contract.status = summary.status.clone();
+            }
+        }
+        state.last_contract_block = chain_tip;
+        // Per-org trust: the average MetadataTrustScore over the committed
+        // registrations the org itself originated. Orgs with no registrations
+        // stay at 0/0 — trust is undefined there, not assumed good.
+        let totals = state.trust_totals.clone();
+        for org in &mut state.orgs {
+            match totals.get(&org.id) {
+                Some((sum, count)) => {
+                    org.trust_score = u8::try_from(sum / count).unwrap_or(u8::MAX);
+                    org.records = *count;
+                }
+                None => {
+                    org.trust_score = 0;
+                    org.records = 0;
+                }
+            }
+        }
         state.refresh_wms();
         state.refresh_throughput();
     }
+    let project_ms = ms_since(project_start);
 
     // ── 8. Retail phase: pharmacies sell from their own inventories to end
     // customers, a little every round — stock accumulates first, and only
     // sustained rounds drain a warehouse completely. Each sale is a real
     // committed InventoryUpdate (quietly, off the live graph).
+    let retail_start = Instant::now();
     for pharmacy in pharmacies {
         let sellable = {
             let state = shared.state.lock().await;
@@ -2007,9 +2624,35 @@ async fn drive_round(shared: &SharedRun, leader: &Arc<Node>, round: u64) {
             ));
         }
     }
+    let retail_ms = ms_since(retail_start);
+    let round_ms = ms_since(round_start);
+    {
+        // The measured round point: throughput, commit latency and where the
+        // wall-clock actually went. These are runner measurements, never
+        // animation timestamps.
+        let mut state = shared.state.lock().await;
+        let point = RoundPoint {
+            round,
+            submitted: state.metrics.submitted,
+            rejected: state.metrics.rejected,
+            commit_ms,
+            pool_count: state.metrics.pool_count,
+            tx_per_sec: state.metrics.tx_per_sec,
+            produce_ms: scenario_ms,
+            payload_ms,
+            submit_ms,
+            settle_ms,
+            project_ms,
+            retail_ms,
+            round_ms,
+        };
+        state.history.push(point);
+        if state.history.len() > 64 {
+            state.history.remove(0);
+        }
+    }
     log::info!(
-        "round {round}: commit {commit_ms} ms, whole round {} ms",
-        round_start.elapsed().as_millis()
+        "round {round}: round {round_ms} ms = scenario {scenario_ms} + payload {payload_ms} + submit {submit_ms} + settle {settle_ms} + mine {commit_ms} + project {project_ms} + retail {retail_ms}"
     );
 }
 
@@ -2228,34 +2871,43 @@ pub async fn org_snapshot(shared: &SharedRun, org: &str, viewer: Option<&str>) -
     // everything. Cleartext presence is double-checked against the member's
     // own transient store when the payload is one it authored or the
     // regulator's global view.
-    let payloads = shared.payloads.lock().await.clone();
-    // What gets LISTED is what the org owns: a member view shows ONLY the
-    // payloads it authored — every one of them readable (its node
-    // demonstrably holds them). What the member cannot read was never in
-    // its view. The regulator's collection membership covers the whole
-    // collection; the public lens lists nothing.
-    let listed: Vec<&(String, String, String, String)> = match viewer {
-        Some(v) if v.starts_with("regulator") => payloads.iter().collect(),
-        _ => payloads
-            .iter()
-            .filter(|(_, _, _, author)| *author == org)
-            .collect(),
+    //
+    // What gets LISTED is what the org owns: a member view shows only the
+    // payloads that org authored. Readability is a separate, server-side
+    // decision per payload (the author, the regulator and the admin lens
+    // read; every other viewer gets the commitment). Clone only the listed
+    // rows — cloning the whole ledger per request made some member
+    // inspections slow.
+    let listed: Vec<(String, String, String, String)> = {
+        let payloads = shared.payloads.lock().await;
+        match viewer {
+            Some(v) if v.starts_with("regulator") => payloads.clone(),
+            _ => payloads
+                .iter()
+                .filter(|(_, _, _, author)| author == org)
+                .cloned()
+                .collect(),
+        }
     };
     let mut pdc_values = Vec::new();
     for (collection, commitment, cleartext, author) in listed {
-        let terms_json = serde_json::from_str::<Value>(cleartext).ok();
+        let terms_json = serde_json::from_str::<Value>(&cleartext).ok();
         let lot_number = terms_json
             .as_ref()
             .and_then(|terms| terms.get("lot").and_then(|lot| lot.as_u64()))
             .unwrap_or(0);
-        // Every listed payload is the viewer's own (or the regulator's
-        // collection-wide read): readability is checked against the node's
-        // transient store; the regulator reads all.
+        // Readability is scoped server-side: the author reads its own
+        // cleartext (checked against the node's own transient store), the
+        // regulator and the admin lens read the collection, and every other
+        // viewer gets the commitment only. UI hiding is not enforcement —
+        // this filter is.
         let payload = match viewer {
             None => None,
-            Some(v) if *author == v => {
+            Some("admin") => Some(cleartext.clone()),
+            Some(v) if v.starts_with("regulator") => Some(cleartext.clone()),
+            Some(v) if author == v => {
                 if node
-                    .transient_payload(collection, commitment)
+                    .transient_payload(&collection, &commitment)
                     .await
                     .is_some()
                 {
@@ -2264,13 +2916,13 @@ pub async fn org_snapshot(shared: &SharedRun, org: &str, viewer: Option<&str>) -
                     None
                 }
             }
-            Some(_) => Some(cleartext.clone()),
+            Some(_) => None,
         };
         pdc_values.push(OrgPayload {
-            collection: collection.clone(),
-            commitment: commitment.clone(),
+            collection,
+            commitment,
             payload,
-            author: author.clone(),
+            author,
             lot: lot_number,
             kind: terms_json
                 .as_ref()
@@ -2326,10 +2978,13 @@ pub async fn org_snapshot(shared: &SharedRun, org: &str, viewer: Option<&str>) -
         .iter()
         .map(|offer| {
             serde_json::json!({
+                "tx_id": offer.tx_id,
                 "product": offer.product,
                 "quantity": offer.quantity,
                 "sold": offer.sold,
                 "price_per_unit": offer.price_per_unit,
+                "round": offer.round,
+                "buyer": offer.buyer,
                 "note": offer.note,
             })
         })
@@ -2338,9 +2993,11 @@ pub async fn org_snapshot(shared: &SharedRun, org: &str, viewer: Option<&str>) -
         .iter()
         .map(|order| {
             serde_json::json!({
+                "tx_id": order.tx_id,
                 "product": order.product,
                 "quantity": order.quantity,
                 "price_per_unit": order.price_per_unit,
+                "round": order.round,
                 "seller": order.seller,
             })
         })
@@ -2397,7 +3054,9 @@ pub fn spawn_run(shared: Arc<SharedRun>) -> tokio::task::JoinHandle<()> {
                         contract_id,
                         quantity,
                     }) => {
-                        watcher_shared.state.lock().await.push_offer(OfferEvent {
+                        let mut state = watcher_shared.state.lock().await;
+                        let round = state.round;
+                        state.push_offer(OfferEvent {
                             kind: "execution".into(),
                             tx_id: String::new(),
                             seller: "—".into(),
@@ -2406,6 +3065,7 @@ pub fn spawn_run(shared: Arc<SharedRun>) -> tokio::task::JoinHandle<()> {
                             quantity,
                             sold: 0,
                             price_per_unit: 0,
+                            round,
                             note: format!("contract {contract_id} executed"),
                         });
                     }
@@ -2451,7 +3111,7 @@ pub async fn run_one_round(shared: &SharedRun) {
 pub async fn run_rounds(shared: &SharedRun, rounds: u64) {
     let leader = setup_run(shared).await;
     for round in 1..=rounds {
-        drive_round(&shared, &leader, round).await;
+        drive_round(shared, &leader, round).await;
     }
     drop(leader);
 }
@@ -2778,7 +3438,7 @@ mod tests {
         assert!(view.iter().any(|entry| {
             entry["payload"]
                 .as_str()
-                .map_or(false, |payload| payload.contains("\"kind\":\"pricing\""))
+                .is_some_and(|payload| payload.contains("\"kind\":\"pricing\""))
         }));
         // The other kinds (storage/transit) are in the list as COMMITMENTS —
         // kind data is only visible in cleartext, so the null rows authored
@@ -2793,6 +3453,17 @@ mod tests {
             .iter()
             .filter(|entry| entry["payload"].is_string())
             .all(|entry| entry["author"] == "manufacturer-1"));
+        // …inspecting ANOTHER member through a member lens stays
+        // commitments-only: origin scoping is enforced server-side.
+        let cross = org_snapshot(&shared, "manufacturer-2", Some("manufacturer-1")).await;
+        assert!(
+            cross["pdc_values"]
+                .as_array()
+                .expect("array")
+                .iter()
+                .all(|entry| entry["payload"].is_null()),
+            "a member reads another member's payloads as commitments only"
+        );
         // …the regulator reads everything…
         let regulator = org_snapshot(&shared, "regulator-1", Some("regulator-1")).await;
         assert!(
@@ -2918,5 +3589,206 @@ mod tests {
             .iter()
             .all(|entry| entry["payload"].is_null()));
         assert_eq!(regulator["chain_height"], certifier["chain_height"]);
+    }
+
+    #[tokio::test]
+    async fn snapshot_sells_security_compliance_and_performance() {
+        let shared = Arc::new(SharedRun::default());
+        run_rounds(&shared, 4).await;
+        let value = shared.snapshot_value().await;
+
+        // Tamper-evident block window: every block carries hash links.
+        let blocks = value["blocks"].as_array().expect("blocks");
+        assert!(!blocks.is_empty(), "the chain window is exposed");
+        assert!(blocks
+            .iter()
+            .all(|block| block["hash"].is_string() && block["previous_hash"].is_string()));
+
+        // Real security posture: OCSP staples minted per member and verified
+        // locally, verifier presence per node.
+        let posture = value["posture"].as_array().expect("posture");
+        assert_eq!(posture.len(), 15, "every company reports posture");
+        assert!(
+            posture.iter().any(|row| row["ocsp"]
+                .as_str()
+                .is_some_and(|ocsp| ocsp.contains("verified locally"))),
+            "staples verify against the issuer"
+        );
+        assert!(posture.iter().any(|row| row["verifier"] == true));
+        assert!(
+            posture.iter().any(|row| row["verifier"] == false),
+            "the verifier-less evil node is visible"
+        );
+        assert!(posture.iter().any(|row| row["collections"]
+            .as_array()
+            .is_some_and(|list| !list.is_empty())));
+
+        // Real contracts with their conditions.
+        let contracts = value["contracts"].as_array().expect("contracts");
+        assert!(
+            contracts
+                .iter()
+                .any(|contract| contract["id"] == "auto-replenish"
+                    && contract["auto_execute"] == true)
+        );
+        assert!(
+            contracts
+                .iter()
+                .any(|contract| contract["id"] == "manual-review"
+                    && contract["auto_execute"] == false)
+        );
+
+        // Compliance rollup from the leader's projections, with per-lot
+        // provenance lineage: after four rounds the first lots have their
+        // full manufacture → dispatch → dispatch → receive sequence.
+        let compliance = &value["compliance"];
+        assert!(compliance["flat_records"].as_u64().unwrap_or(0) > 0);
+        assert!(compliance["lineages_checked"].as_u64().unwrap_or(0) > 0);
+        assert!(
+            compliance["lineages_complete"].as_u64().unwrap_or(0) > 0,
+            "a completed lot's mandatory custody events verify in order"
+        );
+        assert!(compliance["compliant"].as_u64().unwrap_or(0) > 0);
+        assert!(!compliance["recent"].as_array().expect("recent").is_empty());
+
+        // One measured performance point per round.
+        let history = value["history"].as_array().expect("history");
+        assert_eq!(history.len(), 4);
+        assert!(history
+            .iter()
+            .all(|point| point["commit_ms"].as_u64().is_some()));
+    }
+
+    #[tokio::test]
+    async fn offers_vary_and_orgs_carry_trust_scores() {
+        let shared = Arc::new(SharedRun::default());
+        run_rounds(&shared, 5).await;
+        let state = shared.state.lock().await;
+
+        // Prices and quantities vary: not every offer is a full lot at
+        // $10–$11, and every third offer is a premium on a manual band.
+        let offers: Vec<&OfferEvent> = state
+            .offers
+            .iter()
+            .filter(|event| event.kind == "offer")
+            .collect();
+        let prices: std::collections::HashSet<u64> =
+            offers.iter().map(|offer| offer.price_per_unit).collect();
+        let quantities: std::collections::HashSet<u64> =
+            offers.iter().map(|offer| offer.quantity).collect();
+        assert!(prices.len() >= 4, "prices vary: {prices:?}");
+        assert!(quantities.len() >= 4, "quantities vary: {quantities:?}");
+        let premium_buyers: std::collections::HashSet<&str> = offers
+            .iter()
+            .filter(|offer| offer.price_per_unit > CONTRACT_MAX_PRICE)
+            .map(|offer| offer.buyer.as_str())
+            .collect();
+        assert!(
+            premium_buyers.len() >= 2,
+            "premium offers rotate across the manual contracts: {premium_buyers:?}"
+        );
+
+        // All four contracts are registered with their real conditions.
+        let contracts: std::collections::HashSet<&str> =
+            state.contracts.iter().map(|c| c.id.as_str()).collect();
+        for id in [
+            CONTRACT_ID,
+            MANUAL_CONTRACT_ID,
+            VALUE_CONTRACT_ID,
+            PREMIUM_CONTRACT_ID,
+        ] {
+            assert!(contracts.contains(id), "contract {id} registered");
+        }
+
+        // Per-org trust from real registrations: honest makers score high,
+        // the evil under-metadata node is flagged low, certifiers have none.
+        let maker = state
+            .orgs
+            .iter()
+            .find(|org| org.id == "manufacturer-1")
+            .expect("maker org");
+        assert!(
+            maker.records > 0 && maker.trust_score >= 80,
+            "honest maker trust: {maker:?}"
+        );
+        let evil = state
+            .orgs
+            .iter()
+            .find(|org| org.id == "evil-1")
+            .expect("evil org");
+        assert!(
+            evil.records > 0 && evil.trust_score < 80,
+            "evil trust drop: {evil:?}"
+        );
+        let certifier = state
+            .orgs
+            .iter()
+            .find(|org| org.role == "certifier" && !org.evil)
+            .expect("certifier org");
+        assert_eq!(
+            certifier.records, 0,
+            "certifiers originate no registrations"
+        );
+    }
+
+    #[tokio::test]
+    async fn round_points_carry_phase_breakdowns() {
+        // Stress bounds move in lockstep with the form: 50 lots/round and a
+        // zero interval (back-to-back rounds) are valid.
+        let params = SimParams {
+            lots_per_round: 200,
+            round_interval_ms: 0,
+            ..SimParams::defaults()
+        }
+        .sanitized();
+        assert_eq!(
+            params.lots_per_round, 50,
+            "lots/round clamps to the stress bound"
+        );
+        assert_eq!(params.round_interval_ms, 0, "zero interval is allowed");
+
+        let shared = Arc::new(SharedRun::default());
+        run_rounds(&shared, 3).await;
+        let value = shared.snapshot_value().await;
+        let history = value["history"].as_array().expect("history");
+        let point = history.last().expect("a round point");
+        for key in [
+            "produce_ms",
+            "payload_ms",
+            "submit_ms",
+            "settle_ms",
+            "commit_ms",
+            "project_ms",
+            "retail_ms",
+            "round_ms",
+        ] {
+            assert!(point[key].as_u64().is_some(), "phase {key} is measured");
+        }
+        // The phases break the round down; they must not add up past it
+        // (small scheduling overhead between timers is allowed).
+        let phases: u64 = [
+            "produce_ms",
+            "payload_ms",
+            "submit_ms",
+            "settle_ms",
+            "commit_ms",
+            "project_ms",
+            "retail_ms",
+        ]
+        .iter()
+        .map(|key| point[key].as_u64().unwrap_or(0))
+        .sum();
+        let total = point["round_ms"].as_u64().unwrap_or(0);
+        assert!(
+            phases <= total + 50,
+            "phases {phases} ms vs round {total} ms"
+        );
+
+        // Latency tails are measured, not inferred: commit p99 is reported
+        // and sits at or above p95 for the same rolling window.
+        let metrics = &value["metrics"];
+        let p95 = metrics["commit_p95_ms"].as_u64().expect("commit p95");
+        let p99 = metrics["commit_p99_ms"].as_u64().expect("commit p99");
+        assert!(p99 >= p95, "p99 {p99} ms ≥ p95 {p95} ms");
     }
 }

@@ -1,6 +1,6 @@
 # Plan — `glasschain-demo`: browser demo and benchmark web app
 
-**Status:** steps 1–3 + zero-trust/multi-company slice + docs-half of 6 shipped (2026-09-16/17); steps 4–5 pending
+**Status:** steps 1–3 + zero-trust/multi-company slice + docs-half of 6 shipped (2026-09-16/17); frontend fully refactored 2026-09-18 (seven-panel UI, resizable surfaces, sellable traceability/security/compliance/performance panels, measured WebGPU dot layer with Canvas2D fallback, shared collapsible graph, keyed one-way transaction flow, per-org trust scores, four varied contracts); runner stress pass 2026-09-18 (concurrent admission/dissemination, incremental projections, 50 lots/round + zero interval, phase timings with p50/p95/p99 and Stress preset); steps 4–5 pending
 **Reviewed:** 2026-09-05 against `f7b434e`; decisions settled by grill 2026-09-16 (below)
 **Tracking:** [Visual demo and benchmark harness](https://github.com/dbbvitor/GlassChain/issues/61)
 **Decision update:** the owner requested a **web app instead of the gpui desktop
@@ -18,16 +18,22 @@ app** on 2026-09-05. The previous gpui pin, native-window/toolchain spike and
   HTML fragments, bridge is JSON), no Tailwind (build step / Play CDN), no
   Leptos/Yew (wasm toolchain). Named fallback if the table/SSE code turns
   gnarly: htmx as a single build-free file.
-- **WebGPU adoption bar:** p95 frame ≤ 16.7 ms at ~500 visible moving
-  elements on a mid-range iGPU; the same gate applies at step 0 and step 5.
-  The result (browser/version/device/failed-or-met) is recorded in
+- **WebGPU adoption bar (tightened 2026-09-18):** draw-time **p99 ≤ 10 ms**
+  at the target load on a mid-range iGPU; the same gate applies at step 0 and
+  step 5. The result (browser/version/device/failed-or-met) is recorded in
   `docs/demo.md`; WebGPU code ships only if the bar is met, with Canvas2D
   as the automatic fallback for missing adapters/device loss/reduced motion.
+  *(2026-09-18: `demo/static/graph.js` now implements the gate for real — the
+  Canvas2D baseline measures its draw-time p99 against the 10 ms budget (300
+  frames); a WebGPU dot layer on a transparent overlay activates only on a
+  measured miss, with `?renderer=webgpu` as the forced-verification path and
+  `?renderer=canvas` pinning the baseline. The real-device comparison is still
+  pending and must be recorded in docs.)*
 - **Federation (expanded 2026-09-17):** multiple real companies per role
   (3 manufacturers, 2 distributors, 2 logistics, 3 pharmacies, regulator,
-  2 certifiers = 13 honest nodes) **plus two evil companies** — `QuimicaFalsa`
+  2 certifiers = 13 honest nodes) **plus two evil companies** — `evil-1`
   (verified, not a `pricing` member: membership-gate + strict-schema
-  rejections) and `DipFakeCerts` (no verifier: fail-closed #86 rejection;
+  rejections) and `evil-2` (no verifier: fail-closed #86 rejection;
   under-metadata registration admitted with a flagged trust score). Every
   rejection shown is a real code path; equivocation evidence surfaces only
   if the staged BFT engine emits it and is labelled unavailable otherwise.
@@ -223,8 +229,9 @@ limits explicitly rather than drawing successful security or recovery guarantees
   matrix. Compare Canvas2D with a small WebGPU view; settle renderer scope from
   evidence, not a framework preference. *(Settled by grill 2026-09-16 instead of
   a throwaway spike: axum + SSE, vanilla ES modules, session-token commands;
-  the Canvas2D/WebGPU comparison runs against the shipped app with the p95 ≤
-  16.7 ms gate, still pending a real-device measurement.)*
+  the Canvas2D/WebGPU comparison runs against the shipped app with the 10 ms
+  p99 gate (tightened 2026-09-18 from the original p95 ≤ 16.7 ms bar), still
+  pending a real-device measurement.)*
 - [x] **1 — Package and shared fixtures.** Add the excluded demo package/static
   assets, extract only the workload code both tests and runner use, and preserve
   existing harness results. Pin any new tooling in the demo, not core crates.
@@ -244,8 +251,10 @@ limits explicitly rather than drawing successful security or recovery guarantees
   missing instrumentation as unavailable, not fabricated measurements.
 - [ ] **5 — Optional WebGPU acceleration.** Land only with the spike's measurable
   benefit, renderer equivalence and fallback/device-loss tests. No core dependency.
-  *(Experiment code exists behind the measured-budget gate; the real-device
-  comparison is pending.)*
+  *(A measured-gate implementation shipped 2026-09-18: WebGPU dots only, behind
+  the baseline p99 miss, with automatic fallback and a forced `?renderer=webgpu`
+  verification path. Still open: record the real-device comparison in
+  `docs/demo.md`.)*
 - [x] **6 — CI and documentation.** Dedicated demo Rust checks plus browser smoke/
   accessibility tests in fallback mode; optional GPU-capable smoke separately.
   Add `docs/demo.md` when runnable and a short README entry. Explain synthetic
