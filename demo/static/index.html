@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="GlassChain: a local, synthetic supply-chain federation demo. Presentation, never evidence.">
+  <title>GlassChain — synthetic supply chain</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <svg class="sprite" aria-hidden="true">
+    <symbol id="i-play" viewBox="0 0 16 16"><path fill="currentColor" d="M4.4 2.9v10.2c0 .7.8 1.1 1.3.7l8-5.1c.5-.3.5-1.1 0-1.4l-8-5.1c-.5-.4-1.3 0-1.3.7Z"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 16 16"><rect fill="currentColor" x="3.6" y="3.6" width="8.8" height="8.8" rx="1.6"/></symbol>
+    <symbol id="i-reset" viewBox="0 0 16 16"><path d="M13 8a5 5 0 1 1-1.6-3.7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M13.4 1.8v3.1h-3.1" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 16 16"><circle fill="currentColor" cx="8" cy="8" r="3"/><path d="M8 1.2v1.8M8 13v1.8M1.2 8H3M13 8h1.8M3.2 3.2l1.3 1.3M11.5 11.5l1.3 1.3M12.8 3.2l-1.3 1.3M4.5 11.5l-1.3 1.3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 16 16"><path fill="currentColor" d="M13.4 9.7A5.6 5.6 0 0 1 6.3 2.6a5.6 5.6 0 1 0 7.1 7.1Z"/></symbol>
+    <symbol id="i-close" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 16 16"><path d="M3.5 6 8 10.5 12.5 6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  </svg>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">◆</span>
+      <span class="brand-name">GlassChain</span>
+      <span class="chip">Demo</span>
+    </div>
+    <span id="mode" class="mode"></span>
+    <div class="runbar">
+      <span id="conn" class="conn" data-state="connecting" title="Live snapshot stream — reconnects refetch the authoritative snapshot"><i></i><span id="conn-label">connecting</span></span>
+      <span id="run-status" class="status" data-state="idle" title="Runner state"><i></i><span id="run-label">idle</span></span>
+      <button id="btn-start" class="btn btn-primary" title="Start the synthetic rounds — real nodes, real blocks">
+        <svg class="icon" aria-hidden="true"><use href="#i-play"/></svg>Start
+      </button>
+      <button id="btn-stop" class="btn" title="Abort the runner; the committed picture stays for inspection">
+        <svg class="icon" aria-hidden="true"><use href="#i-stop"/></svg>Stop
+      </button>
+      <button id="btn-reset" class="btn btn-quiet-danger" title="Abort the run and wipe the shared state">
+        <svg class="icon" aria-hidden="true"><use href="#i-reset"/></svg>Reset
+      </button>
+      <button id="btn-theme" class="btn btn-icon" aria-label="Toggle light or dark appearance" title="Toggle light / dark">
+        <svg class="icon" aria-hidden="true"><use id="theme-icon" href="#i-sun"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="rail">
+      <nav id="nav" class="rail-nav" aria-label="Sections">
+        <button type="button" data-panel="overview" aria-current="page">Overview</button>
+        <button type="button" data-panel="inventory">Inventory</button>
+        <button type="button" data-panel="trade">Trade</button>
+        <button type="button" data-panel="traceability">Traceability</button>
+        <button type="button" data-panel="security">Trust &amp; Security</button>
+        <button type="button" data-panel="compliance">Compliance</button>
+        <button type="button" data-panel="performance">Performance</button>
+      </nav>
+      <div class="rail-block">
+        <label class="rail-label" for="view-select">Viewing as</label>
+        <select id="view-select" title="See the whole page through this member's eyes">
+          <option value="">Public — the chain only</option>
+        </select>
+        <button id="btn-public" class="btn btn-ghost" type="button">Return to public view</button>
+        <p class="rail-hint" id="view-hint">The public chain: commitments, never private payload cleartext.</p>
+      </div>
+      <div class="rail-foot">
+        <span>Synthetic run — presentation, never evidence.</span>
+        <a href="https://github.com/dbbvitor/GlassChain/blob/main/docs/demo.md">About this demo</a>
+      </div>
+    </aside>
+
+    <main id="main">
+      <div id="banner" class="banner" data-kind="public">
+        <span class="banner-title">Viewing as <b id="banner-name">Public</b></span>
+        <span id="banner-text" class="banner-text"></span>
+      </div>
+
+      <div id="graph-card" class="card graph-card">
+        <div class="card-head">
+          <h2>Federation</h2>
+          <span class="graph-head-right">
+            <span id="renderer" class="card-note" title="Renderer decision: Canvas2D baseline, WebGPU dot layer only when the measured baseline misses the 10 ms p99 budget"></span>
+            <button id="btn-graph" class="btn btn-icon" aria-expanded="true" aria-controls="graph-body" title="Show or hide the federation graph">
+              <svg class="icon chevron" aria-hidden="true"><use href="#i-chevron"/></svg>
+            </button>
+          </span>
+        </div>
+        <div id="graph-body">
+          <div class="canvas-wrap">
+            <canvas id="graph" role="img" aria-label="Interactive federation graph. Each node is a company; moving dots are committed transactions. Click a node to inspect that member, click a dot for the transaction, drag to rearrange, hover for details."></canvas>
+            <canvas id="gpu" aria-hidden="true"></canvas>
+            <div id="graph-tip" class="graph-tip" hidden></div>
+          </div>
+          <div class="legend" aria-hidden="true">
+            <span class="legend-item"><i class="dot-manufacturer"></i>Manufacturers</span>
+            <span class="legend-item"><i class="dot-distributor"></i>Distributors</span>
+            <span class="legend-item"><i class="dot-logistics"></i>Logistics</span>
+            <span class="legend-item"><i class="dot-pharmacy"></i>Pharmacies</span>
+            <span class="legend-item"><i class="dot-certifier"></i>Certifiers</span>
+            <span class="legend-item"><i class="dot-regulator"></i>Regulators</span>
+            <span class="legend-item"><i class="dot-evil"></i>Evil nodes</span>
+            <span class="legend-note">line thickness = traffic carried · each dot flows once, origin to destination</span>
+          </div>
+        </div>
+      </div>
+
+      <section id="panel-overview" class="panel">
+        <div id="kpis" class="kpis"></div>
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-head">
+              <h2>Simulation</h2>
+              <span class="card-note">changes apply live, even mid run</span>
+            </div>
+            <form id="params" class="params" autocomplete="off">
+              <div class="param"><label for="p-manufacturers">Manufacturers</label><input id="p-manufacturers" name="manufacturers" type="number" min="1" max="6" value="3" title="Manufacturer companies in the federation"></div>
+              <div class="param"><label for="p-distributors">Distributors</label><input id="p-distributors" name="distributors" type="number" min="1" max="5" value="2" title="Distribution centers"></div>
+              <div class="param"><label for="p-logistics">Logistics</label><input id="p-logistics" name="logistics" type="number" min="1" max="5" value="2" title="Logistics carriers"></div>
+              <div class="param"><label for="p-pharmacies">Pharmacies</label><input id="p-pharmacies" name="pharmacies" type="number" min="1" max="6" value="3" title="Retail pharmacies — they buy through the contracts"></div>
+              <div class="param"><label for="p-regulators">Regulators</label><input id="p-regulators" name="regulators" type="number" min="0" max="3" value="1" title="Regulators read every private payload"></div>
+              <div class="param"><label for="p-certifiers">Certifiers</label><input id="p-certifiers" name="certifiers" type="number" min="1" max="4" value="2" title="Certification bodies — quality certifications and audits"></div>
+              <div class="param"><label for="p-evil_nodes">Evil nodes</label><input id="p-evil_nodes" name="evil_nodes" type="number" min="0" max="5" value="2" title="Adversary nodes attacking every round"></div>
+              <div class="param"><label for="p-lots_per_round">Lots / round</label><input id="p-lots_per_round" name="lots_per_round" type="number" min="1" max="50" value="3" title="Lots produced each round (up to 50 under stress)"></div>
+              <div class="param"><label for="p-round_interval_ms">Interval (ms)</label><input id="p-round_interval_ms" name="round_interval_ms" type="number" min="0" max="10000" step="50" value="400" title="Pause between rounds; 0 runs back-to-back"></div>
+              <div class="param param-actions">
+                <button id="btn-stress" class="btn" type="button" title="Set lots/round to 50, no pause between rounds, and apply — a sustained throughput and latency stress run">Stress preset</button>
+                <button class="btn btn-primary" type="submit">Apply</button>
+                <span id="params-note" class="card-note" aria-live="polite"></span>
+              </div>
+            </form>
+          </div>
+          <div class="card">
+            <div class="card-head">
+              <h2>Activity</h2>
+              <span class="card-note">committed events, newest first</span>
+            </div>
+            <ul id="feed" class="feed" aria-label="Recent runner activity"></ul>
+          </div>
+        </div>
+      </section>
+
+      <section id="panel-inventory" class="panel" hidden>
+        <div id="wms-kpis" class="kpis"></div>
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-head"><h2>Stock level by member</h2><span class="card-note">on-hand units, committed custody</span></div>
+            <div id="bars" class="bars"></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>Inventory value share</h2><span class="card-note">on-hand × $15.00 (demo bookkeeping)</span></div>
+            <div class="donut-row">
+              <div id="donut" class="donut" role="img" aria-label="Inventory value share per member"></div>
+              <ul id="donut-legend" class="legend-list"></ul>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Inventory directory</h2><span class="card-note">click a member to inspect it</span></div>
+          <div class="table-wrap" data-resize>
+            <table class="data" id="directory-table">
+              <thead><tr><th>Member</th><th>Type</th><th class="num">Lots</th><th class="num">Units</th><th class="num">Value</th><th class="num">Sellable</th><th class="num">Retail sold</th><th>Health</th></tr></thead>
+              <tbody id="directory-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="panel-trade" class="panel" hidden>
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-head"><h2>Awaiting buyer</h2><span class="card-note">premium offers — buy any amount</span></div>
+            <div id="pending-offers" class="offer-list"></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>Executed</h2><span class="card-note">auto-matched contracts and manual buys</span></div>
+            <div id="executed-offers" class="offer-list"></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Contracts</h2><span class="card-note">registered on-chain with their real conditions</span></div>
+          <div class="table-wrap" data-resize>
+            <table class="data" id="contracts-table">
+              <thead><tr><th>Contract</th><th>Buyer</th><th>Product</th><th class="num">Price cap</th><th class="num">Max qty</th><th>Mode</th><th class="num">Executions</th><th class="num">Units bought</th><th>Status</th></tr></thead>
+              <tbody id="contracts-body"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Purchases</h2><span class="card-note">real PurchaseOrders committed on-chain</span></div>
+          <div class="table-wrap" data-resize>
+            <table class="data" id="purchases-table">
+              <thead><tr><th>Tx</th><th>Product</th><th>Seller</th><th>Buyer</th><th class="num">Qty</th><th class="num">Unit price</th><th>Round</th><th>How</th></tr></thead>
+              <tbody id="purchases-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="panel-traceability" class="panel" hidden>
+        <div id="trace-kpis" class="kpis"></div>
+        <div class="card">
+          <div class="card-head"><h2>Lots and custody</h2><span class="card-note">one custody hop per round — click a lot for its full lineage</span></div>
+          <div class="table-wrap tall" data-resize>
+            <table class="data" id="lots-table">
+              <thead><tr><th>Lot</th><th>Status</th><th>Lineage</th><th>Maker</th><th class="num">Trust</th><th>Custody chain</th></tr></thead>
+              <tbody id="lots-body"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-head"><h2>Certifications and audits</h2><span class="card-note">issued by the certifiers once a lot exists</span></div>
+            <div class="table-wrap" data-resize>
+              <table class="data" id="certs-table">
+                <thead><tr><th>Record</th><th>Type</th><th>Lot</th><th>Issuer</th><th>Status</th></tr></thead>
+                <tbody id="certs-body"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>Block chain</h2><span class="card-note">each hash commits to the previous block — click a block</span></div>
+            <div class="table-wrap" data-resize>
+              <table class="data" id="blocks-table">
+                <thead><tr><th class="num">Height</th><th>Hash</th><th>Previous</th><th class="num">Txs</th><th>Committed</th><th>Seal</th></tr></thead>
+                <tbody id="blocks-body"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="panel-security" class="panel" hidden>
+        <div id="security-kpis" class="kpis"></div>
+        <div class="card">
+          <div class="card-head"><h2>Member security posture</h2><span class="card-note">read from each node: verifier, issuer-signed OCSP staple, channels, peer sessions</span></div>
+          <div class="table-wrap" data-resize>
+            <table class="data" id="posture-table">
+              <thead><tr><th>Company</th><th>Role</th><th>Trust</th><th>Certificate verifier</th><th>Certificate</th><th>OCSP staple</th><th>Channels</th><th class="num">Peers</th></tr></thead>
+              <tbody id="posture-body"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Adversary outcomes</h2><span class="card-note">every rejection is a real GlassChain gate — click a row for the why</span></div>
+          <div class="table-wrap" data-resize>
+            <table class="data" id="security-table">
+              <thead><tr><th>Actor</th><th>Attack</th><th>Outcome</th><th>Enforced by</th></tr></thead>
+              <tbody id="security-body"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Who sees what</h2><span class="card-note">filled from each member's own node, not the leader's view</span></div>
+          <div class="table-wrap" data-resize>
+            <table class="data" id="visibility-table">
+              <thead><tr><th>Company</th><th>Role</th><th>Trust</th><th>Chain</th><th>Private payloads</th></tr></thead>
+              <tbody id="visibility-body"></tbody>
+            </table>
+          </div>
+        </div>
+        <div id="equivocation-card" class="card" hidden>
+          <div class="card-head"><h2>Equivocation evidence</h2><span class="card-note">the dev-PoW driver does not produce BFT evidence — any proof shown here would be real</span></div>
+          <ul id="equivocations" class="feed"></ul>
+        </div>
+      </section>
+
+      <section id="panel-compliance" class="panel" hidden>
+        <div id="compliance-kpis" class="kpis"></div>
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-head"><h2>Schema validation</h2><span class="card-note">ADR-006 strict SNCM validation of every in-flight lot</span></div>
+            <div class="table-wrap" data-resize>
+              <table class="data" id="schema-table">
+                <thead><tr><th>Lot</th><th>Maker</th><th>Schema</th><th>Fee schedule</th><th>Lineage</th><th class="num">Trust → avg</th></tr></thead>
+                <tbody id="schema-body"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>Trust distribution</h2><span class="card-note">on-chain metadata quality across flat records</span></div>
+            <div id="trust-chart" class="bars"></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Analytical records</h2><span class="card-note">flat projection of committed registrations — missing fields stay visible</span></div>
+          <div class="table-wrap" data-resize>
+            <table class="data" id="flat-table">
+              <thead><tr><th class="num">Block</th><th>GTIN</th><th>Batch</th><th>Serial</th><th>Custodian</th><th>Event</th><th>Trust</th><th>Missing fields</th></tr></thead>
+              <tbody id="flat-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="panel-performance" class="panel" hidden>
+        <div id="metric-grid" class="kpis"></div>
+        <div class="card">
+          <div class="card-head">
+            <h2>Round time breakdown</h2>
+            <span class="card-note">where each round's wall-clock went — runner measurements, not animation timestamps</span>
+          </div>
+          <div id="round-breakdown" class="breakdown"></div>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <h2>Phase percentiles</h2>
+            <span class="card-note">rolling 64-round window — the p99 tail is where stress shows</span>
+          </div>
+          <div class="table-wrap" data-resize>
+            <table class="data" id="phase-table">
+              <thead><tr><th>Phase</th><th class="num">p50</th><th class="num">p95</th><th class="num">p99</th></tr></thead>
+              <tbody id="phase-body"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-head"><h2>Throughput per round</h2><span class="card-note">committed submissions per second, from the runner</span></div>
+            <div id="throughput-chart" class="chart-wrap"></div>
+          </div>
+          <div class="card">
+            <div class="card-head"><h2>Commit latency per round</h2><span class="card-note">dev-PoW mining ms; not BFT finality</span></div>
+            <div id="latency-chart" class="chart-wrap"></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Run</h2><span class="card-note">from the headless runner, never from animation timestamps</span></div>
+          <div id="run-info" class="run-info"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <footer class="foot">
+    <p>
+      Synthetic demo run through real local GlassChain nodes. Admission is not
+      finality, and nothing here establishes the ADR-010 testnet, security or
+      scalability gates — see the
+      <a href="https://github.com/dbbvitor/GlassChain/blob/main/docs/benchmarks/consensus-capacity.md">benchmark record</a>.
+    </p>
+  </footer>
+
+  <div id="scrim" class="scrim" hidden></div>
+  <aside id="drawer" class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" hidden>
+    <div id="drawer-resize" class="drawer-resize" role="separator" aria-orientation="vertical" tabindex="0" title="Drag or use arrow keys to resize the drawer"></div>
+    <header class="drawer-head">
+      <div class="drawer-heading">
+        <h2 id="drawer-title"></h2>
+        <div id="drawer-badges" class="drawer-badges"></div>
+      </div>
+      <button id="drawer-close" class="btn btn-icon" aria-label="Close">
+        <svg class="icon" aria-hidden="true"><use href="#i-close"/></svg>
+      </button>
+    </header>
+    <div id="drawer-body" class="drawer-body"></div>
+  </aside>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+
+  <dialog id="reset-dialog" class="dialog">
+    <form method="dialog">
+      <h2>Reset the demo?</h2>
+      <p>Aborts the run and wipes the shared state. This cannot be undone.</p>
+      <div class="dialog-actions">
+        <button value="cancel" class="btn" formnovalidate>Cancel</button>
+        <button value="reset" class="btn btn-danger" formnovalidate>Reset</button>
+      </div>
+    </form>
+  </dialog>
+
+  <noscript><p class="noscript">This demo needs JavaScript and a same-origin connection.</p></noscript>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

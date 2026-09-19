@@ -4,6 +4,10 @@ GlassChain coordinates supply-chain offers, inventory automation, and purchase c
 
 ## Language
 
+**Synthetic demo run**:
+A seeded, local, non-production exercise of a real GlassChain federation driven by generated supply-chain transactions (crowds custody, certification and metrics for demonstration), rendered in a browser through a demo bridge. Its outputs are presentation, never evidence: it cannot establish ADR-010 testnet, security or scalability gates, and admission is never displayed as finality.
+_Avoid_: benchmark run (the authoritative ADR-010 gate), production pilot, testnet
+
 **Supply offer**:
 An offer from a seller describing available product, price, currency, quantity, and lead time for a buyer to evaluate.
 _Avoid_: inventory offer

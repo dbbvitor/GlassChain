@@ -18,6 +18,7 @@ history of that failure mode, and correcting it is worth more than a tidy story.
 | [`privacy-and-identity.md`](privacy-and-identity.md) | You are reviewing security, or working on identity. MSP, certificate verification, endorsement policy, private data collections, and an honest inventory of what is inert at runtime. |
 | [`workflows-and-contracts.md`](workflows-and-contracts.md) | You are building business logic. The contract/workflow split, the WASM host ABI, the flow framework, and watcher automation. |
 | [`operations.md`](operations.md) | You want to run it. Build, flags, the REPL, the gRPC surface, storage, the wire protocol, and the security warnings an operator needs first. |
+| [`demo.md`](demo.md) | You want to watch the local browser demo. The synthetic-run boundary, the bridge's security posture, the renderer policy, and what it can never prove. |
 | [`liveness.md`](liveness.md) | You are planning a validator set. Failure-domain placement, jurisdiction floors, uptime and participation targets; these are operational guidance, not measured fleet guarantees. |
 
 ## Decisions
