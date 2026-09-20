@@ -22,7 +22,8 @@ watcher automation engine, a TLS-encrypted TCP/libp2p P2P layer, and a gRPC API.
 - **Toolchain:** Rust **1.98.1** (pinned in `rust-toolchain.toml`), edition 2021.
 - **Runtime:** Tokio async, `tonic`/`prost` for gRPC, `wasmtime` for contract execution.
 - **CI:** `.github/workflows/ci.yml` runs strict rustfmt and clippy gates, a
-  DCO sign-off check (every PR commit needs `git commit -s`), a
+  DCO sign-off check (every human-authored PR commit needs `git commit -s`;
+  bot commits such as Dependabot's are exempt), a
   check/test matrix on Ubuntu, macOS, and Windows, code coverage, and a RustSec
   dependency audit on every push and PR. Coverage uploads require the
   `CODECOV_TOKEN` repository secret; `codecov.yml` gates project coverage at

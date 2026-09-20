@@ -15,7 +15,10 @@ git commit -s -m "feat: describe the change"
 This adds a `Signed-off-by:` line certifying that you wrote the change or have
 the right to submit it under the project license ([Apache-2.0](LICENSE)) —
 see the [DCO text](https://developercertificate.org/) for the full statement.
-CI verifies every commit in a PR carries a matching sign-off.
+CI verifies every commit in a PR carries a matching sign-off. Bot-authored
+commits (`dependabot[bot]`, `github-actions[bot]`, …) are exempt, since a bot
+cannot assert the DCO; the maintainer who merges the PR takes responsibility
+for it.
 
 ## Getting started
 
