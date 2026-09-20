@@ -93,7 +93,9 @@ avoid-breaking-exported-api = false
 
 # Keep only duplicates Clippy reports for the locked workspace graph. The VM's
 # Wasmtime dependency opts out of unused default feature trees, so its cache and
-# component-model duplicates do not need exceptions.
+# component-model duplicates do not need exceptions. `pem`/`yasna` split because
+# `rcgen` 0.14.8+ moved to pem 4 / yasna 0.6 while libp2p's transitive rcgen 0.13
+# still resolves pem 3 / yasna 0.5.
 allowed-duplicate-crates = [
     "base64",
     "bitflags",
@@ -115,6 +117,7 @@ allowed-duplicate-crates = [
     "itertools",
     "parking_lot",
     "parking_lot_core",
+    "pem",
     "pkcs8",
     "r-efi",
     "rand",
@@ -136,4 +139,5 @@ allowed-duplicate-crates = [
     "wit-bindgen",
     "x509-parser",
     "yamux",
+    "yasna",
 ]
