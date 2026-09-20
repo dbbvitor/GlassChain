@@ -36,7 +36,7 @@ hex          = "0.4"
 tokio-rustls = "0.26"
 rustls       = { version = "0.23", features = ["ring"] }
 rcgen        = "0.14"
-libp2p       = { version = "0.56.0", features = [
+libp2p       = { version = "0.57.0", features = [
     "gossipsub",
     "kad",
     "tcp",
