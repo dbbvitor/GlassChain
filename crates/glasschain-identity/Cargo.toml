@@ -10,7 +10,7 @@ keywords = ["blockchain", "supply-chain", "distributed-ledger"]
 categories = ["network-programming", "asynchronous", "cryptography"]
 
 [dependencies]
-glasschain-core = { path = "../glasschain-core" }
+glasschain-core = { version = "0.1.0", path = "../glasschain-core" }
 ed25519-dalek = { version = "3.0", features = ["alloc", "rand_core", "pkcs8"] }
 rcgen = { version = "0.14", features = ["pem"] }
 # OS entropy for identity generation (rand_core 0.10 has no OsRng; this

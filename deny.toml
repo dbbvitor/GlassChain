@@ -1,0 +1,58 @@
+# GlassChain cargo-deny policy (wayfinder tickets #141/#150, part of #139).
+# Verified against Cargo.lock with cargo-deny 0.20.2. Run: cargo deny --all-features check
+#
+# cargo-deny does NOT read .cargo/audit.toml; the ignores below re-express it.
+# It checks a feature-resolved graph (~438 packages) rather than the flat
+# lockfile (~551), so audit.yml keeps cargo-audit for lockfile-wide coverage.
+
+[graph]
+all-features = true
+
+[advisories]
+db-urls = ["https://github.com/RustSec/advisory-db"]
+# Strictest viable settings, verified green:
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+# An ignore that no longer matches an advisory fails the check, keeping the
+# list from going stale.
+unused-ignored-advisory = "deny"
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained: via netlink-packet-core 0.8.x (if-watch 3.2.2 caps it); netlink-packet-core 0.9.0 is paste-free but unreachable. Kept until libp2p-mdns moves off if-watch 3." },
+]
+
+[bans]
+multiple-versions = "deny"
+# Duplicated names tolerated today, ported from clippy.toml's
+# allowed-duplicate-crates (which lists two inert extras, pruned there).
+skip = [
+    "base64", "block-buffer", "chacha20", "cpufeatures", "crypto-common",
+    "curve25519-dalek", "digest", "fiat-crypto", "foldhash", "getrandom",
+    "hashbrown", "r-efi", "rand", "rand_core", "sha2", "syn", "thiserror",
+    "thiserror-impl", "wasm-encoder", "windows-sys",
+]
+# Intra-workspace path dependencies carry `version = "0.1.0"`; the flag stays
+# on for any future path-only dependency.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[licenses]
+# The feature-resolved graph needs exactly these eight. MPL-2.0 attohttpc is
+# lockfile-only (libp2p-upnp -> igd-next) and outside this graph; re-add an
+# `exceptions` entry if libp2p's `upnp` feature is ever enabled.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception", # distinct from Apache-2.0; wasmtime/cranelift
+    "BSD-2-Clause",    # arrayref only
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",     # ICU crates + unicode-ident
+    "Zlib",            # foldhash only
+]
+unused-allowed-license = "deny"
+private = { ignore = false }
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -366,21 +366,21 @@ mod tests {
 
     /// D5 over the persistent backend: the payload is written, the database
     /// is **reopened**, the expired payload is purged (discovered by scan,
-    /// not by a prior read) and the underlying sled key is gone.
+    /// not by a prior read) and the underlying redb key is gone.
     #[test]
-    fn test_restart_purge_over_sled_backend() {
+    fn test_restart_purge_over_redb_backend() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let payload = b"sled-expired-before-restart".to_vec();
+        let payload = b"redb-expired-before-restart".to_vec();
         let commitment = glasschain_core::crypto::sha256(&payload);
         {
             let storage: Arc<dyn StorageProvider> =
-                Arc::new(crate::SledStorageProvider::open(dir.path()).expect("open"));
+                Arc::new(crate::RedbStorageProvider::open(dir.path()).expect("open"));
             let store = TransientStore::new(Arc::clone(&storage));
             store.put("pricing", &commitment, &payload, 0).unwrap();
         }
         // Reopen: a restarted member has an empty in-memory index.
         let storage: Arc<dyn StorageProvider> =
-            Arc::new(crate::SledStorageProvider::open(dir.path()).expect("reopen"));
+            Arc::new(crate::RedbStorageProvider::open(dir.path()).expect("reopen"));
         let restarted = TransientStore::new(Arc::clone(&storage));
         assert_eq!(
             restarted.purge_expired().unwrap(),
@@ -392,7 +392,7 @@ mod tests {
                 .get_state(&transient_key("pricing", &commitment))
                 .unwrap()
                 .is_none(),
-            "the underlying sled key is deleted"
+            "the underlying redb key is deleted"
         );
     }
 }

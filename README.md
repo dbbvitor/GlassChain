@@ -93,9 +93,18 @@ tests in `crates/glasschain-network/tests/`). gRPC starts only with `--rpc-addr`
 Run the repository's validation gates locally (CI also checks platform compatibility):
 
 ```bash
+make ci        # check (fmt + clippy + type-check) -> test (nextest) -> analysis (deny + machete)
+```
+
+`make check`, `make test`, and `make analysis` run individually; `make tools`
+installs the optional tooling (nextest, deny, machete, mutants, typos, …) and
+`make tools-nightly` adds the deep-check components (miri, careful, snarf). The
+raw cargo commands remain available:
+
+```bash
 cargo fmt --all --check
 cargo check --workspace --all-targets --all-features --locked
-cargo test  --workspace --all-targets --all-features --locked
+cargo nextest run --profile ci --workspace --lib --bins --tests --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
@@ -139,7 +148,7 @@ the workspace has no cycles:
 
 | Area | Crates |
 |---|---|
-| **Ledger & data** | `glasschain-core` (blocks, transactions, schema v1, provider seams) · `glasschain-storage` (in-memory / Sled / transient) · `glasschain-indexer` (event bus, provenance index) |
+| **Ledger & data** | `glasschain-core` (blocks, transactions, schema v1, provider seams) · `glasschain-storage` (in-memory / redb / transient) · `glasschain-indexer` (event bus, provenance index) |
 | **Automation** | `glasschain-contracts` (deterministic registry & matching) · `glasschain-vm` (Wasmtime + gas) · `glasschain-workflows` (flows, watchers) |
 | **Identity & privacy** | `glasschain-identity` (MSP, CAs, channels, endorsement, private collections) |
 | **Network & interfaces** | `glasschain-network` (P2P, wire protocol) · `glasschain-rpc` (gRPC) · `glasschain-sdk` (client) · `glasschain-cli` (CLI) · `glasschain-node` (REPL node) |

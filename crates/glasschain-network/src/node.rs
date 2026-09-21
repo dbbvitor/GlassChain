@@ -6076,17 +6076,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sled_backed_restart_rebuilds_world_state_across_persistence() {
-        use glasschain_storage::SledStorageProvider;
+    async fn redb_backed_restart_rebuilds_world_state_across_persistence() {
+        use glasschain_storage::RedbStorageProvider;
         let dir = tempfile::tempdir().expect("temp dir");
         let storage: Arc<dyn StorageProvider> =
-            Arc::new(SledStorageProvider::open(dir.path()).expect("sled must open"));
+            Arc::new(RedbStorageProvider::open(dir.path()).expect("redb must open"));
         let (_, expected) = commit_write_set_scenario(Arc::clone(&storage)).await;
 
         // A genuinely fresh node over the same on-disk directory, without an
         // execution provider: the committed write sets alone must rebuild the
         // world state (persistence + restart rebuild, AC5).
-        let restarted = Node::new_with_storage("n-sled-restart", "127.0.0.1:0", 1, storage);
+        let restarted = Node::new_with_storage("n-redb-restart", "127.0.0.1:0", 1, storage);
         restarted.start(vec![]).await.unwrap();
         assert_eq!(restarted.world_state().await, expected);
     }

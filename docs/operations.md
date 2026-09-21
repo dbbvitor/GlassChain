@@ -85,7 +85,7 @@ Verified from the argument parser in `crates/glasschain-node/src/main.rs`
 | `--listen <ADDR>` | Address the P2P TCP listener binds | `0.0.0.0:8000` | no |
 | `--peer <ADDR>` | Seed peer address to dial at startup (`"host:port"`) | none | **yes** — pass it once per seed |
 | `--difficulty <N>` | Proof-of-Work difficulty: number of leading zero hex characters required in a block hash | `2` | no |
-| `--storage-path <PATH>` | Directory for persistent Sled block storage. When provided, the chain is reloaded from disk on restart; when omitted, storage is in-memory only | none (in-memory) | no |
+| `--storage-path <PATH>` | Directory for persistent block storage (redb). When provided, the chain is reloaded from disk on restart; when omitted, storage is in-memory only | none (in-memory) | no |
 | `--org <NAME>` | Organization name. Causes the node to create an organization Root CA and issue an identity-backed TLS certificate | none (anonymous self-signed cert) | no |
 | `--identity-node-id <ID>` | Node ID embedded in the issued TLS identity certificate (CN) | value of `--id` | no |
 | `--trust-store <PATH>` | PEM file or directory holding the peer organizations' Root/intermediate CA certificates (`*.pem`) and their signed CRLs (`*.crl`, ADR-013). **Requires `--org`.** Verification is fail-closed: a peer whose issuing CA has no current CRL in the store is rejected. Without it, peer organizations are not certificate-verified (logged at startup) | none | no |
@@ -462,20 +462,20 @@ println!("Submit to gRPC SubmitTransaction:\n{tx_json}");
 ## 7. Storage
 
 `glasschain-storage` implements the `StorageProvider` trait from
-`glasschain-core` (`crates/glasschain-storage/src/{lib.rs,sled_backend.rs,transient.rs}`).
+`glasschain-core` (`crates/glasschain-storage/src/{lib.rs,redb_backend.rs,transient.rs}`).
 
 ### Backends
 
 | Backend | When | Details |
 |---|---|---|
 | **In-memory** (`InMemoryStorageProvider`, in core) | default — no `--storage-path` | Ledger + world state in RAM; **everything lost on restart**. |
-| **Sled** (`SledStorageProvider`) | `--storage-path <DIR>` | Pure-Rust embedded KV store; directory created if absent; two trees — `blocks` (serialized `Block` JSON, 8-byte big-endian index keys) and `state` (raw world-state bytes). `open()` is fallible (`CoreError::Storage`) and Sled takes an exclusive lock on the directory — one node per path. |
+| **redb** (`RedbStorageProvider`) | `--storage-path <DIR>` | Pure-Rust embedded ACID KV store; directory created if absent; one database file (`glasschain.redb`) with two tables — `blocks` (serialized `Block` JSON keyed by block index) and `state` (raw world-state bytes keyed by state key). `open()` is fallible (`CoreError::Storage`) and redb takes an exclusive lock on the file — one node per path. |
 
 ### The atomic block+state boundary: `apply_block`
 
 `StorageProvider::apply_block(&Block)` is the one atomic persistence boundary
-(ADR-007 decision 2; `sled_backend.rs:85–166`): tip check, block insert, and
-write-set application run inside a **single sled multi-tree transaction**, so a
+(ADR-007 decision 2; `redb_backend.rs` (`RedbStorageProvider::apply_block`)): tip check, block insert, and
+write-set application run inside a **single redb write transaction**, so a
 stale candidate (tip mismatch / failed `validate_tip_chain`) aborts whole as
 `CoreError::InvalidBlock` and a partial write set can never be acknowledged.
 The in-memory backend implements the same contract (block+state locks); the
@@ -776,7 +776,7 @@ code, default builds the fallbacks, and both must stay green.
 | Job | Runner | Runs |
 |---|---|---|
 | `fmt` / `clippy` | ubuntu | `cargo fmt --all --check`; clippy with `RUSTFLAGS=-D warnings` |
-| `test` | **matrix ubuntu / macOS / Windows** | `cargo test --workspace --lib --bins --tests --all-features` with `RUSTFLAGS=-D warnings`, `RUSTDOCFLAGS=-D warnings` — parallel harnesses; loopback ports come from the shared per-process band allocator (`tests/common/ports.rs`), so no cross-test port race |
+| `test` | **matrix ubuntu / macOS / Windows** | `cargo nextest run --profile ci --workspace --lib --bins --tests --all-features` with `RUSTFLAGS=-D warnings`, `RUSTDOCFLAGS=-D warnings` — process-per-test isolation; loopback ports come from the shared per-process band allocator (`tests/common/ports.rs`), so no cross-test port race |
 | `coverage` | ubuntu | `cargo tarpaulin … --lib --bins --tests --engine llvm --out xml` (llvm engine because wasmtime traps abort the default ptrace engine; benches excluded like the test job), upload to Codecov when a token exists |
 | `audit` | ubuntu (own workflow: `audit.yml`) | `cargo audit --deny warnings --file Cargo.lock` (RustSec); prebuilt installs via `taiki-e/install-action` |
 
@@ -785,20 +785,30 @@ workflow is path-filtered to code — **docs-only changes skip CI**.
 
 ### Makefile targets
 
+`make ci` is the fast local gate: `check` → `test` → `analysis`.
+
+| Target | Runs |
+|---|---|
 | `make setup` | Install pinned toolchain + rustfmt/clippy + `protoc` (may need sudo) |
+| `make tools` / `tools-nightly` / `tools-formal` | Stable tooling (nextest, deny, machete, mutants, typos, cargo-hack, llvm-cov, tarpaulin, audit) / nightly components + careful + snarf / Kani + Verus pointer |
 | `make build` / `build-release` | `cargo build` / `cargo build --release` |
-| `make check` / `test` / `test-pkg pkg=…` / `test-one test=…` | Type-check / full workspace suite (CI gate, benches excluded — see `make bench`) / one crate / one test by substring |
+| `make check` | `fmt-check` → `clippy` → `cargo check` (fast, no tests) |
+| `make test` / `test-pkg pkg=…` / `test-one pkg=… test=…` | nextest with the CI `ci` profile / one crate / substring match |
+| `make analysis` | `cargo deny --all-features check` + `cargo machete --with-metadata` |
 | `make fmt` / `fmt-check` / `clippy` | Format (writes) / verify formatting (CI gate) / clippy `-D warnings` (CI gate) |
-| `make ci` | CI gates in order: fmt-check → clippy → check → test |
-| `make audit` / `coverage` / `coverage-xml` | `cargo audit --deny warnings` (needs `make tools`) / Tarpaulin HTML / Cobertura XML (CI shape) |
+| `make ci` | `check` → `test` → `analysis` |
+| `make snarf` / `careful` / `miri` / `sanitize` | Deep checks: cache-line false sharing / cargo-careful suite / six-crate Miri allowlist with strict flags / ASan+LSan with leaks-as-failures |
+| `make mutants` / `mutants-diff` | Mutation testing (`MUTANTS_PKG=…`, default `glasschain-core`) / diff-only (CI PR-gate command) |
+| `make kani` / `verus` / `llvm-lines` | Kani proofs for `glasschain-core` / Verus critical-code roadmap (`glasschain-vm` first) / compile-time bloat diagnostic |
+| `make audit` / `coverage` / `coverage-xml` | `cargo audit --deny warnings` / llvm-cov HTML / Cobertura XML with the 90% line gate |
 | `make node id=… port=…` | Interactive node REPL — never in automation (Section 2) |
 | `make doc` / `clean` / `bench` | `cargo doc --workspace --no-deps` / `cargo clean` / criterion benches (see Section 12 caveat) |
 
-### Current state (verified 2026-09-12, recorded in `.agents/handoff.md`)
+### Current state (verified 2026-09-21, `make ci`)
 
-All four gates pass; **589 tests** across 33 test harnesses (parallel
-harnesses, benches excluded from the test gate — 9 `#[ignore]`d capacity/WAN
-gates run explicitly); clippy **zero diagnostics** at `-D warnings`.
+All gates pass; **756 tests** run via nextest with 13 `#[ignore]`d capacity/WAN
+gates run explicitly; clippy **zero diagnostics** at `-D warnings`; `cargo deny`
+green under the strictest policy (`deny.toml`); `cargo machete` clean.
 
 House rules that keep the gates green: no `unsafe`, no `unwrap`/`expect` in
 library code, per-crate `thiserror` enums, `log` in libraries, JSON via serde,
@@ -842,11 +852,9 @@ separate from the test gates; `make bench` runs the same three commands.
 
 - `vm_throughput.rs` — per-cost-centre WASM execution throughput (plan target:
   1,000+ autonomous inventory triggers/s).
-- `watcher_throughput.rs` — `WatcherService` ECA throughput. **Note: this
-  bench moved to `glasschain-workflows` in ticket #49, but its header comment
-  still says `cargo bench -p glasschain-contracts`, and the `make bench`
-  target likewise still names `glasschain-contracts` (which has no benchmark
-  harness). Use the two commands above.**
+- `watcher_throughput.rs` — `WatcherService` ECA throughput (moved to
+  `glasschain-workflows` in ticket #49; the `make bench` target and the bench
+  header both name the correct crate now).
 
 ---
 
@@ -858,7 +866,7 @@ separate from the test gates; `make bench` runs the same three commands.
 | `Rejecting peer <id> at <addr>: protocol version '<v>' is incompatible with 'glasschain/6'` | Peer runs a different wire version (e.g. a binary built before `/4`) | Run matching binaries on both ends; rebuild the outdated peer. This is a hard disconnect, not a downgrade. |
 | `Rejecting peer <id> at <addr>: advertised TLS fingerprint does not match the observed session certificate` | Certificate changed mid-connection, or MITM | Check both endpoints' `--org`/restart state. The fingerprint is compared against the one observed during the TLS handshake. |
 | `Rejecting peer <id> at <listen>: node_id changed` / `TLS certificate fingerprint changed` / `org changed` | TOFU record for that listen address no longer matches the returning peer (impersonation or re-key) | Verify peer identity out of band. TOFU records are in-memory and address-bound; a peer on a new address is treated as new. |
-| `Failed to open storage at <path>: storage error: …` (exit 1) | Sled cannot open the directory — most often because **another node process already holds the exclusive lock** on the same `--storage-path` | Give each node its own `--storage-path` directory; stop the other process. |
+| `Failed to open storage at <path>: storage error: …` (exit 1) | redb cannot open the database file — most often because **another node process already holds the exclusive lock** on the same `--storage-path` | Give each node its own `--storage-path` directory; stop the other process. |
 | `Stored chain failed validation; starting fresh` on restart | Stored blocks fail `is_valid`/PoW/link checks — e.g. restarting with a **different `--difficulty`** than the chain was mined with | Restart with the same `--difficulty` (and flags) you used originally. |
 | Build error inside `glasschain-rpc` about `protoc` (e.g. `protoc: No such file or directory`) | `protoc` missing from `PATH`; `tonic-prost-build` needs it at compile time | `make setup`, or install `protobuf-compiler`/`protobuf` with your package manager. Not vendored. |
 | `Invalid --rpc-addr '<addr>': … — gRPC server not started` (warn) | `--rpc-addr` is not a valid `SocketAddr` | Use `host:port` (e.g. `0.0.0.0:50051`). The node keeps running without gRPC. |

@@ -1,10 +1,23 @@
-# Nextest CI profile: the test job runs with `--profile ci`, which writes
-# JUnit XML for Codecov test analytics (flaky-test detection). The path is
-# relative to `target/nextest/<profile>/`, so the file lands at
-# target/nextest/ci/junit.xml.
+# Nextest CI profile: the test job and local `make test` both run with
+# `--profile ci`. JUnit XML goes to `target/nextest/<profile>/junit.xml` for
+# Codecov test analytics.
+#
+# Strictest viable settings (wayfinder ticket #152, part of #139):
+#   * retries = 0        — no flake masking
+#   * flaky-result       — a test that only passes on retry would fail anyway
+#   * global-timeout     — a hung suite cannot run forever
+#   * slow-timeout       — a test stuck past two minutes is terminated
+#   * leak-timeout/fail  — child processes left behind fail the test
+# Test groups are intentionally unset: nextest's process-per-test isolation
+# already makes the per-process port allocator collision-free.
 [profile.ci]
 failure-output = "immediate-final"
 fail-fast = false
+retries = 0
+flaky-result = "fail"
+global-timeout = "30m"
+slow-timeout = { period = "60s", terminate-after = 2 }
+leak-timeout = { period = "200ms", result = "fail" }
 
 [profile.ci.junit]
 path = "junit.xml"

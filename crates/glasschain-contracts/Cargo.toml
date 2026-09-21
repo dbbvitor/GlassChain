@@ -10,7 +10,7 @@ keywords = ["blockchain", "supply-chain", "distributed-ledger"]
 categories = ["network-programming", "asynchronous", "cryptography"]
 
 [dependencies]
-glasschain-core = { path = "../glasschain-core" }
+glasschain-core = { version = "0.1.0", path = "../glasschain-core" }
 serde   = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror  = "2.0"
@@ -20,8 +20,7 @@ base64     = "0.23"
 wat        = "1.258"
 
 [dev-dependencies]
-env_logger = "0.11"
-glasschain-vm = { path = "../glasschain-vm" }
+glasschain-vm = { version = "0.1.0", path = "../glasschain-vm" }
 
 
 [lints]

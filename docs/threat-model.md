@@ -29,7 +29,7 @@ section of the README before trusting any claim.
 2. **gRPC API** — unauthenticated service surface (`glasschain-rpc`);
    transaction submission, queries, event streams. Admin methods gated by
    `AdminGate` (ADR-017): certificate-bound admin principals only, fail closed.
-3. **Storage seam** — pluggable persistence (`SledStorageProvider`); state is
+3. **Storage seam** — pluggable persistence (`RedbStorageProvider`); state is
    rebuilt by replaying the committed chain on restart.
 4. **WASM contract execution** — untrusted contract bytecode inside wasmtime
    with fuel metering (`glasschain-vm`).

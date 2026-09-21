@@ -1,181 +1,164 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 dbbvitor
-//! Sled-backed implementation of [`StorageProvider`].
+//! redb-backed implementation of [`StorageProvider`].
 //!
-//! [`SledStorageProvider`] uses two separate sled trees:
+//! [`RedbStorageProvider`] stores everything in one redb database file inside
+//! the directory passed to [`RedbStorageProvider::open`], in two tables:
 //!
-//! - `blocks` – serialised [`Block`] objects keyed by their 8-byte big-endian
-//!   block index.
+//! - `blocks` – serialised [`Block`] objects keyed by their block index.
 //! - `state`  – arbitrary World State key-value pairs stored as raw bytes.
 //!
-//! Sled is a pure-Rust, high-performance embedded database that requires no
-//! external C dependencies and is optimised for solid-state storage.
+//! redb is a pure-Rust, ACID, embedded key-value store with a stable file
+//! format, MVCC readers, and crash-safe commits by default (wayfinder #173).
 
 use glasschain_core::{Block, CoreError, StorageProvider};
-use sled::Transactional;
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
-/// Persistent, sled-backed implementation of [`StorageProvider`].
+/// Serialised blocks keyed by block index.
+const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("blocks");
+/// World-state key-value pairs.
+const STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("state");
+
+/// The database file created inside the directory passed to `open`.
+const DB_FILE: &str = "glasschain.redb";
+
+/// Persistent, redb-backed implementation of [`StorageProvider`].
 ///
-/// Create a new instance with [`SledStorageProvider::open`], passing a path
-/// to a directory on disk.  The directory will be created if it does not
-/// exist.
+/// Create a new instance with [`RedbStorageProvider::open`], passing a path to
+/// a directory on disk. The directory (and the `glasschain.redb` file inside
+/// it) is created if it does not exist.
 ///
 /// # Example
 /// ```no_run
-/// use glasschain_storage::SledStorageProvider;
+/// use glasschain_storage::RedbStorageProvider;
 /// use glasschain_core::StorageProvider;
 ///
-/// let store = SledStorageProvider::open("/var/lib/glasschain/state").unwrap();
+/// let store = RedbStorageProvider::open("/var/lib/glasschain/state").unwrap();
 /// store.put_state("world_state_key", b"value").unwrap();
 /// ```
-pub struct SledStorageProvider {
-    blocks: sled::Tree,
-    state: sled::Tree,
-    /// Keep a reference to the parent DB so it is not dropped prematurely.
-    _db: sled::Db,
+pub struct RedbStorageProvider {
+    db: Database,
 }
 
-impl SledStorageProvider {
-    /// Open (or create) a sled database at `path`.
+fn storage_err(error: impl std::fmt::Display) -> CoreError {
+    CoreError::Storage(error.to_string())
+}
+
+impl RedbStorageProvider {
+    /// Open (or create) a redb database in `path/glasschain.redb`.
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::Storage`] if the database cannot be opened or the
-    /// internal trees cannot be created.
+    /// Returns [`CoreError::Storage`] if the directory or database cannot be
+    /// created, or the tables cannot be opened.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, CoreError> {
-        let db = sled::open(path).map_err(|e| CoreError::Storage(e.to_string()))?;
-        let blocks = db
-            .open_tree("blocks")
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
-        let state = db
-            .open_tree("state")
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
-        Ok(Self {
-            blocks,
-            state,
-            _db: db,
-        })
+        let dir = path.as_ref();
+        std::fs::create_dir_all(dir).map_err(storage_err)?;
+        let db = Database::create(dir.join(DB_FILE)).map_err(storage_err)?;
+        // A write transaction creates missing tables; commit once so later
+        // read transactions can open both tables.
+        let txn = db.begin_write().map_err(storage_err)?;
+        {
+            txn.open_table(BLOCKS).map_err(storage_err)?;
+            txn.open_table(STATE).map_err(storage_err)?;
+        }
+        txn.commit().map_err(storage_err)?;
+        Ok(Self { db })
     }
 
-    /// Flush all pending writes to disk synchronously.
+    /// Flush pending writes to disk synchronously.
+    ///
+    /// redb commits are crash-safe by default (the default durability fsyncs
+    /// on commit), so there is nothing further to flush. The method remains
+    /// for API parity with the durability contract in ADR-016.
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::Storage`] if the underlying sled flush fails.
-    pub fn flush(&self) -> Result<(), CoreError> {
-        self.blocks
-            .flush()
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
-        self.state
-            .flush()
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
+    /// Never fails today; kept fallible so callers keep their error handling.
+    #[allow(
+        clippy::unused_self,
+        clippy::unnecessary_wraps,
+        reason = "kept as an inherent `&self -> Result` method for parity with the previous backend's flush contract"
+    )]
+    pub const fn flush(&self) -> Result<(), CoreError> {
         Ok(())
     }
+
+    /// Read the current tip block inside an open read or write transaction.
+    fn tip_in_txn(
+        blocks: &impl ReadableTable<u64, &'static [u8]>,
+    ) -> Result<Option<Block>, CoreError> {
+        match blocks.last().map_err(storage_err)? {
+            Some((key, value)) => {
+                let block: Block = serde_json::from_slice(value.value())?;
+                debug_assert_eq!(block.index, key.value());
+                Ok(Some(block))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
-impl StorageProvider for SledStorageProvider {
+impl StorageProvider for RedbStorageProvider {
     fn put_block(&self, block: &Block) -> Result<(), CoreError> {
-        let key = block.index.to_be_bytes();
         let value = serde_json::to_vec(block)?;
-        self.blocks
-            .insert(key, value)
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
-        log::debug!("SledStorage: persisted block {}", block.index);
+        let txn = self.db.begin_write().map_err(storage_err)?;
+        {
+            let mut table = txn.open_table(BLOCKS).map_err(storage_err)?;
+            table
+                .insert(block.index, value.as_slice())
+                .map_err(storage_err)?;
+        }
+        txn.commit().map_err(storage_err)?;
+        log::debug!("RedbStorage: persisted block {}", block.index);
         Ok(())
     }
 
     fn apply_block(&self, block: &Block) -> Result<(), CoreError> {
         // One atomic block-plus-state boundary (ADR-007 decision 2): tip
         // check, block insert, and write-set application run inside a single
-        // sled multi-tree transaction, so a stale candidate is rejected whole
-        // and a partial write set can never be acknowledged.
-        let block_key = block.index.to_be_bytes();
-        let block_value = serde_json::to_vec(block)?;
+        // redb write transaction, so a stale candidate is rejected whole and a
+        // partial write set can never be acknowledged. redb serialises write
+        // transactions (single writer), so reading the tip inside the
+        // transaction is race-free; an uncommitted transaction rolls back on
+        // drop.
+        let value = serde_json::to_vec(block)?;
+        let txn = self.db.begin_write().map_err(storage_err)?;
+        {
+            let mut blocks = txn.open_table(BLOCKS).map_err(storage_err)?;
+            let tip = Self::tip_in_txn(&blocks)?;
+            glasschain_core::validate_tip_chain(block, tip.as_ref())
+                .map_err(|e| CoreError::InvalidBlock(e.to_string()))?;
 
-        // Read the current tip outside the transaction; inside, we verify the
-        // tip key still holds the same bytes (sled's conflict detection
-        // retries or aborts if it changed concurrently) and chain-check the
-        // candidate against it.
-        let tip: Option<(u64, Block)> = match self.latest_block_index()? {
-            Some(tip_index) => Some((
-                tip_index,
-                self.get_block(tip_index)?.ok_or_else(|| {
-                    CoreError::Storage(format!("block {tip_index} missing from store"))
-                })?,
-            )),
-            None => None,
-        };
-        let tip_bytes = tip
-            .as_ref()
-            .map(|(_, tip_block)| serde_json::to_vec(tip_block))
-            .transpose()?;
-
-        // Abort payload is `CoreError` so a stale candidate surfaces as
-        // `InvalidBlock` (matching every other backend) while real sled
-        // failures stay `Storage`.
-        let abort =
-            |message: String| sled::transaction::ConflictableTransactionError::Abort(message);
-        (&self.blocks, &self.state)
-            .transaction(|(tx_blocks, tx_state)| {
-                match (&tip, &tip_bytes) {
-                    (None, None) => {
-                        glasschain_core::validate_tip_chain(block, None)
-                            .map_err(|e| abort(e.to_string()))?;
+            let mut state = txn.open_table(STATE).map_err(storage_err)?;
+            for write in &block.write_set {
+                let key = write.state_key();
+                match &write.op {
+                    glasschain_core::WriteOp::Set(value) => {
+                        state
+                            .insert(key.as_str(), value.as_slice())
+                            .map_err(storage_err)?;
                     }
-                    (Some((tip_index, _)), Some(bytes)) => {
-                        match tx_blocks.get(tip_index.to_be_bytes().as_slice())? {
-                            None => {
-                                return Err(abort("tip block disappeared from store".to_owned()));
-                            }
-                            Some(stored) => {
-                                if stored.as_ref() != bytes.as_slice() {
-                                    return Err(abort(
-                                        "stale tip: tip changed during apply".to_owned(),
-                                    ));
-                                }
-                            }
-                        }
-                        glasschain_core::validate_tip_chain(block, tip.as_ref().map(|(_, t)| t))
-                            .map_err(|e| abort(e.to_string()))?;
-                    }
-                    _ => {
-                        return Err(abort("tip state inconsistent".to_owned()));
+                    glasschain_core::WriteOp::Delete => {
+                        state.remove(key.as_str()).map_err(storage_err)?;
                     }
                 }
-                tx_blocks.insert(block_key.as_slice(), block_value.as_slice())?;
-                for write in &block.write_set {
-                    match &write.op {
-                        glasschain_core::WriteOp::Set(value) => {
-                            tx_state.insert(write.state_key().as_bytes(), value.as_slice())?;
-                        }
-                        glasschain_core::WriteOp::Delete => {
-                            tx_state.remove(write.state_key().as_bytes())?;
-                        }
-                    }
-                }
-                Ok(())
-            })
-            .map_err(|e| match e {
-                sled::transaction::TransactionError::Abort(message) => {
-                    CoreError::InvalidBlock(message)
-                }
-                sled::transaction::TransactionError::Storage(error) => {
-                    CoreError::Storage(error.to_string())
-                }
-            })?;
-        log::debug!("SledStorage: applied block {}", block.index);
+            }
+            blocks
+                .insert(block.index, value.as_slice())
+                .map_err(storage_err)?;
+        }
+        txn.commit().map_err(storage_err)?;
+        log::debug!("RedbStorage: applied block {}", block.index);
         Ok(())
     }
 
     fn get_block(&self, index: u64) -> Result<Option<Block>, CoreError> {
-        let key = index.to_be_bytes();
-        match self
-            .blocks
-            .get(key)
-            .map_err(|e| CoreError::Storage(e.to_string()))?
-        {
-            Some(bytes) => {
-                let block: Block = serde_json::from_slice(&bytes)?;
+        let txn = self.db.begin_read().map_err(storage_err)?;
+        let table = txn.open_table(BLOCKS).map_err(storage_err)?;
+        match table.get(index).map_err(storage_err)? {
+            Some(value) => {
+                let block: Block = serde_json::from_slice(value.value())?;
                 Ok(Some(block))
             }
             None => Ok(None),
@@ -183,58 +166,62 @@ impl StorageProvider for SledStorageProvider {
     }
 
     fn latest_block_index(&self) -> Result<Option<u64>, CoreError> {
-        match self
-            .blocks
+        let txn = self.db.begin_read().map_err(storage_err)?;
+        let table = txn.open_table(BLOCKS).map_err(storage_err)?;
+        let latest = table
             .last()
-            .map_err(|e| CoreError::Storage(e.to_string()))?
-        {
-            Some((key, _)) => {
-                let arr: [u8; 8] = key
-                    .as_ref()
-                    .try_into()
-                    .map_err(|_| CoreError::Storage("corrupt block key".into()))?;
-                Ok(Some(u64::from_be_bytes(arr)))
-            }
-            None => Ok(None),
-        }
+            .map_err(storage_err)?
+            .map(|(key, _)| key.value());
+        Ok(latest)
     }
 
     fn put_state(&self, key: &str, value: &[u8]) -> Result<(), CoreError> {
-        self.state
-            .insert(key.as_bytes(), value)
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let txn = self.db.begin_write().map_err(storage_err)?;
+        {
+            let mut table = txn.open_table(STATE).map_err(storage_err)?;
+            table.insert(key, value).map_err(storage_err)?;
+        }
+        txn.commit().map_err(storage_err)?;
         Ok(())
     }
 
     fn get_state(&self, key: &str) -> Result<Option<Vec<u8>>, CoreError> {
-        Ok(self
-            .state
-            .get(key.as_bytes())
-            .map_err(|e| CoreError::Storage(e.to_string()))?
-            .map(|bytes| bytes.to_vec()))
+        let txn = self.db.begin_read().map_err(storage_err)?;
+        let table = txn.open_table(STATE).map_err(storage_err)?;
+        let value = table
+            .get(key)
+            .map_err(storage_err)?
+            .map(|value| value.value().to_vec());
+        Ok(value)
     }
 
     fn delete_state(&self, key: &str) -> Result<(), CoreError> {
-        self.state
-            .remove(key.as_bytes())
-            .map_err(|e| CoreError::Storage(e.to_string()))?;
+        let txn = self.db.begin_write().map_err(storage_err)?;
+        {
+            let mut table = txn.open_table(STATE).map_err(storage_err)?;
+            table.remove(key).map_err(storage_err)?;
+        }
+        txn.commit().map_err(storage_err)?;
         Ok(())
     }
 
     fn list_state_keys(&self, prefix: &str) -> Result<Vec<String>, CoreError> {
-        // `scan_prefix` streams in key order; only matching keys are read.
+        let txn = self.db.begin_read().map_err(storage_err)?;
+        let table = txn.open_table(STATE).map_err(storage_err)?;
         let mut keys = Vec::new();
-        for entry in self.state.scan_prefix(prefix.as_bytes()) {
-            let (key, _) = entry.map_err(|e| CoreError::Storage(e.to_string()))?;
-            let key = String::from_utf8(key.to_vec())
-                .map_err(|e| CoreError::Storage(format!("non-utf8 state key: {e}")))?;
-            keys.push(key);
+        for entry in table.range(prefix..).map_err(storage_err)? {
+            let (key, _) = entry.map_err(storage_err)?;
+            let key = key.value();
+            if !key.starts_with(prefix) {
+                break;
+            }
+            keys.push(key.to_owned());
         }
         Ok(keys)
     }
 
     fn name(&self) -> &'static str {
-        "sled"
+        "redb"
     }
 }
 
@@ -243,9 +230,9 @@ mod tests {
     use super::*;
     use glasschain_core::Transaction;
 
-    fn open_temp() -> (SledStorageProvider, tempfile::TempDir) {
+    fn open_temp() -> (RedbStorageProvider, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("temp dir");
-        let store = SledStorageProvider::open(dir.path()).expect("open");
+        let store = RedbStorageProvider::open(dir.path()).expect("open");
         (store, dir)
     }
 
@@ -408,16 +395,16 @@ mod tests {
         // ADR-016 regression: a block accepted by `apply_block` is discoverable
         // after another provider instance is opened over the same directory
         // (the process-restart half of the durability promise; power loss is
-        // covered by quorum replication plus here by sled's flush). Reopening
-        // first (`drop` then reopen) matters: in-memory copies must not mask
-        // what actually persisted.
+        // covered by quorum replication plus redb's crash-safe commits).
+        // Reopening first (`drop` then reopen) matters: in-memory copies must
+        // not mask what actually persisted.
         let (store, dir) = open_temp();
         let g = genesis();
         store.apply_block(&g).unwrap();
 
         let dir = dir.keep();
         drop(store);
-        let reopened = SledStorageProvider::open(&dir).expect("reopen");
+        let reopened = RedbStorageProvider::open(&dir).expect("reopen");
         assert_eq!(reopened.latest_block_index().unwrap(), Some(0));
         assert_eq!(reopened.get_block(0).unwrap().unwrap().hash, g.hash);
         assert!(reopened.get_state("no-such-key").unwrap().is_none());
@@ -429,7 +416,7 @@ mod tests {
     #[test]
     fn test_provider_name() {
         let (store, _dir) = open_temp();
-        assert_eq!(store.name(), "sled");
+        assert_eq!(store.name(), "redb");
     }
 
     #[test]

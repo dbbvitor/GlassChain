@@ -747,7 +747,7 @@ Driving it from storage write handles over `mpsc` was explicitly **evaluated
 and rejected**; the rejected-proposals table in `.agents/handoff.md` records it
 verbatim:
 
-> | Drive the watcher from Sled write handles over `mpsc` | Breaks the replay
+> | Drive the watcher from redb write handles over `mpsc` | Breaks the replay
 > invariant; nodes silently diverge after sync. The watcher **must** be fed
 > committed ledger events only |
 

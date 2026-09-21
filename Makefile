@@ -1,14 +1,24 @@
 # ────────────────────────────────────────────────────────────────────────────
 # GlassChain — Makefile
 #
-# Setup, build, test, and CI-gate targets for the GlassChain Rust workspace.
+# Setup, build, test, and gate targets for the GlassChain Rust workspace.
 #
-# The toolchain is pinned to 1.98.1 in `rust-toolchain.toml`; cargo/rustup pick it
-# up automatically, so plain `cargo` commands here use the right toolchain.
+# The toolchain is pinned to 1.98.1 in `rust-toolchain.toml`; cargo/rustup pick
+# it up automatically. `make ci` is the fast local gate; `make check` runs
+# formatting, lints, and a type-check without tests.
 #
-# Targets mirror the gates in .github/workflows/ci.yml, so `make ci` locally
-# reproduces what CI runs. `make setup` gets you from a fresh clone to a
-# building workspace; `make test` runs the full workspace test suite.
+# Gate targets (mirror CI):
+#   check       fmt-check + clippy + cargo check          (fast, no tests)
+#   test        cargo nextest run --profile ci            (same flags as CI)
+#   analysis    cargo deny check + cargo machete          (supply chain + deps)
+#   ci          check -> test -> analysis
+#
+# Deep tools are opt-in (nightly or long runtimes):
+#   careful  mutants  mutants-diff  miri  sanitize  kani  verus  snarf  llvm-lines
+#
+# `make tools` installs the stable tooling; `make tools-nightly` adds nightly
+# components and nightly-only tools; `make tools-formal` installs Kani and
+# points at the pinned Verus release.
 #
 # Notes:
 #   * protoc is required to build glasschain-rpc (tonic_prost_build). `make
@@ -22,7 +32,7 @@
 
 SHELL := /bin/sh
 
-# Flags shared by the CI-gate targets (override: make test CARGO_FLAGS="...").
+# Flags shared by the gate targets (override: make test CARGO_FLAGS="...").
 CARGO_FLAGS := --workspace --all-targets --all-features --locked
 
 # Test targets drop --all-targets: criterion bench *executions* dominate the
@@ -33,15 +43,33 @@ TEST_FLAGS := --workspace --lib --bins --tests --all-features --locked
 
 # The network integration tests allocate loopback ports through the shared
 # per-process band allocator (glasschain-network/tests/common/ports.rs), so
-# the libtest harnesses run in parallel safely — same as CI.
+# nextest's process-per-test isolation runs them in parallel safely.
 
 # Pinned channel from rust-toolchain.toml.
 TOOLCHAIN := 1.98.1
 
+# Host triple for sanitizer builds (`--target` keeps rustflags off build scripts).
+HOST := $(shell rustc -vV 2>/dev/null | sed -n 's/^host: //p')
+
+# `make mutants` scope; the CI full run shards all 12 crates.
+MUTANTS_PKG ?= glasschain-core
+
+# Miri: six-crate allowlist, strict flags, no leak exemption (ticket #153).
+MIRI_FLAGS := -Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check
+MIRI_PKGS := -p glasschain-core -p glasschain-contracts -p glasschain-indexer \
+             -p glasschain-workflows -p glasschain-storage -p glasschain-sdk
+MIRI_SKIPS := --skip wasm --skip sled_backend \
+              --skip test_pending_pool_bound_rejects_and_drains \
+              --skip test_slice_quota_spreads_a_burst_across_rounds \
+              --skip ledger_default_uses_the_workspace_difficulty \
+              --skip test_d3_index_semantics_match_full_rebuild_after_history_growth
+
 .DEFAULT_GOAL := help
 
-.PHONY: help setup tools build build-release check test test-pkg test-one \
-        fmt fmt-check clippy bench audit coverage coverage-xml ci doc node clean
+.PHONY: help setup tools tools-nightly tools-formal build build-release check \
+        test test-pkg test-one analysis fmt fmt-check clippy snarf careful \
+        mutants mutants-diff miri sanitize kani verus llvm-lines bench audit \
+        coverage coverage-xml ci doc node clean
 
 help: ## Show this help
 	@awk -F ':.*## ' '/^[a-zA-Z0-9_-]+:.*## / {printf "  %-16s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -66,9 +94,29 @@ setup: ## Install the pinned toolchain, rustfmt/clippy, and protoc (may need sud
 	  esac; \
 	fi
 
-tools: ## Install optional tooling for the coverage and audit targets
+tools: ## Install the stable tooling used by the gate and deep targets
+	cargo install --locked cargo-nextest
+	cargo install --locked cargo-machete
+	cargo install --locked cargo-deny
+	cargo install --locked cargo-mutants
+	cargo install --locked typos-cli
+	cargo install --locked cargo-hack
+	cargo install --locked cargo-llvm-cov
 	cargo install --locked cargo-tarpaulin
 	cargo install --locked cargo-audit
+
+tools-nightly: ## Install nightly components and nightly-only tools (miri, careful, snarf)
+	rustup toolchain install nightly
+	rustup component add --toolchain nightly rust-src miri
+	cargo install --locked cargo-careful
+	cargo install --locked cargo-snarf
+
+tools-formal: ## Install Kani; print the pinned Verus release pointer
+	cargo install --locked kani-verifier
+	cargo kani setup
+	@echo "Verus has no aarch64 Linux artifact: download the pinned release zip"
+	@echo "(x86_64 Linux/macOS) from https://github.com/verus-lang/verus/releases"
+	@echo "and put 'verus' + 'cargo-verus' on PATH."
 
 ## ── Build ──────────────────────────────────────────────────────────────────
 
@@ -78,19 +126,25 @@ build: ## Build the workspace (debug)
 build-release: ## Build the workspace (release)
 	cargo build --release
 
-## ── Test ───────────────────────────────────────────────────────────────────
+## ── Gate ───────────────────────────────────────────────────────────────────
 
-check: ## Type-check all targets (fast; run often while iterating)
+check: ## Fast gate: formatting, lints, and type-check (no tests)
+	$(MAKE) fmt-check
+	$(MAKE) clippy
 	cargo check $(CARGO_FLAGS)
 
-test: ## Run the full workspace test suite (CI gate; benches excluded, see make bench)
-        cargo test $(TEST_FLAGS)
+test: ## Run the full workspace suite with nextest (same flags as CI)
+	cargo nextest run --profile ci $(TEST_FLAGS)
 
-test-pkg: ## Test a single crate: make test-pkg pkg=glasschain-network
-        cargo test -p $(pkg) --lib --bins --tests --all-features --locked
+test-pkg: ## Test one crate: make test-pkg pkg=glasschain-network
+	cargo nextest run -p $(pkg) --profile ci $(TEST_FLAGS)
 
-test-one: ## Run one test by substring: make test-one test=mine
-	cargo test $(CARGO_FLAGS) -- $(test)
+test-one: ## Run tests matching a substring: make test-one pkg=glasschain-core test=mine
+	cargo nextest run $(if $(pkg),-p $(pkg),) $(test)
+
+analysis: ## Supply-chain and dependency hygiene (CI gate)
+	cargo deny --all-features check
+	cargo machete --with-metadata
 
 ## ── Lint & quality ──────────────────────────────────────────────────────────
 
@@ -103,27 +157,58 @@ fmt-check: ## Verify formatting without modifying files (CI gate)
 clippy: ## Run clippy with warnings as errors (CI gate)
 	cargo clippy $(CARGO_FLAGS) -- -D warnings
 
-bench: ## Run the criterion benches (CI runs them in the Benchmarks workflow)
-	        cargo bench -p glasschain-core
-	        cargo bench -p glasschain-vm
-	        cargo bench -p glasschain-workflows
+## ── Deep tools (opt-in) ─────────────────────────────────────────────────────
 
-audit: ## Audit dependencies for known vulnerabilities (run `make tools` first)
+snarf: ## Cache-line false-sharing check (nightly; run `make tools-nightly` first)
+	cargo +nightly snarf --format github --color never
+
+careful: ## Run the suite under cargo-careful (nightly, std debug assertions)
+	cargo +nightly careful nextest run --profile ci $(TEST_FLAGS)
+
+mutants: ## Mutation-test one crate (default glasschain-core; override MUTANTS_PKG=...)
+	cargo mutants -p $(MUTANTS_PKG)
+
+mutants-diff: ## Mutation-test only the current diff (the CI PR-gate command)
+	cargo mutants --in-diff --baseline=skip --in-place --timeout 60
+
+miri: ## Run Miri over the six-crate allowlist with the strictest flags
+	MIRIFLAGS="$(MIRI_FLAGS)" cargo +nightly miri test $(MIRI_PKGS) --lib -- $(MIRI_SKIPS)
+
+sanitize: ## Run the suite under ASan/LSan (nightly; leaks are failures)
+	RUSTFLAGS="-Zsanitizer=address" ASAN_OPTIONS=detect_leaks=1 \
+	  cargo +nightly test --workspace --lib --bins --tests --all-features --locked \
+	  -Zbuild-std --target $(HOST)
+
+kani: ## Run the Kani proofs for glasschain-core
+	cargo kani -p glasschain-core
+
+verus: ## Verify the critical-code roadmap (starts with glasschain-vm gas)
+	cargo verus verify -p glasschain-vm
+
+llvm-lines: ## Compile-time bloat diagnostic: LLVM IR lines per generic function
+	cargo llvm-lines -p glasschain-core | head -30
+
+bench: ## Run the criterion benches
+	cargo bench -p glasschain-core
+	cargo bench -p glasschain-vm
+	cargo bench -p glasschain-workflows
+
+audit: ## Audit dependencies for known vulnerabilities
 	cargo audit --deny warnings --file Cargo.lock
 
-coverage: ## Generate an HTML coverage report (run `make tools` first)
-	cargo tarpaulin --verbose --workspace --all-features --all-targets --locked --timeout 120 --out html
+coverage: ## HTML coverage report (cargo-llvm-cov; CI switches to this engine next)
+	cargo llvm-cov nextest --html --profile ci $(TEST_FLAGS)
 
-coverage-xml: ## Generate Cobertura XML coverage (same command CI uses)
-	cargo tarpaulin --verbose --workspace --all-features --all-targets --locked --timeout 120 --out xml
+coverage-xml: ## Cobertura XML coverage with the 90% line gate
+	cargo llvm-cov nextest --cobertura --output-path cobertura.xml \
+	  --fail-under-lines 90 --profile ci $(TEST_FLAGS)
 
 ## ── Aggregate ───────────────────────────────────────────────────────────────
 
-ci: ## Run the CI gates in order: fmt-check -> clippy -> check -> test
-	        $(MAKE) fmt-check
-	        $(MAKE) clippy
-	        $(MAKE) check
-	        $(MAKE) test
+ci: ## Fast local gate: check -> test -> analysis
+	$(MAKE) check
+	$(MAKE) test
+	$(MAKE) analysis
 
 ## ── Run & docs ──────────────────────────────────────────────────────────────
 

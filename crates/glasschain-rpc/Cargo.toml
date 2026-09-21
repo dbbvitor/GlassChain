@@ -10,17 +10,16 @@ keywords = ["blockchain", "supply-chain", "distributed-ledger"]
 categories = ["network-programming", "asynchronous", "cryptography"]
 
 [dependencies]
-glasschain-core = { path = "../glasschain-core" }
-glasschain-network = { path = "../glasschain-network" }
-glasschain-identity = { path = "../glasschain-identity" }
-glasschain-indexer = { path = "../glasschain-indexer" }
+glasschain-core = { version = "0.1.0", path = "../glasschain-core" }
+glasschain-network = { version = "0.1.0", path = "../glasschain-network" }
+glasschain-identity = { version = "0.1.0", path = "../glasschain-identity" }
+glasschain-indexer = { version = "0.1.0", path = "../glasschain-indexer" }
 tonic = { version = "0.14.6", features = ["transport"] }
 tonic-prost = "0.14.6"
 prost = "0.14"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
 serde_json = "1.0"
-thiserror = "2.0"
 log = "0.4"
 ed25519-dalek = { version = "3.0", features = ["rand_core"] }
 hex = "0.4"
@@ -38,6 +37,12 @@ prost = "0.14"
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"
+
+# `tonic-prost` is referenced only by the generated code in OUT_DIR, and
+# `tonic-prost-build` only by build.rs; machete cannot see either, so both are
+# documented ignores rather than dead dependencies.
+[package.metadata.cargo-machete]
+ignored = ["tonic-prost", "tonic-prost-build"]
 
 [lints]
 workspace = true
