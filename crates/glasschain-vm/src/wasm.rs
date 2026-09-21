@@ -943,6 +943,59 @@ mod tests {
         assert!(result.canonicalize().is_ok());
     }
 
+    /// `set_state` must accept a key or value whose end lands exactly on the
+    /// end of linear memory: the bounds check rejects only `end > data.len()`.
+    /// A `>=` (or `==`) comparison would drop the last byte of the buffer.
+    #[test]
+    fn test_set_state_accepts_offsets_ending_at_memory_end() {
+        let provider = WasmExecutionProvider::new().unwrap();
+        // 65529 + 7 == 65536: the key ends exactly at the end of the 64 KiB page.
+        let key_at_end = compile_wat(
+            r#"
+(module
+  (import "env" "set_state" (func $set_state (param i32 i32 i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "x")
+  (data (i32.const 65529) "approve")
+  (func (export "execute")
+    (call $set_state (i32.const 65529) (i32.const 7) (i32.const 0) (i32.const 1))
+  )
+)
+"#,
+        );
+        let result = provider
+            .execute("key-at-memory-end", &key_at_end, limits(50_000))
+            .unwrap();
+        assert_eq!(
+            result.ephemeral,
+            vec![("approve".to_string(), b"x".to_vec())],
+            "a key ending exactly at the memory end is accepted"
+        );
+
+        // 65534 + 2 == 65536: the value ends exactly at the end of the page.
+        let value_at_end = compile_wat(
+            r#"
+(module
+  (import "env" "set_state" (func $set_state (param i32 i32 i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "x")
+  (data (i32.const 65534) "42")
+  (func (export "execute")
+    (call $set_state (i32.const 0) (i32.const 1) (i32.const 65534) (i32.const 2))
+  )
+)
+"#,
+        );
+        let result = provider
+            .execute("value-at-memory-end", &value_at_end, limits(50_000))
+            .unwrap();
+        assert_eq!(
+            result.ephemeral,
+            vec![("x".to_string(), b"42".to_vec())],
+            "a value ending exactly at the memory end is accepted"
+        );
+    }
+
     /// The explicit `persist_state` host operation carries channel, contract,
     /// key, set/delete, and public/PDC visibility (ADR-007 decision 3).
     #[test]

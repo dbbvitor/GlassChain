@@ -205,10 +205,12 @@ jobs:
           shared-key: rust-cache
           cache-on-failure: true
 
-      - name: Install cargo-mutants and cargo-nextest
+      # cargo-mutants runs `cargo test`, not nextest: nextest skips doctests,
+      # and a mutation caught only by a doctest would falsely report as missed.
+      - name: Install cargo-mutants
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-mutants,cargo-nextest
+          tool: cargo-mutants
 
       - name: Write the PR diff
         run: git diff "origin/${{ github.base_ref }}...HEAD" > pr.diff

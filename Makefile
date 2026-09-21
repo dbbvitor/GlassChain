@@ -168,9 +168,10 @@ careful: ## Run the suite under cargo-careful (nightly, std debug assertions)
 	cargo +nightly careful nextest run --profile ci $(TEST_FLAGS)
 
 mutants: ## Mutation-test one crate (default glasschain-core; override MUTANTS_PKG=...)
-	cargo mutants -p $(MUTANTS_PKG)
+	cargo mutants -p $(MUTANTS_PKG) --timeout 60
 
 mutants-diff: ## Mutation-test only the current diff (the CI PR-gate command)
+	# --timeout is a CLI-only option: `.cargo/mutants.toml` rejects it.
 	cargo mutants --in-diff --baseline=skip --in-place --timeout 60
 
 miri: ## Run Miri over the six-crate allowlist with the strictest flags
