@@ -144,7 +144,9 @@ test-one: ## Run tests matching a substring: make test-one pkg=glasschain-core t
 
 analysis: ## Supply-chain and dependency hygiene (CI gate)
 	cargo deny --all-features check
-	cargo machete --with-metadata
+	# `crates` scopes machete to the workspace: `--with-metadata` rewrites the
+	# lockfile of every package it scans, and the excluded demo/ has its own.
+	cargo machete --with-metadata crates
 
 ## ── Lint & quality ──────────────────────────────────────────────────────────
 
