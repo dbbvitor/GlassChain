@@ -135,7 +135,7 @@ pub enum IndexerError {
 /// In-memory [`IndexerProvider`] — the default (no-dependency) backend.
 ///
 /// This implementation is suitable for testing, development, and single-node
-/// deployments where persistence is handled by the Sled storage layer.
+/// deployments where persistence is handled by the redb storage layer.
 #[derive(Debug)]
 pub struct InMemoryIndexer {
     blocks: RwLock<HashMap<u64, IndexedBlock>>,

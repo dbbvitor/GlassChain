@@ -1,0 +1,7 @@
+# cargo-mutants configuration (wayfinder tickets #146/#156, part of #139).
+#
+# `--all-features` is mandatory: without it, cfg-gated `bft.rs` mutants are
+# compiled out and report as false misses (117 of 142 in the #146 baseline).
+additional_cargo_test_args = ["--all-features"]
+# Per-mutant cap; the deep-checks shards use the same value.
+timeout = 60

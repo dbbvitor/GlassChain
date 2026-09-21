@@ -85,6 +85,12 @@ cargo fmt --all --check
 before finishing a task.** The suite is fast (~5s of test time once compiled), and
 finding a failure locally is far cheaper than finding it in CI.
 
+`make ci` runs the same fast gate locally (`make check` → `make test` →
+`make analysis`); `make tools` installs the optional tooling and deep checks are
+opt-in (`make miri`, `make sanitize`, `make mutants`, `make careful`, `make kani`,
+`make verus`, `make snarf`). See the `Makefile` and
+[`docs/operations.md`](docs/operations.md#makefile-targets).
+
 ### Running a node
 
 ```bash
@@ -136,7 +142,7 @@ GlassChain/
     ├── glasschain-contracts/   # ContractEngine, WatcherService (ECA triggers)
     ├── glasschain-network/     # TCP+TLS P2P node, protocol, libp2p Swarm
     ├── glasschain-node/        # Interactive REPL binary + gRPC wiring
-    ├── glasschain-storage/     # SledStorageProvider, in-memory backend
+    ├── glasschain-storage/     # RedbStorageProvider, in-memory backend
     ├── glasschain-identity/    # Identity, Organization, Channel, EndorsementEngine, MSP
     ├── glasschain-vm/          # WasmExecutionProvider, GasCosts/GasCounter
     ├── glasschain-indexer/     # IndexerProvider, ProvenanceIndex, AnalyticalFlattener, EventBus

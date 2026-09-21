@@ -18,7 +18,7 @@
 //! │   └──────┬───────┘  └──────┬───────┘  └──────┬───────┘     │
 //! │          │                 │                  │             │
 //! │     PoW / Raft /      In-Memory /       Script /            │
-//! │     PBFT / BFT         Sled / Rocks       WASM              │
+//! │     PBFT / BFT         redb / Rocks       WASM              │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
@@ -76,7 +76,7 @@ pub trait ConsensusProvider: Send + Sync {
 /// derived from all committed transactions (analogous to Ethereum's state
 /// trie or Hyperledger Fabric's `CouchDB` state database).
 ///
-/// Implementors may back this with in-memory structures, `sled`, `RocksDB`, or
+/// Implementors may back this with in-memory structures, `redb`, `RocksDB`, or
 /// any other store.
 pub trait StorageProvider: Send + Sync {
     /// Persist a committed block.
@@ -102,7 +102,7 @@ pub trait StorageProvider: Send + Sync {
     /// The default implementation is a sequential fallback (block first, then
     /// one `put_state`/`delete_state` per write): it is correct for
     /// single-writer processes but **not atomic**.  Implementors should
-    /// override it with a real atomic section (e.g. a sled multi-tree
+    /// override it with a real atomic section (e.g. a redb multi-table
     /// transaction).
     ///
     /// # Errors

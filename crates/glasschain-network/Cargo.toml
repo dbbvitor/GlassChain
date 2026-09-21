@@ -10,12 +10,12 @@ keywords = ["blockchain", "supply-chain", "distributed-ledger"]
 categories = ["network-programming", "asynchronous", "cryptography"]
 
 [dependencies]
-glasschain-core       = { path = "../glasschain-core" }
-glasschain-contracts  = { path = "../glasschain-contracts" }
-glasschain-workflows  = { path = "../glasschain-workflows" }
-glasschain-indexer    = { path = "../glasschain-indexer" }
-glasschain-identity   = { path = "../glasschain-identity" }
-glasschain-storage    = { path = "../glasschain-storage" }
+glasschain-core       = { version = "0.1.0", path = "../glasschain-core" }
+glasschain-contracts  = { version = "0.1.0", path = "../glasschain-contracts" }
+glasschain-workflows  = { version = "0.1.0", path = "../glasschain-workflows" }
+glasschain-indexer    = { version = "0.1.0", path = "../glasschain-indexer" }
+glasschain-identity   = { version = "0.1.0", path = "../glasschain-identity" }
+glasschain-storage    = { version = "0.1.0", path = "../glasschain-storage" }
 # BLS signing for the `bft`-gated historical QC verifier (#97); the dev-dep
 # entry below covers the test scenarios with the same pin.
 bls-signatures = { version = "0.15", default-features = false, features = ["blst"], optional = true }
@@ -54,14 +54,10 @@ env_logger   = "0.11"
 x509-parser  = "0.18"
 wat          = "1.258"
 tempfile     = "3"
-# ed25519 key material for the bft_finality scenario (tests/bft_finality.rs,
-# cfg-gated to the `bft` feature). Dev-deps compile unconditionally; the crate
-# is already in the workspace graph via glasschain-identity.
-ed25519-dalek = "3.0"
 # BLS keys for the bft_finality scenario (cfg-gated with the bft feature).
 bls-signatures = { version = "0.15", default-features = false, features = ["blst"] }
-glasschain-vm = { path = "../glasschain-vm" }
-glasschain-storage = { path = "../glasschain-storage" }
+glasschain-vm = { version = "0.1.0", path = "../glasschain-vm" }
+glasschain-storage = { version = "0.1.0", path = "../glasschain-storage" }
 criterion = "0.8"
 # default-features = false drops madsim's `rpc` feature, whose optional
 # bincode 1.x dependency is unmaintained (RUSTSEC-2025-0141). Only `macros`

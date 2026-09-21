@@ -1,7 +1,5 @@
-# The audit job denies all warnings. These are the remaining transitive
-# dependencies with no compatible migration in the current workspace graph:
-# - sled 0.34.7 (latest stable, 2021) pins fxhash 0.2.1 and parking_lot 0.11
-#   -> instant; only the sled 1.0 alpha drops both.
+# The audit job denies all warnings. One transitive exception remains in the
+# current workspace graph:
 # - libp2p's if-watch 3.2.2 caps netlink-packet-core at 0.8.x, which pulls
 #   unmaintained paste; netlink-packet-core 0.9.0 is paste-free.
 # Revisit every exception when an upstream dependency offers a compatible fix.
@@ -17,7 +15,5 @@ update_index = true
 
 [advisories]
 ignore = [
-    "RUSTSEC-2025-0057",
-    "RUSTSEC-2024-0384",
     "RUSTSEC-2024-0436",
 ]

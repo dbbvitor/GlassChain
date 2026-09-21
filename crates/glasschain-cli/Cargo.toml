@@ -14,13 +14,11 @@ name = "glasschain"
 path = "src/main.rs"
 
 [dependencies]
-glasschain-core    = { path = "../glasschain-core" }
-glasschain-identity = { path = "../glasschain-identity" }
-glasschain-rpc      = { path = "../glasschain-rpc" }
-glasschain-storage = { path = "../glasschain-storage" }
-glasschain-sdk     = { path = "../glasschain-sdk" }
-base64             = "0.23"
-ed25519-dalek      = { version = "3.0", features = ["rand_core"] }
+glasschain-core    = { version = "0.1.0", path = "../glasschain-core" }
+glasschain-identity = { version = "0.1.0", path = "../glasschain-identity" }
+glasschain-rpc      = { version = "0.1.0", path = "../glasschain-rpc" }
+glasschain-storage = { version = "0.1.0", path = "../glasschain-storage" }
+glasschain-sdk     = { version = "0.1.0", path = "../glasschain-sdk" }
 tokio              = { version = "1", features = ["rt"] }
 tonic              = { version = "0.14.6", features = ["transport"] }
 hex                = "0.4"
@@ -32,7 +30,7 @@ log                = "0.4"
 env_logger         = "0.11"
 
 [dev-dependencies]
-glasschain-network = { path = "../glasschain-network" }
+glasschain-network = { version = "0.1.0", path = "../glasschain-network" }
 tokio = { version = "1", features = ["rt", "macros"] }
 tonic = { version = "0.14.6", features = ["transport"] }
 rustls-pki-types = { version = "1.15", features = ["std"] }

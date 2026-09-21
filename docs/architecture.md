@@ -77,7 +77,7 @@ source lines including `#[cfg(test)]` and `tests/` files, as of `main`
 | `glasschain-core` | ~7.3k | The ledger leaf: `Block`, `Ledger`, `Transaction`/`TransactionKind`, the provider traits, PoW, canonical schema v1 (13 record families), capabilities (ADR-010), endorsement policies and evaluation, write sets (ADR-007), the BFT provider behind the `bft` feature | `block.rs`, `ledger.rs`, `transaction.rs`, `providers.rs`, `canonical.rs`, `capability.rs`, `endorsement.rs`, `write_set.rs`, `bft.rs` |
 | `glasschain-contracts` | ~1.4k | Deterministic contract layer (ticket #49 split): `ContractEngine` (BTreeMap registry), condition matching, WASM approval gate; strictly pure functions of committed state | `engine.rs`, `contract.rs`, `approval_gate.rs` |
 | `glasschain-workflows` | ~4.8k | I/O-driven layer: `FlowRunner` (handle/ack), purchase/settlement, recall/quarantine/dispute, attestation flows, `WatcherService` (ECA inventory triggers), triage | `runner.rs`, `purchase_flow.rs`, `recall_flow.rs`, `attestation_flow.rs`, `watcher.rs`, `checkpoint.rs`, `triage.rs` |
-| `glasschain-storage` | ~0.6k | `StorageProvider` backends: `SledStorageProvider` (atomic multi-tree `apply_block`), `TransientStore` (PDC private payloads) | `sled_backend.rs`, `transient.rs` |
+| `glasschain-storage` | ~0.6k | `StorageProvider` backends: `RedbStorageProvider` (atomic multi-table `apply_block`), `TransientStore` (PDC private payloads) | `redb_backend.rs`, `transient.rs` |
 | `glasschain-identity` | ~2.6k | `Identity` (ed25519 + X.509), `Organization` (Root CA / MSP), `CertChainVerifier` (rustls-webpki), `Channel` (PDC collections), `MspEndorsementProvider` | `identity.rs`, `msp.rs`, `cert_verifier.rs`, `channel.rs`, `msp_policy.rs` |
 | `glasschain-vm` | ~1.8k | Wasmtime-backed `ExecutionProvider` with independent fuel/op-gas budgets | `wasm.rs`, `gas.rs` |
 | `glasschain-indexer` | ~2.3k | `IndexerProvider`/`InMemoryIndexer`, `EventBusProvider`/`InMemoryEventBus`, `ProvenanceIndex` (custody chains), `AnalyticalFlattener` | `indexer.rs`, `event_bus.rs`, `provenance.rs`, `flattener.rs` |
@@ -164,7 +164,7 @@ defined in core but implemented in `glasschain-identity`
 (`MspEndorsementProvider`); `ExecutionProvider` is defined in core and
 implemented in `glasschain-vm` (`WasmExecutionProvider`); `StorageProvider` is
 defined in core and implemented in `glasschain-storage`
-(`SledStorageProvider`). None of those crates depends on core.
+(`RedbStorageProvider`). None of those crates depends on core.
 
 ---
 
@@ -188,7 +188,7 @@ find nothing.
 | Trait | What it abstracts | Method shape | Implemented by (today) | Why the seam exists |
 |---|---|---|---|---|
 | `ConsensusProvider` | Turning the pending pool + a previous block into a certified commit notification, and validating a remote block | `propose_block(index, txs, previous) -> CommitNotification`; `validate_block(block, previous)` | `PowConsensusProvider` (core, default); `BftConsensusProvider` (core, `bft` feature, default-off) | Swap dev/test PoW for BFT without touching the node; ADR-002. The `CommitNotification` (`certificate: QuorumCertificate`) is the seam's output — ticket #38 retired the `MineBlock` RPC by putting consensus behind this seam |
-| `StorageProvider` | Persistent blocks + world state | `put_block`, `apply_block`, `get_block`, `latest_block_index`, `put_state`, `get_state`, `delete_state` | `in_memory::InMemoryStorageProvider` (core, default); `SledStorageProvider` (`glasschain-storage`) | Drop in RocksDB/Postgres later; the atomic `apply_block` boundary (block + state in one transaction) is the crucial contract (ADR-007 decision 2) |
+| `StorageProvider` | Persistent blocks + world state | `put_block`, `apply_block`, `get_block`, `latest_block_index`, `put_state`, `get_state`, `delete_state` | `in_memory::InMemoryStorageProvider` (core, default); `RedbStorageProvider` (`glasschain-storage`) | Drop in RocksDB/Postgres later; the atomic `apply_block` boundary (block + state in one transaction) is the crucial contract (ADR-007 decision 2) |
 | `ExecutionProvider` | Running a contract payload against a world-state snapshot and getting the typed result back | `execute(contract_id, payload, limits)`; `execute_with_state(..., initial_state, limits)` | `WasmExecutionProvider` (`glasschain-vm`) | WASM is one possible runtime (EVM was considered and rejected in ADR-001); the typed `ExecutionResult` (ephemeral vs persistent writes) is ADR-007 decision 1 |
 | `EndorsementProvider` | Business authorization: does a set of signers satisfy a policy expression? | `evaluate(expression, request) -> EndorsementEvaluation` | `MspEndorsementProvider` (`glasschain-identity`) | Identity-neutral seam (ADR-008): core defines the expression/request/result types; an implementation derives principals from verified credentials. Distinct-principal counting means duplicate/replayed signatures never inflate the count |
 | `NetworkProvider` | Broadcasting to peers | `broadcast(bytes)`, `connected_peers()`, `name()` | **None — zero implementations in the workspace** | The libp2p insertion point described in `providers.rs` ("Implement `NetworkProvider` on a struct that wraps a `libp2p::Swarm`", passing it to a `Node::with_network_provider` that **does not exist in `node.rs`**). The TCP node never goes through the trait — `broadcast` is a private method on `Node`, not a trait call. It is a dead seam today — see §7 |
@@ -472,7 +472,7 @@ untrusted.
 | The chain | `Ledger.chain: Vec<Block>` (memory; mirrored into storage) | The ordered, hash-chained blocks: transactions, the canonical `write_set`, PoW/BFT certificate inputs | **Yes — the single source of truth** | — |
 | Pending pool | `Ledger.pending_transactions: Vec<Transaction>` | Accepted-not-yet-committed transactions | No (uncommitted) | Lost on restart, deliberately |
 | World-state cache | `NodeState.world_state: HashMap<String, Vec<u8>>` | Materialized committed write sets, keyed `ws:<channel>:<contract>:<key>` | No (derived) | `Node::rebuild_world_state` |
-| Storage state DB | `StorageProvider` (`state` tree in sled) | The same write sets, persisted; PDC keys hold the SHA-256 commitment | No (derived) | `rebuild_world_state` re-applies each block's write set to storage on rebuild (it heals a backend that persisted the block but not the state) |
+| Storage state DB | `StorageProvider` (`state` table in redb) | The same write sets, persisted; PDC keys hold the SHA-256 commitment | No (derived) | `rebuild_world_state` re-applies each block's write set to storage on rebuild (it heals a backend that persisted the block but not the state) |
 | Transient store | `TransientStore` over the node's `StorageProvider`, keys `transient:<collection>:<commitment>` | PDC private payloads (pre- and post-commit) on collection members only; per-entry expiry | No (transient) | `purge_expired_private_payloads`; gone after retention (default 72h, `channel.rs`) — the chain's commitments persist forever |
 | Analytics projections | `NodeState`/`Node` fields: `InMemoryIndexer`, `InMemoryEventBus`, `ProvenanceIndex`, `AnalyticalFlattener` | Block/tx summaries, commit events, custody chains, flat asset rows | No (derived) | `rebuild_runtime_state_from_chain` |
 | Watcher/engine state | `NodeState.engine`, `NodeState.watcher` + storage key `watcher:state` | Contract registry/status, inventory levels, trigger fire counts | No (derived) | `ContractEngine::rebuild_from_chain`, watcher snapshot-or-replay in `rebuild_runtime_state_from_chain` |
@@ -487,8 +487,8 @@ every write (sets write, deletes remove). A stale candidate is rejected
 **whole** with `CoreError::InvalidBlock`; a partial write set is never
 acknowledged. `InMemoryStorageProvider` uses a lock pair (the default trait
 implementation is a sequential fallback, correct for single-writer processes
-but not atomic); `SledStorageProvider` overrides it with a real sled
-multi-tree transaction whose abort maps back to `InvalidBlock` and whose
+but not atomic); `RedbStorageProvider` overrides it with a real redb
+multi-table transaction whose abort maps back to `InvalidBlock` and whose
 storage errors map to `Storage` — the consistent error shape across backends.
 
 ### What heals what

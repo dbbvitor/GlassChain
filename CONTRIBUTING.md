@@ -25,8 +25,8 @@ for it.
 ```bash
 git clone git@github.com:dbbvitor/GlassChain.git
 cd GlassChain
-cargo build
-cargo test --workspace --lib --bins --tests --all-features --locked
+make setup     # pinned toolchain + rustfmt/clippy + protoc
+make test      # full suite via nextest (same flags as CI)
 ```
 
 A first build pulls `wasmtime`, `libp2p`, and `tonic` — expect several minutes.
@@ -36,9 +36,16 @@ A first build pulls `wasmtime`, `libp2p`, and `tonic` — expect several minutes
 These are the same gates CI runs; finding a failure locally is cheaper:
 
 ```bash
+make ci        # check (fmt + clippy + type-check) -> test -> analysis (deny + machete)
+```
+
+The raw cargo equivalents (useful when the Makefile's optional tooling is not
+installed — `make tools` installs it):
+
+```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --lib --bins --tests --all-features --locked
+cargo nextest run --profile ci --workspace --lib --bins --tests --all-features --locked
 ```
 
 Requirements:

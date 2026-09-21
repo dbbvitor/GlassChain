@@ -7,7 +7,7 @@ use glasschain_core::{
 use glasschain_identity::{CertChainVerifier, Identity, MspEndorsementProvider, Organization};
 use glasschain_network::{Node, NodeEvent};
 use glasschain_rpc::{AdminGate, GlasschainServer};
-use glasschain_storage::SledStorageProvider;
+use glasschain_storage::RedbStorageProvider;
 use glasschain_vm::WasmExecutionProvider;
 use std::env;
 use std::io::Write;
@@ -165,7 +165,7 @@ OPTIONS:
     --listen <ADDR>         Listen address (default: "0.0.0.0:8000")
     --peer <ADDR>           Seed peer address (repeatable)
     --difficulty <N>        PoW difficulty – number of leading zeros (default: 2)
-    --storage-path <PATH>   Directory for persistent Sled block storage (optional).
+    --storage-path <PATH>   Directory for persistent block storage (optional).
                             When provided, the chain is reloaded from disk on restart.
     --org <NAME>            Organization name for issuing an identity-backed TLS certificate.
     --identity-node-id <ID> Node ID to embed in the issued TLS identity certificate.
@@ -958,7 +958,7 @@ async fn main() {
         issued_identity
     });
 
-    // Build the node — optionally backed by persistent Sled storage.
+    // Build the node — optionally backed by persistent redb storage.
     let node = storage_path.as_ref().map_or_else(
         || {
             identity.clone().map_or_else(
@@ -975,7 +975,7 @@ async fn main() {
         },
         |path| {
             log::info!("Using persistent storage at {path}");
-            match SledStorageProvider::open(path) {
+            match RedbStorageProvider::open(path) {
                 Ok(storage) => {
                     if let Some(identity) = identity.clone() {
                         Arc::new(Node::new_with_storage_and_identity(

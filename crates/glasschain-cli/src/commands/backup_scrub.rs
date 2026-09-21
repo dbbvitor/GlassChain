@@ -12,12 +12,12 @@
 
 use anyhow::Result;
 use clap::Args;
-use glasschain_storage::{SledStorageProvider, TransientStore};
+use glasschain_storage::{RedbStorageProvider, TransientStore};
 
 /// Arguments accepted by the `backup-scrub` sub-command.
 #[derive(Args, Debug)]
 pub struct BackupScrubArgs {
-    /// Path to a (copied) `GlassChain` sled storage directory.
+    /// Path to a (copied) `GlassChain` redb storage directory.
     #[arg(long)]
     pub storage: String,
 }
@@ -36,11 +36,11 @@ pub struct BackupScrubArgs {
 pub fn run(args: BackupScrubArgs, out: &mut dyn std::io::Write) -> Result<()> {
     log::info!("backup-scrub: storage={}", args.storage);
 
-    let storage = SledStorageProvider::open(&args.storage)?;
+    let storage = RedbStorageProvider::open(&args.storage)?;
     let transient = TransientStore::new(std::sync::Arc::new(storage));
     let purged = transient.purge_expired()?;
     // The backend is owned by the transient store; an explicit flush happens
-    // on drop of the sled DB (opened inside). Report the outcome.
+    // on drop of the redb DB (opened inside). Report the outcome.
     writeln!(
         out,
         "backup-scrub: purged {purged} expired private payload(s) from {}",
@@ -66,7 +66,7 @@ mod tests {
                 .as_nanos()
         ));
         let storage: std::sync::Arc<dyn glasschain_core::StorageProvider> =
-            std::sync::Arc::new(SledStorageProvider::open(&dir).unwrap());
+            std::sync::Arc::new(RedbStorageProvider::open(&dir).unwrap());
         let transient = TransientStore::new(std::sync::Arc::clone(&storage));
         let live = b"still-within-retention";
         let expired = b"past-retention";
@@ -102,7 +102,7 @@ mod tests {
         assert!(report.contains("purged 1 expired"), "{report}");
 
         // The copy re-opened has the live payload only.
-        let storage = SledStorageProvider::open(&dir).unwrap();
+        let storage = RedbStorageProvider::open(&dir).unwrap();
         let transient = TransientStore::new(std::sync::Arc::new(storage));
         assert_eq!(
             transient

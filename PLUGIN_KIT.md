@@ -20,7 +20,7 @@ forks and no changes to the rest of the stack.
 │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘                  │
 │         │                 │                  │                          │
 │   PoW / Raft /      In-Memory /         Script /                        │
-│   PBFT / BFT          Sled / Rocks        WASM                          │
+│   PBFT / BFT          redb / Rocks        WASM                          │
 │                                                                         │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                  │
 │  │  Network     │  │   Indexer    │  │  Event Bus   │                  │
@@ -163,7 +163,7 @@ pub trait StorageProvider: Send + Sync {
     ///
     /// The trait ships a sequential default (correct for single-writer
     /// processes, not atomic); override it with a real atomic section
-    /// (e.g. a sled multi-tree transaction).
+    /// (e.g. a redb multi-table transaction).
     fn apply_block(&self, block: &Block) -> Result<(), CoreError> { … }
 
     fn put_state(&self, key: &str, value: &[u8]) -> Result<(), CoreError>;
@@ -187,7 +187,7 @@ pub trait StorageProvider: Send + Sync {
 | Name | Crate | Notes |
 |:-----|:------|:------|
 | `InMemoryStorageProvider` | `glasschain-core` | Testing / dev only |
-| `SledStorageProvider` | `glasschain-storage` | Pure Rust, single-node production |
+| `RedbStorageProvider` | `glasschain-storage` | Pure Rust, single-node production |
 
 ### Implementing a RocksDB adapter
 
@@ -1217,7 +1217,7 @@ GlassChain/
     ├── glasschain-workflows/   # Flow state machines, checkpoints, WatcherService
     ├── glasschain-network/     # TCP+TLS P2P node + experimental unwired libp2p Swarm
     ├── glasschain-node/        # Interactive REPL binary + gRPC wiring
-    ├── glasschain-storage/     # SledStorageProvider (persistent on-disk backend)
+    ├── glasschain-storage/     # RedbStorageProvider (persistent on-disk backend)
     ├── glasschain-identity/    # Identity, Organization, Channel, EndorsementEngine
     ├── glasschain-vm/          # WasmExecutionProvider + GasCosts/GasCounter (Phase 4)
     ├── glasschain-indexer/     # IndexerProvider, ProvenanceIndex, AnalyticalFlattener

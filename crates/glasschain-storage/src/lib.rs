@@ -10,15 +10,16 @@
 //!
 //! | Feature / Module   | Description                                    |
 //! |:-------------------|:-----------------------------------------------|
-//! | [`sled_backend`]   | Pure-Rust embedded KV store (recommended)      |
+//! | [`redb_backend`]   | Pure-Rust embedded ACID KV store (recommended) |
+//! | [`transient`]      | TTL-scoped private-payload side store          |
 //!
-//! The `sled` backend is suitable for single-node and moderate-load
-//! deployments.  For high-throughput production clusters, a `RocksDB` adapter
+//! The `redb` backend is suitable for single-node and moderate-load
+//! deployments. For high-throughput production clusters, another adapter
 //! following the same [`StorageProvider`][glasschain_core::StorageProvider]
 //! trait can be dropped in without changing any node code.
 
-pub mod sled_backend;
+pub mod redb_backend;
 pub mod transient;
 
-pub use sled_backend::SledStorageProvider;
+pub use redb_backend::RedbStorageProvider;
 pub use transient::{TransientStore, TRANSIENT_PREFIX};
