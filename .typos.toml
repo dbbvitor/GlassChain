@@ -1,0 +1,9 @@
+# typos configuration (wayfinder #165): domain terms and accepted variants that
+# are correct as written. Keep this list minimal — real typos are fixed in code.
+[default.extend-words]
+# Portuguese SNCM domain term (Sistema Nacional de Controle de Medicamentos).
+Controle = "Controle"
+# Portuguese field label in the asset metadata mapping table ("Data de validade").
+validade = "validade"
+# Accepted computing variant; typos prefers "unparsable".
+unparseable = "unparseable"

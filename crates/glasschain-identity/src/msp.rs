@@ -533,7 +533,7 @@ impl IntermediateCa {
 
     /// Revoke a previously issued member certificate (ADR-013). See
     /// [`Organization::revoke_identity`]; revocations mint into this CA's own
-    /// CRL, which verifiers check against intermediate-issued leafs.
+    /// CRL, which verifiers check against intermediate-issued leaves.
     ///
     /// # Errors
     ///

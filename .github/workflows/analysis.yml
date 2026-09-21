@@ -1,0 +1,219 @@
+name: Analysis
+
+# PR-only gates that do not belong in the core ci.yml (wayfinder #165):
+# dependency hygiene, supply-chain policy, spelling, cache-line layout,
+# feature-combination compilation, mutation testing on the diff, and the
+# nightly cargo-careful run.
+#
+# Every job is ubuntu-only and blocking. Guardrail (wayfinder #139): a job
+# whose cold-cache runtime exceeds 20 minutes moves to deep-checks.yml.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "clippy.toml"
+      - "deny.toml"
+      - ".cargo/**"
+      - ".config/**"
+      - ".typos.toml"
+      - ".github/**"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: analysis-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deps:
+    name: Dependency hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install cargo-machete and cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete,cargo-deny
+
+      # `crates` scopes machete to the workspace: --with-metadata rewrites the
+      # lockfile of every package it scans, and the excluded demo/ has its own.
+      - name: Unused dependencies
+        run: cargo machete --with-metadata crates
+
+      - name: Supply-chain policy (licenses, bans, advisories, sources)
+        run: cargo deny --all-features check
+
+  typos:
+    name: Spelling
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install typos
+        uses: taiki-e/install-action@v2
+        with:
+          tool: typos
+
+      - name: Check spelling
+        run: typos
+
+  snarf:
+    name: Cache-line layout
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ github.job }}
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      - name: Install cargo-snarf
+        run: cargo install --locked cargo-snarf
+
+      # Findings exit non-zero and are printed to stdout; the ~55k type-name
+      # collision warnings go to stderr, so they are kept out of the job log.
+      - name: Check cache-line sharing
+        run: cargo +nightly snarf --format github --color never 2>snarf-warnings.log
+
+  hack:
+    name: Feature matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ github.job }}
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+
+      # CI otherwise only compiles default and --all-features, so feature
+      # combinations (bft, pq-tls, insecure-tls) are never built.
+      - name: Compile every feature combination
+        run: cargo hack check --each-feature --workspace --all-targets --locked
+
+  careful:
+    name: cargo-careful
+    runs-on: ubuntu-latest
+    # 20-minute guardrail: measure the cold-cache runtime; demote to
+    # deep-checks.yml if it exceeds 20 minutes.
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install nightly Rust with rust-src
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ github.job }}
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      - name: Install cargo-careful and cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-careful,cargo-nextest
+
+      - name: Run the suite with std debug assertions
+        run: cargo +nightly careful nextest run --profile ci --workspace --lib --bins --tests --all-features --locked
+
+  mutants:
+    name: Mutation (diff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The diff needs the merge base with the target branch.
+          fetch-depth: 0
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ github.job }}
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      - name: Install cargo-mutants and cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants,cargo-nextest
+
+      - name: Write the PR diff
+        run: git diff "origin/${{ github.base_ref }}...HEAD" > pr.diff
+
+      # `.cargo/mutants.toml` adds --all-features (without it, cfg-gated
+      # mutants are compiled out and report as false misses).
+      - name: Mutate only the diff
+        run: cargo mutants --in-diff pr.diff --baseline=skip --in-place --timeout 60

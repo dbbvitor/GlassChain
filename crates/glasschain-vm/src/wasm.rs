@@ -98,18 +98,18 @@ impl WasmExecutionProvider {
                         let Ok(vl) = usize::try_from(val_len) else {
                             return Ok(());
                         };
-                        let Some(kend) = kp.checked_add(kl) else {
+                        let Some(key_end) = kp.checked_add(kl) else {
                             return Ok(());
                         };
-                        let Some(vend) = vp.checked_add(vl) else {
+                        let Some(value_end) = vp.checked_add(vl) else {
                             return Ok(());
                         };
-                        if kend > data.len() || vend > data.len() {
+                        if key_end > data.len() || value_end > data.len() {
                             return Ok(());
                         }
                         (
-                            String::from_utf8_lossy(&data[kp..kend]).to_string(),
-                            data[vp..vend].to_vec(),
+                            String::from_utf8_lossy(&data[kp..key_end]).to_string(),
+                            data[vp..value_end].to_vec(),
                         )
                     };
 

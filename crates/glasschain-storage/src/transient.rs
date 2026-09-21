@@ -300,8 +300,14 @@ mod tests {
     /// sweep.
     struct FlakyDelete {
         inner: Arc<dyn StorageProvider>,
-        fail_next_delete: std::sync::atomic::AtomicBool,
+        fail_next_delete: FailFlag,
     }
+
+    /// Cache-line-aligned flag so `snarf` does not report the test helper as
+    /// false sharing (wayfinder #149): the atomic gets its own cache line
+    /// instead of sharing one with the `Arc` field.
+    #[repr(align(64))]
+    struct FailFlag(std::sync::atomic::AtomicBool);
 
     impl StorageProvider for FlakyDelete {
         fn put_block(&self, block: &glasschain_core::Block) -> Result<(), CoreError> {
@@ -322,6 +328,7 @@ mod tests {
         fn delete_state(&self, key: &str) -> Result<(), CoreError> {
             if self
                 .fail_next_delete
+                .0
                 .swap(false, std::sync::atomic::Ordering::SeqCst)
             {
                 return Err(CoreError::Storage("simulated interrupted delete".into()));
@@ -341,7 +348,7 @@ mod tests {
         let inner: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
         let flaky: Arc<dyn StorageProvider> = Arc::new(FlakyDelete {
             inner: Arc::clone(&inner),
-            fail_next_delete: std::sync::atomic::AtomicBool::new(true),
+            fail_next_delete: FailFlag(std::sync::atomic::AtomicBool::new(true)),
         });
         let store = TransientStore::new(Arc::clone(&flaky));
         let payload = b"retry-me".to_vec();

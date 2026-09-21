@@ -229,6 +229,9 @@ impl PeerWrite {
         }
     }
 
+    /// Only the BFT vote paths (`handle_vote` / `handle_precommit`) await a
+    /// queued send; without `bft` the async variant has no callers.
+    #[cfg(feature = "bft")]
     async fn send(&self, msg: Message) -> bool {
         if is_consensus_class(&msg) {
             self.consensus.send(msg).await.is_ok()

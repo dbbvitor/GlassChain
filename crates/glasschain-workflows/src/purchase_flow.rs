@@ -269,7 +269,7 @@ impl Transition<PurchaseFlowState> for ShipOrderTransition {
         };
         let Some(occurred_at) = self.config.shipment_timestamp() else {
             // `po:<rfq_id>` did not parse — a config invariant broke; the flow
-            // stays put rather than emitting a mis-stamped record.
+            // stays put rather than emitting a wrongly stamped record.
             return TransitionResult::new(state.clone(), Vec::new(), false);
         };
         let shipment = build_shipment(po_ref, occurred_at, &self.config);
