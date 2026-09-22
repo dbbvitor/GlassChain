@@ -10,6 +10,8 @@ pub mod crypto;
 pub mod endorsement;
 pub mod error;
 pub mod ledger;
+#[cfg(kani)]
+mod proofs;
 pub mod providers;
 pub mod schema;
 pub mod transaction;

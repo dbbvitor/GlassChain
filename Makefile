@@ -183,7 +183,7 @@ sanitize: ## Run the suite under ASan/LSan (nightly; leaks are failures)
 	  -Zbuild-std --target $(HOST)
 
 kani: ## Run the Kani proofs for glasschain-core
-	cargo kani -p glasschain-core
+	cargo kani -p glasschain-core --harness proofs::iso8601_check_is_total_and_bounded --default-unwind 16
 
 verus: ## Verify the critical-code roadmap (starts with glasschain-vm gas)
 	cargo verus verify -p glasschain-vm
