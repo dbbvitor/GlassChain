@@ -21,6 +21,7 @@ use crate::error::CoreError;
 use crate::TraceableAsset;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 use uuid::Uuid;
@@ -414,13 +415,14 @@ const LEGACY_ASSET_KEYS: [&str; 6] = [
 
 /// One immutable schema version in the registry: the descriptor plus its
 /// derived `schema_hash` (ADR-006 decision 6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaEntry {
     /// The immutable descriptor.
     pub descriptor: &'static SchemaDescriptor,
     /// SHA-256 of the descriptor's canonical form — the registry key's third
-    /// component.
-    pub schema_hash: &'static str,
+    /// component. Borrowed for the static v1 tables, owned for versions added
+    /// at runtime by [`Registry::with_schema`].
+    pub schema_hash: Cow<'static, str>,
 }
 
 /// An immutable, network-wide schema registry keyed by
@@ -483,7 +485,7 @@ impl Registry {
     pub fn with_schema(mut self, descriptor: &'static SchemaDescriptor) -> Self {
         let entry = SchemaEntry {
             descriptor,
-            schema_hash: descriptor_hash(descriptor).leak(),
+            schema_hash: Cow::Owned(descriptor_hash(descriptor)),
         };
         self.schemas
             .insert((descriptor.schema_id, descriptor.version), entry);
@@ -496,7 +498,7 @@ impl Registry {
             .map(|d| {
                 let entry = SchemaEntry {
                     descriptor: d,
-                    schema_hash: SCHEMA_HASHES[&(d.schema_id, d.version)].as_str(),
+                    schema_hash: Cow::Borrowed(SCHEMA_HASHES[&(d.schema_id, d.version)].as_str()),
                 };
                 ((d.schema_id, d.version), entry)
             })
@@ -515,7 +517,7 @@ impl Registry {
         self.schemas
             .iter()
             .find(|((id, ver), _)| *id == schema_id && *ver == version)
-            .map(|(_, entry)| *entry)
+            .map(|(_, entry)| entry.clone())
     }
 
     /// Look up a registered extension namespace by name.

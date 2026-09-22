@@ -810,7 +810,8 @@ async fn admin_channel_ops_manage_collections_end_to_end() {
     });
     let channel = connect(&endpoint).await;
     let mut client = NodeServiceClient::new(channel);
-    std::mem::forget(handle);
+    // Dropping the JoinHandle detaches the server task; it keeps serving.
+    drop(handle);
 
     let mut create = tonic::Request::new(CreateChannelRequest {
         name: "pricing".into(),
@@ -899,7 +900,8 @@ async fn admin_channel_ops_reject_a_non_admin_certificate() {
         let _ = server.serve_listener(listener).await;
     });
     let channel = connect(&endpoint).await;
-    std::mem::forget(handle);
+    // Dropping the JoinHandle detaches the server task; it keeps serving.
+    drop(handle);
     let mut client = NodeServiceClient::new(channel);
 
     let mut create =
@@ -934,7 +936,8 @@ async fn with_auth_lenient_mode_serves_the_ledger_api() {
         let _ = server.serve_listener(listener).await;
     });
     let channel = connect(&endpoint).await;
-    std::mem::forget(handle);
+    // Dropping the JoinHandle detaches the server task; it keeps serving.
+    drop(handle);
     let mut client = LedgerClient::new(channel);
 
     let status = client

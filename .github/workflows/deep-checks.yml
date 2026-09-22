@@ -1,0 +1,300 @@
+name: Deep checks
+
+# Scheduled Tier-3/Tier-4 analysis (wayfinder #166, policy from #147):
+#
+#   nightly        miri matrix over the six-crate allowlist, the full
+#                  cargo-mutants run sharded 16 ways, ASan/LSan over the
+#                  workspace.
+#   weekly Monday  Kani proofs, Verus proofs, the 13 ignored gates under a
+#                  raised fd limit, the turmoil deterministic chaos run.
+#
+# The two cron entries select their job groups through `github.event.schedule`;
+# a manual dispatch runs both groups. No job blocks a PR, so failures surface
+# as the rolling `ci-failure` issue managed by ci-failure-issues.yml.
+on:
+  schedule:
+    - cron: "17 2 * * *"
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deep-checks-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  miri:
+    name: Miri (${{ matrix.crate }})
+    # Nightly group only: this job is not the weekly-Monday group.
+    if: github.event.schedule != '23 4 * * 1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - glasschain-core
+          - glasschain-contracts
+          - glasschain-indexer
+          - glasschain-workflows
+          - glasschain-storage
+          - glasschain-sdk
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install nightly Rust with miri
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: miri
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: miri-${{ matrix.crate }}
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      # Strict flags (wayfinder #153), no `-Zmiri-ignore-leaks`: the `Cow`
+      # schema-hash fix removed the only known leak. Default features only;
+      # FFI crates (blst, wasmtime, ring) cannot run under Miri.
+      - name: Run Miri
+        env:
+          MIRIFLAGS: >-
+            -Zmiri-disable-isolation
+            -Zmiri-strict-provenance
+            -Zmiri-symbolic-alignment-check
+        run: |
+          cargo +nightly miri test -p ${{ matrix.crate }} --lib -- \
+            --skip wasm \
+            --skip test_pending_pool_bound_rejects_and_drains \
+            --skip test_slice_quota_spreads_a_burst_across_rounds \
+            --skip ledger_default_uses_the_workspace_difficulty \
+            --skip test_d3_index_semantics_match_full_rebuild_after_history_growth
+
+  mutants:
+    name: Mutation (shard ${{ matrix.shard }}/16)
+    if: github.event.schedule != '23 4 * * 1'
+    runs-on: ubuntu-latest
+    # 2 256 mutants over 16 serial shards; the first cold shard dominates.
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: mutants-${{ matrix.shard }}
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      - name: Install cargo-mutants and cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants,cargo-nextest
+
+      # `--baseline=skip` requires the tests to pass in the same tree, and
+      # sharding must not run the baseline 16 times.
+      - name: Prove the suite passes before mutating
+        run: cargo nextest run --profile ci --workspace --lib --bins --tests --all-features --locked
+
+      # `--in-place` (ephemeral runners) cannot combine with `--jobs`, so a
+      # shard is serial. `--all-features` comes from `.cargo/mutants.toml`;
+      # exit code 2 means survivors were found and is reported, not failed
+      # (#156: outcomes are collected before any score gate exists).
+      - name: Mutate shard ${{ matrix.shard }}
+        run: |
+          set +e
+          cargo mutants --shard ${{ matrix.shard }}/16 --in-place --baseline=skip --timeout 60
+          code=$?
+          set -e
+          if [ "$code" -ne 0 ] && [ "$code" -ne 2 ]; then
+            exit "$code"
+          fi
+
+      - name: Upload outcomes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-outcomes-${{ matrix.shard }}
+          path: mutants.out/outcomes.json
+          if-no-files-found: ignore
+
+  asan:
+    name: ASan/LSan
+    if: github.event.schedule != '23 4 * * 1'
+    runs-on: ubuntu-latest
+    # Cold `-Zbuild-std` workspace build exceeds 50 minutes even on 8 cores.
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install nightly Rust with rust-src
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rust-src
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: asan
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      # Zero suppressions: leaks are failures (wayfinder #163).
+      - name: Run the suite under ASan/LSan
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          ASAN_OPTIONS: detect_leaks=1
+        run: >-
+          cargo +nightly test --workspace --lib --bins --tests --all-features --locked
+          -Zbuild-std --target x86_64-unknown-linux-gnu
+
+  kani:
+    name: Kani proofs
+    if: github.event.schedule != '17 2 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: kani
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier@0.68.0
+          cargo kani setup
+
+      # Default features only: the `bft` feature links the blst C library,
+      # which Kani cannot model (wayfinder #157).
+      - name: Verify glasschain-core
+        run: cargo kani -p glasschain-core
+
+  verus:
+    name: Verus proofs
+    if: github.event.schedule != '17 2 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Verus
+        run: |
+          curl -sSLo verus.zip \
+            https://github.com/verus-lang/verus/releases/download/release%2F0.2026.09.20.aef82ed/verus-0.2026.09.20.aef82ed-x86-linux.zip
+          unzip -q verus.zip
+          echo "$PWD/verus-x86-linux" >> "$GITHUB_PATH"
+
+      # The gas module is the first roadmap module (#170); more crates join as
+      # their annotations land.
+      - name: Verify the gas proofs
+        run: cargo verus verify -p glasschain-vm
+
+  gates:
+    name: Ignored gates
+    if: github.event.schedule != '17 2 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: gates
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      # The 13 ignored gates (wayfinder #166): capacity, BFT finality,
+      # saturation, tcp-partition recovery, memory/latency and cost
+      # measurements. They are wall-clock heavy and need a raised fd limit.
+      - name: Capacity and finality gates
+        run: |
+          ulimit -n 65535
+          cargo test -p glasschain-network --test consensus_capacity --all-features --locked -- --ignored --nocapture
+
+      - name: TCP partition gates
+        run: |
+          ulimit -n 65535
+          cargo test -p glasschain-network --test tcp_partition --all-features --locked -- --ignored --nocapture
+
+      - name: Read-path memory gates
+        run: |
+          ulimit -n 65535
+          cargo test -p glasschain-indexer --test read_path_memory --all-features --locked -- --ignored --nocapture
+
+      - name: Verification cost measurement
+        run: |
+          ulimit -n 65535
+          cargo test -p glasschain-network --lib --all-features --locked -- --ignored --nocapture
+
+  turmoil:
+    name: Turmoil chaos
+    if: github.event.schedule != '17 2 * * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: turmoil
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      - name: Run the deterministic chaos scenario
+        run: cargo test -p glasschain-network --test turmoil_chaos --features turmoil-sim --locked

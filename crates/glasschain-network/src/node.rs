@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 dbbvitor
 use crate::error::NetworkError;
+use crate::net::{connect, from_std, TcpListener};
 use crate::peer::{PeerReader, PeerWriter};
 use crate::protocol::{Message, PROTOCOL_VERSION};
 #[cfg(feature = "bft")]
@@ -39,7 +40,6 @@ use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
 use std::collections::{HashMap, HashSet};
 use std::net::TcpListener as StdTcpListener;
 use std::sync::{Arc, OnceLock};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{broadcast, Mutex};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -1842,7 +1842,7 @@ impl Node {
         // (see `stash_prebound_listener`): re-binding a just-probed address
         // is the `AddrInUse` window Windows refuses to paper over.
         let listener = match adopt_prebound_listener(&self.listen_addr) {
-            Some(std_listener) => TcpListener::from_std(std_listener)?,
+            Some(std_listener) => from_std(std_listener)?,
             None => TcpListener::bind(&self.listen_addr).await?,
         };
         log::info!("Node {} listening on {}", self.node_id, self.listen_addr);
@@ -3929,7 +3929,7 @@ async fn connect_to_peer(
     storage: Arc<dyn StorageProvider>,
     tls: Arc<NodeTls>,
 ) {
-    match TcpStream::connect(&peer_addr).await {
+    match connect(&peer_addr).await {
         Ok(mut stream) => {
             log::info!("Connected to peer {peer_addr}");
 
@@ -4909,7 +4909,7 @@ pub fn adopt_prebound_listener(addr: &str) -> Option<StdTcpListener> {
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 /// Map the negotiated key exchange group to a comparable [`rustls::NamedGroup`].
-#[cfg(test)]
+#[cfg(all(test, not(feature = "turmoil-sim")))]
 fn glasschain_group(
     negotiated: Option<&'static dyn rustls::crypto::SupportedKxGroup>,
 ) -> rustls::NamedGroup {
@@ -4918,7 +4918,10 @@ fn glasschain_group(
         .expect("a completed handshake negotiated a key exchange group")
 }
 
-#[cfg(test)]
+// Simulated sockets only exist inside a `turmoil::Sim`, so the unit tests
+// (which bind real loopback ports) run on the default transport only; the
+// `turmoil-sim` feature exists for tests/turmoil_chaos.rs.
+#[cfg(all(test, not(feature = "turmoil-sim")))]
 mod tests {
     use super::*;
     use glasschain_core::{
@@ -4942,7 +4945,7 @@ mod tests {
         // no one else can take the port in between.
         assert!(adopt_prebound_listener(&addr).is_none());
         assert!(StdTcpListener::bind(&addr).is_err());
-        assert!(TcpStream::connect(&addr).await.is_ok());
+        assert!(tokio::net::TcpStream::connect(&addr).await.is_ok());
     }
 
     #[tokio::test]

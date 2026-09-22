@@ -15,7 +15,7 @@
 //!
 //! These are **real TCP wall-clock tests**, not deterministic simulated
 //! network runs; margins are generous and results are labeled separately
-//! from madsim-style deterministic execution.
+//! from turmoil's simulated execution.
 
 use std::sync::{atomic::Ordering, Arc};
 use std::time::Duration;

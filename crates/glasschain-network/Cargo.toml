@@ -48,6 +48,10 @@ libp2p       = { version = "0.57.0", features = [
     "tokio",
 ] }
 futures      = "0.3"
+# Deterministic simulation transport (decision #154). Optional so the default
+# build keeps tokio's real sockets; the `turmoil-sim` feature swaps the node's
+# TCP seam to turmoil's simulated sockets inside `turmoil::Sim` runs only.
+turmoil      = { version = "0.7.2", optional = true }
 
 [dev-dependencies]
 env_logger   = "0.11"
@@ -59,12 +63,6 @@ bls-signatures = { version = "0.15", default-features = false, features = ["blst
 glasschain-vm = { version = "0.1.0", path = "../glasschain-vm" }
 glasschain-storage = { version = "0.1.0", path = "../glasschain-storage" }
 criterion = "0.8"
-# default-features = false drops madsim's `rpc` feature, whose optional
-# bincode 1.x dependency is unmaintained (RUSTSEC-2025-0141). Only `macros`
-# is used by tests/madsim_chaos.rs.
-madsim     = { version = "0.2", default-features = false, features = [
-    "macros",
-] }
 
 [features]
 default       = []
@@ -81,6 +79,10 @@ pq-tls        = ["rustls/aws_lc_rs"]
 # Enables `glasschain-core/bft` so the node can attest blocks with a real
 # quorum certificate instead of dev/test Proof-of-Work.
 bft = ["glasschain-core/bft", "dep:bls-signatures"]
+# Deterministic chaos runs (decision #154): routes the node's TCP seam through
+# turmoil's simulated sockets while inside a `turmoil::Sim`, leaving real tokio
+# sockets untouched elsewhere. Test-only in practice.
+turmoil-sim = ["dep:turmoil"]
 
 [[bench]]
 name = "wire_codec"

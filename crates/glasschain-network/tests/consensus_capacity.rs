@@ -18,9 +18,8 @@
 //!   joining late converges to the leader's chain),
 //! * **private-data dissemination** measured separately from consensus.
 //!
-//! Mode: like `madsim_chaos.rs`, this file runs under the real Tokio runtime
-//! by default and inside the madsim simulator with
-//! `RUSTFLAGS="--cfg madsim"` (deterministic scheduling, seeded runs).
+//! Mode: real Tokio runtime with real TCP; deterministic partition scenarios
+//! run under turmoil in `turmoil_chaos.rs`.
 //!
 //! Run (ignored by default — the full gate takes minutes):
 //! ```bash
@@ -580,16 +579,14 @@ async fn capacity_gate(validator_count: usize, txs_per_round: usize, rounds: usi
 }
 
 /// The committed gate: 200 validators.
-#[cfg_attr(madsim, madsim::test)]
-#[cfg_attr(not(madsim), tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "capacity gate: minutes-long, run explicitly with --ignored --nocapture"]
 async fn capacity_gate_200_validators() {
     capacity_gate(200, 20, 10).await;
 }
 
 /// The committed gate: 300 validators.
-#[cfg_attr(madsim, madsim::test)]
-#[cfg_attr(not(madsim), tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "capacity gate: minutes-long, run explicitly with --ignored --nocapture"]
 async fn capacity_gate_300_validators() {
     capacity_gate(300, 20, 10).await;
@@ -597,8 +594,7 @@ async fn capacity_gate_300_validators() {
 
 /// A fast smoke check (not ignored): the harness works end-to-end at a small
 /// validator count so the gate's plumbing cannot rot silently.
-#[cfg_attr(madsim, madsim::test)]
-#[cfg_attr(not(madsim), tokio::test(flavor = "multi_thread", worker_threads = 2))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capacity_harness_smoke() {
     let _ = env_logger::try_init();
     let mut set = build_star(6, 4, 1).await;
@@ -962,29 +958,21 @@ mod bft_finality_gate_section {
         let seq = seq as usize;
         signed(lot_record(seq), "org-maker")
     }
-
-    #[cfg_attr(madsim, madsim::test)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     #[ignore = "bft finality gate: run explicitly"]
     async fn bft_finality_gate_10_validators() {
         bft_finality_gate(10, 10, 10).await;
     }
-
-    #[cfg_attr(madsim, madsim::test)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     #[ignore = "bft finality gate: minutes-long, needs a raised fd limit (ulimit -n 65535); run explicitly"]
     async fn bft_finality_gate_100_validators() {
         bft_finality_gate(100, 10, 10).await;
     }
-
-    #[cfg_attr(madsim, madsim::test)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     #[ignore = "bft finality gate: heavier mesh (~80k sockets); raise the fd limit first"]
     async fn bft_finality_gate_200_validators() {
         bft_finality_gate(200, 10, 10).await;
     }
-
-    #[cfg_attr(madsim, madsim::test)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     #[ignore = "bft finality gate: heaviest mesh (~180k sockets); raise the fd limit first"]
     async fn bft_finality_gate_300_validators() {
@@ -1066,7 +1054,6 @@ mod bft_finality_gate_section {
     /// and finality under load against the unloaded baseline. The failing
     /// budget this study looks for is pool depth/bytes growth and round
     /// latency, in that order.
-    #[cfg_attr(madsim, madsim::test)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     #[ignore = "offered-load saturation: minutes-long, needs a raised fd limit; run explicitly"]
     #[allow(clippy::too_many_lines)]

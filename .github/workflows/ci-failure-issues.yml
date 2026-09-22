@@ -1,0 +1,79 @@
+name: CI failure issues
+
+# Rolling per-workflow issue for scheduled failures (wayfinder #147): one open
+# issue per workflow, labelled `ci-failure`, updated on each failing run and
+# closed automatically by the next green scheduled run. PR-triggered runs are
+# ignored: the gate is the PR's own status, not an issue.
+on:
+  workflow_run:
+    workflows:
+      - Deep checks
+      - Fuzz
+      - Reproducible build
+      - Coverage insights
+    types: [completed]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: ci-failure-issues
+  cancel-in-progress: false
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.workflow_run.event == 'schedule'
+      || github.event.workflow_run.event == 'workflow_dispatch'
+    steps:
+      - name: Open, update, or close the rolling issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          WORKFLOW: ${{ github.event.workflow_run.name }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          # `skipped` and `cancelled` runs say nothing about the workflow.
+          case "$CONCLUSION" in
+            success) ;;
+            failure|timed_out|startup_failure) ;;
+            *) echo "Ignoring conclusion: $CONCLUSION"; exit 0 ;;
+          esac
+
+          gh label create ci-failure --color B60205 \
+            --description "A scheduled workflow is failing" --force
+
+          issue=$(gh issue list --repo "$REPO" --label ci-failure --state open --limit 50 \
+            --json number,title \
+            --jq ".[] | select(.title | contains(\"$WORKFLOW\")) | .number" | head -1)
+
+          if [ "$CONCLUSION" = "success" ]; then
+            if [ -z "$issue" ]; then
+              echo "Green, no open issue for $WORKFLOW."
+              exit 0
+            fi
+            gh issue comment "$issue" --repo "$REPO" \
+              --body "Green again: $RUN_URL (\`$SHA\`). Closing."
+            gh issue close "$issue" --repo "$REPO" --reason completed
+            exit 0
+          fi
+
+          body=$(printf '`%s` concluded **%s** on `%s`.\n\nRun: %s\n' \
+            "$WORKFLOW" "$CONCLUSION" "$SHA" "$RUN_URL")
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --repo "$REPO" --body "$body"
+          else
+            gh issue create --repo "$REPO" \
+              --title "[ci] $WORKFLOW failing on main" \
+              --label ci-failure \
+              --body "$body
+
+          This issue closes automatically when the workflow is green again."
+          fi
