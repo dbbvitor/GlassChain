@@ -320,11 +320,12 @@ With the seam carrying certificates, the manual fork machinery was removed:
   `Node::mine()` / `Node::mine_async()`.
 - **The fork-following test was retired.** `test_concurrent_mining_longest_chain_wins`
   (which asserted that concurrent mining forks and the longest chain wins) is
-  gone. The madsim chaos suite
-  (`crates/glasschain-network/tests/madsim_chaos.rs`) now asserts the **no-fork
+  gone. The chaos suite
+  (`crates/glasschain-network/tests/deterministic_chaos.rs`) now asserts the **no-fork
   model**: commits are final at commit and carry certificates, and joining nodes
   *converge* — "convergence is liveness, not fork resolution"
-  (`test_madsim_partition_reference_implementation`, madsim_chaos.rs:627).
+  (`test_partition_reference_implementation`). Network-level partitions run
+  under turmoil in `turmoil_chaos.rs` (ADR-019).
 
 One nuance worth being precise about: `Ledger::try_replace_chain` still exists
 and is still the sync-admission path (a longer candidate chain can replace the
@@ -772,7 +773,7 @@ rounds** — every projection below it waits on that measurement.
 - [`docs/benchmarks/consensus-capacity.md`](benchmarks/consensus-capacity.md) — ticket #48 measured evidence, with its honest-scope caveats.
 - `crates/glasschain-core/src/consensus.rs`, `bft.rs`, `block.rs`, `ledger.rs`, `capability.rs`, `providers.rs` — the seam, BLS votes/certificates, and implementations.
 - `crates/glasschain-network/src/node.rs`, `rounds.rs` — engine selection, the vote-round driver, commit paths, admission gates; `protocol.rs` for the round messages.
-- `crates/glasschain-network/tests/bft_finality.rs`, `bft_vote_rounds.rs`, `consensus_capacity.rs`, `madsim_chaos.rs` — the scenarios the claims above are tested against.
+- `crates/glasschain-network/tests/bft_finality.rs`, `bft_vote_rounds.rs`, `consensus_capacity.rs`, `deterministic_chaos.rs` — the scenarios the claims above are tested against.
 - [`.agents/plans/performance.md`](../.agents/plans/performance.md) — the §10 evaluation in full, with its step list and sources.
 - `.agents/memories/participation-model.md`, `bft-at-scale.md`, `external-review-verdicts.md`, `debt-gap-handoff.md` — design and evidence records.
 

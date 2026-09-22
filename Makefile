@@ -102,7 +102,6 @@ tools: ## Install the stable tooling used by the gate and deep targets
 	cargo install --locked typos-cli
 	cargo install --locked cargo-hack
 	cargo install --locked cargo-llvm-cov
-	cargo install --locked cargo-tarpaulin
 	cargo install --locked cargo-audit
 
 tools-nightly: ## Install nightly components and nightly-only tools (miri, careful, snarf)

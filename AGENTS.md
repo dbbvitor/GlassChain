@@ -36,7 +36,11 @@ watcher automation engine, a TLS-encrypted TCP/libp2p P2P layer, and a gRPC API.
   feature-sensitivity views), `reproducible.yml` (weekly
   Linux-only build-twice hash verification), and `release.yml` (on `v*` tags:
   cargo-auditable build, CycloneDX SBOMs, git-cliff notes, Cosign keyless
-  signing). It is a safety net, not a substitute — run
+  signing). `analysis.yml` adds the blocking PR gates (machete, deny, typos,
+  snarf, cargo-hack, cargo-careful, diff mutants) and `deep-checks.yml` the
+  scheduled tiers (miri, full mutants, ASan/LSan, Kani, Verus, the ignored
+  gates, turmoil); scheduled failures file a rolling `ci-failure` issue
+  (ADR-019). It is a safety net, not a substitute — run
   the checks below locally before declaring work done, because a cold CI build
   takes minutes.
 
@@ -88,7 +92,9 @@ finding a failure locally is far cheaper than finding it in CI.
 `make ci` runs the same fast gate locally (`make check` → `make test` →
 `make analysis`); `make tools` installs the optional tooling and deep checks are
 opt-in (`make miri`, `make sanitize`, `make mutants`, `make careful`, `make kani`,
-`make verus`, `make snarf`). See the `Makefile` and
+`make verus`, `make snarf`). `make kani` and `make verus` run the same commands
+as the weekly workflow; the Kani scope limit and its evidence are recorded in
+`.agents/memories/kani-deferral.md`. See the `Makefile` and
 [`docs/operations.md`](docs/operations.md#makefile-targets).
 
 ### Running a node
@@ -239,7 +245,8 @@ hide unrelated warnings with broad `#[allow]` attributes.
 
 - Unit tests live in `#[cfg(test)] mod tests` blocks inside the module they cover.
   Integration tests live in `crates/glasschain-network/tests/`
-  (`node_integration.rs`, `chaos_tests.rs`, `madsim_chaos.rs`, `sncm_compliance.rs`).
+  (`node_integration.rs`, `chaos_tests.rs`, `deterministic_chaos.rs`,
+  `turmoil_chaos.rs`, `sncm_compliance.rs`).
 - Treat the current test run as evidence; do not copy historical test counts or
   claim all tests passed from a partial run. Large scale benchmarks are ignored
   by default and are separate from the ordinary suite.

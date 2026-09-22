@@ -205,6 +205,7 @@ jobs:
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: 1.98.1
+          components: llvm-tools-preview
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -213,31 +214,28 @@ jobs:
           shared-key: rust-cache
           cache-on-failure: true
 
-      - name: Install cargo-tarpaulin
+      - name: Install cargo-llvm-cov and cargo-nextest
         uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
         with:
-          tool: cargo-tarpaulin
+          tool: cargo-llvm-cov,cargo-nextest
 
       - name: Generate coverage report
-        # --engine llvm: wasmtime delivers WASM traps (e.g. `unreachable`, fuel
-        # exhaustion) via SIGILL/SIGSEGV caught by its own signal handler; the
-        # default ptrace engine intercepts those signals and aborts the run.
-        # --lib --bins --tests: same surface as the test job — benches are
-        # excluded (their test-mode setup dominates the run and yields no
-        # library coverage). Tests bind ports through the shared per-process
-        # allocator (glasschain-network/tests/common/ports.rs), so the
-        # parallel libtest harness cannot collide on loopback ports even
-        # under tarpaulin's instrumented execution (the bind→drop→rebind
-        # window that forced RUST_TEST_THREADS=1 here, sncm_compliance
-        # 2026-09-03, is gone).
-        run: cargo tarpaulin --verbose --workspace --all-features --lib --bins --tests --locked --timeout 120 --engine llvm --out xml
+        # cargo-llvm-cov with nextest: the same runner and flags as the test
+        # job, so a passing test matrix implies a complete report. Benches are
+        # excluded like the test job (their setup dominates the run and yields
+        # no library coverage). Verified locally before the flip: 94.18% line
+        # coverage (19 523 / 20 729 lines) against the pinned 90% gate; see
+        # ADR-019.
+        run: >-
+          cargo llvm-cov nextest --profile ci --workspace --lib --bins --tests
+          --all-features --locked --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
         if: ${{ env.CODECOV_TOKEN != '' }}
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7
         with:
-          files: cobertura.xml
+          files: lcov.info
           # The flag defined in codecov.yml; one report → one flag.
-          flags: tarpaulin
+          flags: llvm-cov
           fail_ci_if_error: true
           token: ${{ env.CODECOV_TOKEN }}

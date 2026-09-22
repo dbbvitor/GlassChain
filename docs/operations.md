@@ -771,17 +771,38 @@ code paths: `BftConsensusProvider`, `set_bft_consensus`, and the
 `#[cfg(not(feature = "bft"))]` fallbacks — `--all-features` compiles the BFT
 code, default builds the fallbacks, and both must stay green.
 
-### What CI runs (`.github/workflows/ci.yml`)
+### What CI runs (`.github/workflows/`)
+
+`ci.yml` — every push and PR:
 
 | Job | Runner | Runs |
 |---|---|---|
 | `fmt` / `clippy` | ubuntu | `cargo fmt --all --check`; clippy with `RUSTFLAGS=-D warnings` |
 | `test` | **matrix ubuntu / macOS / Windows** | `cargo nextest run --profile ci --workspace --lib --bins --tests --all-features` with `RUSTFLAGS=-D warnings`, `RUSTDOCFLAGS=-D warnings` — process-per-test isolation; loopback ports come from the shared per-process band allocator (`tests/common/ports.rs`), so no cross-test port race |
-| `coverage` | ubuntu | `cargo tarpaulin … --lib --bins --tests --engine llvm --out xml` (llvm engine because wasmtime traps abort the default ptrace engine; benches excluded like the test job), upload to Codecov when a token exists |
+| `coverage` | ubuntu | `cargo llvm-cov nextest --profile ci … --lcov` (nextest integration; benches excluded like the test job), upload to Codecov when a token exists. Verified at 94.18% line coverage before the tarpaulin → llvm-cov flip (ADR-019) |
 | `audit` | ubuntu (own workflow: `audit.yml`) | `cargo audit --deny warnings --file Cargo.lock` (RustSec); prebuilt installs via `taiki-e/install-action` |
 
-All `protoc`-requiring jobs install it via `arduino/setup-protoc`, and the
-workflow is path-filtered to code — **docs-only changes skip CI**.
+`analysis.yml` — the blocking PR gate (ADR-019): `cargo machete
+--with-metadata` + `cargo deny --all-features check`, `typos`, `cargo +nightly
+snarf --format github`, `cargo hack check --each-feature`, `cargo +nightly
+careful nextest run --profile ci`, and `cargo mutants --in-diff` over the
+merge-base diff (`--baseline=skip --in-place --timeout 60`).
+
+`deep-checks.yml` — scheduled, never blocking a PR. Nightly: the Miri matrix
+over six crates, the full mutants run in 16 serial shards, ASan/LSan over the
+workspace. Weekly Monday: Kani (heap-free predicates; scope and evidence in
+`.agents/memories/kani-deferral.md`), Verus (`glasschain-vm` gas module), the
+13 `#[ignore]`d capacity/measurement gates under `ulimit -n 65535`, and the
+turmoil deterministic partition scenario (`cargo test -p glasschain-network
+--test turmoil_chaos --features turmoil-sim`).
+
+`ci-failure-issues.yml` — turns a scheduled failure into one rolling issue per
+workflow (`ci-failure` label) and closes it on the next green run. `fuzz.yml`,
+`reproducible.yml` and `coverage-insights.yml` stay on their weekly schedules.
+
+All `protoc`-requiring jobs install it via `arduino/setup-protoc`; the test
+workflow is path-filtered to code — **docs-only changes skip CI**. Every
+workflow action is pinned to a commit SHA and updated by Dependabot.
 
 ### Makefile targets
 
@@ -790,7 +811,7 @@ workflow is path-filtered to code — **docs-only changes skip CI**.
 | Target | Runs |
 |---|---|
 | `make setup` | Install pinned toolchain + rustfmt/clippy + `protoc` (may need sudo) |
-| `make tools` / `tools-nightly` / `tools-formal` | Stable tooling (nextest, deny, machete, mutants, typos, cargo-hack, llvm-cov, tarpaulin, audit) / nightly components + careful + snarf / Kani + Verus pointer |
+| `make tools` / `tools-nightly` / `tools-formal` | Stable tooling (nextest, deny, machete, mutants, typos, cargo-hack, llvm-cov, audit) / nightly components + careful + snarf / Kani + Verus pointer |
 | `make build` / `build-release` | `cargo build` / `cargo build --release` |
 | `make check` | `fmt-check` → `clippy` → `cargo check` (fast, no tests) |
 | `make test` / `test-pkg pkg=…` / `test-one pkg=… test=…` | nextest with the CI `ci` profile / one crate / substring match |
@@ -829,9 +850,9 @@ star topology.
 
 ```bash
 cargo test -p glasschain-network --test consensus_capacity -- --ignored --nocapture
-# deterministic madsim run:
-RUSTFLAGS="--cfg madsim" cargo test -p glasschain-network \
-  --test consensus_capacity -- --ignored --nocapture
+# the weekly deep-checks job raises the fd limit first:
+ulimit -n 65535 && cargo test -p glasschain-network --test consensus_capacity \
+  --all-features --locked -- --ignored --nocapture
 ```
 
 Interpretation is subtle: the degenerate PoW quorum certificate measures
