@@ -187,3 +187,23 @@ pub fn build_receipt(
     receipt.record_id = format!("receipt:{}", shipment.record_id);
     receipt
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Transition names are the durable checkpoint vocabulary.
+    #[test]
+    fn transition_names_are_stable() {
+        assert_eq!(AnchorLotTransition.name(), "AnchorLot");
+        assert_eq!(
+            ShipmentToReceiptTransition {
+                receiver_id: "receiver".into(),
+                issuer: "issuer".into(),
+                received_on: "2026-09-01".into(),
+            }
+            .name(),
+            "ShipmentToReceipt"
+        );
+    }
+}

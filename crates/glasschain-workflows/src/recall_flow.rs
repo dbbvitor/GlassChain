@@ -798,4 +798,47 @@ mod tests {
             "dispute reason leaked on-chain: {payload_json}"
         );
     }
+
+    /// Transition names are the durable checkpoint vocabulary.
+    #[test]
+    fn transition_names_are_stable() {
+        let config = recall_config();
+        assert_eq!(
+            RecallAnchorLotTransition {
+                config: config.clone()
+            }
+            .name(),
+            "AnchorLot"
+        );
+        assert_eq!(
+            IssueRecallTransition {
+                config: config.clone()
+            }
+            .name(),
+            "IssueRecall"
+        );
+        assert_eq!(
+            ActivateRecallTransition {
+                config: config.clone()
+            }
+            .name(),
+            "ActivateRecall"
+        );
+        assert_eq!(CompleteRecallTransition { config }.name(), "CompleteRecall");
+        assert_eq!(
+            ObserveRecallTransition {
+                config: response_config("org-a")
+            }
+            .name(),
+            "ObserveRecall"
+        );
+        assert_eq!(
+            RespondTransition {
+                config: response_config("org-a"),
+                transformation_type: "recall",
+            }
+            .name(),
+            "Respond"
+        );
+    }
 }

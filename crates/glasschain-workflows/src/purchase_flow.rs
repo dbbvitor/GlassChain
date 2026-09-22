@@ -923,4 +923,48 @@ mod tests {
             })
         );
     }
+
+    /// Every transition and step name is part of the durable checkpoint
+    /// vocabulary; a renamed or empty name would silently corrupt resumes.
+    #[test]
+    fn transition_and_step_names_are_stable() {
+        let flow_config = config("buyer", "seller");
+        assert_eq!(AcceptQuoteTransition.name(), "AcceptQuote");
+        assert_eq!(
+            CommitPurchaseOrderTransition {
+                config: flow_config.clone()
+            }
+            .name(),
+            "CommitPurchaseOrder"
+        );
+        assert_eq!(
+            AcceptPurchaseOrderTransition {
+                config: flow_config.clone()
+            }
+            .name(),
+            "AcceptPurchaseOrder"
+        );
+        assert_eq!(
+            ShipOrderTransition {
+                config: flow_config.clone()
+            }
+            .name(),
+            "ShipOrder"
+        );
+        assert_eq!(
+            RecordDeliveryTransition {
+                config: flow_config
+            }
+            .name(),
+            "RecordDelivery"
+        );
+        assert_eq!(AwaitSettlementTransition.name(), "AwaitSettlement");
+        assert_eq!(RaiseDisputeTransition.name(), "RaiseDispute");
+        assert_eq!(SettleTransition.name(), "Settle");
+
+        assert_eq!(
+            buyer_initial(&config("buyer", "seller")).step(),
+            "rfq_issued"
+        );
+    }
 }

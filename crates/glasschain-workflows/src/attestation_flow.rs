@@ -401,4 +401,17 @@ mod tests {
             .expect("handle");
         assert!(outcome.is_none(), "unanchored lot must not anchor the flow");
     }
+
+    /// Transition names are the durable checkpoint vocabulary.
+    #[test]
+    fn transition_names_are_stable() {
+        assert_eq!(AnchorLotTransition.name(), "AnchorLot");
+        assert_eq!(
+            EmitAttestationTransition {
+                config: config("quality_certification")
+            }
+            .name(),
+            "EmitAttestation"
+        );
+    }
 }
