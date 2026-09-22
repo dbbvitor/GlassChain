@@ -35,6 +35,10 @@ resolver = "2"
 # explicit `#[allow(unsafe_code)]` with a safety comment explaining why it is
 # sound.
 unsafe_code = "deny"
+# Verus turns this on during verification and erases ghost items otherwise, so
+# verified crates guard `use vstd::prelude::*` and ghost-only modules with it
+# (decision #170).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(verus_only)"] }
 
 [workspace.lints.clippy]
 # ── Core lint groups ──────────────────────────────────────────────────────────

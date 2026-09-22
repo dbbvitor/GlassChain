@@ -20,6 +20,43 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+// Brings the `verus!` macro; in normal builds it expands to plain Rust with
+// the ghost code erased, in `cargo verus verify` it is the verification
+// surface (decision #170).
+use vstd::prelude::*;
+
+verus! {
+
+/// Verified cost arithmetic: `flat + per_byte × byte_count`, saturating at
+/// `u64::MAX` — a cost no budget can cover — instead of overflowing.
+pub(crate) const fn state_cost(flat: u64, per_byte: u64, byte_count: u64) -> (total: u64)
+    ensures
+        if per_byte * byte_count + flat <= u64::MAX as int {
+            total == per_byte * byte_count + flat
+        } else {
+            total == u64::MAX as int
+        },
+{
+    flat.saturating_add(per_byte.saturating_mul(byte_count))
+}
+
+/// Apply a charge to `used` against `limit`, saturating the balance at
+/// `u64::MAX`. Returns the balance after the charge and whether it still fits
+/// within the limit.
+pub(crate) const fn apply_charge(used: u64, amount: u64, limit: u64) -> (result: (u64, bool))
+    ensures
+        result.0 == if used + amount <= u64::MAX as int {
+            used + amount
+        } else {
+            u64::MAX as int
+        },
+        result.1 <==> result.0 <= limit,
+{
+    let charged = used.saturating_add(amount);
+    (charged, charged <= limit)
+}
+
+} // verus!
 
 // ── GasReport ────────────────────────────────────────────────────────────────
 
@@ -114,18 +151,20 @@ impl GasCosts {
 
     /// Total gas cost for a state-read operation on `byte_count` bytes.
     ///
-    /// Formula: `state_read + per_byte_read × byte_count`.
+    /// Formula: `state_read + per_byte_read × byte_count`, saturating at
+    /// `u64::MAX` instead of overflowing (proved in [`state_cost`]).
     #[must_use]
     pub const fn total_state_read_cost(&self, byte_count: u64) -> u64 {
-        self.state_read + self.per_byte_read * byte_count
+        state_cost(self.state_read, self.per_byte_read, byte_count)
     }
 
     /// Total gas cost for a state-write operation on `byte_count` bytes.
     ///
-    /// Formula: `state_write + per_byte_write × byte_count`.
+    /// Formula: `state_write + per_byte_write × byte_count`, saturating at
+    /// `u64::MAX` instead of overflowing (proved in [`state_cost`]).
     #[must_use]
     pub const fn total_state_write_cost(&self, byte_count: u64) -> u64 {
-        self.state_write + self.per_byte_write * byte_count
+        state_cost(self.state_write, self.per_byte_write, byte_count)
     }
 }
 
@@ -218,11 +257,12 @@ impl GasCounter {
     /// the charge.  The counter is still updated even on error, so callers
     /// **must** halt execution upon receiving this error.
     pub fn charge(&mut self, amount: u64) -> Result<(), String> {
-        self.used += amount;
-        if self.used > self.limit {
-            Err("gas exhausted".to_string())
-        } else {
+        let (charged, fits) = apply_charge(self.used, amount, self.limit);
+        self.used = charged;
+        if fits {
             Ok(())
+        } else {
+            Err("gas exhausted".to_string())
         }
     }
 
@@ -365,6 +405,44 @@ mod tests {
             counter.push_call().is_err(),
             "5th push_call must fail with custom max_call_depth=4"
         );
+    }
+
+    /// The verified cost arithmetic saturates at `u64::MAX` instead of
+    /// overflowing on a hostile `byte_count` and cost table.
+    #[test]
+    fn test_state_costs_saturate_instead_of_overflowing() {
+        let costs = GasCosts {
+            state_read: 1,
+            state_write: 1,
+            per_byte_read: u64::MAX,
+            per_byte_write: u64::MAX,
+            ..GasCosts::default_costs()
+        };
+        assert_eq!(costs.total_state_read_cost(2), u64::MAX);
+        assert_eq!(costs.total_state_write_cost(2), u64::MAX);
+
+        let costs = GasCosts {
+            state_read: u64::MAX,
+            state_write: u64::MAX,
+            per_byte_read: 1,
+            per_byte_write: 1,
+            ..GasCosts::default_costs()
+        };
+        assert_eq!(costs.total_state_read_cost(1), u64::MAX);
+        assert_eq!(costs.total_state_write_cost(1), u64::MAX);
+    }
+
+    /// A charge that would overflow saturates and reports exhaustion instead of
+    /// panicking.
+    #[test]
+    fn test_charge_saturates_instead_of_overflowing() {
+        let mut counter = GasCounter::new(u64::MAX - 1);
+        counter.charge(1).expect("exactly at the limit");
+        assert_eq!(counter.used, 1);
+
+        let err = counter.charge(u64::MAX).expect_err("must not fit");
+        assert!(err.contains("gas exhausted"), "{err}");
+        assert_eq!(counter.used, u64::MAX, "the balance saturates");
     }
 
     // ── GasCounter — basic charging ───────────────────────────────────────────
