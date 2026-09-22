@@ -375,6 +375,7 @@ mod tests {
     /// is **reopened**, the expired payload is purged (discovered by scan,
     /// not by a prior read) and the underlying redb key is gone.
     #[test]
+    #[cfg_attr(miri, ignore = "redb takes fcntl range locks, unsupported by Miri")]
     fn test_restart_purge_over_redb_backend() {
         let dir = tempfile::tempdir().expect("temp dir");
         let payload = b"redb-expired-before-restart".to_vec();

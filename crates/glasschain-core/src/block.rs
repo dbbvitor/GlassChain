@@ -41,6 +41,18 @@ pub struct Block {
     pub certificate: Option<QuorumCertificate>,
 }
 
+/// Return `true` when `hash` starts with `difficulty` `'0'` bytes.
+///
+/// Allocation-free — the previous inline version built a `"0".repeat(difficulty)`
+/// target string on every call — and the shipped predicate the Kani harness
+/// proves (`proofs::proof_of_work_is_prefix_monotone`).
+pub(crate) fn has_leading_zeros(hash: &str, difficulty: usize) -> bool {
+    hash.len() >= difficulty
+        && hash.as_bytes()[..difficulty]
+            .iter()
+            .all(|&byte| byte == b'0')
+}
+
 impl Block {
     /// Compute the canonical SHA-256 hash for the current block state.
     ///
@@ -75,8 +87,7 @@ impl Block {
     /// (i.e., it starts with `difficulty` leading zero characters).
     #[must_use]
     pub fn has_valid_pow(&self, difficulty: usize) -> bool {
-        let target = "0".repeat(difficulty);
-        self.hash.starts_with(&target)
+        has_leading_zeros(&self.hash, difficulty)
     }
 
     /// Create a new, **unmined** block with no persistent write set.

@@ -225,7 +225,10 @@ impl StorageProvider for RedbStorageProvider {
     }
 }
 
-#[cfg(test)]
+// redb takes `fcntl` range locks on its files; Miri reports that syscall as
+// unsupported, so these tests are excluded there (the backend still compiles
+// under Miri). Run them normally with `cargo test -p glasschain-storage`.
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
     use glasschain_core::Transaction;

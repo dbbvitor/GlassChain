@@ -58,7 +58,9 @@ MUTANTS_PKG ?= glasschain-core
 MIRI_FLAGS := -Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check
 MIRI_PKGS := -p glasschain-core -p glasschain-contracts -p glasschain-indexer \
              -p glasschain-workflows -p glasschain-storage -p glasschain-sdk
-MIRI_SKIPS := --skip wasm --skip sled_backend \
+# redb-backed tests are gated with `cfg_attr(miri, ignore)` in-tree (fcntl
+# range locks are unsupported by Miri), so no skip is needed for them.
+MIRI_SKIPS := --skip wasm \
               --skip test_pending_pool_bound_rejects_and_drains \
               --skip test_slice_quota_spreads_a_burst_across_rounds \
               --skip ledger_default_uses_the_workspace_difficulty \
@@ -166,8 +168,8 @@ snarf: ## Cache-line false-sharing check (nightly; run `make tools-nightly` firs
 careful: ## Run the suite under cargo-careful (nightly, std debug assertions)
 	cargo +nightly careful nextest run --profile ci $(TEST_FLAGS)
 
-mutants: ## Mutation-test one crate (default glasschain-core; override MUTANTS_PKG=...)
-	cargo mutants -p $(MUTANTS_PKG) --timeout 60
+mutants: ## Mutation-test one crate in place (default glasschain-core; override MUTANTS_PKG=...)
+	cargo mutants -p $(MUTANTS_PKG) --in-place --timeout 60
 
 mutants-diff: ## Mutation-test only the current diff (the CI PR-gate command)
 	# --timeout is a CLI-only option: `.cargo/mutants.toml` rejects it.
@@ -182,7 +184,7 @@ sanitize: ## Run the suite under ASan/LSan (nightly; leaks are failures)
 	  -Zbuild-std --target $(HOST)
 
 kani: ## Run the Kani proofs for glasschain-core
-	cargo kani -p glasschain-core --harness proofs::iso8601_check_is_total_and_bounded --default-unwind 16
+	cargo kani -p glasschain-core --default-unwind 16
 
 verus: ## Verify the critical-code roadmap (starts with glasschain-vm gas)
 	cargo verus verify -p glasschain-vm

@@ -71,11 +71,13 @@ it on the next green run. PR failures do not open issues.
   fields, so the cap cannot live in the config file. The full run shards
   because `--in-place` and `--jobs` are mutually exclusive, making each shard
   serial internally.
-- **Kani** gates the heap-free predicate surface only. kani-verifier 0.68.0 /
-  CBMC 6.11.0 cannot process the rest of `glasschain-core`: harnesses that
-  reach the capability SHA-256 path pull in unsupported x86 intrinsics, and
-  heap-using scoring/schema paths abort CBMC with status 15. The evidence
-  lives in `.agents/memories/kani-deferral.md`.
+- **Kani** gates the predicate surface: the ISO-8601 structural check, the
+  allocation-free proof-of-work prefix predicate, and the expiry-date
+  contribution to the trust score. kani-verifier 0.68.0 / CBMC 6.11.0 cannot
+  process the rest of `glasschain-core`: the capability SHA-256 path pulls in
+  unsupported x86 intrinsics, unbounded symbolic heap aborts CBMC, and
+  `validate_asset`'s `format!` messages never finish. The evidence lives in
+  `.agents/memories/kani-deferral.md`.
 
 ### Coverage engine
 
@@ -98,7 +100,8 @@ No compiler-cfg runtime swap.
 - **Verus is the primary tool** (unbounded proofs over the critical roadmap:
   gas → quorum safety → determinism → chain rules → scoring). The first
   module is gas: `state_cost` and `apply_charge` are proved in production form
-  with saturation specs, and the shipped methods delegate to them.
+  with saturation specs, and the shipped methods delegate to them. Verus is
+  what covers the modules Kani cannot process.
 - **Kani is the breadth layer** for heap-free predicates, with the scope
   limitation and evidence above.
 

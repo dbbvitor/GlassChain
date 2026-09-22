@@ -117,16 +117,28 @@ jobs:
         with:
           tool: cargo-mutants,cargo-nextest
 
+      # `--in-place` is what lets each mutant reuse the previous build; the
+      # scratch copy (target included, so the rust-cache still pays off) keeps
+      # cargo-mutants from ever touching the checked-out tree. `--jobs` would
+      # force copy mode, which the tool documents as losing all build reuse —
+      # for the full workspace that is thousands of cold builds.
+      - name: Stage a scratch tree
+        run: |
+          mkdir -p "$RUNNER_TEMP/mutants"
+          rsync -a --exclude .git "$GITHUB_WORKSPACE/" "$RUNNER_TEMP/mutants/"
+
       # `--baseline=skip` requires the tests to pass in the same tree, and
       # sharding must not run the baseline 16 times.
       - name: Prove the suite passes before mutating
+        working-directory: ${{ runner.temp }}/mutants
         run: cargo nextest run --profile ci --workspace --lib --bins --tests --all-features --locked
 
-      # `--in-place` (ephemeral runners) cannot combine with `--jobs`, so a
-      # shard is serial. `--all-features` comes from `.cargo/mutants.toml`;
-      # exit code 2 means survivors were found and is reported, not failed
-      # (#156: outcomes are collected before any score gate exists).
+      # A shard is serial: `--in-place` cannot combine with `--jobs`.
+      # `--all-features` comes from `.cargo/mutants.toml`; exit code 2 means
+      # survivors were found and is reported, not failed (#156: outcomes are
+      # collected before any score gate exists).
       - name: Mutate shard ${{ matrix.shard }}
+        working-directory: ${{ runner.temp }}/mutants
         run: |
           set +e
           cargo mutants --shard ${{ matrix.shard }}/16 --in-place --baseline=skip --timeout 60
@@ -141,7 +153,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: mutants-outcomes-${{ matrix.shard }}
-          path: mutants.out/outcomes.json
+          path: ${{ runner.temp }}/mutants/mutants.out/outcomes.json
           if-no-files-found: ignore
 
   asan:
@@ -209,14 +221,13 @@ jobs:
           cargo install --locked kani-verifier@0.68.0
           cargo kani setup
 
-      # Weighted toward what the toolchain can actually process: harnesses
-      # that reach SHA-256 (capability hashes) hit unsupported x86 intrinsics,
-      # and heap-heavy scoring/schema paths make CBMC fail with status 15.
-      # The deferral and its evidence live in
-      # `.agents/memories/kani-deferral.md`; the harness module explains the
-      # scope.
-      - name: Verify the heap-free predicate surface
-        run: cargo kani -p glasschain-core --harness proofs::iso8601_check_is_total_and_bounded --default-unwind 16
+      # Three predicates verify: the ISO-8601 check, the allocation-free PoW
+      # prefix predicate, and the expiry-date contribution to the trust score.
+      # Capability hashes hit unsupported x86 intrinsics and the schema report
+      # is too slow for CBMC; the evidence lives in
+      # `.agents/memories/kani-deferral.md`.
+      - name: Verify the predicate surface
+        run: cargo kani -p glasschain-core --default-unwind 16
 
   verus:
     name: Verus proofs

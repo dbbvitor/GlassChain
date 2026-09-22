@@ -11,11 +11,16 @@ the map body; this file is execution order and constraints only.
   cherry-picked. `Registry::with_schema`'s leak is reimplemented as the record
   describes (`Cow<'static, str>`); the Verus module is rewritten from the
   pinned release.
-- `--in-place` cannot be combined with `--jobs` (cargo-mutants 27.1.0), so the
-  full mutants run is 16 shards that are each serial internally
-  (`.agents/memories/cargo-mutants-footguns.md`).
+- `--in-place` cannot be combined with `--jobs` (cargo-mutants 27.1.0). CI
+  jobs stage a scratch copy and run `--in-place` there: the checkout is never
+  mutated and builds stay incremental. `--jobs` would force copy mode, which
+  the tool documents as losing all build reuse — infeasible for the full
+  workspace (`.agents/memories/cargo-mutants-footguns.md`).
 - Nightly/formal tools are installed by the workflow, not locally: the box has
   4 cores and the repo's `target/` is not shared between worktrees.
+- Kani covers three predicates; the rest is deferred with evidence
+  (`.agents/memories/kani-deferral.md`). Verus covers the modules Kani cannot
+  process.
 
 ## #166 — deep-checks + prerequisites
 

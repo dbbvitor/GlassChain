@@ -219,7 +219,17 @@ jobs:
       - name: Write the PR diff
         run: git diff "origin/${{ github.base_ref }}...HEAD" > pr.diff
 
+      # `--in-place` is what lets each mutant reuse the previous build; the
+      # scratch copy (target included, so the rust-cache still pays off) keeps
+      # cargo-mutants from ever touching the checked-out tree. `--jobs` would
+      # force copy mode, which the tool documents as losing all build reuse.
+      - name: Stage a scratch tree
+        run: |
+          mkdir -p "$RUNNER_TEMP/mutants"
+          rsync -a --exclude .git "$GITHUB_WORKSPACE/" "$RUNNER_TEMP/mutants/"
+
       # `.cargo/mutants.toml` adds --all-features (without it, cfg-gated
       # mutants are compiled out and report as false misses).
       - name: Mutate only the diff
+        working-directory: ${{ runner.temp }}/mutants
         run: cargo mutants --in-diff pr.diff --baseline=skip --in-place --timeout 60
