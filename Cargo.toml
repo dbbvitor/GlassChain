@@ -50,3 +50,10 @@ all      = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 nursery  = { level = "warn", priority = -1 }
 cargo    = { level = "warn", priority = -1 }
+
+# Mutation runs compile once per viable mutant; debug info is pure overhead
+# there and failure output stays readable enough without it (mutants.rs
+# performance guidance, wayfinder #166).
+[profile.mutants]
+inherits = "test"
+debug = "none"

@@ -8,3 +8,5 @@ additional_cargo_test_args = ["--all-features"]
 # rejects unknown fields, so it cannot live here. Every invocation that needs
 # the cap passes it explicitly (`make mutants`, `make mutants-diff`,
 # analysis.yml's diff job, and the deep-checks shards).
+# Build with the stripped `mutants` profile (Cargo.toml).
+profile = "mutants"

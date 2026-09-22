@@ -786,4 +786,127 @@ mod tests {
             verifier.verify_ocsp_staple(outsider.certificate_pem.as_ref().unwrap(), &staple);
         assert!(status.is_err(), "a foreign certificate must not match");
     }
+
+    /// The DER length encoder and TLV reader are exact at every boundary
+    /// (kills the `<`/`<=` and truncation-check mutants).
+    #[test]
+    fn der_lengths_and_tlv_boundaries_are_exact() {
+        let mut out = Vec::new();
+        for (len, expected) in [
+            (0x00, vec![0x00]),
+            (0x7F, vec![0x7F]),
+            (0x80, vec![0x81, 0x80]),
+            (0xFF, vec![0x81, 0xFF]),
+            (0x100, vec![0x82, 0x01, 0x00]),
+            (0xFFFF, vec![0x82, 0xFF, 0xFF]),
+        ] {
+            out.clear();
+            write_len(&mut out, len);
+            assert_eq!(out, expected, "length {len:#x}");
+        }
+
+        // Short form, empty contents.
+        let (element, used) = read_tlv(&[0x04, 0x00]).expect("empty element");
+        assert_eq!(element.tag, 0x04);
+        assert!(element.contents.is_empty());
+        assert_eq!(used, 2);
+
+        // Truncated and non-minimal long forms are malformed.
+        assert!(read_tlv(&[]).is_err());
+        assert!(read_tlv(&[0x04]).is_err());
+        assert!(read_tlv(&[0x04, 0x81]).is_err());
+        assert!(read_tlv(&[0x04, 0x05, 0x01]).is_err());
+        assert!(read_tlv(&[0x04, 0x80]).is_err());
+        assert!(read_tlv(&[0x04, 0x81, 0x01, 0xAA]).is_err());
+        assert!(read_tlv(&[0x04, 0x82, 0x00, 0xFF, 0xAA]).is_err());
+        assert!(read_tlv(&[0x04, 0x83, 0x01, 0x00, 0x00]).is_err());
+
+        // 0x80 is the smallest long-form length and is accepted.
+        let mut long = vec![0x04, 0x81, 0x80];
+        long.extend_from_slice(&[0xAA; 0x80]);
+        let (element, used) = read_tlv(&long).expect("minimal long form");
+        assert_eq!(element.contents.len(), 0x80);
+        assert_eq!(used, 3 + 0x80);
+
+        // 0x100 is the smallest two-byte length and is accepted.
+        let mut long = vec![0x04, 0x82, 0x01, 0x00];
+        long.extend_from_slice(&[0xAA; 0x100]);
+        let (element, used) = read_tlv(&long).expect("minimal two-byte length");
+        assert_eq!(element.contents.len(), 0x100);
+        assert_eq!(used, 4 + 0x100);
+    }
+
+    /// Explicit tags index their low five bits (kills the
+    /// `explicit_index -> 0` mutant).
+    #[test]
+    fn explicit_tag_index_uses_the_low_five_bits() {
+        assert_eq!(explicit_index(0xA0), 0);
+        assert_eq!(explicit_index(0xA3), 3);
+        assert_eq!(explicit_index(0xBF), 0x1F);
+    }
+
+    /// The hash helper and the staple validity window carry their real values
+    /// (kills the digest-replacement and constant-arithmetic mutants).
+    #[test]
+    fn sha256_and_validity_constants_match_their_known_values() {
+        let expected: [u8; 32] = [
+            0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+            0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+            0xf2, 0x00, 0x15, 0xad,
+        ];
+        assert_eq!(sha256_bytes(b"abc"), expected);
+        assert_eq!(OCSP_VALIDITY_SECS, 21_600);
+    }
+
+    /// A valid staple stops parsing once a structural envelope byte is
+    /// corrupted (kills the envelope-comparison mutants).
+    #[test]
+    fn parse_staple_rejects_corrupted_envelope_fields() {
+        let mut org = Organization::new("PharmaCorp").expect("org");
+        org.issue_identity("node-a").expect("identity");
+        let staple = org.ocsp_response_der("node-a").expect("mint");
+        assert!(parse_staple(&staple).is_ok());
+
+        let find = |pattern: &[u8]| {
+            staple
+                .windows(pattern.len())
+                .position(|window| window == pattern)
+                .expect("pattern in a minted staple")
+        };
+
+        // responseStatus ENUMERATED must be successful (0).
+        let mut mutated = staple.clone();
+        let status = find(&[0x0A, 0x01, 0x00, 0xA0]);
+        mutated[status] = 0x0B;
+        assert!(parse_staple(&mutated).is_err(), "non-zero status");
+        mutated = staple.clone();
+        mutated[status + 2] = 0x01;
+        assert!(parse_staple(&mutated).is_err(), "non-zero status value");
+
+        // The responseBytes wrapper is [0] EXPLICIT.
+        mutated = staple.clone();
+        mutated[status + 3] = 0xA1;
+        assert!(parse_staple(&mutated).is_err(), "wrong explicit tag");
+
+        // The inner response type must be id-pkix-ocsp-basic.
+        mutated = staple.clone();
+        let basic_oid = find(OID_BASIC);
+        mutated[basic_oid] ^= 0x01;
+        assert!(parse_staple(&mutated).is_err(), "wrong response OID");
+
+        // The signature algorithm must be ecdsa-with-SHA256.
+        mutated = staple.clone();
+        let ecdsa_oid = find(OID_ECDSA_WITH_SHA256);
+        mutated[ecdsa_oid] ^= 0x01;
+        assert!(parse_staple(&mutated).is_err(), "wrong signature OID");
+
+        // The BIT STRING is one unused-bits octet plus exactly 64 signature bytes.
+        let bit_string = find(&[0x03, 0x41, 0x00]);
+        mutated = staple.clone();
+        mutated[bit_string + 2] = 0x01;
+        assert!(parse_staple(&mutated).is_err(), "non-zero unused bits");
+        mutated = staple.clone();
+        mutated[bit_string + 1] = 0x40;
+        assert!(parse_staple(&mutated).is_err(), "short signature");
+    }
 }

@@ -668,14 +668,15 @@ impl EquivocationProof {
     }
 }
 
-#[cfg(all(test, feature = "bft"))]
+#[cfg(test)]
+#[cfg(feature = "bft")]
 mod tests {
     use super::*;
     use crate::Ledger;
 
     /// `count` validators with deterministic BLS keys and valid proofs of
     /// possession, plus the matching signing keys.
-    fn provider(count: usize) -> (BftConsensusProvider, Vec<PrivateKey>) {
+    fn validator_material(count: usize) -> (Vec<ValidatorInfo>, Vec<PrivateKey>) {
         let mut validators = Vec::new();
         let mut keys = Vec::new();
         for i in 0..u8::try_from(count).expect("test validator count fits u8") {
@@ -692,6 +693,17 @@ mod tests {
             });
             keys.push(secret);
         }
+        (validators, keys)
+    }
+
+    /// `count` validators with the signing key at `local` (bitmap index).
+    fn provider_signing_with(count: usize, local: usize) -> BftConsensusProvider {
+        let (validators, keys) = validator_material(count);
+        BftConsensusProvider::new(validators, keys[local]).expect("valid validators")
+    }
+
+    fn provider(count: usize) -> (BftConsensusProvider, Vec<PrivateKey>) {
+        let (validators, keys) = validator_material(count);
         (
             BftConsensusProvider::new(validators, keys[0]).expect("valid validators"),
             keys,
@@ -1107,5 +1119,134 @@ mod tests {
             .expect_err("orphan must fail");
         assert!(err.to_string().contains("does not chain"), "{err}");
         assert_eq!(provider.name(), "bft");
+    }
+
+    /// The local signer's bitmap bit lands in the right byte and bit position
+    /// when the index crosses the first byte (kills `local_index -> Some(0)`
+    /// and the `index / 8` / `index % 8` / shift mutants).
+    #[test]
+    fn test_attest_bitmap_marks_the_local_index_beyond_the_first_byte() {
+        let mut ledger = Ledger::new(1);
+        let genesis = ledger.mine_pending_transactions().expect("genesis").clone();
+        let provider = provider_signing_with(12, 10);
+        let notification = provider.attest(genesis);
+        assert_eq!(
+            notification.certificate.signers_bitmap,
+            vec![0, 0b0000_0100]
+        );
+    }
+
+    /// The vote message is `domain || BE(u32) length || hash`, so a length or
+    /// hash mutation changes the bytes (kills body-replacement and
+    /// length-arithmetic mutants).
+    #[test]
+    fn test_vote_message_encodes_domain_length_and_hash() {
+        let mut expected = b"glasschain-bft-vote:".to_vec();
+        expected.extend_from_slice(&3u32.to_be_bytes());
+        expected.extend_from_slice(b"abc");
+        assert_eq!(BftVote::vote_message("abc"), expected);
+        assert_ne!(BftVote::vote_message("abc"), BftVote::vote_message("abd"));
+        assert_ne!(BftVote::vote_message("abc"), BftVote::vote_message("abcd"));
+    }
+
+    /// `aggregate_votes` marks every distinct voter's bit and collapses
+    /// duplicates (kills the bitmap byte/bit arithmetic mutants).
+    #[test]
+    fn test_aggregate_votes_marks_every_voter_and_dedupes() {
+        let (provider, keys) = provider(12);
+        let ledger = Ledger::new(1);
+        let chain_id = ledger.chain[0].hash.clone();
+        let first = BftVote::sign(&chain_id, 3, 1, VotePhase::Precommit, "block-x", &keys[0]);
+        let tenth = BftVote::sign(&chain_id, 3, 1, VotePhase::Precommit, "block-x", &keys[10]);
+        let (bitmap, _) = provider
+            .aggregate_votes(&[first.clone(), tenth, first.clone()])
+            .expect("aggregate");
+        assert_eq!(bitmap, vec![0b0000_0001, 0b0000_0100]);
+
+        // Deduplication: the same vote twice contributes one signature, so the
+        // aggregate (and bitmap) equals the single-vote result. Kills the
+        // bitmap-membership shift mutant in the dedupe check.
+        let (single_bitmap, single_aggregate) = provider
+            .aggregate_votes(std::slice::from_ref(&first))
+            .expect("aggregate");
+        let (duplicate_bitmap, duplicate_aggregate) = provider
+            .aggregate_votes(&[first.clone(), first])
+            .expect("aggregate");
+        assert_eq!(duplicate_bitmap, single_bitmap);
+        assert_eq!(duplicate_aggregate, single_aggregate);
+    }
+
+    /// An equivocation proof verifies only when both votes are internally
+    /// valid, name different hashes, and agree with the proof context and
+    /// chain (kills the `verify -> Ok(())` and context-comparison mutants).
+    #[test]
+    fn test_equivocation_proof_verifies_and_rejects_tampering() {
+        let (provider, _) = provider(1);
+        let ledger = Ledger::new(1);
+        let chain_id = ledger.chain[0].hash.clone();
+        let first = provider.sign_vote(&chain_id, 5, 2, VotePhase::Prevote, "hash-a");
+        let second = provider.sign_vote(&chain_id, 5, 2, VotePhase::Prevote, "hash-b");
+        let proof = EquivocationProof {
+            height: 5,
+            round: 2,
+            phase: VotePhase::Prevote,
+            public_key: first.public_key.clone(),
+            first_vote: first.clone(),
+            second_vote: second,
+        };
+        assert!(proof.verify().is_ok());
+
+        let same_hash = EquivocationProof {
+            second_vote: first,
+            ..proof.clone()
+        };
+        assert!(
+            same_hash.verify().is_err(),
+            "one hash twice is not equivocation"
+        );
+
+        for (label, mutated) in [
+            (
+                "height",
+                EquivocationProof {
+                    height: 6,
+                    ..proof.clone()
+                },
+            ),
+            (
+                "round",
+                EquivocationProof {
+                    round: 3,
+                    ..proof.clone()
+                },
+            ),
+            (
+                "phase",
+                EquivocationProof {
+                    phase: VotePhase::Precommit,
+                    ..proof.clone()
+                },
+            ),
+            (
+                "public key",
+                EquivocationProof {
+                    public_key: vec![0; 48],
+                    ..proof.clone()
+                },
+            ),
+        ] {
+            assert!(mutated.verify().is_err(), "{label} disagreement must fail");
+        }
+
+        let other_chain = provider.sign_vote("other-chain", 5, 2, VotePhase::Prevote, "hash-b");
+        let cross_chain = EquivocationProof {
+            second_vote: other_chain,
+            ..proof.clone()
+        };
+        assert!(cross_chain.verify().is_err(), "cross-chain votes must fail");
+
+        let mut tampered = proof;
+        tampered.second_vote.block_hash = "hash-c".into();
+        assert!(tampered.verify().is_err(), "unsigned hash change must fail");
     }
 }

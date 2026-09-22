@@ -3791,4 +3791,45 @@ mod tests {
         let p99 = metrics["commit_p99_ms"].as_u64().expect("commit p99");
         assert!(p99 >= p95, "p99 {p99} ms ≥ p95 {p95} ms");
     }
+
+    #[test]
+    fn percentile_is_exact_at_the_boundaries() {
+        assert_eq!(percentile(&[], 50), 0);
+        assert_eq!(percentile(&[5], 50), 5);
+        assert_eq!(percentile(&[4, 1, 3, 2], 50), 3);
+        assert_eq!(percentile(&[1, 2, 3, 4], 95), 4);
+        assert_eq!(percentile(&[10, 20], 0), 10);
+        assert_eq!(percentile(&[10, 20], 100), 20);
+    }
+
+    #[test]
+    fn run_state_edges_feed_and_commit_metrics_are_exact() {
+        let mut state = RunState::default();
+
+        state.count_edge("a", "b");
+        state.count_edge("a", "b");
+        state.count_edge("b", "c");
+        assert_eq!(state.edges.len(), 2);
+        assert_eq!(state.edges[0].from, "a");
+        assert_eq!(state.edges[0].count, 2);
+        assert_eq!(state.edges[1].to, "c");
+        assert_eq!(state.edges[1].count, 1);
+
+        for index in 0..FEED_CAP + 3 {
+            state.push_feed(format!("item-{index}"));
+        }
+        assert_eq!(state.feed.len(), FEED_CAP);
+        assert_eq!(state.feed[0].label, "item-3");
+        assert_eq!(state.feed[0].height, state.chain_height);
+
+        for commit_ms in [100, 200, 300, 400] {
+            state.record_commit(commit_ms, 7, 70);
+        }
+        assert_eq!(state.metrics.blocks, 4);
+        assert_eq!(state.metrics.last_commit_ms, 400);
+        assert_eq!(state.metrics.pool_count, 7);
+        assert_eq!(state.metrics.pool_bytes, 70);
+        assert_eq!(state.metrics.commit_p50_ms, 300);
+        assert_eq!(state.metrics.commit_p95_ms, 400);
+    }
 }
