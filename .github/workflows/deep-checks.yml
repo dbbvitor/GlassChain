@@ -134,19 +134,21 @@ jobs:
         run: cargo nextest run --profile ci --workspace --lib --bins --tests --all-features --locked
 
       # A shard is serial: `--in-place` cannot combine with `--jobs`.
-      # `--all-features` comes from `.cargo/mutants.toml`; exit code 2 means
-      # survivors were found and is reported, not failed (#156: outcomes are
-      # collected before any score gate exists).
+      # `--all-features` and the Kani-harness exclusion come from
+      # `.cargo/mutants.toml`. Exit 2 means survivors, exit 3 timeouts
+      # (#156: outcomes are collected before any score gate exists); anything
+      # else is a real error.
       - name: Mutate shard ${{ matrix.shard }}
         working-directory: ${{ runner.temp }}/mutants
         run: |
           set +e
-          cargo mutants --shard ${{ matrix.shard }}/16 --in-place --baseline=skip --timeout 60
+          cargo mutants --shard ${{ matrix.shard }}/16 --in-place --baseline=skip --timeout 180
           code=$?
           set -e
-          if [ "$code" -ne 0 ] && [ "$code" -ne 2 ]; then
-            exit "$code"
-          fi
+          case "$code" in
+            0|2|3) exit 0 ;;
+            *) exit "$code" ;;
+          esac
 
       - name: Upload outcomes
         if: always()

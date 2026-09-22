@@ -10,3 +10,9 @@ additional_cargo_test_args = ["--all-features"]
 # analysis.yml's diff job, and the deep-checks shards).
 # Build with the stripped `mutants` profile (Cargo.toml).
 profile = "mutants"
+
+# Kani writes `cargo kani`-only code: cargo-mutants does not treat
+# `cfg(kani)` as a test-only gate, so it would mutate the harness bodies,
+# which the ordinary test suite never runs. The harnesses are exercised by
+# Kani itself in the weekly deep-checks job (wayfinder #166/#157).
+exclude_globs = ["crates/glasschain-core/src/proofs.rs"]

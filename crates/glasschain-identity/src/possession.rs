@@ -57,12 +57,23 @@ pub fn verify_org_possession(
     verify_ed25519(&key, &org_possession_message(org, node_id, binding), proof)
 }
 
+/// Map an X.509 directory string to its text. Both the UTF-8 (rcgen) and the
+/// `PrintableString` encodings appear in federation certificates, so both are
+/// accepted.
+fn directory_string_text(value: x509_cert::ext::pkix::name::DirectoryString) -> Option<String> {
+    use x509_cert::ext::pkix::name::DirectoryString;
+
+    match value {
+        DirectoryString::Utf8String(text) => Some(text),
+        DirectoryString::PrintableString(text) => Some(text.to_string()),
+        _ => None,
+    }
+}
+
 /// The certificate subject's Organization name (the MSP principal for a
 /// remote member), if present.
 #[must_use]
 pub fn certificate_organization(cert_pem: &str) -> Option<String> {
-    use x509_cert::ext::pkix::name::DirectoryString;
-
     let der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).ok()?;
     let cert = Certificate::from_der(der.as_ref()).ok()?;
     let value = cert
@@ -71,11 +82,7 @@ pub fn certificate_organization(cert_pem: &str) -> Option<String> {
         .organization()
         .ok()
         .flatten()?;
-    match value {
-        DirectoryString::Utf8String(text) => Some(text),
-        DirectoryString::PrintableString(text) => Some(text.to_string()),
-        _ => None,
-    }
+    directory_string_text(value)
 }
 
 /// The certificate subject's Organizational-Unit role, if present — the
@@ -86,8 +93,6 @@ pub fn certificate_organization(cert_pem: &str) -> Option<String> {
 /// caller-supplied label.
 #[must_use]
 pub fn certificate_admin_role(cert_pem: &str) -> Option<String> {
-    use x509_cert::ext::pkix::name::DirectoryString;
-
     let der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).ok()?;
     let cert = Certificate::from_der(der.as_ref()).ok()?;
     let value = cert
@@ -96,19 +101,13 @@ pub fn certificate_admin_role(cert_pem: &str) -> Option<String> {
         .organization_unit()
         .ok()
         .flatten()?;
-    match value {
-        DirectoryString::Utf8String(text) => Some(text),
-        DirectoryString::PrintableString(text) => Some(text.to_string()),
-        _ => None,
-    }
+    directory_string_text(value)
 }
 
 /// The certificate subject's Common Name — the certificate-bound node id a
 /// remote member presents (ticket #47, ADR-017 admin headers).
 #[must_use]
 pub fn certificate_subject_cn(cert_pem: &str) -> Option<String> {
-    use x509_cert::ext::pkix::name::DirectoryString;
-
     let der = CertificateDer::from_pem_slice(cert_pem.as_bytes()).ok()?;
     let cert = Certificate::from_der(der.as_ref()).ok()?;
     let value = cert
@@ -117,19 +116,13 @@ pub fn certificate_subject_cn(cert_pem: &str) -> Option<String> {
         .common_name()
         .ok()
         .flatten()?;
-    match value {
-        DirectoryString::Utf8String(text) => Some(text),
-        DirectoryString::PrintableString(text) => Some(text.to_string()),
-        _ => None,
-    }
+    directory_string_text(value)
 }
 
 /// The DER form of [`certificate_admin_role`] — the role the gRPC admin gate
 /// reads from a wire-carried certificate (ADR-017).
 #[must_use]
 pub fn certificate_admin_role_der(cert_der: &[u8]) -> Option<String> {
-    use x509_cert::ext::pkix::name::DirectoryString;
-
     let cert = Certificate::from_der(cert_der).ok()?;
     let value = cert
         .tbs_certificate()
@@ -137,11 +130,7 @@ pub fn certificate_admin_role_der(cert_der: &[u8]) -> Option<String> {
         .organization_unit()
         .ok()
         .flatten()?;
-    match value {
-        DirectoryString::Utf8String(text) => Some(text),
-        DirectoryString::PrintableString(text) => Some(text.to_string()),
-        _ => None,
-    }
+    directory_string_text(value)
 }
 
 /// The raw 32-byte ed25519 public key inside a PEM certificate, if it parses
@@ -329,5 +318,50 @@ mod tests {
         assert!(!verify_ed25519(&key, message, &proof[..63]));
         // Valid shape, wrong signature.
         assert!(!verify_ed25519(&key, b"other", &proof));
+    }
+
+    /// Both directory-string encodings carry the principal text; dropping
+    /// either arm would silently lose a federation principal.
+    #[test]
+    fn directory_strings_accept_utf8_and_printable() {
+        use x509_cert::der::asn1::PrintableString;
+        use x509_cert::ext::pkix::name::DirectoryString;
+
+        let utf8 = DirectoryString::Utf8String("PharmaCorp".into());
+        let printable = DirectoryString::PrintableString(
+            PrintableString::new("PharmaCorp").expect("printable string"),
+        );
+        assert_eq!(directory_string_text(utf8).as_deref(), Some("PharmaCorp"));
+        assert_eq!(
+            directory_string_text(printable).as_deref(),
+            Some("PharmaCorp")
+        );
+    }
+
+    /// The signed possession messages are exact byte encodings (kills the
+    /// body-replacement mutants).
+    #[test]
+    fn possession_message_builders_are_exact() {
+        let mut expected = b"glasschain-tofu-pin:".to_vec();
+        expected.extend_from_slice(&4u32.to_be_bytes());
+        expected.extend_from_slice(b"node");
+        expected.extend_from_slice(&3u32.to_be_bytes());
+        expected.extend_from_slice(b"tls");
+        assert_eq!(tofu_pin_message("node", "tls"), expected);
+        assert_ne!(
+            tofu_pin_message("node", "tls"),
+            tofu_pin_message("node2", "tls")
+        );
+
+        let mut expected = b"glasschain-msp-registration:".to_vec();
+        expected.extend_from_slice(&3u32.to_be_bytes());
+        expected.extend_from_slice(b"org");
+        expected.extend_from_slice(&2u32.to_be_bytes());
+        expected.extend_from_slice(&[7, 8]);
+        assert_eq!(msp_registration_message("org", &[7, 8]), expected);
+        assert_ne!(
+            msp_registration_message("org", &[7, 8]),
+            msp_registration_message("org", &[7, 9])
+        );
     }
 }

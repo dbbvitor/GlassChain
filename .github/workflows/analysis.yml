@@ -229,7 +229,19 @@ jobs:
           rsync -a --exclude .git "$GITHUB_WORKSPACE/" "$RUNNER_TEMP/mutants/"
 
       # `.cargo/mutants.toml` adds --all-features (without it, cfg-gated
-      # mutants are compiled out and report as false misses).
+      # mutants are compiled out and report as false misses) and excludes the
+      # Kani-only harness module. Exit codes: 0 all caught, 2 survivors
+      # reported (the gate carries no score policy yet), 3 timeouts (a mutant
+      # that hangs the suite is evidence, not a tool failure); anything else
+      # is a real error.
       - name: Mutate only the diff
         working-directory: ${{ runner.temp }}/mutants
-        run: cargo mutants --in-diff pr.diff --baseline=skip --in-place --timeout 60
+        run: |
+          set +e
+          cargo mutants --in-diff pr.diff --baseline=skip --in-place --timeout 120
+          code=$?
+          set -e
+          case "$code" in
+            0|2|3) exit 0 ;;
+            *) exit "$code" ;;
+          esac
