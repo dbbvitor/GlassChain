@@ -1019,4 +1019,27 @@ mod tests {
             RevocationReason::Unspecified
         );
     }
+
+    #[test]
+    fn intermediate_ca_mints_a_parseable_good_staple() {
+        let mut org = Organization::new("RootOrg").expect("org");
+        let mut intermediate = org.issue_intermediate_ca("InterOrg").expect("intermediate");
+        let member = intermediate.issue_identity("node-i").expect("member");
+        assert!(member.certificate_pem.is_some());
+
+        let staple = intermediate.ocsp_response_der("node-i").expect("staple");
+        let parsed = crate::ocsp::parse_staple(&staple).expect("parseable staple");
+        assert!(parsed.status, "a minted staple attests good");
+        assert!(
+            !parsed.serial.is_empty(),
+            "the staple names the member serial"
+        );
+        assert!(
+            parsed.next_update > parsed.this_update,
+            "the staple window is forward in time"
+        );
+
+        // An unknown node has no live certificate to attest.
+        assert!(intermediate.ocsp_response_der("missing").is_err());
+    }
 }

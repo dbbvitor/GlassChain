@@ -1145,7 +1145,7 @@ mod tests {
         expected.extend_from_slice(&3u32.to_be_bytes());
         expected.extend_from_slice(b"abc");
         assert_eq!(BftVote::vote_message("abc"), expected);
-        assert_ne!(BftVote::vote_message("abc"), BftVote::vote_message("abd"));
+        assert_ne!(BftVote::vote_message("abc"), BftVote::vote_message("ab1"));
         assert_ne!(BftVote::vote_message("abc"), BftVote::vote_message("abcd"));
     }
 
