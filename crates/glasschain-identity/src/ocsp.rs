@@ -909,4 +909,230 @@ mod tests {
         mutated[bit_string + 1] = 0x40;
         assert!(parse_staple(&mutated).is_err(), "short signature");
     }
+
+    /// Build a parseable OCSP envelope with knobs for the structural edge
+    /// cases `parse_staple` must accept or reject. The signature bytes are
+    /// dummy: `parse_staple` parses, it does not verify.
+    fn craft_staple(
+        basic_extra: usize,
+        single_len: usize,
+        serial_tag: u8,
+        status_tag: u8,
+    ) -> Vec<u8> {
+        let cert_id = sequence(
+            &[
+                oid(OID_SHA256),
+                octet_string(&[0u8; 32]),
+                octet_string(&[0u8; 32]),
+                vec![serial_tag, 0x01, 0x01],
+            ]
+            .concat(),
+        );
+
+        let mut single_elems = vec![
+            cert_id,
+            vec![status_tag, 0x00],
+            generalized_time(1_700_000_000),
+        ];
+        if single_len >= 4 {
+            single_elems.push(write_explicit(0, &generalized_time(1_700_000_100)));
+        }
+        single_elems.truncate(single_len);
+        let single_body = single_elems.concat();
+
+        let response_data = [
+            write_explicit(0, &sequence(&[])),
+            generalized_time(1_700_000_000),
+            sequence(&sequence(&single_body)),
+        ]
+        .concat();
+        let tbs = sequence(&response_data);
+
+        let mut sig_alg = oid(OID_ECDSA_WITH_SHA256);
+        sig_alg.extend([0x05, 0x00]);
+        let sig_alg = sequence(&sig_alg);
+
+        let mut signature = vec![0x03, 0x41, 0x00];
+        signature.extend([0u8; 64]);
+
+        let mut basic_body = [tbs, sig_alg, signature].concat();
+        for _ in 0..basic_extra {
+            basic_body.extend(sequence(&[]));
+        }
+        let basic = sequence(&basic_body);
+
+        let response_bytes = [oid(OID_BASIC), octet_string(&basic)].concat();
+        let mut outer = enumerated(0);
+        outer.extend(write_explicit(0, &sequence(&response_bytes)));
+        sequence(&outer)
+    }
+
+    /// The crafted envelope parses at every shape boundary: the extra
+    /// `BasicOCSPResponse` element is ignored, a three-element
+    /// `SingleResponse` falls back to `thisUpdate`, and a `[1]` status is
+    /// revoked.
+    #[test]
+    fn parse_staple_accepts_boundary_single_response_shapes() {
+        let four = craft_staple(0, 4, 0x02, 0x80);
+        let parsed = parse_staple(&four).expect("four-element single");
+        assert!(parsed.status);
+        assert_eq!(parsed.this_update, 1_700_000_000);
+        assert_eq!(
+            parsed.next_update, 1_700_000_100,
+            "nextUpdate is read when present"
+        );
+
+        let three = craft_staple(0, 3, 0x02, 0x80);
+        let parsed = parse_staple(&three).expect("three-element single");
+        assert_eq!(
+            parsed.next_update, parsed.this_update,
+            "without nextUpdate the window falls back to thisUpdate"
+        );
+
+        let revoked = craft_staple(0, 4, 0x02, 0xA1);
+        let parsed = parse_staple(&revoked).expect("revoked status");
+        assert!(!parsed.status, "a [1] status arm parses as revoked");
+
+        assert!(
+            parse_staple(&craft_staple(1, 4, 0x02, 0x80)).is_ok(),
+            "an extra BasicOCSPResponse element is ignored"
+        );
+    }
+
+    /// Truncated or mistagged elements are rejected, not indexed out of
+    /// bounds: a two-element `SingleResponse` and a non-INTEGER serial.
+    #[test]
+    fn parse_staple_rejects_truncated_and_mistagged_elements() {
+        assert!(
+            matches!(
+                parse_staple(&craft_staple(0, 2, 0x02, 0x80)),
+                Err(OcspError::Malformed)
+            ),
+            "fewer than three SingleResponse elements must be rejected"
+        );
+        assert!(
+            matches!(
+                parse_staple(&craft_staple(0, 4, 0x04, 0x80)),
+                Err(OcspError::Malformed)
+            ),
+            "a non-INTEGER serial must be rejected"
+        );
+    }
+
+    /// Every structural tag check fires: flipping one tag to a still-parseable
+    /// but wrong value must not let the envelope through.
+    #[test]
+    fn parse_staple_rejects_mistagged_envelope_elements() {
+        let base = craft_staple(0, 4, 0x02, 0x80);
+        assert!(parse_staple(&base).is_ok());
+
+        let find = |needle: &[u8]| {
+            base.windows(needle.len())
+                .position(|window| window == needle)
+                .expect("element in the crafted staple")
+        };
+        let with_tag = |needle: &[u8], tag: u8| {
+            let mut mutated = base.clone();
+            let pos = find(needle);
+            mutated[pos] = tag;
+            mutated
+        };
+
+        // responseBytes wrapper must be [0] EXPLICIT: tag 0xC0 also has index
+        // 0 but the wrong class.
+        let outer = read_sequence(sequence_body(&base).unwrap()).unwrap();
+        let wrapper = write_explicit(0, outer[1].contents);
+        assert!(matches!(
+            parse_staple(&with_tag(&wrapper, 0xC0)),
+            Err(OcspError::Malformed)
+        ));
+
+        // The response-type OID's tag must be OBJECT IDENTIFIER (0x06).
+        let oid_pos = find(OID_BASIC);
+        let mut mutated = base.clone();
+        mutated[oid_pos - 2] = 0x07;
+        assert!(matches!(parse_staple(&mutated), Err(OcspError::Malformed)));
+
+        // BasicOCSPResponse: tbs, signatureAlgorithm and signature tags.
+        let bytes_seq = read_sequence(sequence_body(outer[1].contents).unwrap()).unwrap();
+        let basic = read_sequence(sequence_body(bytes_seq[1].contents).unwrap()).unwrap();
+        let tbs_tlv = sequence(basic[0].contents);
+        let alg_tlv = sequence(basic[1].contents);
+        assert!(matches!(
+            parse_staple(&with_tag(&tbs_tlv, 0x31)),
+            Err(OcspError::Malformed)
+        ));
+        assert!(matches!(
+            parse_staple(&with_tag(&alg_tlv, 0x31)),
+            Err(OcspError::Malformed)
+        ));
+
+        // ResponseData: responderID and producedAt tags.
+        let response_data = read_sequence(basic[0].contents).unwrap();
+        let responder_tlv = write_explicit(0, response_data[0].contents);
+        let mut produced_tlv = Vec::new();
+        write_tlv(&mut produced_tlv, 0x18, response_data[1].contents);
+        assert!(matches!(
+            parse_staple(&with_tag(&responder_tlv, 0xA2)),
+            Err(OcspError::Malformed)
+        ));
+        assert!(matches!(
+            parse_staple(&with_tag(&produced_tlv, 0x19)),
+            Err(OcspError::Malformed)
+        ));
+    }
+
+    /// Every digit of a `GeneralizedTime` carries its own place value, and
+    /// the h/m/s guards are strict: 23:59:59 is valid, 24/60/60 is not.
+    #[test]
+    fn generalized_time_arithmetic_and_boundaries_are_exact() {
+        assert_eq!(read_generalized(b"21981231235959Z").unwrap(), 7_226_582_399);
+    }
+
+    /// The freshness window is inclusive at both ends: `now` may equal
+    /// `thisUpdate` or `nextUpdate`, but not sit outside them.
+    #[test]
+    fn verify_against_enforces_the_freshness_window_inclusively() {
+        let mut org = Organization::new("PharmaCorp").expect("org");
+        org.issue_identity("node-a").expect("identity");
+        let this_update = 1_700_000_000u64;
+        let validity = 3_600u64;
+        let staple = mint_good_response(&OcspMintInput {
+            serial: [0u8; 8],
+            issuer_subject_der: org.ca_subject_der(),
+            issuer_public_key: org.ca_public_key(),
+            issuer_pkcs8_der: org.ca_key_pkcs8_der(),
+            now: this_update,
+            validity_secs: validity,
+        })
+        .expect("mint");
+        let parsed = parse_staple(&staple).expect("parse");
+        let key = org.ca_public_key();
+        let serial = parsed.serial.clone();
+
+        assert_eq!(
+            parsed.verify_against(key, &serial, this_update).unwrap(),
+            OcspStatus::Good
+        );
+        assert_eq!(
+            parsed
+                .verify_against(key, &serial, this_update + validity)
+                .unwrap(),
+            OcspStatus::Good,
+            "nextUpdate is inclusive"
+        );
+        assert_eq!(
+            parsed
+                .verify_against(key, &serial, this_update + validity + 1)
+                .unwrap_err(),
+            OcspError::Expired
+        );
+        assert_eq!(
+            parsed
+                .verify_against(key, &serial, this_update - 1)
+                .unwrap_err(),
+            OcspError::Expired,
+            "before thisUpdate is not yet valid"
+        );
+    }
 }

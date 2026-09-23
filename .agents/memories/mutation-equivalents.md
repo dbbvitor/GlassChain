@@ -47,6 +47,18 @@ Unreachable or behaviorally identical:
   guard: log-only.
 - `cert_verifier::verified_subject_cn` `PrintableString` arm: rcgen emits only
   UTF8String CNs, so no fixture reaches the arm through the public API.
+- `cert_verifier::add_federation_root_file` / `add_crl_file` `added += 1` vs
+  `-=`: `added` is an `i32` whose only uses are the empty-file guard (identical
+  for 0 vs negative) and the anchor label `"{label}#{added}"`, which reaches
+  only a `log::debug!` — the anchor count and every verification decision are
+  unchanged.
+- `ocsp::write_explicit` `0xA0 | (index & 0x1F)` vs `^`: `0xA0`'s low five bits
+  are zero, so the two spellings are bit-identical for every `index`.
+- `ocsp::read_generalized` the four `||`→`&&` joins in the component-range
+  guard: `time::Month::try_from`, `Date::from_calendar_date` and `with_hms`
+  enforce the same (or stricter) ranges, so bypassing a guard still returns
+  `Malformed`. The strict `>` boundaries are real and are pinned by
+  `generalized_time_arithmetic_and_boundaries_are_exact`.
 
 ## storage / rpc / cli
 
