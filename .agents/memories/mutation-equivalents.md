@@ -96,3 +96,26 @@ Unreachable or behaviorally identical:
   observable through a unit test.
 - `main -> ()`, its match-arm deletions and header guards: `main` is the binary
   entry point and is not invoked by the unit tests.
+
+## glasschain-vm / wasm.rs
+
+- `get_state_len`/`get_state`/`get_state`-write `checked_add` overflow arms
+  (`Ok(-1)`): both operands come from `usize::try_from(i32)`, so their sum is
+  below 2³² and cannot overflow a 64-bit `usize`. Unreachable on the targets
+  the suite runs on.
+- `get_state_len`/`get_state` `i32::try_from(len).unwrap_or(-1)`: the fallback
+  needs a state value longer than `i32::MAX` (~2 GiB); no test allocates one.
+- `execute_internal` `trap == OutOfFuel || get_fuel() == 0` vs `&&`: under
+  wasmtime a zero fuel balance only occurs on an `OutOfFuel` trap (the trap is
+  raised at the block boundary where the deduction would go negative), so the
+  two spellings agree. Fuel exhaustion is still pinned by
+  `test_gas_exhaustion` and the boundary guard by
+  `operation_gas_limit_equal_to_usage_after_trap_is_execution_error`.
+
+## glasschain-network / libp2p_swarm.rs
+
+- `LibP2pNode::add_known_peer`/`shutdown -> ()`: both are fire-and-forget
+  command enqueues whose send errors are swallowed into `log::warn!` lines.
+  Their effects — a Kademlia routing-table insert and the event loop exiting —
+  are not surfaced through any public API the unit tests can observe; the
+  end-to-end test calls both but cannot distinguish a no-op body.

@@ -7513,10 +7513,20 @@ mod tests {
             &[],
         )
         .await;
+        // `process_message` reads the wall clock itself; if the clock stepped
+        // backward between the two reads the +2h boundary moved, so the exact
+        // boundary case is not evaluable under a non-monotonic clock.
+        let now_after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        if now_after < now_secs {
+            return;
+        }
         assert_eq!(
             node.ledger.lock().await.chain.len(),
             2,
-            "a block exactly at the +2h boundary is not 'too far ahead'"
+            "a block exactly at the +2h boundary is not 'too far ahead' (before={now_secs}, after={now_after})"
         );
     }
 

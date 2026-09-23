@@ -123,8 +123,12 @@ mod tests {
             })
             .await
             .unwrap();
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), reader.receive())
+            .await
+            .expect("receive must not block")
+            .unwrap();
         assert!(matches!(
-            reader.receive().await.unwrap(),
+            received,
             Message::Goodbye { reason } if reason == "bye"
         ));
     }
@@ -158,8 +162,9 @@ mod tests {
     }
     #[tokio::test]
     async fn oversized_payload_send_is_refused() {
-        let (client, _server) = duplex(MAX_MESSAGE_SIZE + 1);
-        let mut writer = PeerWriter::new(client, "peer:8000".into());
+        // A sink never blocks, so a mutant that skips the size guard fails the
+        // assertion instead of hanging on a full duplex buffer.
+        let mut writer = PeerWriter::new(tokio::io::sink(), "peer:8000".into());
         let message = Message::Goodbye {
             reason: "x".repeat(MAX_MESSAGE_SIZE + 1),
         };
@@ -167,5 +172,106 @@ mod tests {
             writer.send(&message).await,
             Err(NetworkError::MessageTooLarge { .. })
         ));
+    }
+
+    /// A reader that yields `data`, then fails every further read with `kind`.
+    struct ErrorAfter {
+        data: Vec<u8>,
+        pos: usize,
+        kind: std::io::ErrorKind,
+    }
+
+    impl ErrorAfter {
+        fn new(data: Vec<u8>, kind: std::io::ErrorKind) -> Self {
+            Self { data, pos: 0, kind }
+        }
+    }
+
+    impl tokio::io::AsyncRead for ErrorAfter {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if this.pos < this.data.len() {
+                let end = (this.pos + buf.remaining()).min(this.data.len());
+                let chunk = this.data[this.pos..end].to_vec();
+                buf.put_slice(&chunk);
+                this.pos = end;
+                std::task::Poll::Ready(Ok(()))
+            } else {
+                std::task::Poll::Ready(Err(std::io::Error::new(this.kind, "injected")))
+            }
+        }
+    }
+
+    /// A non-EOF error on the length header is an I/O error, not a clean
+    /// disconnect.
+    #[tokio::test]
+    async fn non_eof_error_on_length_header_is_io() {
+        let reader = ErrorAfter::new(Vec::new(), std::io::ErrorKind::ConnectionReset);
+        let mut peer = PeerReader::new(reader, "peer:8000".into());
+        assert!(matches!(peer.receive().await, Err(NetworkError::Io(_))));
+    }
+
+    /// A non-EOF error on the body is an I/O error, not a clean disconnect.
+    #[tokio::test]
+    async fn non_eof_error_on_body_is_io() {
+        let header = 5u32.to_be_bytes().to_vec();
+        let reader = ErrorAfter::new(header, std::io::ErrorKind::ConnectionReset);
+        let mut peer = PeerReader::new(reader, "peer:8000".into());
+        assert!(matches!(peer.receive().await, Err(NetworkError::Io(_))));
+    }
+
+    /// EOF after a valid header is a clean disconnect, not an I/O error.
+    #[tokio::test]
+    async fn truncated_body_maps_to_disconnect() {
+        let header = 5u32.to_be_bytes().to_vec();
+        let reader = ErrorAfter::new(header, std::io::ErrorKind::UnexpectedEof);
+        let mut peer = PeerReader::new(reader, "peer:8000".into());
+        assert!(matches!(
+            peer.receive().await,
+            Err(NetworkError::PeerDisconnected(_))
+        ));
+    }
+
+    /// A frame of exactly `MAX_MESSAGE_SIZE` bytes is in bounds: the guard is
+    /// `>`, so it must reach the body read (here EOF) rather than be rejected.
+    #[tokio::test]
+    async fn length_exactly_at_max_is_not_rejected() {
+        let header = u32::try_from(MAX_MESSAGE_SIZE)
+            .expect("16 MiB fits u32")
+            .to_be_bytes()
+            .to_vec();
+        let reader = ErrorAfter::new(header, std::io::ErrorKind::UnexpectedEof);
+        let mut peer = PeerReader::new(reader, "peer:8000".into());
+        assert!(matches!(
+            peer.receive().await,
+            Err(NetworkError::PeerDisconnected(_))
+        ));
+    }
+
+    /// A payload of exactly `MAX_MESSAGE_SIZE` bytes is accepted by the send
+    /// guard (strict `>`), not refused.
+    #[tokio::test]
+    async fn payload_exactly_at_max_is_sent() {
+        let overhead = serde_json::to_vec(&Message::Goodbye {
+            reason: String::new(),
+        })
+        .expect("serializes")
+        .len();
+        let message = Message::Goodbye {
+            reason: "x".repeat(MAX_MESSAGE_SIZE - overhead),
+        };
+        assert_eq!(
+            serde_json::to_vec(&message).expect("serializes").len(),
+            MAX_MESSAGE_SIZE
+        );
+        let mut writer = PeerWriter::new(tokio::io::sink(), "peer:8000".into());
+        writer
+            .send(&message)
+            .await
+            .expect("an exactly-max payload must be sent, not refused");
     }
 }
