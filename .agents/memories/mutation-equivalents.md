@@ -67,3 +67,20 @@ Unreachable or behaviorally identical:
   tests exercise parsing, not the process. Not reachable from a unit test.
 - `channel_admin::connect_with_retry` `Instant::now() < deadline` vs `<=`: the
   retry loop's one-instant boundary is unobservable without injecting time.
+
+## glasschain-node REPL (main.rs)
+
+- `parse_price` `s.is_empty() || s.starts_with('-')`: the `||`/`&&` variants
+  agree on every input — an empty string fails the later `whole.is_empty()`
+  check, and a `-` prefix fails the all-digits check, so both branches return
+  `None`. Confirmed by the existing `parse_price_rejects_*` tests.
+- `parse_price` `!frac…all(is_ascii_digit) || frac.len() > 2`: same — a
+  non-digit fraction fails `frac.parse()`, and a >2-digit fraction is caught by
+  the `_ => return None` arm; both spellings return `None`.
+- `parse_args` second `i += 1` vs `i *= 1`: only shifts how many loop steps run;
+  the parsed `CliArgs` is unchanged for every flag/unknown/trailing-input shape
+  the tests exercise.
+- `usage -> ()`, `log_event -> ()`: side-effect-only (stderr / `log`); not
+  observable through a unit test.
+- `main -> ()`, its match-arm deletions and header guards: `main` is the binary
+  entry point and is not invoked by the unit tests.
