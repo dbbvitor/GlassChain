@@ -1450,6 +1450,50 @@ mod tests {
     }
 
     #[test]
+    fn required_count_reports_the_root_threshold() {
+        assert_eq!(PolicyExpression::signed_by("org-a").required_count(), 1);
+        assert_eq!(
+            PolicyExpression::NOutOf {
+                required: 3,
+                rules: vec![
+                    PolicyExpression::signed_by("org-a"),
+                    PolicyExpression::signed_by("org-b"),
+                    PolicyExpression::signed_by("org-c"),
+                ],
+            }
+            .required_count(),
+            3
+        );
+    }
+
+    #[test]
+    fn endorsement_payload_clears_carriers_and_is_stable() {
+        let tx = Transaction::new(TransactionKind::InventoryUpdate(crate::InventoryUpdate {
+            product_id: "SKU".into(),
+            owner_id: "owner".into(),
+            quantity_delta: 1,
+            reason: "payload".into(),
+        }));
+        let payload = TransactionEndorsement::payload(&tx).expect("serialize");
+        assert!(!payload.is_empty());
+        let decoded: Transaction =
+            serde_json::from_slice(&payload).expect("the payload is a transaction");
+        assert_eq!(decoded.id, tx.id);
+        assert!(decoded.endorsements.is_empty(), "carriers are cleared");
+
+        // Two transactions differing only in their carriers sign identical
+        // bytes: signatures must never be self-referential.
+        let mut carried = tx;
+        carried
+            .endorsements
+            .push(carrier("supply", "inventory", &["k1"]));
+        assert_eq!(
+            TransactionEndorsement::payload(&carried).expect("serialize"),
+            payload
+        );
+    }
+
+    #[test]
     fn test_transaction_endorsement_serde_back_compat() {
         let tx = delivery_receipt_tx("receiver-org");
         // The carrier rides the transaction serialization.

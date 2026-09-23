@@ -551,6 +551,40 @@ mod tests {
     }
 
     #[test]
+    fn offer_conditions_are_inclusive_at_their_boundaries() {
+        let mut engine = ContractEngine::new();
+        engine
+            .register_contract(make_contract(
+                "c1", "buyer-1", "SKU-001", 1000, 5, 10, 100, true,
+            ))
+            .unwrap();
+        // Exactly at every limit: price == max, lead == max, quantity == min.
+        let offer = make_offer("seller-1", "SKU-001", 10, 1000, 5);
+        let txs = engine.evaluate_supply_offer(&offer, "offer-tx-1");
+        assert_eq!(
+            txs.len(),
+            2,
+            "an offer exactly at the declared limits must match"
+        );
+    }
+
+    #[test]
+    fn debug_output_names_the_engine() {
+        let mut engine = ContractEngine::new();
+        engine
+            .register_contract(make_contract(
+                "c1", "buyer-1", "SKU-001", 1000, 5, 10, 100, true,
+            ))
+            .unwrap();
+        let debug = format!("{engine:?}");
+        assert!(debug.contains("ContractEngine"), "{debug}");
+        assert!(
+            debug.contains("c1"),
+            "registered contracts are listed: {debug}"
+        );
+    }
+
+    #[test]
     fn test_offer_product_mismatch_rejected() {
         let mut engine = ContractEngine::new();
         engine

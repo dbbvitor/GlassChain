@@ -501,6 +501,11 @@ mod tests {
     }
 
     #[test]
+    fn test_provider_name_is_stable() {
+        assert_eq!(MspEndorsementProvider::new().name(), "msp-ed25519");
+    }
+
+    #[test]
     fn test_multi_key_targets_all_layers_required() {
         let (provider, org_a, org_b) = registered();
         let policies = glasschain_core::ScopedPolicies {
