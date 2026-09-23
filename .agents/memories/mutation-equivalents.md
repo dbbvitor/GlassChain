@@ -47,3 +47,23 @@ Unreachable or behaviorally identical:
   guard: log-only.
 - `cert_verifier::verified_subject_cn` `PrintableString` arm: rcgen emits only
   UTF8String CNs, so no fixture reaches the arm through the public API.
+
+## storage / rpc / cli
+
+- `transient::TransientStore::record_expiry -> ()`: the expiry index is only a
+  fast path. `purge_expired` falls back to enumerating persisted envelopes
+  ("durable discovery"), so the expired set — and the returned count — is
+  identical with an empty index. The index also cannot be observed directly.
+- `transient::TransientStore::put` `now + retention_secs` vs `now * retention_secs`:
+  the two agree for every retention except `1`, where `+` yields a live entry
+  for the remainder of the current second and `*` expires it immediately. No
+  clock injection exists, so the difference is only observable inside a
+  sub-second window at `retention_secs == 1`.
+- `MspAuthInterceptor::verify_request` / `AdminGate::authorize`
+  `skew > N` vs `skew >= N`: the two differ only when the timestamp is exactly
+  `N` seconds from `now`. The header is built and verified at different wall
+  times, so neither direction is deterministic without clock injection.
+- `glasschain-cli` `main -> Ok(())`: `main` is the binary entry point; the unit
+  tests exercise parsing, not the process. Not reachable from a unit test.
+- `channel_admin::connect_with_retry` `Instant::now() < deadline` vs `<=`: the
+  retry loop's one-instant boundary is unobservable without injecting time.

@@ -1016,4 +1016,22 @@ mod tests {
             );
         }
     }
+
+    /// `now_unix` must report the real wall clock, not a constant.
+    #[test]
+    fn test_now_unix_tracks_the_wall_clock() {
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let value = super::now_unix();
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            value >= before && value <= after,
+            "now_unix()={value} outside [{before}, {after}]"
+        );
+    }
 }

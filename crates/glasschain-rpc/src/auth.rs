@@ -881,6 +881,20 @@ mod tests {
         assert!(!registry.is_empty());
     }
 
+    /// `len` and `is_empty` must reflect the true registration count, not a
+    /// hard-coded constant.
+    #[test]
+    fn test_registry_len_and_is_empty_track_registrations() {
+        let registry = TrustedKeyRegistry::new();
+        assert_eq!(registry.len(), 0);
+        assert!(registry.is_empty());
+
+        registry.register("node-a", [0x01u8; 32]);
+        registry.register("node-b", [0x02u8; 32]);
+        assert_eq!(registry.len(), 2);
+        assert!(!registry.is_empty());
+    }
+
     /// A correctly signed, freshly timestamped request is accepted.
     #[test]
     fn test_valid_token_accepted() {
