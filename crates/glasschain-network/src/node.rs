@@ -7003,4 +7003,88 @@ mod tests {
             glasschain_group(client_stream.get_ref().1.negotiated_key_exchange_group());
         assert_eq!(client_group, rustls::NamedGroup::X25519);
     }
+
+    // ── Accessor, predicate and admin-surface coverage ───────────────────────
+
+    fn channel_config(name: &str) -> ChannelConfig {
+        ChannelConfig {
+            name: name.to_owned(),
+            member_ids: vec!["org-member".to_owned()],
+            description: "test channel".to_owned(),
+            endorsement_policy: None,
+            retention_secs: 3_600,
+        }
+    }
+
+    #[test]
+    fn consensus_classes_are_classified_exactly() {
+        assert!(is_consensus_class(&Message::RequestChain));
+        assert!(!is_consensus_class(&Message::Peers(Vec::new())));
+    }
+
+    #[tokio::test]
+    async fn channel_admin_surface_is_exact() {
+        let node = Node::new("channel-admin", "127.0.0.1:0", 1);
+        assert!(node.collection_names().await.is_empty());
+
+        node.admin_create_channel(channel_config("pricing"))
+            .await
+            .expect("create channel");
+        assert_eq!(node.collection_names().await, vec!["pricing".to_owned()]);
+
+        // Duplicate names are rejected.
+        assert!(node
+            .admin_create_channel(channel_config("pricing"))
+            .await
+            .is_err());
+
+        // Unknown channels are rejected by both member operations.
+        assert!(node
+            .admin_channel_add_member("missing", "org-x")
+            .await
+            .is_err());
+        assert!(node
+            .admin_channel_remove_member("missing", "org-x")
+            .await
+            .is_err());
+
+        // Remove reports whether the member was present.
+        assert!(!node
+            .admin_channel_remove_member("pricing", "org-x")
+            .await
+            .expect("remove absent member"));
+        node.admin_channel_add_member("pricing", "org-x")
+            .await
+            .expect("add member");
+        assert!(node
+            .admin_channel_remove_member("pricing", "org-x")
+            .await
+            .expect("remove present member"));
+    }
+
+    #[tokio::test]
+    async fn node_accessors_fail_closed_and_start_at_zero() {
+        let node = Node::new("accessors", "127.0.0.1:0", 1);
+
+        // No send has failed yet, and no private payload is stored.
+        assert_eq!(node.dropped_outbound("127.0.0.1:9").await, 0);
+        assert_eq!(
+            node.purge_expired_private_payloads()
+                .await
+                .expect("purge empty store"),
+            0
+        );
+
+        // Without a certificate verifier, private paths are never trusted.
+        let state = node.state.lock().await;
+        let trusted = state.private_peer_trusted("127.0.0.1:9", "pricing");
+        drop(state);
+        assert!(!trusted);
+
+        #[cfg(feature = "bft")]
+        assert!(
+            node.last_round_phase_timings().await.is_none(),
+            "no round has committed on a fresh node"
+        );
+    }
 }
