@@ -651,6 +651,22 @@ mod tests {
     }
 
     #[test]
+    fn test_successful_purchase_accumulates_quantity_and_execution_count() {
+        let mut engine = ContractEngine::new();
+        engine
+            .register_contract(make_contract(
+                "c1", "buyer-1", "SKU-001", 1500, 10, 10, 100, true,
+            ))
+            .unwrap();
+        let offer = make_offer("seller-1", "SKU-001", 50, 1000, 5);
+        let txs = engine.evaluate_supply_offer(&offer, "offer-tx-1");
+        assert_eq!(txs.len(), 2);
+        let c = engine.get_contract("c1").unwrap();
+        assert_eq!(c.quantity_purchased, 50);
+        assert_eq!(c.execution_count, 1);
+    }
+
+    #[test]
     fn test_exhausted_budget_fulfills_contract_without_new_purchase() {
         let mut engine = ContractEngine::new();
         engine
@@ -827,9 +843,13 @@ mod tests {
         let rebuilt = ContractEngine::rebuild_from_chain(&[genesis_block, block1]);
 
         let contract = rebuilt.get_contract("c1").unwrap();
-        assert!(
-            contract.quantity_purchased > 0,
+        assert_eq!(
+            contract.quantity_purchased, 50,
             "quantity_purchased must be restored from the ContractExecution replay"
+        );
+        assert_eq!(
+            contract.execution_count, 1,
+            "execution_count must be restored from the ContractExecution replay"
         );
         // 50 units purchased < max_quantity 100 → still Active, not Fulfilled.
         assert_eq!(

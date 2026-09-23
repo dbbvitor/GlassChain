@@ -1245,4 +1245,20 @@ mod tests {
         assert_eq!(offers.len(), 1);
         assert_eq!(offers[0].seller_id, "acme");
     }
+
+    /// Admission needs a real `PoW` *or* a non-degenerate certificate: a
+    /// degenerate `PoW` certificate never substitutes for a missing `PoW`.
+    #[test]
+    fn block_consensus_admissible_requires_pow_or_live_certificate() {
+        let mut ledger = Ledger::new(1);
+        let block = ledger.mine_pending_transactions().expect("mine").clone();
+        assert!(Ledger::block_consensus_admissible(&block, 1));
+
+        let mut certified = block.clone();
+        certified.certificate = Some(crate::consensus::QuorumCertificate::pow(&block));
+        assert!(
+            !Ledger::block_consensus_admissible(&certified, 64),
+            "a degenerate certificate must not admit a block that fails PoW"
+        );
+    }
 }

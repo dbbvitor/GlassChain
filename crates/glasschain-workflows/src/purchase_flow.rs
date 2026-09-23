@@ -967,4 +967,159 @@ mod tests {
             "rfq_issued"
         );
     }
+
+    /// `CommitPurchaseOrder` needs the accepted-quote state *and* the
+    /// `"commit-po"` wake.
+    #[test]
+    fn commit_purchase_order_requires_state_and_wake() {
+        let transition = CommitPurchaseOrderTransition {
+            config: config("org-buyer", "org-maker"),
+        };
+        let accepted = PurchaseFlowState::QuoteAccepted {
+            rfq_id: "rfq-1".into(),
+            quote_id: "q-1".into(),
+        };
+        assert!(transition.matches(&accepted, &Event::Woken("commit-po".into())));
+        assert!(!transition.matches(&accepted, &Event::Woken("ship".into())));
+        assert!(!transition.matches(
+            &PurchaseFlowState::AwaitingPurchaseOrder,
+            &Event::Woken("commit-po".into())
+        ));
+    }
+
+    /// `ShipOrder` needs the accepted-PO state *and* the `"ship"` wake.
+    #[test]
+    fn ship_order_requires_state_and_wake() {
+        let transition = ShipOrderTransition {
+            config: config("org-buyer", "org-maker"),
+        };
+        let accepted = PurchaseFlowState::PoAccepted {
+            po_ref: "po:rfq-1".into(),
+        };
+        assert!(transition.matches(&accepted, &Event::Woken("ship".into())));
+        assert!(!transition.matches(&accepted, &Event::Woken("commit-po".into())));
+        assert!(!transition.matches(
+            &PurchaseFlowState::AwaitingPurchaseOrder,
+            &Event::Woken("ship".into())
+        ));
+    }
+
+    /// `RecordDelivery` requires all of schema, lot, counterparties and the PO
+    /// prefix: flipping any one clause must reject the event.
+    #[test]
+    fn record_delivery_requires_every_shipment_clause() {
+        let transition = RecordDeliveryTransition {
+            config: config("org-buyer", "org-maker"),
+        };
+        let state = PurchaseFlowState::AwaitingShipment {
+            po_ref: "po:rfq-1".into(),
+        };
+        let payload = |lot: &str, from: &str, to: &str| {
+            vec![
+                ("lot_ref", Value::String(lot.to_owned())),
+                ("from_org", Value::String(from.to_owned())),
+                ("to_org", Value::String(to.to_owned())),
+            ]
+        };
+        assert!(transition.matches(
+            &state,
+            &committed(
+                "shipment",
+                "shipment:po:rfq-1:lot-1",
+                &payload("lot-1", "org-maker", "org-buyer")
+            )
+        ));
+        // Wrong schema.
+        assert!(!transition.matches(
+            &state,
+            &committed(
+                "purchase_order",
+                "shipment:po:rfq-1:lot-1",
+                &payload("lot-1", "org-maker", "org-buyer")
+            )
+        ));
+        // Wrong lot.
+        assert!(!transition.matches(
+            &state,
+            &committed(
+                "shipment",
+                "shipment:po:rfq-1:lot-1",
+                &payload("lot-2", "org-maker", "org-buyer")
+            )
+        ));
+        // Wrong sender.
+        assert!(!transition.matches(
+            &state,
+            &committed(
+                "shipment",
+                "shipment:po:rfq-1:lot-1",
+                &payload("lot-1", "org-other", "org-buyer")
+            )
+        ));
+        // Wrong receiver.
+        assert!(!transition.matches(
+            &state,
+            &committed(
+                "shipment",
+                "shipment:po:rfq-1:lot-1",
+                &payload("lot-1", "org-maker", "org-other")
+            )
+        ));
+        // Wrong PO prefix.
+        assert!(!transition.matches(
+            &state,
+            &committed(
+                "shipment",
+                "shipment:po:other:lot-1",
+                &payload("lot-1", "org-maker", "org-buyer")
+            )
+        ));
+        // Wrong state.
+        assert!(!transition.matches(
+            &PurchaseFlowState::AwaitingPurchaseOrder,
+            &committed(
+                "shipment",
+                "shipment:po:rfq-1:lot-1",
+                &payload("lot-1", "org-maker", "org-buyer")
+            )
+        ));
+    }
+
+    /// `RaiseDispute` needs the delivered state *and* a `"dispute:"` wake.
+    #[test]
+    fn raise_dispute_requires_state_and_wake() {
+        let transition = RaiseDisputeTransition;
+        let delivered = PurchaseFlowState::Delivered {
+            po_ref: "po:rfq-1".into(),
+            receipt_ref: "receipt:x".into(),
+        };
+        assert!(transition.matches(&delivered, &Event::Woken("dispute:late".into())));
+        assert!(!transition.matches(&delivered, &Event::Woken("settle".into())));
+        assert!(!transition.matches(
+            &PurchaseFlowState::AwaitingPurchaseOrder,
+            &Event::Woken("dispute:late".into())
+        ));
+    }
+
+    /// `Settle` needs a delivered/disputed state *and* the `"settle"` wake.
+    #[test]
+    fn settle_requires_settleable_state_and_wake() {
+        let transition = SettleTransition;
+        let delivered = PurchaseFlowState::Delivered {
+            po_ref: "po:rfq-1".into(),
+            receipt_ref: "receipt:x".into(),
+        };
+        let disputed = PurchaseFlowState::Disputed {
+            po_ref: "po:rfq-1".into(),
+            receipt_ref: "receipt:x".into(),
+            reason: "late".into(),
+        };
+        assert!(transition.matches(&delivered, &Event::Woken("settle".into())));
+        assert!(transition.matches(&disputed, &Event::Woken("settle".into())));
+        assert!(!transition.matches(&delivered, &Event::Woken("dispute:late".into())));
+        assert!(!transition.matches(
+            &PurchaseFlowState::AwaitingPurchaseOrder,
+            &Event::Woken("settle".into())
+        ));
+    }
 }

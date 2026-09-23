@@ -137,3 +137,29 @@ impl FlowTriage {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Staleness is strict: a flow exactly at the threshold is not stuck.
+    #[test]
+    fn stuck_flows_uses_a_strict_staleness_threshold() {
+        let triage = FlowTriage::new();
+        triage.record("f-old", "kind", "step", 100);
+        triage.record("f-edge", "kind", "step", 900);
+        // now = 1000: f-old is 900s stale, f-edge is exactly 100s stale.
+        let ids: Vec<String> = triage
+            .stuck_flows(1000, 100)
+            .into_iter()
+            .map(|entry| entry.flow_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["f-old".to_owned()],
+            "exactly-at-threshold is not stuck"
+        );
+        assert_eq!(triage.stuck_flows(1000, 99).len(), 2);
+        assert!(triage.stuck_flows(1000, 900).is_empty());
+    }
+}

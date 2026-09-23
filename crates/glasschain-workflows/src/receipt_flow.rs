@@ -192,6 +192,14 @@ pub fn build_receipt(
 mod tests {
     use super::*;
 
+    fn shipment(lot_ref: &str) -> CanonicalRecord {
+        let mut payload = BTreeMap::new();
+        payload.insert("lot_ref".to_owned(), Value::String(lot_ref.to_owned()));
+        let mut record = CanonicalRecord::new(1_700_000_500, "shipment", payload, "org-seller");
+        record.record_id = format!("shipment:po:rfq-1:{lot_ref}");
+        record
+    }
+
     /// Transition names are the durable checkpoint vocabulary.
     #[test]
     fn transition_names_are_stable() {
@@ -205,5 +213,45 @@ mod tests {
             .name(),
             "ShipmentToReceipt"
         );
+    }
+
+    /// `ShipmentToReceipt` needs the anchored lot *and* a shipment record
+    /// whose `lot_ref` matches; neither clause alone may trigger it.
+    #[test]
+    fn shipment_to_receipt_matches_only_the_anchored_lot() {
+        let transition = ShipmentToReceiptTransition {
+            receiver_id: "receiver".into(),
+            issuer: "issuer".into(),
+            received_on: "2026-09-01".into(),
+        };
+        let anchored = ReceiptFlowState::LotAnchored {
+            lot_ref: "lot-1".into(),
+            lot_commitment: "c".into(),
+        };
+        assert!(transition.matches(&anchored, &Event::RecordCommitted(shipment("lot-1"))));
+        assert!(!transition.matches(&anchored, &Event::RecordCommitted(shipment("lot-2"))));
+
+        let mut wrong_schema = shipment("lot-1");
+        wrong_schema.schema_id = "purchase_order".to_owned();
+        assert!(!transition.matches(&anchored, &Event::RecordCommitted(wrong_schema)));
+
+        assert!(!transition.matches(
+            &ReceiptFlowState::AwaitingLot,
+            &Event::RecordCommitted(shipment("lot-1"))
+        ));
+    }
+
+    /// The receipt is stamped exactly one second after the consumed shipment.
+    #[test]
+    fn build_receipt_stamps_one_second_after_shipment() {
+        let shipment = shipment("lot-1");
+        let transition = ShipmentToReceiptTransition {
+            receiver_id: "receiver".into(),
+            issuer: "issuer".into(),
+            received_on: "2026-09-01".into(),
+        };
+        let receipt = build_receipt(&shipment, &transition);
+        assert_eq!(receipt.occurred_at, shipment.occurred_at + 1);
+        assert_eq!(receipt.record_id, format!("receipt:{}", shipment.record_id));
     }
 }

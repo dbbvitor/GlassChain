@@ -414,4 +414,45 @@ mod tests {
             "EmitAttestation"
         );
     }
+
+    /// Step labels are the triage/checkpoint vocabulary: every variant maps to
+    /// its own stable string.
+    #[test]
+    fn step_labels_are_stable() {
+        assert_eq!(AttestationFlowState::AwaitingLot.step(), "awaiting_lot");
+        assert_eq!(
+            AttestationFlowState::LotAnchored {
+                lot_ref: "lot-1".into(),
+                lot_commitment: "abc".into(),
+            }
+            .step(),
+            "lot_anchored"
+        );
+        assert_eq!(
+            AttestationFlowState::Completed {
+                record_ref: "r".into(),
+            }
+            .step(),
+            "completed"
+        );
+    }
+
+    /// `EmitAttestation` needs the anchored state *and* the `"attest"` wake:
+    /// neither clause alone may trigger it.
+    #[test]
+    fn emit_attestation_requires_anchored_state_and_attest_wake() {
+        let transition = EmitAttestationTransition {
+            config: config("quality_certification"),
+        };
+        let anchored = AttestationFlowState::LotAnchored {
+            lot_ref: "lot-1".into(),
+            lot_commitment: "abc".into(),
+        };
+        assert!(transition.matches(&anchored, &Event::Woken("attest".into())));
+        assert!(!transition.matches(&anchored, &Event::Woken("other".into())));
+        assert!(!transition.matches(
+            &AttestationFlowState::AwaitingLot,
+            &Event::Woken("attest".into())
+        ));
+    }
 }

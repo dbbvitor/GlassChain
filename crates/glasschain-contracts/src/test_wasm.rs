@@ -48,3 +48,25 @@ fn compile(wat: &str) -> String {
     let wasm = wat::parse_str(wat).expect("fixture WAT must compile");
     base64::engine::general_purpose::STANDARD.encode(&wasm)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decode(b64: &str) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("fixture must be valid base64")
+    }
+
+    /// Both fixtures must be real, distinct WASM modules: an empty or garbage
+    /// string must not pass for a module that the VM can execute.
+    #[test]
+    fn fixtures_are_distinct_valid_wasm_modules() {
+        let approving = decode(&approving_wasm_b64());
+        let denying = decode(&denying_wasm_b64());
+        assert_eq!(&approving[..4], b"\0asm");
+        assert_eq!(&denying[..4], b"\0asm");
+        assert_ne!(approving, denying);
+    }
+}

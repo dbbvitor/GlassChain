@@ -157,6 +157,23 @@ mod tests {
     }
 
     #[test]
+    fn test_notification_validate_propagates_certificate_mismatch() {
+        let mut ledger = Ledger::new(1);
+        let block = ledger.mine_pending_transactions().expect("mine").clone();
+        let certificate = QuorumCertificate::pow(&block);
+        let mut tampered = block;
+        tampered.hash = "deadbeef".into();
+        let notification = CommitNotification {
+            block: tampered,
+            certificate,
+        };
+        assert!(
+            notification.validate().is_err(),
+            "a notification whose certificate does not attest its block must fail"
+        );
+    }
+
+    #[test]
     fn test_certificate_rejects_wrong_index() {
         let mut ledger = Ledger::new(1);
         let block = ledger.mine_pending_transactions().expect("mine").clone();

@@ -132,4 +132,10 @@ mod tests {
         assert_eq!(base64_decode("not base64!"), None);
         assert_eq!(base64_decode(""), Some(Vec::new()));
     }
+
+    #[test]
+    fn is_ed25519_matches_only_the_default_algorithm() {
+        assert!(SignatureAlgorithm::Ed25519.is_ed25519());
+        assert!(!SignatureAlgorithm::Bls12381.is_ed25519());
+    }
 }

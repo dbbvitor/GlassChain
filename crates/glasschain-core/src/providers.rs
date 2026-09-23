@@ -933,4 +933,9 @@ mod default_impl_tests {
         assert_eq!(result.ephemeral, vec![("payload".to_owned(), Vec::new())]);
         assert_eq!(ExecutionLimits::new(7, 8).fuel_limit, 7);
     }
+
+    #[test]
+    fn in_memory_storage_provider_name_is_stable() {
+        assert_eq!(InMemoryStorageProvider::new().name(), "in-memory");
+    }
 }

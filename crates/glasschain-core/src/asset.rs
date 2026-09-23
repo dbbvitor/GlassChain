@@ -370,6 +370,10 @@ mod tests {
         assert!(!super::is_valid_iso8601_date("2027-06-32")); // day > 31
         assert!(!super::is_valid_iso8601_date(""));
         assert!(!super::is_valid_iso8601_date("not-a-date"));
+        // Exactly one separator wrong must reject: the two checks are an AND,
+        // not an OR (a single bad separator must not fall through to parsing).
+        assert!(!super::is_valid_iso8601_date("2027-0630"));
+        assert!(!super::is_valid_iso8601_date("2027x06-30"));
     }
     #[test]
     fn iso8601_date_rejects_unparsable_components() {

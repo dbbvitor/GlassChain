@@ -1159,7 +1159,7 @@ mod tests {
         let first = BftVote::sign(&chain_id, 3, 1, VotePhase::Precommit, "block-x", &keys[0]);
         let tenth = BftVote::sign(&chain_id, 3, 1, VotePhase::Precommit, "block-x", &keys[10]);
         let (bitmap, _) = provider
-            .aggregate_votes(&[first.clone(), tenth, first.clone()])
+            .aggregate_votes(&[first.clone(), tenth.clone(), first.clone()])
             .expect("aggregate");
         assert_eq!(bitmap, vec![0b0000_0001, 0b0000_0100]);
 
@@ -1174,6 +1174,17 @@ mod tests {
             .expect("aggregate");
         assert_eq!(duplicate_bitmap, single_bitmap);
         assert_eq!(duplicate_aggregate, single_aggregate);
+
+        // A duplicate voter whose bit is *not* bit 0 must still be collapsed:
+        // the membership check must shift by `index % 8`, not the other way.
+        let (tenth_bitmap, tenth_aggregate) = provider
+            .aggregate_votes(std::slice::from_ref(&tenth))
+            .expect("aggregate");
+        let (tenth_dup_bitmap, tenth_dup_aggregate) = provider
+            .aggregate_votes(&[tenth.clone(), tenth])
+            .expect("aggregate");
+        assert_eq!(tenth_dup_bitmap, tenth_bitmap);
+        assert_eq!(tenth_dup_aggregate, tenth_aggregate);
     }
 
     /// An equivocation proof verifies only when both votes are internally

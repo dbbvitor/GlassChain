@@ -841,4 +841,160 @@ mod tests {
             "Respond"
         );
     }
+
+    /// Step labels are the triage/checkpoint vocabulary: every variant maps to
+    /// its own stable string.
+    #[test]
+    fn step_labels_are_stable() {
+        assert_eq!(RecallFlowState::AwaitingLot.step(), "awaiting_lot");
+        assert_eq!(
+            RecallFlowState::LotAnchored {
+                lot_ref: "l".into(),
+                lot_commitment: "c".into(),
+            }
+            .step(),
+            "lot_anchored"
+        );
+        assert_eq!(
+            RecallFlowState::Recalled {
+                lot_ref: "l".into(),
+                recall_ref: "r".into(),
+                reason: "x".into(),
+            }
+            .step(),
+            "recalled"
+        );
+        assert_eq!(
+            RecallFlowState::RecallActive {
+                lot_ref: "l".into(),
+                recall_ref: "r".into(),
+                reason: "x".into(),
+            }
+            .step(),
+            "recall_active"
+        );
+        assert_eq!(
+            RecallFlowState::Completed {
+                recall_ref: "r".into(),
+            }
+            .step(),
+            "completed"
+        );
+        assert_eq!(
+            RecallResponseState::WatchingLot {
+                lot_ref: "l".into(),
+            }
+            .step(),
+            "watching_lot"
+        );
+        assert_eq!(
+            RecallResponseState::RecallObserved {
+                lot_ref: "l".into(),
+                recall_ref: "r".into(),
+            }
+            .step(),
+            "recall_observed"
+        );
+        assert_eq!(
+            RecallResponseState::Responded {
+                lot_ref: "l".into(),
+                response_ref: "r".into(),
+            }
+            .step(),
+            "responded"
+        );
+    }
+
+    /// Each lifecycle transition needs its own state *and* wake reason.
+    #[test]
+    fn recall_transitions_require_state_and_wake() {
+        let config = recall_config();
+        let anchored = RecallFlowState::LotAnchored {
+            lot_ref: "lot-1".into(),
+            lot_commitment: "c".into(),
+        };
+        let issue = IssueRecallTransition {
+            config: config.clone(),
+        };
+        assert!(issue.matches(&anchored, &Event::Woken("recall:x".into())));
+        assert!(!issue.matches(&anchored, &Event::Woken("activate".into())));
+        assert!(!issue.matches(
+            &RecallFlowState::AwaitingLot,
+            &Event::Woken("recall:x".into())
+        ));
+
+        let recalled = RecallFlowState::Recalled {
+            lot_ref: "lot-1".into(),
+            recall_ref: "recall:lot-1".into(),
+            reason: "x".into(),
+        };
+        let activate = ActivateRecallTransition {
+            config: config.clone(),
+        };
+        assert!(activate.matches(&recalled, &Event::Woken("activate".into())));
+        assert!(!activate.matches(&recalled, &Event::Woken("complete".into())));
+        assert!(!activate.matches(&anchored, &Event::Woken("activate".into())));
+
+        let active = RecallFlowState::RecallActive {
+            lot_ref: "lot-1".into(),
+            recall_ref: "recall:lot-1:active".into(),
+            reason: "x".into(),
+        };
+        let complete = CompleteRecallTransition { config };
+        assert!(complete.matches(&active, &Event::Woken("complete".into())));
+        assert!(!complete.matches(&active, &Event::Woken("activate".into())));
+        assert!(!complete.matches(&recalled, &Event::Woken("complete".into())));
+    }
+
+    /// `Respond` needs the observed state *and* a wake reason its
+    /// `transformation_type` accepts.
+    #[test]
+    fn respond_requires_observed_state_and_matching_wake() {
+        let observed = RecallResponseState::RecallObserved {
+            lot_ref: "lot-1".into(),
+            recall_ref: "recall:lot-1".into(),
+        };
+        let quarantine = RespondTransition {
+            config: response_config("org-a"),
+            transformation_type: "quarantine",
+        };
+        assert!(quarantine.matches(&observed, &Event::Woken("quarantine".into())));
+        assert!(!quarantine.matches(&observed, &Event::Woken("other".into())));
+        assert!(!quarantine.matches(
+            &RecallResponseState::WatchingLot {
+                lot_ref: "lot-1".into(),
+            },
+            &Event::Woken("quarantine".into())
+        ));
+    }
+
+    /// `wake_matches` is type-specific: each transformation accepts only its
+    /// own reason (with the dispute reason suffix).
+    #[test]
+    fn wake_matches_is_type_specific() {
+        let base = response_config("org-a");
+        let quarantine = RespondTransition {
+            config: base.clone(),
+            transformation_type: "quarantine",
+        };
+        assert!(quarantine.wake_matches("quarantine"));
+        assert!(!quarantine.wake_matches("quarantine-extra"));
+        assert!(!quarantine.wake_matches("dispute"));
+
+        let dispute = RespondTransition {
+            config: base.clone(),
+            transformation_type: "disputed",
+        };
+        assert!(dispute.wake_matches("dispute"));
+        assert!(dispute.wake_matches("dispute:batch-not-in-stock"));
+        assert!(!dispute.wake_matches("quarantine"));
+
+        let other = RespondTransition {
+            config: base,
+            transformation_type: "recall",
+        };
+        assert!(other.wake_matches("recall"));
+        assert!(!other.wake_matches("recall:x"));
+        assert!(!other.wake_matches("quarantine"));
+    }
 }
