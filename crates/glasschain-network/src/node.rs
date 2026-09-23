@@ -4921,7 +4921,8 @@ fn glasschain_group(
 // Simulated sockets only exist inside a `turmoil::Sim`, so the unit tests
 // (which bind real loopback ports) run on the default transport only; the
 // `turmoil-sim` feature exists for tests/turmoil_chaos.rs.
-#[cfg(all(test, not(feature = "turmoil-sim")))]
+#[cfg(test)]
+#[cfg(not(feature = "turmoil-sim"))]
 mod tests {
     use super::*;
     use glasschain_core::{

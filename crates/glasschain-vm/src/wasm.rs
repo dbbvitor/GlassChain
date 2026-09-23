@@ -1235,4 +1235,48 @@ mod tests {
         assert!(result.writes.is_empty());
         assert!(result.ephemeral.is_empty());
     }
+
+    /// Every malformed host-call argument shape returns the `-1` sentinel:
+    /// negative pointers or lengths (the `i32 -> usize` conversions fail) and
+    /// ends past the memory (kills the `Ok(-1)` mutation to `Ok(1)` and the
+    /// bounds-comparison mutants).
+    #[test]
+    fn test_host_calls_reject_negative_and_out_of_bounds_arguments() {
+        let provider = WasmExecutionProvider::new().unwrap();
+        let wasm = compile_wat(
+            r#"
+(module
+  (import "env" "set_state"     (func $set_state     (param i32 i32 i32 i32)))
+  (import "env" "get_state_len" (func $get_state_len (param i32 i32) (result i32)))
+  (import "env" "get_state"     (func $get_state     (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "key")
+  ;; results[i] holds the low byte of call i's return value
+  (data (i32.const 40) "\00\00\00\00\00\00")
+  (data (i32.const 60) "record")
+  (func $record (param $index i32) (param $value i32)
+    (i32.store8 (i32.add (i32.const 40) (local.get $index)) (local.get $value))
+  )
+  (func (export "execute")
+    ;; get_state_len: negative key pointer, negative key length, key past memory
+    (call $record (i32.const 0) (call $get_state_len (i32.const -1) (i32.const 1)))
+    (call $record (i32.const 1) (call $get_state_len (i32.const 0) (i32.const -1)))
+    (call $record (i32.const 2) (call $get_state_len (i32.const 65530) (i32.const 100)))
+    ;; get_state: negative key pointer, negative value pointer, value past memory
+    (call $record (i32.const 3) (call $get_state (i32.const -1) (i32.const 1) (i32.const 0) (i32.const 8)))
+    (call $record (i32.const 4) (call $get_state (i32.const 0) (i32.const 3) (i32.const -1) (i32.const 8)))
+    (call $record (i32.const 5) (call $get_state (i32.const 0) (i32.const 3) (i32.const 65530) (i32.const 100)))
+    (call $set_state (i32.const 60) (i32.const 6) (i32.const 40) (i32.const 6))
+  )
+)
+"#,
+        );
+        let result = provider
+            .execute("host-argument-rejection", &wasm, limits(50_000))
+            .unwrap();
+        assert_eq!(result.ephemeral.len(), 1);
+        assert_eq!(result.ephemeral[0].0, "record");
+        // -1 as i32, stored byte-wise.
+        assert_eq!(result.ephemeral[0].1, vec![0xFF; 6]);
+    }
 }
