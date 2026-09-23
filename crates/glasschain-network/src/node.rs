@@ -4909,7 +4909,7 @@ pub fn adopt_prebound_listener(addr: &str) -> Option<StdTcpListener> {
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
 /// Map the negotiated key exchange group to a comparable [`rustls::NamedGroup`].
-#[cfg(all(test, not(feature = "turmoil-sim")))]
+#[cfg(test)]
 fn glasschain_group(
     negotiated: Option<&'static dyn rustls::crypto::SupportedKxGroup>,
 ) -> rustls::NamedGroup {
@@ -4918,11 +4918,7 @@ fn glasschain_group(
         .expect("a completed handshake negotiated a key exchange group")
 }
 
-// Simulated sockets only exist inside a `turmoil::Sim`, so the unit tests
-// (which bind real loopback ports) run on the default transport only; the
-// `turmoil-sim` feature exists for tests/turmoil_chaos.rs.
 #[cfg(test)]
-#[cfg(not(feature = "turmoil-sim"))]
 mod tests {
     use super::*;
     use glasschain_core::{
