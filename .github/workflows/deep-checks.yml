@@ -86,7 +86,11 @@ jobs:
     if: github.event.schedule != '23 4 * * 1'
     runs-on: ubuntu-latest
     # 2 256 mutants over 16 serial shards; the first cold shard dominates.
+    # `wild` (https://mutants.rs/performance.html) more than halves the
+    # per-mutant relinks, so it applies to the proof run and the shards alike.
     timeout-minutes: 240
+    env:
+      RUSTFLAGS: -C link-arg=-fuse-ld=wild
     strategy:
       fail-fast: false
       matrix:
@@ -108,14 +112,19 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          key: mutants-${{ matrix.shard }}
+          key: mutants-${{ matrix.shard }}-wild
           shared-key: rust-cache
           cache-on-failure: true
 
-      - name: Install cargo-mutants and cargo-nextest
+      - name: Install cargo-mutants, cargo-nextest and wild
         uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
         with:
-          tool: cargo-mutants,cargo-nextest
+          tool: cargo-mutants,cargo-nextest,wild
+
+      # gcc's `-fuse-ld=wild` resolves `ld.wild` on PATH; the release ships
+      # only `wild`.
+      - name: Expose wild as ld.wild
+        run: ln -sf "$CARGO_HOME/bin/wild" "$CARGO_HOME/bin/ld.wild"
 
       # `--in-place` is what lets each mutant reuse the previous build; the
       # scratch copy (target included, so the rust-cache still pays off) keeps
@@ -150,12 +159,14 @@ jobs:
             *) exit "$code" ;;
           esac
 
-      - name: Upload outcomes
+      # The whole `mutants.out` (outcomes.json, missed.txt and the per-mutant
+      # diff/ files) so a failed shard is diagnosable without a re-run.
+      - name: Upload mutants.out
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: mutants-outcomes-${{ matrix.shard }}
-          path: ${{ runner.temp }}/mutants/mutants.out/outcomes.json
+          name: mutants-out-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/mutants/mutants.out
           if-no-files-found: ignore
 
   asan:

@@ -37,6 +37,17 @@ a rename, a cfg attribute and a test helper, yet it selected 15 mutants in
 `WasmExecutionProvider::build_linker` and `<ShipOrderTransition as
 Transition<PurchaseFlowState>>::apply`.
 
+## `wild` needs an `ld.wild` symlink
+
+`taiki-e/install-action` installs the `wild` binary (alias `wild-linker`) but
+not the `ld.wild` name gcc's `-fuse-ld=wild` resolves on PATH. The CI jobs
+create it (`ln -sf "$CARGO_HOME/bin/wild" "$CARGO_HOME/bin/ld.wild"`) before
+setting `RUSTFLAGS=-C link-arg=-fuse-ld=wild`. `-C linker=wild` alone fails
+("Couldn't find library `gcc_s`") because rustc then skips the gcc driver.
+`wild` changed the cache key: rust-cache does not hash `RUSTFLAGS` by default,
+so the jobs suffix their key with `-wild` or the cached artifacts never match
+the wild-linked fingerprints.
+
 ## test code is skipped
 
 `visit::attrs_excluded` skips `#[cfg(test)]`, `#[test]`, `#[tokio::test]`, and

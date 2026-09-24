@@ -54,6 +54,10 @@ HOST := $(shell rustc -vV 2>/dev/null | sed -n 's/^host: //p')
 # `make mutants` scope; the CI full run shards all 12 crates.
 MUTANTS_PKG ?= glasschain-core
 
+# Mutation testing relinks once per mutant; use the `wild` linker when it is on
+# PATH (https://mutants.rs/performance.html — the CI jobs install it too).
+MUTANTS_RUSTFLAGS := $(strip $(RUSTFLAGS) $(shell command -v wild >/dev/null 2>&1 && echo -C link-arg=-fuse-ld=wild))
+
 # Miri: six-crate allowlist, strict flags, no leak exemption (ticket #153).
 MIRI_FLAGS := -Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check
 MIRI_PKGS := -p glasschain-core -p glasschain-contracts -p glasschain-indexer \
@@ -169,11 +173,11 @@ careful: ## Run the suite under cargo-careful (nightly, std debug assertions)
 	cargo +nightly careful nextest run --profile ci $(TEST_FLAGS)
 
 mutants: ## Mutation-test one crate in place (default glasschain-core; override MUTANTS_PKG=...)
-	cargo mutants -p $(MUTANTS_PKG) --in-place --timeout 60
+	RUSTFLAGS="$(MUTANTS_RUSTFLAGS)" cargo mutants -p $(MUTANTS_PKG) --in-place --timeout 60
 
 mutants-diff: ## Mutation-test only the current diff (the CI PR-gate command)
 	# --timeout is a CLI-only option: `.cargo/mutants.toml` rejects it.
-	cargo mutants --in-diff --baseline=skip --in-place --timeout 60
+	RUSTFLAGS="$(MUTANTS_RUSTFLAGS)" cargo mutants --in-diff --baseline=skip --in-place --timeout 60
 
 miri: ## Run Miri over the six-crate allowlist with the strictest flags
 	MIRIFLAGS="$(MIRI_FLAGS)" cargo +nightly miri test $(MIRI_PKGS) --lib -- $(MIRI_SKIPS)

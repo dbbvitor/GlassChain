@@ -205,16 +205,25 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          key: ${{ github.job }}
+          # `-wild` keeps the wild-linked artifacts separate from the other
+          # jobs' caches (the flags change every build fingerprint).
+          key: ${{ github.job }}-wild
           shared-key: rust-cache
           cache-on-failure: true
 
       # cargo-mutants runs `cargo test`, not nextest: nextest skips doctests,
       # and a mutation caught only by a doctest would falsely report as missed.
-      - name: Install cargo-mutants
+      # `wild` is the linker from https://mutants.rs/performance.html: each
+      # mutant relinks, and it more than halves those relinks.
+      - name: Install cargo-mutants and wild
         uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
         with:
-          tool: cargo-mutants
+          tool: cargo-mutants,wild
+
+      # gcc's `-fuse-ld=wild` resolves `ld.wild` on PATH; the release ships
+      # only `wild`.
+      - name: Expose wild as ld.wild
+        run: ln -sf "$CARGO_HOME/bin/wild" "$CARGO_HOME/bin/ld.wild"
 
       - name: Write the PR diff
         run: git diff "origin/${{ github.base_ref }}...HEAD" > pr.diff
@@ -236,6 +245,8 @@ jobs:
       # is a real error.
       - name: Mutate only the diff
         working-directory: ${{ runner.temp }}/mutants
+        env:
+          RUSTFLAGS: -C link-arg=-fuse-ld=wild
         run: |
           set +e
           cargo mutants --in-diff pr.diff --baseline=skip --in-place --timeout 120
@@ -245,3 +256,14 @@ jobs:
             0|2|3) exit 0 ;;
             *) exit "$code" ;;
           esac
+
+      # Keep the survivor diffs readable even when the job passes (survivors
+      # are reported, not yet gated): `mutants.out/missed.txt` plus the
+      # per-mutant `diff/` files.
+      - name: Upload mutants.out
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mutants-out
+          path: ${{ runner.temp }}/mutants/mutants.out
+          if-no-files-found: ignore
