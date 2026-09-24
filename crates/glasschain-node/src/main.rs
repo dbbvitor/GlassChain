@@ -502,7 +502,7 @@ impl CliArgs {
 fn parse_args(args: &[String]) -> CliArgs {
     let mut parsed = CliArgs::defaults();
     // A flag/value pair per iteration; a trailing flag without a value ends
-    // the scan. No index arithmetic to mis-mutate into a non-terminating loop.
+    // the scan. No index arithmetic for a mutation to turn into a loop.
     let mut args = args.iter().skip(1);
     while let Some(flag) = args.next() {
         let Some(value) = args.next() else {
