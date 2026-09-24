@@ -32,8 +32,8 @@ no leverage; tests + mutation for the primitives underneath (ADR-019).
 | Trust score (`core/asset.rs`) | `MetadataTrustScore::compute`, `is_valid_iso8601_date` | Verus — score arithmetic proved 2026-09-24 (`asset::trust_proofs`: exact 20/10 formula, `<= 100`, standard gate); Kani keeps the ISO-8601 structural parity |
 | BFT quorum/bitmap/context (`core/{bft,consensus}.rs`) | `QuorumCertificate::validate`, `verify_certificate`, vote/context messages | Verus — quorum/bitmap kernels proved 2026-09-24 (`proof_arith` in `bft.rs`); context framing deferred (panic-on-length-cast path); BLS assumed |
 | TOFU pin transition (`network/node.rs`) | `PeerRegistry::verify_or_register` → `core::pin::decide` | Verus — `spec_decide` gate proved 2026-09-24 (`pin.rs`: poisoned/NodeId/Org reject, rotate only with a valid proof under the pinned key); ed25519 assumed |
-| Private-payload gate (`network/node.rs`) | `private_peer_trusted`, `payload_targets`, `Channel::is_member` | Verus (membership conjunction; hash assumed) |
-| Channel/membership rules (`identity/channel.rs`, `msp_policy`) | `is_member`, height-bounded authorization | Verus (modulo ed25519) |
+| Private-payload gate (`network/node.rs`) | `private_peer_trusted`, `payload_targets`, `Channel::is_member` | Verus (membership conjunction; hash assumed; `HashMap`/`HashSet<String>` state will need the key-model assumption below) |
+| Channel/membership rules (`identity/channel.rs`, `msp_policy`) | `is_member`, height-bounded authorization | Verus (modulo ed25519; `member_set: HashSet<String>` — same key-model cost) |
 | OCSP DER codec (`identity/ocsp.rs`) | `minimal_be`, `read_tlv`, `read_generalized` | Kani (slices/parsers) — `minimal_be`/`read_tlv` proved |
 | Signed message encoders (`identity/possession.rs`) | `org_possession_message`, `tofu_pin_message`, `msp_registration_message` | Kani attempted; CBMC times out (below) — tests + mutation |
 | Canonical record rules (`core/canonical.rs`) | `is_hex64`, `is_present`, `matches_type`, `validate_record_with` | Kani (predicates); JSON/`format!` body deferred |
@@ -176,3 +176,12 @@ by `test_zero_required_never_evaluates_true`.
 - `verusdoc` is not wired up: it needs Verus built from source (`vargo build
   -p verusdoc`) plus manual rustdoc flags. Specs are documented in prose on
   the kernels and in ADR-019 instead.
+- Planned Verus surfaces keyed by `HashMap`/`HashSet<String>` (channel
+  membership, private-payload gating) will need vstd's key-model assumption
+  (`assume(obeys_key_model::<String>())` — the primitive axioms do not cover
+  `String`) with the narrow cheat-check exemption, or a route through slices
+  as the TOFU decision did. Budget for it before starting those slices.
+- Workflow: for a new or churning module, write the Kani harness before the
+  Verus spec — it finds panics and boundary violations cheaply and keeps the
+  spec you eventually write honest. The ownership corpus is stable enough
+  that the zero-trust set went Verus-first on purpose (ADR-019).

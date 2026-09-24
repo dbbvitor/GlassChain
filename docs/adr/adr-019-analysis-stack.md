@@ -151,13 +151,23 @@ mutation for the crypto primitives underneath:
 | Kani expansion | CBMC supports the allocation/intrinsic paths |
 | Kani autoharness sweep | Kani stops killing `goto-instrument` and stops hitting the `catch_unwind` ICE on whole-crate runs |
 | Kani hash-path proofs | a harness needs a hash-adjacent property; `crypto::sha256` is the `#[kani::stub]` seam |
-| Endorsement policy algebra proofs | a tool models the serde-derived recursive enum (Verus upstream fix or hand-written serde in a `verus!` type) or CBMC learns the recursive heap tree |
+| Endorsement policy algebra proofs | a tool models the serde-derived recursive enum (Verus upstream fix or hand-written serde in a `verus!` type) **or** the tree is flattened into an arena/index encoding CBMC can model |
 | Singular (`integer_ring`) | a ring-equality proof appears **and** Singular 4.3.2 is the installed version (4.4.x is incompatible) |
 | verusdoc | specs must render in rustdoc; verusdoc currently needs Verus built from source |
 | nightly live-mutation triage | the mutants shards' `outcomes.json` show a stable survivor set worth a score gate |
 
 ## Consequences
 
+- **Verus-first is deliberate here**: the zero-trust surfaces are stable and
+  high-value, so paying the specification cost up front is affordable. For a
+  new or churning module, write the cheap Kani harness first — it finds
+  panics and boundary violations in minutes — and only then invest in specs.
+  Proof code is code: it decays when the implementation moves, so every
+  proved module keeps its tests and mutation coverage.
+- Both proof jobs run on PRs because they measured inside the guardrail
+  (cold: Verus 2m13s, Kani 6m33s). If the Kani harness set approaches the
+  30-minute cap, Kani moves back to `deep-checks.yml` first; Verus stays on
+  PRs.
 - Contributors run `make ci` before a PR; the raw equivalents stay in
   `AGENTS.md`/`CONTRIBUTING.md`. Deep tooling is opt-in locally and pinned in
   the scheduled workflow.
