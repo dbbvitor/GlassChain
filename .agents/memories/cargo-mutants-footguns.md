@@ -48,6 +48,25 @@ setting `RUSTFLAGS=-C link-arg=-fuse-ld=wild`. `-C linker=wild` alone fails
 so the jobs suffix their key with `-wild` or the cached artifacts never match
 the wild-linked fingerprints.
 
+## the timeout bucket is non-fatal but hides missed
+
+cargo-mutants returns 3 (timeout) in preference to 2 (missed) when a run has
+both, so the CI gates check `mutants.out/missed.txt` rather than the exit
+code. Known timeout mutants (the suite hangs under them, so they are
+detections, not survivors — not skipped):
+
+- `glasschain-core` `Block::calculate_hash` / `crypto::sha256` whole-body
+  replacements: `Block::mine`'s nonce loop never terminates.
+- `glasschain-core` `Ledger::fold_capability` / `fold_committed_ids`
+  `+=`→`*=`: the fold loop never advances.
+- `glasschain-cli` `channel_admin::execute` retry-guard → `true` and
+  `glasschain-node` `parse_args` first `i += 1`→`-=`: infinite loops.
+- `glasschain-network` `PeerWriter::send -> Ok(())` and `>`→`<`: small sends
+  never leave, so peers spin to their own deadlines.
+
+Turning any of these into a fast assertion needs a production-side bound or a
+test-level timeout around the loop.
+
 ## test code is skipped
 
 `visit::attrs_excluded` skips `#[cfg(test)]`, `#[test]`, `#[tokio::test]`, and

@@ -239,10 +239,15 @@ jobs:
 
       # `.cargo/mutants.toml` adds --all-features (without it, cfg-gated
       # mutants are compiled out and report as false misses) and excludes the
-      # Kani-only harness module. Exit codes: 0 all caught, 2 survivors
-      # reported (the gate carries no score policy yet), 3 timeouts (a mutant
-      # that hangs the suite is evidence, not a tool failure); anything else
-      # is a real error.
+      # Kani-only harness module.
+      #
+      # Survivors fail the gate: catch/fix them, or add a reasoned
+      # `exclude_re` entry (`mutants-skip:`) to `.cargo/mutants.toml`.
+      # cargo-mutants gives timeouts (3) precedence over missed (2) in its
+      # exit code, so the survivor check reads `missed.txt` instead of
+      # trusting the code. A timeout is a detection (the suite hangs, it does
+      # not pass), so it stays non-fatal and is surfaced in the artifact;
+      # anything else is a real error.
       - name: Mutate only the diff
         working-directory: ${{ runner.temp }}/mutants
         env:
@@ -252,8 +257,12 @@ jobs:
           cargo mutants --in-diff pr.diff --baseline=skip --in-place --timeout 120
           code=$?
           set -e
+          if [ "$code" = "2" ] || [ -s mutants.out/missed.txt ]; then
+            echo "::error::cargo-mutants found $(wc -l < mutants.out/missed.txt) survivor(s) in the diff — catch/fix them, or add a reasoned exclude_re entry to .cargo/mutants.toml"
+            exit 2
+          fi
           case "$code" in
-            0|2|3) exit 0 ;;
+            0|3) exit 0 ;;
             *) exit "$code" ;;
           esac
 

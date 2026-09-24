@@ -144,9 +144,15 @@ jobs:
 
       # A shard is serial: `--in-place` cannot combine with `--jobs`.
       # `--all-features` and the Kani-harness exclusion come from
-      # `.cargo/mutants.toml`. Exit 2 means survivors, exit 3 timeouts
-      # (#156: outcomes are collected before any score gate exists); anything
-      # else is a real error.
+      # `.cargo/mutants.toml`.
+      #
+      # Survivors fail the shard: catch/fix them, or add a reasoned
+      # `exclude_re` entry (`mutants-skip:`) to `.cargo/mutants.toml`.
+      # cargo-mutants gives timeouts (3) precedence over missed (2) in its
+      # exit code, so the survivor check reads `missed.txt` instead of
+      # trusting the code; a timeout is a detection, not a silent survivor,
+      # and stays non-fatal (surfaced in the artifact). Anything else is a
+      # real error.
       - name: Mutate shard ${{ matrix.shard }}
         working-directory: ${{ runner.temp }}/mutants
         run: |
@@ -154,8 +160,12 @@ jobs:
           cargo mutants --shard ${{ matrix.shard }}/16 --in-place --baseline=skip --timeout 180
           code=$?
           set -e
+          if [ "$code" = "2" ] || [ -s mutants.out/missed.txt ]; then
+            echo "::error::cargo-mutants shard ${{ matrix.shard }} found $(wc -l < mutants.out/missed.txt) survivor(s) — catch/fix them, or add a reasoned exclude_re entry to .cargo/mutants.toml"
+            exit 2
+          fi
           case "$code" in
-            0|2|3) exit 0 ;;
+            0|3) exit 0 ;;
             *) exit "$code" ;;
           esac
 

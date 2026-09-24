@@ -24,6 +24,9 @@ exclude_globs = ["crates/glasschain-core/src/proofs.rs"]
 # explained in `.agents/memories/mutation-equivalents.md`. Skipping them keeps
 # a full run reporting only real gaps.
 #
+# Policy: CI fails on any surviving mutant. A survivor must be caught/fixed,
+# or listed here with a reason — `exclude_re` is the deliberate-skip path.
+#
 # The regex matches the mutant name printed by `cargo-mutants --list`. Entries
 # that pin a line/column stop matching when the code moves, so the mutant
 # reappears (safe direction) rather than staying silently ignored.
