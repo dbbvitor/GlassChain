@@ -14,37 +14,37 @@ profile = "mutants"
 # exercised only end-to-end, in aggregate. The regex matches the mutant name
 # printed by `cargo-mutants --list` (relative to `demo/`).
 exclude_re = [
-    # main.rs — the binary entry point is not invoked by the unit tests.
+    # mutants-skip: main.rs — the binary entry point is not invoked by the unit tests.
     "replace main with \\(\\)",
-    # scenario.rs — draining `len - CAP` at `len == CAP` is a zero-length
+    # mutants-skip: scenario.rs — draining `len - CAP` at `len == CAP` is a zero-length
     # no-op, so the strict and inclusive spellings agree.
     "replace > with >= in RunState::push_feed",
     "replace > with >= in RunState::push_security",
     "replace > with >= in RunState::push_offer",
-    # scenario.rs — the lists are only ever grown one entry at a time, so the
+    # mutants-skip: scenario.rs — the lists are only ever grown one entry at a time, so the
     # overrun is always exactly 1: `len - CAP` and `len / CAP` agree.
     "replace - with / in RunState::push_feed",
     "replace - with / in RunState::push_security",
     "replace - with / in RunState::push_offer",
-    # scenario.rs — the deleted arm and the catch-all both return "pharmacy-1".
+    # mutants-skip: scenario.rs — the deleted arm and the catch-all both return "pharmacy-1".
     "delete match arm MANUAL_CONTRACT_ID in offer_buyer",
-    # scenario.rs — `seq = round * 100` only feeds forged record ids that are
+    # mutants-skip: scenario.rs — `seq = round * 100` only feeds forged record ids that are
     # rejected and never surfaced in an event or snapshot.
     "replace \\* with (\\+|/) in evil_attacks",
-    # scenario.rs — `wait_for_ids` polls a live node's pending pool against a
+    # mutants-skip: scenario.rs — `wait_for_ids` polls a live node's pending pool against a
     # 2.5 s wall-clock deadline; unit-testing it needs a running federation.
     " in wait_for_ids$",
     "replace wait_for_ids with \\(\\)",
-    # scenario.rs — `build_federation` binds loopback sockets, runs the
+    # mutants-skip: scenario.rs — `build_federation` binds loopback sockets, runs the
     # handshake wave and sleeps; only the end-to-end run exercises it.
     " in build_federation$",
-    # scenario.rs — `submit_round` fans out to live nodes and folds aggregate
+    # mutants-skip: scenario.rs — `submit_round` fans out to live nodes and folds aggregate
     # counters; the counts are asserted end-to-end, not per-increment.
     " in submit_round$",
-    # scenario.rs — `spawn_run` is the long-running runner loop (rebuild on
+    # mutants-skip: scenario.rs — `spawn_run` is the long-running runner loop (rebuild on
     # topology change, drive, sleep); tests call its pieces directly instead.
     " in spawn_run$",
-    # scenario.rs — `drive_round` is the monolithic per-round driver: one
+    # mutants-skip: scenario.rs — `drive_round` is the monolithic per-round driver: one
     # function spanning produce → payloads → submit → settle → mine →
     # project → retail. Its branches are covered end-to-end in aggregate
     # (blocks, lots, offers, WMS, security, compliance); pinning each

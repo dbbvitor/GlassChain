@@ -130,6 +130,16 @@ Unreachable or behaviorally identical:
   `test_gas_exhaustion` and the boundary guard by
   `operation_gas_limit_equal_to_usage_after_trap_is_execution_error`.
 
+## glasschain-demo (standalone package)
+
+The demo is excluded from the workspace, so its skips live in
+`demo/.cargo/mutants.toml` (`rg 'mutants-skip:' demo/.cargo/mutants.toml`):
+the runner internals that only run end-to-end (`drive_round`, `submit_round`,
+`build_federation`, `wait_for_ids`, `spawn_run`), the binary entry point, the
+one-at-a-time push cap (`len - CAP` ≡ `len / CAP`), the duplicate
+`offer_buyer` arm, and the `evil_attacks` seq that never surfaces. The demo's
+own test module (bridge handlers + scenario helpers) covers the rest.
+
 ## glasschain-network / libp2p_swarm.rs
 
 - `LibP2pNode::add_known_peer`/`shutdown -> ()`: both are fire-and-forget
