@@ -138,8 +138,7 @@ pub struct Company {
 /// `pricing`), odd-indexed evils are certifiers (no verifier at all).
 pub fn build_companies(params: &SimParams) -> Vec<Company> {
     let mut companies = Vec::new();
-    let mut counter = 0u8;
-    let mut push_role = |count: u8, role: &str, companies: &mut Vec<Company>| {
+    let push_role = |count: u8, role: &str, companies: &mut Vec<Company>| {
         for index in 1..=count {
             companies.push(Company {
                 id: format!("{role}-{index}"),
@@ -147,7 +146,6 @@ pub fn build_companies(params: &SimParams) -> Vec<Company> {
                 evil: false,
                 has_verifier: true,
             });
-            counter += 1;
         }
     };
     push_role(params.manufacturers, "manufacturer", &mut companies);
@@ -167,9 +165,7 @@ pub fn build_companies(params: &SimParams) -> Vec<Company> {
             evil: true,
             has_verifier: !even,
         });
-        counter += 1;
     }
-    let _ = counter;
     companies
 }
 
@@ -3498,8 +3494,60 @@ mod tests {
             !view["sell_offers"].as_array().expect("array").is_empty(),
             "the manufacturer's advertised sell offers are listed"
         );
+        // Private bookkeeping is exactly scoped: the member's own lens sees
+        // it, another member's lens does not.
+        assert_eq!(view["private_visible"], true);
+        let other = org_snapshot(&shared, "manufacturer-1", Some("pharmacy-1")).await;
+        assert_eq!(other["private_visible"], false);
+        assert!(other["cash"].is_null());
+        assert!(other["sell_offers"].as_array().expect("array").is_empty());
+
+        // The listed sells/buys are exactly this org's offer/purchase events.
+        let state = shared.state.lock().await;
+        let expected_sells = state
+            .offers
+            .iter()
+            .filter(|event| event.kind == "offer" && event.seller == "manufacturer-1")
+            .count();
+        let expected_buys = state
+            .offers
+            .iter()
+            .filter(|event| event.kind == "purchase" && event.buyer == "manufacturer-1")
+            .count();
+        drop(state);
+        assert_eq!(
+            view["sell_offers"].as_array().expect("array").len(),
+            expected_sells
+        );
+        assert_eq!(
+            view["purchases"].as_array().expect("array").len(),
+            expected_buys
+        );
+
         let pharmacy = org_snapshot(&shared, "pharmacy-1", Some("pharmacy-1")).await;
         assert!(pharmacy["stock"].is_object());
+        // A member with no warehouse row has no stock: the lookup is by exact
+        // company, never "some other row".
+        let regulator = org_snapshot(&shared, "regulator-1", Some("regulator-1")).await;
+        assert!(regulator["stock"].is_null());
+        // A non-pharmacy never has inbound deliveries; a pharmacy's count is
+        // the strict `stage < 3` slice of the pipeline.
+        let manufacturer = org_snapshot(&shared, "manufacturer-1", Some("manufacturer-1")).await;
+        assert_eq!(manufacturer["pending_inbound"].as_u64(), Some(0));
+        let pipeline = shared.pipeline.lock().await;
+        let total = pipeline
+            .iter()
+            .filter(|entry| entry.pharmacy == "pharmacy-1")
+            .count();
+        let delivered = pipeline
+            .iter()
+            .filter(|entry| entry.pharmacy == "pharmacy-1" && entry.stage >= 3)
+            .count();
+        drop(pipeline);
+        assert_eq!(
+            pharmacy["pending_inbound"].as_u64(),
+            Some((total - delivered) as u64)
+        );
     }
 
     #[tokio::test]
@@ -3589,6 +3637,20 @@ mod tests {
             .iter()
             .all(|entry| entry["payload"].is_null()));
         assert_eq!(regulator["chain_height"], certifier["chain_height"]);
+
+        // Membership is exact: honest non-certifier companies are in
+        // `pricing`; certifiers and evil nodes are not.
+        let state = shared.state.lock().await;
+        assert!(state
+            .orgs
+            .iter()
+            .filter(|org| org.evil || org.role == "certifier")
+            .all(|org| org.member_of.is_empty()));
+        assert!(state
+            .orgs
+            .iter()
+            .filter(|org| !org.evil && org.role != "certifier")
+            .all(|org| org.member_of == vec![COLLECTION.to_owned()]));
     }
 
     #[tokio::test]
@@ -3642,6 +3704,13 @@ mod tests {
         // provenance lineage: after four rounds the first lots have their
         // full manufacture → dispatch → dispatch → receive sequence.
         let compliance = &value["compliance"];
+        // `setup_run` seeds the schema identity, not an empty default.
+        let expected_schema = format!("v{SCHEMA_VERSION_V1}");
+        assert_eq!(
+            compliance["schema_version"].as_str(),
+            Some(expected_schema.as_str())
+        );
+        assert_eq!(compliance["fields_total"].as_u64(), Some(6));
         assert!(compliance["flat_records"].as_u64().unwrap_or(0) > 0);
         assert!(compliance["lineages_checked"].as_u64().unwrap_or(0) > 0);
         assert!(
@@ -3831,5 +3900,455 @@ mod tests {
         assert_eq!(state.metrics.pool_bytes, 70);
         assert_eq!(state.metrics.commit_p50_ms, 300);
         assert_eq!(state.metrics.commit_p95_ms, 400);
+    }
+
+    // ── Pure helpers and RunState bookkeeping ───────────────────────────────
+
+    fn security_event(actor: &str) -> SecurityEvent {
+        SecurityEvent {
+            actor: actor.into(),
+            action: "probe".into(),
+            outcome: "rejected".into(),
+            detail: "detail".into(),
+            explanation: "explanation".into(),
+        }
+    }
+
+    fn offer_event(tx_id: &str) -> OfferEvent {
+        OfferEvent {
+            kind: "offer".into(),
+            tx_id: tx_id.into(),
+            seller: "seller".into(),
+            buyer: "buyer".into(),
+            product: "SKU-DEMO".into(),
+            quantity: 100,
+            sold: 0,
+            price_per_unit: 1_000,
+            round: 1,
+            note: "awaiting".into(),
+        }
+    }
+
+    #[test]
+    fn company_roles_and_evil_flavors_are_exact() {
+        let params = SimParams {
+            manufacturers: 2,
+            distributors: 1,
+            logistics: 1,
+            pharmacies: 3,
+            regulators: 1,
+            certifiers: 1,
+            evil_nodes: 3,
+            lots_per_round: 1,
+            round_interval_ms: 1,
+        };
+        let companies = build_companies(&params);
+        let count = |role: &str| {
+            companies
+                .iter()
+                .filter(|company| company.role == role && !company.evil)
+                .count()
+        };
+        assert_eq!(count("manufacturer"), 2);
+        assert_eq!(count("distributor"), 1);
+        assert_eq!(count("logistics"), 1);
+        assert_eq!(count("pharmacy"), 3);
+        assert_eq!(count("regulator"), 1);
+        assert_eq!(count("certifier"), 1);
+        let evils: Vec<&Company> = companies.iter().filter(|company| company.evil).collect();
+        assert_eq!(evils.len(), 3);
+        // Odd evil index → verifier-less certifier; even → verified manufacturer.
+        assert_eq!(evils[0].role, "manufacturer");
+        assert!(evils[0].has_verifier);
+        assert_eq!(evils[1].role, "certifier");
+        assert!(!evils[1].has_verifier);
+        assert_eq!(evils[2].role, "manufacturer");
+        assert!(evils[2].has_verifier);
+    }
+
+    #[test]
+    fn run_state_caps_feed_security_and_offers() {
+        let mut state = RunState::default();
+        for index in 0..FEED_CAP + 5 {
+            state.push_feed(format!("f{index}"));
+        }
+        assert_eq!(state.feed.len(), FEED_CAP);
+        assert_eq!(state.feed[0].label, "f5");
+
+        for index in 0..SECURITY_CAP + 3 {
+            state.push_security(security_event(&format!("a{index}")));
+        }
+        assert_eq!(state.security.len(), SECURITY_CAP);
+        assert_eq!(state.security[0].actor, "a3");
+
+        for index in 0..OFFER_CAP + 4 {
+            state.push_offer(offer_event(&format!("o{index}")));
+        }
+        assert_eq!(state.offers.len(), OFFER_CAP);
+        assert_eq!(state.offers[0].tx_id, "o4");
+    }
+
+    #[test]
+    fn record_tx_keeps_the_last_forty_and_counts_edges() {
+        let mut state = RunState::default();
+        state.record_tx("t1".into(), "kind", "a", "b", "l1".into());
+        state.record_tx("t2".into(), "kind", "a", "c", "l2".into());
+        // A shared `from` must not fold two distinct edges together.
+        assert_eq!(state.edges.len(), 2);
+        assert_eq!(state.edges[0].count, 1);
+        assert_eq!(state.edges[1].to, "c");
+
+        for index in 0..40 {
+            state.record_tx(format!("t{index}"), "kind", "x", "y", "l".into());
+        }
+        assert_eq!(state.transactions.len(), 40);
+        assert_eq!(state.transactions[0].id, "t0");
+        assert_eq!(state.transactions[39].id, "t39");
+    }
+
+    #[test]
+    fn record_commit_caps_the_percentile_window() {
+        let mut state = RunState::default();
+        for index in 0..COMMIT_WINDOW + 4 {
+            state.record_commit(u64::try_from(index).expect("fits"), 0, 0);
+        }
+        assert_eq!(state.commit_times.len(), COMMIT_WINDOW);
+        assert_eq!(state.commit_times[0], 4, "the newest window is kept");
+        assert_eq!(state.metrics.blocks, (COMMIT_WINDOW + 4) as u64);
+    }
+
+    #[test]
+    fn refresh_wms_recomputes_stock_and_low_stock() {
+        let mut state = RunState::default();
+        let row = |company: &str| WmsRow {
+            company: company.into(),
+            role: "pharmacy".into(),
+            product: "SKU-DEMO".into(),
+            ..WmsRow::default()
+        };
+        state.wms.push(row("pharmacy-1"));
+        state.wms.push(row("pharmacy-2"));
+        state.wms.push(row("pharmacy-3"));
+        state.inventory.insert("pharmacy-1".into(), 199);
+        state.inventory.insert("pharmacy-2".into(), 200);
+        state.inventory.insert("pharmacy-3".into(), 10_000);
+        // system_stock 10_399 → pressure 2 → low-stock threshold 200.
+        assert_eq!(buy_pressure(&state), 2);
+        state.refresh_wms();
+        assert_eq!(state.wms[0].sellable_units, 199);
+        assert_eq!(state.wms[1].sellable_units, 200);
+        assert_eq!(state.wms_summary.low_stock, 1, "only 199 < 200 is low");
+        assert_eq!(state.wms_summary.members, 3);
+    }
+
+    #[test]
+    fn wms_move_creates_rows_and_only_credits_positive_receipts() {
+        let mut state = RunState::default();
+        state.wms_move("pharmacy-1", "pharmacy", 5, 2);
+        assert_eq!(state.wms.len(), 1);
+        assert_eq!(state.wms[0].received_units, 5);
+        assert_eq!(state.wms[0].dispatched_units, 2);
+        assert_eq!(state.sellable("pharmacy-1"), 5);
+
+        // A zero-receipt move must not create an inventory entry.
+        state.wms_move("pharmacy-2", "pharmacy", 0, 3);
+        assert_eq!(state.wms.len(), 2);
+        assert!(!state.inventory.contains_key("pharmacy-2"));
+    }
+
+    #[test]
+    fn sellable_reads_the_inventory_map() {
+        let mut state = RunState::default();
+        assert_eq!(state.sellable("nobody"), 0);
+        state.inventory.insert("pharmacy-1".into(), 7);
+        assert_eq!(state.sellable("pharmacy-1"), 7);
+    }
+
+    #[test]
+    fn refresh_throughput_uses_whole_elapsed_seconds() {
+        let mut state = RunState {
+            started_ms: Some(now_millis().saturating_sub(2_000)),
+            metrics: Metrics {
+                submitted: 10,
+                ..Metrics::default()
+            },
+            ..RunState::default()
+        };
+        state.refresh_throughput();
+        assert_eq!(state.metrics.elapsed_s, 2);
+        assert_eq!(state.metrics.tx_per_sec, 5);
+
+        // Without a start stamp the window is zero and the 1-second floor
+        // keeps throughput finite.
+        let mut fresh = RunState::default();
+        fresh.metrics.submitted = 3;
+        fresh.refresh_throughput();
+        assert_eq!(fresh.metrics.elapsed_s, 0);
+        assert_eq!(fresh.metrics.tx_per_sec, 3);
+    }
+
+    #[test]
+    fn payload_summary_describes_every_kind() {
+        assert!(payload_summary(&serde_json::json!({
+            "kind": "storage", "warehouse": "DC-x", "temp_range": "2-8",
+            "humidity": "60", "retention_days": 90
+        }))
+        .contains("DC-x"));
+        assert!(payload_summary(&serde_json::json!({
+            "kind": "transit", "route": "mfg → hub", "transit_hours": 36,
+            "cold_chain": "continuous", "delivery_window": "next day"
+        }))
+        .contains("mfg → hub"));
+        assert!(payload_summary(&serde_json::json!({
+            "kind": "process", "steps": ["mixing", "filling"],
+            "batch_record": "BR-1", "gmp_line": "line-1", "operator_shift": "B"
+        }))
+        .contains("mixing → filling"));
+        assert!(payload_summary(&serde_json::json!({
+            "kind": "intake", "checks": ["seal integrity"], "quarantine_hours": 24
+        }))
+        .contains("seal integrity"));
+        assert!(payload_summary(&serde_json::json!({
+            "kind": "temperature_log", "sensor": "TS-1", "min_c": 2.0,
+            "max_c": 7.5, "samples_per_hour": 4, "excursions": 0
+        }))
+        .contains("TS-1"));
+        assert!(payload_summary(&serde_json::json!({
+            "kind": "certification_evidence", "findings": "conforms",
+            "samples_tested": 12, "lab_reference": "LAB-1", "next_audit": "2027"
+        }))
+        .contains("LAB-1"));
+        assert!(payload_summary(&serde_json::json!({
+            "kind": "regulator_notes", "inspection": "routine",
+            "finding": "none", "inspector": "officer"
+        }))
+        .contains("officer"));
+        // The fallback (pricing/terms) keeps the negotiated terms readable.
+        assert!(payload_summary(&serde_json::json!({
+            "kind": "pricing", "member_price_per_unit": 875,
+            "list_price_per_unit": 1_000, "quantity": 5,
+            "currency": "USD", "payment_terms": "net 60"
+        }))
+        .contains("net 60"));
+    }
+
+    #[test]
+    fn offer_price_ladder_is_exact() {
+        assert_eq!(offer_price(0), 1_350);
+        assert_eq!(offer_price(1), 1_100);
+        assert_eq!(offer_price(2), 950);
+        assert_eq!(offer_price(3), 1_500);
+        assert_eq!(offer_price(5), 950);
+        assert_eq!(offer_price(7), 1_050);
+    }
+
+    #[test]
+    fn offer_quantity_tiers_and_pressure_are_exact() {
+        assert_eq!(offer_quantity(0, 0), 250);
+        assert_eq!(offer_quantity(3, 1), 350);
+        assert_eq!(offer_quantity(1, 2), 500);
+        // Seq 35 prices exactly at the auto cap: it stays on the auto tiers.
+        assert_eq!(offer_price(35), CONTRACT_MAX_PRICE);
+        assert_eq!(offer_quantity(35, 0), 150);
+        assert_eq!(offer_quantity(7, 0), 100);
+    }
+
+    #[test]
+    fn contract_bands_and_buyers_are_exact() {
+        assert_eq!(manual_contract_for_price(2_500), PREMIUM_CONTRACT_ID);
+        assert_eq!(manual_contract_for_price(2_000), MANUAL_CONTRACT_ID);
+        assert_eq!(manual_contract_for_price(1_700), MANUAL_CONTRACT_ID);
+        assert_eq!(manual_contract_for_price(1_600), VALUE_CONTRACT_ID);
+        assert_eq!(manual_contract_for_price(1_000), VALUE_CONTRACT_ID);
+
+        assert_eq!(offer_buyer(2_500), "pharmacy-3");
+        assert_eq!(offer_buyer(1_700), "pharmacy-1");
+        assert_eq!(offer_buyer(1_000), "pharmacy-2");
+
+        assert_eq!(manual_contract_for_buyer("pharmacy-2"), VALUE_CONTRACT_ID);
+        assert_eq!(manual_contract_for_buyer("pharmacy-3"), PREMIUM_CONTRACT_ID);
+        assert_eq!(manual_contract_for_buyer("pharmacy-1"), MANUAL_CONTRACT_ID);
+    }
+
+    #[test]
+    fn stock_pressure_tracks_the_fleet_stock() {
+        let mut state = RunState::default();
+        assert_eq!(system_stock(&state), 0);
+        assert_eq!(buy_pressure(&state), 1);
+        state.inventory.insert("a".into(), 100);
+        assert_eq!(system_stock(&state), 100);
+        assert_eq!(buy_pressure(&state), 1, "a small stock is still scarce");
+        state.inventory.insert("b".into(), 4_900);
+        assert_eq!(system_stock(&state), 5_000);
+        assert_eq!(buy_pressure(&state), 2);
+        state.inventory.insert("c".into(), 50_000);
+        assert_eq!(
+            buy_pressure(&state),
+            PRESSURE_CAP,
+            "capped at the flush end"
+        );
+    }
+
+    #[test]
+    fn supply_offer_derives_price_quantity_and_lead_time() {
+        let offer = |seq: u64, pressure: u64| {
+            let TransactionKind::SupplyOffer(offer) = supply_offer(seq, "seller-1", pressure).kind
+            else {
+                panic!("expected a SupplyOffer");
+            };
+            offer
+        };
+        let quote = offer(3, 1);
+        assert_eq!(quote.price_per_unit, offer_price(3));
+        assert_eq!(quote.quantity_available, offer_quantity(3, 1));
+        assert_eq!(quote.lead_time_days, 6, "3 + 3 % 4");
+        assert_eq!(quote.seller_id, "seller-1");
+        assert_eq!(offer(7, 0).lead_time_days, 6, "3 + 7 % 4");
+    }
+
+    #[test]
+    fn pricing_terms_apply_the_member_discount() {
+        let value: serde_json::Value =
+            serde_json::from_str(&pricing_terms(1, 2, "manufacturer-1")).expect("json");
+        let list = offer_price(1);
+        assert_eq!(value["list_price_per_unit"].as_u64(), Some(list));
+        assert_eq!(
+            value["member_price_per_unit"].as_u64(),
+            Some(list - list / 8)
+        );
+        assert_eq!(value["quantity"].as_u64(), Some(offer_quantity(1, 2)));
+        assert_eq!(value["author"].as_str(), Some("manufacturer-1"));
+    }
+
+    #[test]
+    fn intake_and_temperature_terms_carry_their_kinds() {
+        let intake: serde_json::Value =
+            serde_json::from_str(&intake_checklist(1, "distributor-1")).expect("json");
+        assert_eq!(intake["kind"].as_str(), Some("intake"));
+        assert_eq!(intake["quarantine_hours"].as_u64(), Some(24));
+        assert!(intake["checks"][0].as_str().is_some());
+
+        let temperature: serde_json::Value =
+            serde_json::from_str(&temperature_log_terms(1, "logistics-1")).expect("json");
+        assert_eq!(temperature["kind"].as_str(), Some("temperature_log"));
+        assert_eq!(temperature["sensor"].as_str(), Some("TS-0001"));
+    }
+
+    #[test]
+    fn retail_sale_is_a_negative_inventory_delta() {
+        let TransactionKind::InventoryUpdate(update) = retail_sale_tx("pharmacy-1", 40, 2).kind
+        else {
+            panic!("expected an InventoryUpdate");
+        };
+        assert_eq!(update.quantity_delta, -40);
+        assert_eq!(update.owner_id, "pharmacy-1");
+    }
+
+    #[tokio::test]
+    async fn apply_params_bumps_topology_only_when_a_count_changes() {
+        let shared = SharedRun::default();
+        let before = shared
+            .topology_version
+            .load(std::sync::atomic::Ordering::SeqCst);
+
+        // Every topology field, changed alone, must bump the version: this
+        // pins each `||` and each `!=` in the change test.
+        let mut base = SimParams::defaults();
+        for mutate in [
+            |params: &mut SimParams| params.manufacturers += 1,
+            |params: &mut SimParams| params.distributors += 1,
+            |params: &mut SimParams| params.logistics += 1,
+            |params: &mut SimParams| params.pharmacies += 1,
+            |params: &mut SimParams| params.regulators += 1,
+            |params: &mut SimParams| params.certifiers += 1,
+            |params: &mut SimParams| params.evil_nodes += 1,
+        ] {
+            let mut requested = base.clone();
+            mutate(&mut requested);
+            base = apply_params(&shared, requested).await;
+        }
+        let after = shared
+            .topology_version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(after, before + 7, "each topology change bumped the version");
+
+        // A timing-only edit does not rebuild the federation.
+        let mut timing = base.clone();
+        timing.round_interval_ms = 123;
+        let applied = apply_params(&shared, timing).await;
+        assert_eq!(applied.round_interval_ms, 123);
+        assert_eq!(
+            shared
+                .topology_version
+                .load(std::sync::atomic::Ordering::SeqCst),
+            after,
+            "timing-only edits do not bump the topology"
+        );
+    }
+
+    #[tokio::test]
+    async fn params_view_echoes_the_stored_params() {
+        let shared = SharedRun::default();
+        let requested = SimParams {
+            round_interval_ms: 777,
+            lots_per_round: 9,
+            ..SimParams::defaults()
+        };
+        let applied = apply_params(&shared, requested).await;
+        assert_eq!(applied.round_interval_ms, 777);
+        assert_eq!(params_for_view(&shared).await.round_interval_ms, 777);
+        assert_eq!(params_for_view(&shared).await.lots_per_round, 9);
+    }
+
+    #[test]
+    fn ms_since_measures_elapsed_millis() {
+        let start = Instant::now();
+        std::thread::sleep(Duration::from_millis(20));
+        let elapsed = ms_since(start);
+        assert!((15..5_000).contains(&elapsed), "{elapsed}");
+    }
+
+    #[test]
+    fn now_millis_tracks_the_wall_clock() {
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as u64;
+        let value = now_millis();
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as u64;
+        assert!(
+            value >= before && value <= after,
+            "{value} outside [{before}, {after}]"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_purchase_rejects_an_unknown_offer() {
+        let shared = Arc::new(SharedRun::default());
+        run_one_round(&shared).await;
+        let error = complete_purchase(&shared, "no-such-offer", "pharmacy-1", 1)
+            .await
+            .expect_err("an unknown offer must be rejected");
+        assert!(error.contains("offer not found"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn evil_attacks_count_every_refusal_and_admit_the_under_metadata() {
+        let shared = Arc::new(SharedRun::default());
+        let _leader = setup_run(&shared).await;
+        let companies = build_companies(&shared.params.lock().await.clone());
+        let evil_count = companies.iter().filter(|company| company.evil).count() as u64;
+        assert!(evil_count > 0);
+
+        let before = shared.state.lock().await.metrics.rejected;
+        let admitted = evil_attacks(&shared, &companies, 1).await;
+        let after = shared.state.lock().await.metrics.rejected;
+        // Four of the five attacks per evil node are refused and counted; the
+        // fifth (under-metadata registration) is admitted by design.
+        assert_eq!(after - before, 4 * evil_count);
+        assert_eq!(admitted.len() as u64, evil_count);
     }
 }

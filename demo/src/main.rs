@@ -67,7 +67,13 @@ fn host_header_ok(headers: &HeaderMap) -> bool {
         .get(header::HOST)
         .and_then(|host| host.to_str().ok())
         .map(|host| {
-            let bare = host.split(':').next().unwrap_or("");
+            // A bracketed IPv6 literal keeps its brackets and drops any port;
+            // a hostname/IPv4 stem is everything before the first colon.
+            let bare = if host.starts_with('[') {
+                host.find(']').map_or(host, |end| &host[..=end])
+            } else {
+                host.split(':').next().unwrap_or("")
+            };
             HOSTS.contains(&bare)
         })
         .unwrap_or(false)
@@ -341,5 +347,261 @@ async fn main() {
     eprintln!("Demonstration only: {0}", scenario::MODE_LABEL);
     if let Err(error) = axum::serve(listener, app).await {
         eprintln!("demo bridge ended: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderName;
+
+    const TOKEN: &str = "test-token";
+
+    fn bridge() -> Bridge {
+        Bridge {
+            shared: Arc::new(SharedRun::default()),
+            token: Arc::new(TOKEN.to_owned()),
+        }
+    }
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_str(value).expect("valid header value"),
+            );
+        }
+        map
+    }
+
+    fn loopback_host() -> HeaderMap {
+        headers(&[("host", "127.0.0.1:18850")])
+    }
+
+    fn loopback_origin() -> HeaderMap {
+        headers(&[
+            ("host", "127.0.0.1:18850"),
+            ("origin", "http://127.0.0.1:18850"),
+            ("x-glass-auth", TOKEN),
+        ])
+    }
+
+    async fn body_string(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        String::from_utf8(bytes.to_vec()).expect("utf-8 body")
+    }
+
+    /// `host_header_ok` accepts the four loopback stems and rejects anything
+    /// else (DNS-rebinding defense).
+    #[test]
+    fn host_header_accepts_only_loopback_stems() {
+        assert!(host_header_ok(&headers(&[("host", "127.0.0.1:18850")])));
+        assert!(host_header_ok(&headers(&[("host", "localhost")])));
+        assert!(host_header_ok(&headers(&[("host", "[::1]:18850")])));
+        assert!(host_header_ok(&headers(&[("host", "[::]:18850")])));
+        assert!(!host_header_ok(&headers(&[("host", "evil.example:80")])));
+        assert!(!host_header_ok(&headers(&[])));
+    }
+
+    /// `origin_ok` accepts loopback origins and rejects external ones (CSRF /
+    /// cross-origin drive-by defense).
+    #[test]
+    fn origin_accepts_only_loopback_origins() {
+        assert!(origin_ok(&headers(&[("origin", "http://127.0.0.1:18850")])));
+        assert!(origin_ok(&headers(&[("origin", "http://localhost:18850")])));
+        assert!(origin_ok(&headers(&[("origin", "http://[::1]:18850")])));
+        assert!(!origin_ok(&headers(&[("origin", "https://evil.example")])));
+        assert!(!origin_ok(&headers(&[])));
+    }
+
+    #[test]
+    fn csp_is_attached_to_every_response() {
+        let response = with_csp(StatusCode::OK.into_response());
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_SECURITY_POLICY)
+                .and_then(|value| value.to_str().ok()),
+            Some(CSP)
+        );
+    }
+
+    #[tokio::test]
+    async fn json_and_error_responses_carry_status_and_body() {
+        let response = json_plain(serde_json::json!({ "ok": true }));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        assert!(body_string(response).await.contains("\"ok\":true"));
+
+        let response = error_json(StatusCode::BAD_REQUEST, "boom");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_string(response).await;
+        assert!(body.contains("boom"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn asset_responses_are_typed_and_uncached() {
+        let response = asset_response("<html>", "text/html; charset=utf-8");
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(body_string(response).await, "<html>");
+    }
+
+    #[tokio::test]
+    async fn get_index_is_host_gated() {
+        assert_eq!(get_index(loopback_host()).await.status(), StatusCode::OK);
+        let rejected = get_index(headers(&[("host", "evil.example")])).await;
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+        assert!(body_string(rejected).await.contains("host mismatch"));
+    }
+
+    #[tokio::test]
+    async fn get_bootstrap_returns_the_token_only_to_loopback() {
+        let response = get_bootstrap(State(bridge()), loopback_host()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_string(response).await;
+        assert!(body.contains(TOKEN), "{body}");
+        assert!(body.contains("\"mode\""), "{body}");
+
+        let rejected = get_bootstrap(State(bridge()), headers(&[("host", "evil.example")])).await;
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn get_snapshot_serves_public_and_per_org_views() {
+        let state = bridge();
+        let response =
+            get_snapshot(State(state.clone()), loopback_host(), Query(HashMap::new())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut query = HashMap::new();
+        query.insert("as".to_owned(), "pharmacy-1".to_owned());
+        let response = get_snapshot(State(state), loopback_host(), Query(query)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let rejected = get_snapshot(
+            State(bridge()),
+            headers(&[("host", "evil.example")]),
+            Query(HashMap::new()),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn post_run_is_origin_and_token_gated() {
+        let bridge = bridge();
+        let command = |action: &str| {
+            Json(RunCommand {
+                action: action.to_owned(),
+            })
+        };
+
+        // No Origin → cross-origin rejection, before any token check.
+        let rejected = post_run(
+            State(bridge.clone()),
+            headers(&[("host", "127.0.0.1:18850")]),
+            command("reset"),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+        // Origin present, token wrong.
+        let rejected = post_run(
+            State(bridge.clone()),
+            headers(&[
+                ("origin", "http://127.0.0.1:18850"),
+                ("x-glass-auth", "wrong"),
+            ]),
+            command("reset"),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+        // Each documented action is accepted and updates the run status.
+        for (action, expected) in [("reset", "idle"), ("start", "running"), ("stop", "stopped")] {
+            let response =
+                post_run(State(bridge.clone()), loopback_origin(), command(action)).await;
+            assert_eq!(response.status(), StatusCode::OK, "action {action}");
+            assert_eq!(
+                bridge.shared.state.lock().await.status,
+                expected,
+                "action {action}"
+            );
+        }
+
+        // An unknown action is a bad request, not a silent no-op.
+        let rejected = post_run(State(bridge), loopback_origin(), command("nope")).await;
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn post_purchase_and_params_are_gated() {
+        let bridge = bridge();
+        let purchase = Json(PurchaseCommand {
+            offer_tx_id: "missing".to_owned(),
+            buyer: None,
+            quantity: None,
+        });
+        let rejected = post_purchase(
+            State(bridge.clone()),
+            headers(&[("origin", "https://evil.example")]),
+            purchase,
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+        let purchase = Json(PurchaseCommand {
+            offer_tx_id: "missing".to_owned(),
+            buyer: None,
+            quantity: None,
+        });
+        let not_found = post_purchase(State(bridge.clone()), loopback_origin(), purchase).await;
+        assert_eq!(not_found.status(), StatusCode::BAD_REQUEST);
+        assert!(body_string(not_found).await.contains("offer not found"));
+
+        let rejected = post_params(
+            State(bridge.clone()),
+            headers(&[("origin", "https://evil.example")]),
+            Json(scenario::SimParams::default()),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+
+        let accepted = post_params(
+            State(bridge),
+            loopback_origin(),
+            Json(scenario::SimParams::default()),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        assert!(body_string(accepted).await.contains("\"params\""));
+    }
+
+    #[tokio::test]
+    async fn get_events_is_host_gated() {
+        let rejected = get_events(State(bridge()), headers(&[("host", "evil.example")])).await;
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
     }
 }
