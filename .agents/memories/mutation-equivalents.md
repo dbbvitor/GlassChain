@@ -5,10 +5,15 @@ the mutation is unobservable through any public behavior, changes only log
 text, or is unreachable in the reachable state space. Re-check this list when
 the surrounding code changes; otherwise do not write tests for these.
 
-These entries are enforced by `.cargo/mutants.toml`'s `exclude_re` list (each
-entry there carries the same reason inline). If a mutation reappears in a run,
-its `exclude_re` regex stopped matching — re-check the code and the reason
-before re-adding it.
+These entries are enforced by `.cargo/mutants.toml`'s `exclude_re` list. Each
+skip is tagged for search:
+
+```bash
+rg 'mutants-skip:' .cargo/mutants.toml   # every skip + its reason
+```
+
+If a mutation reappears in a run, its `exclude_re` regex stopped matching —
+re-check the code and the reason before re-adding it.
 
 ## node.rs
 
