@@ -143,15 +143,16 @@ impl PolicyExpression {
     /// signatures) is the caller's responsibility — this function assumes its
     /// input is already a set.
     ///
-    /// An `NOutOf` with no rules never evaluates true (the allow-all shape is
-    /// rejected by [`Self::validate`]; this guard keeps unvalidated
-    /// expressions from accidentally passing too).
+    /// An `NOutOf` with no rules never evaluates true, and neither does one
+    /// whose `required` is zero (the allow-all shape is rejected by
+    /// [`Self::validate`]; these guards keep unvalidated expressions from
+    /// accidentally passing too).
     #[must_use]
     pub fn evaluate(&self, principals: &HashSet<Principal>) -> bool {
         match self {
             Self::SignedBy(principal) => principals.contains(principal),
             Self::NOutOf { required, rules } => {
-                if rules.is_empty() {
+                if rules.is_empty() || *required == 0 {
                     return false;
                 }
                 rules
@@ -772,6 +773,18 @@ mod tests {
         assert!(expression.evaluate(&set(&["regulator", "custodian-b"])));
         assert!(!expression.evaluate(&set(&["regulator"])));
         assert!(!expression.evaluate(&set(&["custodian-a", "custodian-b"])));
+    }
+
+    #[test]
+    fn test_zero_required_never_evaluates_true() {
+        // `validate` rejects `required == 0`, but an unvalidated expression
+        // must fail closed too: zero-of-n is an allow-all shape.
+        let expression = PolicyExpression::NOutOf {
+            required: 0,
+            rules: vec![PolicyExpression::signed_by("org-a")],
+        };
+        assert!(!expression.evaluate(&set(&["org-a"])));
+        assert!(!expression.evaluate(&set(&[])));
     }
 
     #[test]
