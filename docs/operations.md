@@ -786,7 +786,8 @@ code, default builds the fallbacks, and both must stay green.
 --with-metadata` + `cargo deny --all-features check`, `typos`, `cargo +nightly
 snarf --format github`, `cargo hack check --each-feature`, `cargo +nightly
 careful nextest run --profile ci`, and `cargo mutants --in-diff` over the
-merge-base diff (`--baseline=skip --in-place --timeout 120`). Both mutation
+merge-base diff (`--baseline=skip --in-place --timeout 240`; the cap absorbs
+the first mutant's cold test-binary build). Both mutation
 jobs follow the cargo-mutants CI guidance
 ([ci](https://mutants.rs/ci.html), [pr-diff](https://mutants.rs/pr-diff.html),
 [performance](https://mutants.rs/performance.html)): `taiki-e/install-action`

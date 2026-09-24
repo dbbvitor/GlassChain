@@ -246,13 +246,16 @@ jobs:
       # `.cargo/mutants.toml`. cargo-mutants gives timeouts precedence over
       # missed in its exit code, so the survivor check reads `missed.txt` for
       # a precise message; both codes fail either way.
+      #
+      # The per-mutant cap is generous because the *first* mutant's test phase
+      # also compiles the test binaries when the `-wild` cache is cold.
       - name: Mutate only the diff
         working-directory: ${{ runner.temp }}/mutants
         env:
           RUSTFLAGS: -C link-arg=-fuse-ld=wild
         run: |
           set +e
-          cargo mutants --in-diff pr.diff --baseline=skip --in-place --timeout 120
+          cargo mutants --in-diff pr.diff --baseline=skip --in-place --timeout 240
           code=$?
           set -e
           if [ "$code" = "2" ] || [ -s mutants.out/missed.txt ]; then
