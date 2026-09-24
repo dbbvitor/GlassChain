@@ -1720,11 +1720,20 @@ mod tests {
             admin_gate: Some(glasschain_rpc::AdminGate::new(Arc::new(gate_verifier))),
         };
 
-        // A bad path hits the `Err` branch and the REPL keeps going.
+        assert!(
+            node.cert_verifier().await.is_none(),
+            "the REPL node starts without a verifier"
+        );
+        // A bad path hits the `Err` branch and the REPL keeps going, without
+        // installing anything.
         let reload = parse_command("reload-trust-store /tmp/bad-path")
             .unwrap()
             .unwrap();
         assert!(execute_repl_command(&node, reload, &ctx).await);
+        assert!(
+            node.cert_verifier().await.is_none(),
+            "a failed reload must not install a verifier"
+        );
 
         // The directory store reload succeeds: files and CRLs counted,
         // verifier and admin gate swapped.
@@ -1732,6 +1741,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(execute_repl_command(&node, reload, &ctx).await);
+        assert!(
+            node.cert_verifier().await.is_some(),
+            "the matching (org, root) arm must install the reloaded verifier"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

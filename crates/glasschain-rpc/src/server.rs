@@ -849,7 +849,7 @@ impl GlasschainServer {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_transaction_protos, event_to_response};
+    use super::*;
     use glasschain_core::{InventoryUpdate, Transaction, TransactionKind};
     use glasschain_network::NodeEvent;
 
@@ -1033,5 +1033,40 @@ mod tests {
             value >= before && value <= after,
             "now_unix()={value} outside [{before}, {after}]"
         );
+    }
+
+    /// `exchange_certificate` requires **both** fields: a non-empty PEM with
+    /// an empty org name is still an invalid argument.
+    #[tokio::test]
+    async fn exchange_certificate_requires_both_org_and_pem() {
+        let node = std::sync::Arc::new(glasschain_network::Node::new("n-rpc", "127.0.0.1:0", 1));
+        let state = ServerState {
+            provenance: node.provenance_index(),
+            flattener: node.analytical_flattener(),
+            node,
+            admin: None,
+        };
+
+        let request = Request::new(ExchangeCertificateRequest {
+            org_name: String::new(),
+            root_ca_cert_pem: "-----BEGIN CERTIFICATE-----".to_owned(),
+            node_id: "n-rpc".to_owned(),
+        });
+        let err = state
+            .exchange_certificate(request)
+            .await
+            .expect_err("empty org_name must be rejected even with a PEM");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        let request = Request::new(ExchangeCertificateRequest {
+            org_name: "PharmaCorp".to_owned(),
+            root_ca_cert_pem: String::new(),
+            node_id: "n-rpc".to_owned(),
+        });
+        let err = state
+            .exchange_certificate(request)
+            .await
+            .expect_err("empty PEM must be rejected even with an org name");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }

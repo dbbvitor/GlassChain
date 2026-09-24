@@ -5,6 +5,11 @@ the mutation is unobservable through any public behavior, changes only log
 text, or is unreachable in the reachable state space. Re-check this list when
 the surrounding code changes; otherwise do not write tests for these.
 
+These entries are enforced by `.cargo/mutants.toml`'s `exclude_re` list (each
+entry there carries the same reason inline). If a mutation reappears in a run,
+its `exclude_re` regex stopped matching — re-check the code and the reason
+before re-adding it.
+
 ## node.rs
 
 Log-only — the mutated expression only decides whether a `log::warn!` fires:
@@ -79,6 +84,14 @@ Unreachable or behaviorally identical:
   tests exercise parsing, not the process. Not reachable from a unit test.
 - `channel_admin::connect_with_retry` `Instant::now() < deadline` vs `<=`: the
   retry loop's one-instant boundary is unobservable without injecting time.
+- `glasschain-rpc` `ServerState::get_peers -> Ok(Response::new(Default::default()))`:
+  the `Node`'s peer registry has no public setter, so a non-empty
+  `GetPeersResponse` cannot be built from the rpc crate; the integration test
+  only observes the empty-vs-empty case.
+- `glasschain-rpc` `ServerState::create_channel` `req.retention_secs == 0` vs
+  `!=`: the default-retention branch is observable only through a retention
+  accessor (none exists) or a full PDC round-trip; the integration test asserts
+  names and membership, not the retention window.
 
 ## glasschain-node REPL (main.rs)
 
