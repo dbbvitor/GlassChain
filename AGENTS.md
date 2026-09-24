@@ -37,8 +37,9 @@ watcher automation engine, a TLS-encrypted TCP/libp2p P2P layer, and a gRPC API.
   Linux-only build-twice hash verification), and `release.yml` (on `v*` tags:
   cargo-auditable build, CycloneDX SBOMs, git-cliff notes, Cosign keyless
   signing). `analysis.yml` adds the blocking PR gates (machete, deny, typos,
-  snarf, cargo-hack, cargo-careful, diff mutants) and `deep-checks.yml` the
-  scheduled tiers (miri, full mutants, ASan/LSan, Kani, Verus, the ignored
+  snarf, cargo-hack, cargo-careful, diff mutants); `ci.yml`'s `kani` and
+  `verus` jobs run the curated proofs on every push and PR; `deep-checks.yml`
+  the scheduled tiers (miri, full mutants, ASan/LSan, the ignored
   gates, turmoil); scheduled failures file a rolling `ci-failure` issue
   (ADR-019). It is a safety net, not a substitute — run
   the checks below locally before declaring work done, because a cold CI build
@@ -92,8 +93,10 @@ finding a failure locally is far cheaper than finding it in CI.
 `make ci` runs the same fast gate locally (`make check` → `make test` →
 `make analysis`); `make tools` installs the optional tooling and deep checks are
 opt-in (`make miri`, `make sanitize`, `make mutants`, `make careful`, `make kani`,
-`make verus`, `make snarf`). `make kani` and `make verus` run the same commands
-as the weekly workflow; the Kani scope limit and its evidence are recorded in
+`make verus`, `make snarf`). `make kani` runs the same curated harnesses as
+`ci.yml`'s `kani` job; `make verus` runs the same proofs as its `verus` job
+(gas + BFT quorum/bitmap). The Kani scope, the zero-trust Verus-first
+assignment and the toolchain limits are recorded in
 `.agents/memories/kani-deferral.md`. See the `Makefile` and
 [`docs/operations.md`](docs/operations.md#makefile-targets).
 

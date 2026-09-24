@@ -74,7 +74,7 @@ MIRI_SKIPS := --skip wasm \
 
 .PHONY: help setup tools tools-nightly tools-formal build build-release check \
         test test-pkg test-one analysis fmt fmt-check clippy snarf careful \
-        mutants mutants-diff miri sanitize kani verus llvm-lines bench audit \
+        mutants mutants-diff miri sanitize kani kani-coverage verus llvm-lines bench audit \
         coverage coverage-xml ci doc node clean
 
 help: ## Show this help
@@ -187,11 +187,15 @@ sanitize: ## Run the suite under ASan/LSan (nightly; leaks are failures)
 	  cargo +nightly test --workspace --lib --bins --tests --all-features --locked \
 	  -Zbuild-std --target $(HOST)
 
-kani: ## Run the Kani proofs for glasschain-core
-	cargo kani -p glasschain-core --default-unwind 16
+kani: ## Run the curated Kani proofs (glasschain-core + glasschain-identity)
+	cargo kani -p glasschain-core -p glasschain-identity --default-unwind 16 --output-format=terse
 
-verus: ## Verify the critical-code roadmap (starts with glasschain-vm gas)
-	cargo verus verify -p glasschain-vm
+kani-coverage: ## Kani source-coverage report for the curated harnesses (local gap analysis)
+	cargo kani -p glasschain-core -p glasschain-identity --default-unwind 16 \
+	  --coverage -Z source-coverage --output-format=terse
+
+verus: ## Verify the zero-trust roadmap (gas + BFT quorum/bitmap proofs)
+	cargo verus verify -p glasschain-vm -p glasschain-core --all-features --locked -- --expand-errors
 
 llvm-lines: ## Compile-time bloat diagnostic: LLVM IR lines per generic function
 	cargo llvm-lines -p glasschain-core | head -30

@@ -15,6 +15,146 @@ use crate::providers::ConsensusProvider;
 use crate::transaction::Transaction;
 #[cfg(feature = "bft")]
 use crate::Block;
+
+/// Quorum and signer-bitmap arithmetic, proved in production form with Verus
+/// (ADR-019). Kept in a private module so `vstd::prelude`'s glob import
+/// cannot shadow identifiers in the crate's test modules.
+#[cfg(feature = "bft")]
+mod proof_arith {
+    use vstd::prelude::*;
+
+    verus! {
+
+    /// The mathematical quorum threshold: `min(2 × validators, usize::MAX) / 3
+    /// + 1`. The saturation branch is unreachable in practice (a set of
+    /// `usize::MAX / 2` validators cannot exist); it exists so that no set size
+    /// can make the exec arithmetic wrap below a quorum.
+    pub open spec fn spec_quorum_threshold(validator_count: usize) -> int {
+        (if validator_count as int * 2 <= usize::MAX as int {
+            validator_count as int * 2
+        } else {
+            usize::MAX as int
+        }) / 3 + 1
+    }
+
+    /// Bytes in a signer bitmap sized for `validator_count` validators.
+    pub open spec fn spec_bitmap_len(validator_count: usize) -> int {
+        (validator_count as int + 7) / 8
+    }
+
+    /// The byte holding validator `index`'s bit.
+    pub open spec fn spec_bitmap_byte(index: usize) -> int {
+        index as int / 8
+    }
+
+    /// The mask selecting validator `index`'s bit inside its byte.
+    pub open spec fn spec_bitmap_mask(index: usize) -> u8 {
+        1u8 << (index as int % 8)
+    }
+
+    /// The quorum arithmetic, proved in production form (ADR-019).
+    pub const fn quorum_threshold(validator_count: usize) -> (threshold: usize)
+        ensures
+            threshold as int == spec_quorum_threshold(validator_count),
+            threshold >= 1,
+            validator_count > 0 ==> threshold <= validator_count,
+    {
+        validator_count.saturating_mul(2) / 3 + 1
+    }
+
+    /// Bytes in a signer bitmap sized for `validator_count` validators.
+    pub const fn bitmap_len(validator_count: usize) -> (len: usize)
+        ensures
+            len as int == spec_bitmap_len(validator_count),
+            len as int * 8 >= validator_count as int,
+            validator_count > 0 ==> (len > 0 && (len as int - 1) * 8 < validator_count as int),
+            len <= validator_count,
+    {
+        let bytes = validator_count / 8;
+        if validator_count.is_multiple_of(8) {
+            bytes
+        } else {
+            bytes + 1
+        }
+    }
+
+    /// The byte holding validator `index`'s bit.
+    pub const fn bitmap_byte(index: usize) -> (byte: usize)
+        ensures byte as int == spec_bitmap_byte(index),
+    {
+        index / 8
+    }
+
+    /// The mask selecting validator `index`'s bit inside its byte.
+    pub const fn bitmap_mask(index: usize) -> (mask: u8)
+        ensures
+            mask == spec_bitmap_mask(index),
+            mask != 0,
+    {
+        assert(index % 8 < 8 ==> (1u8 << (index % 8)) != 0) by (bit_vector);
+        let mask = 1u8 << (index % 8);
+        assert(mask != 0);
+        mask
+    }
+
+    /// A validator index always lands inside a bitmap allocated with
+    /// [`bitmap_len`] — the invariant every bitmap access relies on.
+    proof fn bitmap_byte_in_bounds(index: usize, validator_count: usize)
+        requires index < validator_count,
+        ensures spec_bitmap_byte(index) < spec_bitmap_len(validator_count),
+    {
+    }
+
+    /// The quorum gate: `true` exactly when `signers` reaches the ⅔+1 threshold.
+    pub const fn meets_quorum(signers: usize, validator_count: usize) -> (met: bool)
+        ensures met == (signers as int >= spec_quorum_threshold(validator_count)),
+    {
+        signers >= quorum_threshold(validator_count)
+    }
+
+    /// A reached quorum is a strict ⅔ supermajority — the safety property the
+    /// certificate gate exists for.
+    proof fn quorum_is_a_strict_supermajority(validator_count: usize, signers: usize)
+        requires
+            validator_count > 0,
+            validator_count <= usize::MAX / 2,
+            signers as int >= spec_quorum_threshold(validator_count),
+        ensures signers as int * 3 > validator_count as int * 2,
+    {
+    }
+
+    /// `true` when validator `index`'s bit is set in a bitmap sized for
+    /// `validator_count` validators.
+    // `validator_count` appears only in the Verus contract, which is ghost
+    // code erased in normal builds.
+    #[allow(unused_variables)]
+    pub const fn bitmap_contains(
+        bitmap: &[u8],
+        index: usize,
+        validator_count: usize,
+    ) -> (set: bool)
+        requires
+            bitmap.len() as int == spec_bitmap_len(validator_count),
+            index < validator_count,
+        ensures set == (bitmap[spec_bitmap_byte(index)] & spec_bitmap_mask(index) != 0),
+    {
+        assert(index < validator_count);
+        let byte = bitmap_byte(index);
+        let mask = bitmap_mask(index);
+        assert(byte < bitmap.len()) by {
+            bitmap_byte_in_bounds(index, validator_count);
+        };
+        bitmap[byte] & mask != 0
+    }
+
+        } // verus!
+}
+
+#[cfg(feature = "bft")]
+pub(crate) use proof_arith::{
+    bitmap_byte, bitmap_contains, bitmap_len, bitmap_mask, meets_quorum, quorum_threshold,
+};
+
 /// One validator in the BFT validator set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatorInfo {
@@ -136,7 +276,7 @@ impl BftConsensusProvider {
     /// ⅔ of the validator set, rounded up — the quorum threshold.
     #[must_use]
     pub const fn quorum(&self) -> usize {
-        self.validators.len() * 2 / 3 + 1
+        quorum_threshold(self.validators.len())
     }
 
     /// The bitmap index of the local proposer, if it is in the validator set.
@@ -160,9 +300,9 @@ impl BftConsensusProvider {
     pub fn attest(&self, mut block: Block) -> CommitNotification {
         block.hash = block.calculate_hash();
         let signature = self.signing_key.sign(BftVote::vote_message(&block.hash));
-        let mut signers_bitmap = vec![0u8; self.validators.len().div_ceil(8)];
+        let mut signers_bitmap = vec![0u8; bitmap_len(self.validators.len())];
         if let Some(index) = self.local_index() {
-            signers_bitmap[index / 8] |= 1 << (index % 8);
+            signers_bitmap[bitmap_byte(index)] |= bitmap_mask(index);
         }
         let certificate = QuorumCertificate {
             block_index: block.index,
@@ -224,12 +364,12 @@ impl BftConsensusProvider {
     ///
     /// Returns [`CoreError::InvalidBlock`] when any vote fails verification.
     pub fn aggregate_votes(&self, votes: &[BftVote]) -> Result<(Vec<u8>, Vec<u8>), CoreError> {
-        let mut signers_bitmap = vec![0u8; self.validators.len().div_ceil(8)];
+        let mut signers_bitmap = vec![0u8; bitmap_len(self.validators.len())];
         let mut signatures: Vec<Signature> = Vec::with_capacity(votes.len());
         for vote in votes {
             let index = self.verify_vote(vote)?;
-            if signers_bitmap[index / 8] & (1 << (index % 8)) == 0 {
-                signers_bitmap[index / 8] |= 1 << (index % 8);
+            if !bitmap_contains(&signers_bitmap, index, self.validators.len()) {
+                signers_bitmap[bitmap_byte(index)] |= bitmap_mask(index);
                 signatures.push(
                     Signature::from_bytes(vote.signature.as_slice()).map_err(|e| {
                         CoreError::InvalidBlock(format!("bft: invalid vote signature: {e}"))
@@ -271,7 +411,7 @@ impl BftConsensusProvider {
             .filter(|(_, set)| *set)
             .map(|(index, _)| index)
             .collect();
-        if signer_bits.len() < self.quorum() {
+        if !meets_quorum(signer_bits.len(), self.validator_count()) {
             return Err(CoreError::InvalidBlock(format!(
                 "bft: quorum {} not reached ({} validators in bitmap)",
                 self.quorum(),

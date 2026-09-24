@@ -18,9 +18,10 @@ the map body; this file is execution order and constraints only.
   workspace (`.agents/memories/cargo-mutants-footguns.md`).
 - Nightly/formal tools are installed by the workflow, not locally: the box has
   4 cores and the repo's `target/` is not shared between worktrees.
-- Kani covers three predicates; the rest is deferred with evidence
-  (`.agents/memories/kani-deferral.md`). Verus covers the modules Kani cannot
-  process.
+- Kani runs the curated harnesses in `ci.yml` on every PR and push (core
+  predicates + identity zero-trust byte surfaces); autoharness is deferred
+  with evidence (`.agents/memories/kani-deferral.md`). Verus is the primary
+  zero-trust tool; Kani picks up what Verus cannot model.
 
 ## #166 — deep-checks + prerequisites
 
@@ -29,8 +30,8 @@ the map body; this file is execution order and constraints only.
 2. `.github/workflows/deep-checks.yml`
    - nightly: miri matrix (6 crates, per-crate skips, strict flags), full
      mutants 16 shards, ASan/LSan (`-Zbuild-std`, `detect_leaks=1`).
-   - weekly Monday: Kani 0.68.0, Verus 0.2026.09.20.aef82ed, the 13 ignored
-     gates under `ulimit -n 65535`, turmoil chaos run.
+   - weekly Monday: the 13 ignored gates under `ulimit -n 65535`, turmoil
+     chaos run (Kani and Verus moved to `ci.yml`).
 3. Auto-issue: rolling per-workflow issue, `ci-failure` label, auto-close on
    green — deep-checks, fuzz, reproducible, coverage-insights.
 

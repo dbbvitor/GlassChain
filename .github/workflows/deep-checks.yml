@@ -5,8 +5,8 @@ name: Deep checks
 #   nightly        miri matrix over the six-crate allowlist, the full
 #                  cargo-mutants run sharded 16 ways, ASan/LSan over the
 #                  workspace.
-#   weekly Monday  Kani proofs, Verus proofs, the 13 ignored gates under a
-#                  raised fd limit, the turmoil deterministic chaos run.
+#   weekly Monday  the 13 ignored gates under a raised fd limit and the
+#                  turmoil deterministic chaos run.
 #
 # The two cron entries select their job groups through `github.event.schedule`;
 # a manual dispatch runs both groups. No job blocks a PR, so failures surface
@@ -212,61 +212,6 @@ jobs:
         run: >-
           cargo +nightly test --workspace --lib --bins --tests --all-features --locked
           -Zbuild-std --target x86_64-unknown-linux-gnu
-
-  kani:
-    name: Kani proofs
-    if: github.event.schedule != '17 2 * * *'
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
-        with:
-          toolchain: 1.98.1
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          key: kani
-          shared-key: rust-cache
-          cache-on-failure: true
-
-      - name: Install Kani
-        run: |
-          cargo install --locked kani-verifier@0.68.0
-          cargo kani setup
-
-      # Three predicates verify: the ISO-8601 check, the allocation-free PoW
-      # prefix predicate, and the expiry-date contribution to the trust score.
-      # Capability hashes hit unsupported x86 intrinsics and the schema report
-      # is too slow for CBMC; the evidence lives in
-      # `.agents/memories/kani-deferral.md`.
-      - name: Verify the predicate surface
-        run: cargo kani -p glasschain-core --default-unwind 16
-
-  verus:
-    name: Verus proofs
-    if: github.event.schedule != '17 2 * * *'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Install Verus
-        run: |
-          curl -sSLo verus.zip \
-            https://github.com/verus-lang/verus/releases/download/release%2F0.2026.09.20.aef82ed/verus-0.2026.09.20.aef82ed-x86-linux.zip
-          unzip -q verus.zip
-          echo "$PWD/verus-x86-linux" >> "$GITHUB_PATH"
-
-      # The gas module is the first roadmap module (#170); more crates join as
-      # their annotations land.
-      - name: Verify the gas proofs
-        run: cargo verus verify -p glasschain-vm
 
   gates:
     name: Ignored gates

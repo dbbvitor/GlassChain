@@ -2,6 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-09-21
+**Revised:** 2026-09-24 — Kani and Verus moved to PR/push `ci.yml` jobs; Verus-first zero-trust assignment with the BFT quorum/bitmap slice proved; autoharness deferral
 **Decision owner:** project owner
 **Relates to:**
 [ADR-015](adr-015-audited-c-crypto-backends.md) (audited backends / dependency evidence) ·
@@ -42,9 +43,8 @@ the slowest was the cache-line layout at ~6.5 minutes.
 
 Nightly: Miri over the six-crate allowlist (per-crate skips, strict flags);
 the full mutants run over all 12 crates in 16 shards; ASan/LSan over the
-workspace. Weekly Monday: Kani and Verus proof jobs, the 13 `#[ignore]`d
-measurement and capacity gates under `ulimit -n 65535`, and the turmoil
-determinism scenario.
+workspace. Weekly Monday: the 13 `#[ignore]`d measurement and capacity gates
+under `ulimit -n 65535`, and the turmoil determinism scenario.
 
 Failures surface as **one rolling issue per workflow** (`ci-failure` label):
 `ci-failure-issues.yml` opens or updates it on a scheduled failure and closes
@@ -71,13 +71,21 @@ it on the next green run. PR failures do not open issues.
   fields, so the cap cannot live in the config file. The full run shards
   because `--in-place` and `--jobs` are mutually exclusive, making each shard
   serial internally.
-- **Kani** gates the predicate surface: the ISO-8601 structural check, the
-  allocation-free proof-of-work prefix predicate, and the expiry-date
-  contribution to the trust score. kani-verifier 0.68.0 / CBMC 6.11.0 cannot
-  process the rest of `glasschain-core`: the capability SHA-256 path pulls in
-  unsupported x86 intrinsics, unbounded symbolic heap aborts CBMC, and
-  `validate_asset`'s `format!` messages never finish. The evidence lives in
-  `.agents/memories/kani-deferral.md`.
+- **Kani** is the fallback for zero-trust logic Verus cannot express, and the
+  breadth layer for heap-free predicates. The curated harnesses run in
+  `ci.yml`'s `kani` job on every PR and push — the `glasschain-core`
+  predicate surface plus the `glasschain-identity` zero-trust byte surfaces
+  (`ocsp::minimal_be` serial comparison, `ocsp::read_tlv` DER framing).
+  Measured warm at 2m40s, inside the 30-minute guardrail, which is why the
+  weekly `deep-checks.yml` Kani job was retired. What CBMC still cannot
+  reach — the capability SHA-256 path (unsupported x86 intrinsics),
+  unbounded symbolic heap, `validate_asset`'s `format!` messages — stays
+  test + mutation covered. `cargo kani autoharness -Z autoharness` is **not**
+  a gate: kani-verifier 0.68.0 kills `goto-instrument` on this workspace even
+  with `--harness-timeout` and `-j 1`, and whole-crate runs hit an
+  `intrinsics.rs` ICE on crates whose dependency monomorphizations reach
+  `catch_unwind` (wasmtime). It remains a local, advisory tool. The evidence
+  lives in `.agents/memories/kani-deferral.md`.
 
 ### Coverage engine
 
@@ -95,15 +103,32 @@ sockets at runtime (`turmoil::in_simulation()`), so the `turmoil-sim` Cargo
 feature stays additive and every non-simulation build keeps tokio's sockets.
 No compiler-cfg runtime swap.
 
-### Formal verification split
+### Formal verification split: Verus first on zero-trust, Kani for the rest
 
-- **Verus is the primary tool** (unbounded proofs over the critical roadmap:
-  gas → quorum safety → determinism → chain rules → scoring). The first
-  module is gas: `state_cost` and `apply_charge` are proved in production form
-  with saturation specs, and the shipped methods delegate to them. Verus is
-  what covers the modules Kani cannot process.
-- **Kani is the breadth layer** for heap-free predicates, with the scope
-  limitation and evidence above.
+Every zero-trust surface is assigned to the strongest tool that can express
+it — Verus whenever possible, Kani where Verus has no leverage, tests +
+mutation for the crypto primitives underneath:
+
+- **Verus is the primary tool** for zero-trust decision logic that is pure
+  Rust: endorsement policy algebra, trust-score arithmetic, BFT
+  quorum/bitmap rules, the TOFU pin transition, channel membership and the
+  private-payload gate. Verus also owns the critical roadmap (gas → quorum
+  safety → determinism → chain rules → scoring). Two modules are already
+  proved in production form: the vm gas arithmetic, and the BFT
+  quorum/bitmap kernels in `glasschain-core` (`quorum_threshold`,
+  `bitmap_len`/`bitmap_byte`/`bitmap_mask`, `meets_quorum`, and the
+  `bitmap_contains` bounds lemma) — the certificate gate and every signer
+  bitmap access now route through them. Both proof jobs run in `ci.yml` on
+  every PR and push. BFT context-message framing is Kani/mutation territory
+  (it has a panic-on-length-cast path Verus cannot discharge for arbitrary
+  `&str`).
+- **Kani is the fallback** wherever Verus cannot model the code but CBMC can:
+  parsers, byte-framing, and hash-adjacent structural properties. Its
+  curated scope today is listed above; the per-surface assignment and its
+  effort estimate live in `.agents/memories/kani-deferral.md`.
+- **Neither tool reaches the primitives** (`ed25519-dalek`, BLS12-381,
+  `ring`, `webpki`) or the DER/X.509 parsers they sit behind. Those stay
+  tested and mutation-covered; a proof may only assume them.
 
 ### Deferred, with triggers
 
@@ -115,6 +140,10 @@ No compiler-cfg runtime swap.
 | cross-platform release binaries | first external release |
 | cargo-dist | upstream keyless Sigstore support |
 | Kani expansion | CBMC supports the allocation/intrinsic paths |
+| Kani autoharness sweep | Kani stops killing `goto-instrument` and stops hitting the `catch_unwind` ICE on whole-crate runs |
+| Kani hash-path proofs | a harness needs a hash-adjacent property; `crypto::sha256` is the `#[kani::stub]` seam |
+| Singular (`integer_ring`) | a ring-equality proof appears **and** Singular 4.3.2 is the installed version (4.4.x is incompatible) |
+| verusdoc | specs must render in rustdoc; verusdoc currently needs Verus built from source |
 | nightly live-mutation triage | the mutants shards' `outcomes.json` show a stable survivor set worth a score gate |
 
 ## Consequences

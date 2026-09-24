@@ -14,8 +14,11 @@ profile = "mutants"
 # Kani writes `cargo kani`-only code: cargo-mutants does not treat
 # `cfg(kani)` as a test-only gate, so it would mutate the harness bodies,
 # which the ordinary test suite never runs. The harnesses are exercised by
-# Kani itself in the weekly deep-checks job (wayfinder #166/#157).
-exclude_globs = ["crates/glasschain-core/src/proofs.rs"]
+# Kani itself in ci.yml's `kani` job (wayfinder #165/#157).
+exclude_globs = [
+    "crates/glasschain-core/src/proofs.rs",
+    "crates/glasschain-identity/src/proofs.rs",
+]
 
 # ── Skipped (untestable) mutants ─────────────────────────────────────────────
 #

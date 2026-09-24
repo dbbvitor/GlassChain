@@ -62,6 +62,9 @@ pub mod msp_policy;
 pub mod ocsp;
 pub mod possession;
 
+#[cfg(kani)]
+mod proofs;
+
 pub use cert_verifier::{CertChainVerifier, CertVerificationError, VerificationLevel};
 pub use channel::{default_retention_secs, Channel, ChannelConfig, DEFAULT_REGULATOR_ORGS};
 pub use endorsement::{

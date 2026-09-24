@@ -171,15 +171,15 @@ fn generalized_time(unix_secs: u64) -> Vec<u8> {
 }
 
 /// One decoded TLV element: `(tag, contents_range)` over a DER buffer.
-struct Element<'a> {
-    tag: u8,
-    contents: &'a [u8],
+pub(crate) struct Element<'a> {
+    pub(crate) tag: u8,
+    pub(crate) contents: &'a [u8],
 }
 
 /// Decode exactly one TLV element starting at `data[0..]`, returning it and
 /// the byte offset just past it. Any truncation or non-minimal length is
 /// malformed DER.
-fn read_tlv(data: &[u8]) -> Result<(Element<'_>, usize), OcspError> {
+pub(crate) fn read_tlv(data: &[u8]) -> Result<(Element<'_>, usize), OcspError> {
     if data.len() < 2 {
         return Err(OcspError::Malformed);
     }
@@ -493,7 +493,7 @@ fn read_generalized(body: &[u8]) -> Result<u64, OcspError> {
 
 /// Compare serials as minimal unsigned big-endian integers: leading zero
 /// bytes stripped, all-zero → empty.
-fn minimal_be(bytes: &[u8]) -> &[u8] {
+pub(crate) fn minimal_be(bytes: &[u8]) -> &[u8] {
     let stripped = &bytes[bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len())..];
     stripped
 }

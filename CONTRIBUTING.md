@@ -31,10 +31,11 @@ make test      # full suite via nextest (same flags as CI)
 
 A first build pulls `wasmtime`, `libp2p`, and `tonic` — expect several minutes.
 
-The blocking PR gate (`analysis.yml`: dependency hygiene, spelling, snarf,
-feature matrix, cargo-careful, diff mutants) and the scheduled deep checks
-(`deep-checks.yml`: miri, full mutants, ASan/LSan, Kani, Verus) are documented
-in [ADR-019](docs/adr/adr-019-analysis-stack.md).
+The blocking PR gates (`analysis.yml`: dependency hygiene, spelling, snarf,
+feature matrix, cargo-careful, diff mutants; `ci.yml`: the curated Kani and
+Verus proofs) and the scheduled deep checks (`deep-checks.yml`: miri, full
+mutants, ASan/LSan) are documented in
+[ADR-019](docs/adr/adr-019-analysis-stack.md).
 
 ## Before opening a pull request
 

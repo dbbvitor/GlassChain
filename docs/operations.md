@@ -780,6 +780,8 @@ code, default builds the fallbacks, and both must stay green.
 | `fmt` / `clippy` | ubuntu | `cargo fmt --all --check`; clippy with `RUSTFLAGS=-D warnings` |
 | `test` | **matrix ubuntu / macOS / Windows** | `cargo nextest run --profile ci --workspace --lib --bins --tests --all-features` with `RUSTFLAGS=-D warnings`, `RUSTDOCFLAGS=-D warnings` — process-per-test isolation; loopback ports come from the shared per-process band allocator (`tests/common/ports.rs`), so no cross-test port race |
 | `coverage` | ubuntu | `cargo llvm-cov nextest --profile ci … --lcov` (nextest integration; benches excluded like the test job), upload to Codecov when a token exists. Verified at 94.18% line coverage before the tarpaulin → llvm-cov flip (ADR-019) |
+| `kani` | ubuntu | `cargo kani -p glasschain-core -p glasschain-identity --default-unwind 16 --output-format=terse --sarif kani.sarif -Z concrete-playback --concrete-playback=print` — curated proofs for the core predicate surface and the identity zero-trust byte surfaces; SARIF on the Code Scanning tab. Warm 2m40s, 30-minute timeout. `cargo kani autoharness` is deliberately not a step (0.68.0 kills `goto-instrument`; evidence in `.agents/memories/kani-deferral.md`) |
+| `verus` | ubuntu | `cargo verus verify -p glasschain-vm -p glasschain-core --all-features --locked` — production-form proofs for the gas arithmetic and the BFT quorum/bitmap kernels; Verus `0.2026.09.20.aef82ed` from the pinned release zip. A cheat-marker grep (bare `assume(`/`admit(`, `external_body`, `axiom`) runs first so proofs cannot pass vacuously. Warm seconds, 30-minute timeout |
 | `audit` | ubuntu (own workflow: `audit.yml`) | `cargo audit --deny warnings --file Cargo.lock` (RustSec); prebuilt installs via `taiki-e/install-action` |
 
 `analysis.yml` — the blocking PR gate (ADR-019): `cargo machete
@@ -812,11 +814,11 @@ runner timeouts are skipped in `demo/.cargo/mutants.toml`.
 
 `deep-checks.yml` — scheduled, never blocking a PR. Nightly: the Miri matrix
 over six crates, the full mutants run in 16 serial shards, ASan/LSan over the
-workspace. Weekly Monday: Kani (heap-free predicates; scope and evidence in
-`.agents/memories/kani-deferral.md`), Verus (`glasschain-vm` gas module), the
-13 `#[ignore]`d capacity/measurement gates under `ulimit -n 65535`, and the
-turmoil deterministic partition scenario (`cargo test -p glasschain-network
---test turmoil_chaos --features turmoil-sim`).
+workspace. Weekly Monday: the 13 `#[ignore]`d capacity/measurement gates under
+`ulimit -n 65535`, and the turmoil deterministic partition scenario (`cargo
+test -p glasschain-network --test turmoil_chaos --features turmoil-sim`).
+Kani and Verus moved to `ci.yml`'s blocking jobs (scope and evidence in
+`.agents/memories/kani-deferral.md`).
 
 `ci-failure-issues.yml` — turns a scheduled failure into one rolling issue per
 workflow (`ci-failure` label) and closes it on the next green run. `fuzz.yml`,
@@ -842,7 +844,7 @@ workflow action is pinned to a commit SHA and updated by Dependabot.
 | `make ci` | `check` → `test` → `analysis` |
 | `make snarf` / `careful` / `miri` / `sanitize` | Deep checks: cache-line false sharing / cargo-careful suite / six-crate Miri allowlist with strict flags / ASan+LSan with leaks-as-failures |
 | `make mutants` / `mutants-diff` | Mutation testing (`MUTANTS_PKG=…`, default `glasschain-core`) / diff-only (CI PR-gate command) |
-| `make kani` / `verus` / `llvm-lines` | Kani proofs for `glasschain-core` / Verus critical-code roadmap (`glasschain-vm` first) / compile-time bloat diagnostic |
+| `make kani` / `kani-coverage` / `verus` / `llvm-lines` | Curated Kani proofs (`glasschain-core` + `glasschain-identity`) / Kani source-coverage report for local gap analysis / Verus zero-trust roadmap (`glasschain-vm` gas + `glasschain-core` BFT quorum/bitmap) / compile-time bloat diagnostic |
 | `make audit` / `coverage` / `coverage-xml` | `cargo audit --deny warnings` / llvm-cov HTML / Cobertura XML with the 90% line gate |
 | `make node id=… port=…` | Interactive node REPL — never in automation (Section 2) |
 | `make doc` / `clean` / `bench` | `cargo doc --workspace --no-deps` / `cargo clean` / criterion benches (see Section 12 caveat) |

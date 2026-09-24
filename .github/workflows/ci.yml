@@ -239,3 +239,92 @@ jobs:
           flags: llvm-cov
           fail_ci_if_error: true
           token: ${{ env.CODECOV_TOKEN }}
+
+  # The curated Kani harnesses run on every PR and push (ADR-019): the pure
+  # predicate surface of glasschain-core and the zero-trust byte surfaces of
+  # glasschain-identity. Measured warm at 2m40s and well inside the
+  # 30-minute guardrail, so the weekly deep-checks Kani job was retired with
+  # this move. Autoharness is deliberately not a step here: kani-verifier
+  # 0.68.0 kills goto-instrument on this workspace, so it stays a local,
+  # advisory tool until the recorded revisit trigger (see
+  # .agents/memories/kani-deferral.md).
+  kani:
+    name: Kani proofs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.98.1
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: kani
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier@0.68.0
+          cargo kani setup
+
+      # --sarif feeds GitHub code scanning; concrete playback prints a
+      # runnable reproducer into the job log when a harness fails.
+      - name: Verify the curated harnesses
+        run: >-
+          cargo kani -p glasschain-core -p glasschain-identity --default-unwind 16
+          --output-format=terse --sarif kani.sarif
+          -Z concrete-playback --concrete-playback=print
+
+      - name: Upload the SARIF report
+        if: always() && hashFiles('kani.sarif') != ''
+        # Forks and private repos may not have code scanning enabled; the
+        # SARIF upload must never mask a failing (or passing) proof gate.
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@1190a975f95ce23525efb6a3fc21ea29567c1b52 # v3
+        with:
+          sarif_file: kani.sarif
+
+  # Verus proves the zero-trust decision logic (ADR-019): the vm gas module
+  # and the BFT quorum/bitmap arithmetic. A warm run is seconds and a cold
+  # one is minutes, so it runs on every PR and push like the Kani job; the
+  # weekly deep-checks Verus job was retired with this move.
+  verus:
+    name: Verus proofs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # The Verus LLM guide's cheat checker: `assume`/`admit`/`external_body`/
+      # `axiom` would make a proof pass vacuously. `kani::assume` is Kani's
+      # harness constraint, not a Verus proof shortcut, so the pattern only
+      # matches bare `assume(`.
+      - name: Check for proof cheats
+        run: |
+          if grep -rnE '(^|[^:a-zA-Z0-9_])(assume|admit)\(|external_body|#\[axiom|verus::.*axiom' \
+              crates --include='*.rs'; then
+            echo "::error::Verus cheat marker found in the sources"
+            exit 1
+          fi
+
+      - name: Install Verus
+        run: |
+          curl -sSLo verus.zip \
+            https://github.com/verus-lang/verus/releases/download/release%2F0.2026.09.20.aef82ed/verus-0.2026.09.20.aef82ed-x86-linux.zip
+          unzip -q verus.zip
+          echo "$PWD/verus-x86-linux" >> "$GITHUB_PATH"
+
+      # The gas module and the BFT quorum/bitmap kernels are the roadmap
+      # modules (#170); more crates join as their annotations land.
+      - name: Verify the production proofs
+        run: cargo verus verify -p glasschain-vm -p glasschain-core --all-features --locked
