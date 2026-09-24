@@ -3497,34 +3497,50 @@ mod tests {
         // Private bookkeeping is exactly scoped: the member's own lens sees
         // it, another member's lens does not.
         assert_eq!(view["private_visible"], true);
+        // The admin lens is private-visible too (its own `||` arm).
+        let admin = org_snapshot(&shared, "manufacturer-1", Some("admin")).await;
+        assert_eq!(admin["private_visible"], true);
         let other = org_snapshot(&shared, "manufacturer-1", Some("pharmacy-1")).await;
         assert_eq!(other["private_visible"], false);
         assert!(other["cash"].is_null());
         assert!(other["sell_offers"].as_array().expect("array").is_empty());
 
-        // The listed sells/buys are exactly this org's offer/purchase events.
+        // The listed sells/buys are exactly this org's offer/purchase events,
+        // by transaction id — a count alone would not separate an offer from
+        // its generated purchase.
         let state = shared.state.lock().await;
-        let expected_sells = state
+        let expected_sells: Vec<String> = state
             .offers
             .iter()
             .filter(|event| event.kind == "offer" && event.seller == "manufacturer-1")
-            .count();
-        let expected_buys = state
+            .map(|event| event.tx_id.clone())
+            .collect();
+        let expected_buys: Vec<String> = state
             .offers
             .iter()
-            .filter(|event| event.kind == "purchase" && event.buyer == "manufacturer-1")
-            .count();
+            .filter(|event| event.kind == "purchase" && event.buyer == "pharmacy-1")
+            .map(|event| event.tx_id.clone())
+            .collect();
         drop(state);
-        assert_eq!(
-            view["sell_offers"].as_array().expect("array").len(),
-            expected_sells
-        );
-        assert_eq!(
-            view["purchases"].as_array().expect("array").len(),
-            expected_buys
-        );
+        let actual_sells: Vec<String> = view["sell_offers"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|entry| entry["tx_id"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(actual_sells, expected_sells);
 
+        // A buyer's view lists exactly its own purchases (the auto contract's
+        // buyer is pharmacy-1, so the list is not empty).
         let pharmacy = org_snapshot(&shared, "pharmacy-1", Some("pharmacy-1")).await;
+        let actual_buys: Vec<String> = pharmacy["purchases"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|entry| entry["tx_id"].as_str().map(str::to_owned))
+            .collect();
+        assert!(!expected_buys.is_empty());
+        assert_eq!(actual_buys, expected_buys);
         assert!(pharmacy["stock"].is_object());
         // A member with no warehouse row has no stock: the lookup is by exact
         // company, never "some other row".
@@ -4029,16 +4045,22 @@ mod tests {
         state.wms.push(row("pharmacy-1"));
         state.wms.push(row("pharmacy-2"));
         state.wms.push(row("pharmacy-3"));
+        state.wms.push(row("pharmacy-4"));
         state.inventory.insert("pharmacy-1".into(), 199);
-        state.inventory.insert("pharmacy-2".into(), 200);
-        state.inventory.insert("pharmacy-3".into(), 10_000);
-        // system_stock 10_399 → pressure 2 → low-stock threshold 200.
+        state.inventory.insert("pharmacy-2".into(), 199);
+        state.inventory.insert("pharmacy-3".into(), 200);
+        state.inventory.insert("pharmacy-4".into(), 10_000);
+        // system_stock 10_598 → pressure 2 → low-stock threshold 200; the two
+        // 199 rows are low, the 200 and 10 000 rows are not.
         assert_eq!(buy_pressure(&state), 2);
         state.refresh_wms();
         assert_eq!(state.wms[0].sellable_units, 199);
-        assert_eq!(state.wms[1].sellable_units, 200);
-        assert_eq!(state.wms_summary.low_stock, 1, "only 199 < 200 is low");
-        assert_eq!(state.wms_summary.members, 3);
+        assert_eq!(state.wms[2].sellable_units, 200);
+        assert_eq!(
+            state.wms_summary.low_stock, 2,
+            "strictly below 200, not equal to or above it"
+        );
+        assert_eq!(state.wms_summary.members, 4);
     }
 
     #[test]
@@ -4339,6 +4361,15 @@ mod tests {
     async fn evil_attacks_count_every_refusal_and_admit_the_under_metadata() {
         let shared = Arc::new(SharedRun::default());
         let _leader = setup_run(&shared).await;
+        // `setup_run` seeds the schema identity before any projection runs.
+        {
+            let state = shared.state.lock().await;
+            assert_eq!(
+                state.compliance.schema_version,
+                format!("v{SCHEMA_VERSION_V1}")
+            );
+            assert_eq!(state.compliance.fields_total, 6);
+        }
         let companies = build_companies(&shared.params.lock().await.clone());
         let evil_count = companies.iter().filter(|company| company.evil).count() as u64;
         assert!(evil_count > 0);

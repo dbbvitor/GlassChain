@@ -21,6 +21,11 @@ exclude_re = [
     "replace > with >= in RunState::push_feed",
     "replace > with >= in RunState::push_security",
     "replace > with >= in RunState::push_offer",
+    # scenario.rs — the lists are only ever grown one entry at a time, so the
+    # overrun is always exactly 1: `len - CAP` and `len / CAP` agree.
+    "replace - with / in RunState::push_feed",
+    "replace - with / in RunState::push_security",
+    "replace - with / in RunState::push_offer",
     # scenario.rs — the deleted arm and the catch-all both return "pharmacy-1".
     "delete match arm MANUAL_CONTRACT_ID in offer_buyer",
     # scenario.rs — `seq = round * 100` only feeds forged record ids that are
@@ -29,6 +34,7 @@ exclude_re = [
     # scenario.rs — `wait_for_ids` polls a live node's pending pool against a
     # 2.5 s wall-clock deadline; unit-testing it needs a running federation.
     " in wait_for_ids$",
+    "replace wait_for_ids with \\(\\)",
     # scenario.rs — `build_federation` binds loopback sockets, runs the
     # handshake wave and sleeps; only the end-to-end run exercises it.
     " in build_federation$",
