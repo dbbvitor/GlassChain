@@ -11,6 +11,7 @@ use crate::rounds::{
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use glasschain_contracts::ContractEngine;
 use glasschain_core::crypto::sha256;
+use glasschain_core::pin::{IdentityClaim, PinDecision, PinState, RejectReason, RotationProof};
 use glasschain_core::providers::in_memory::InMemoryStorageProvider;
 #[cfg(feature = "bft")]
 use glasschain_core::BFT_CONSENSUS_CAPABILITY_ID;
@@ -569,85 +570,98 @@ impl PeerRegistry {
         public_key: Option<Vec<u8>>,
         fingerprint_proof: Option<&[u8]>,
     ) -> Result<TofuOutcome, String> {
-        if let Some(reason) = self.poisoned.get(listen_addr) {
-            return Err(format!(
-                "persisted TOFU pin for '{listen_addr}' is unreadable ({reason}); \
-                 remove the stored pin to re-trust this address"
-            ));
-        }
-        if let Some(existing) = self.peers.get_mut(listen_addr) {
-            if existing.node_id != node_id {
-                return Err(format!(
-                    "node_id changed: expected '{}', got '{node_id}'",
-                    existing.node_id,
-                ));
-            }
-            // Org drift: a returning peer claiming a different organization is
-            // either a re-keyed node or an impersonation; both are rejections
-            // (ticket #47 — the org gates private-payload delivery).
-            if existing.org != org {
-                return Err(format!(
-                    "org changed for node '{node_id}': expected '{}', got '{org}'",
-                    existing.org
-                ));
-            }
-            if existing.cert_fingerprint != cert_fingerprint {
-                // Transport re-issue (#88): only the pinned identity key may
-                // authorize a new fingerprint, so a persisted pin never
-                // silently forgets the original peer.
-                let Some(pinned_key) = existing.public_key.as_deref() else {
-                    return Err(format!(
-                        "TLS certificate fingerprint changed for node '{node_id}' and no \
-                         pinned identity key is available for a signed rotation; operator \
-                         action required"
-                    ));
-                };
-                let Some(proof) = fingerprint_proof else {
-                    return Err(format!(
-                        "TLS certificate fingerprint changed for node '{node_id}' without a \
-                         signed rotation proof"
-                    ));
-                };
-                if !glasschain_identity::verify_ed25519(
-                    pinned_key,
-                    &glasschain_identity::tofu_pin_message(node_id, cert_fingerprint),
-                    proof,
-                ) {
-                    return Err(format!(
-                        "TLS certificate fingerprint changed for node '{node_id}' with an \
-                         invalid rotation proof (not signed by the pinned key)"
-                    ));
+        let pinned = self.peers.get(listen_addr).map(|peer| PinState {
+            node_id: peer.node_id.as_str(),
+            cert_fingerprint: peer.cert_fingerprint.as_str(),
+            org: peer.org.as_str(),
+            public_key: peer.public_key.as_deref(),
+        });
+        let claim = IdentityClaim {
+            node_id,
+            cert_fingerprint,
+            org,
+            public_key: public_key.as_deref(),
+        };
+        // Transport re-issue (#88): only the pinned identity key may authorize
+        // a new fingerprint, so a persisted pin never silently forgets the
+        // original peer. The proof is checked only when the fingerprint
+        // changed and a pinned key exists; `glasschain_core::pin::decide` is
+        // the verified gate that turns this into accept/reject/rotate.
+        let rotation_proof = match pinned.as_ref() {
+            Some(pin) if pin.cert_fingerprint != cert_fingerprint => {
+                match (pin.public_key, fingerprint_proof) {
+                    (Some(pinned_key), Some(proof)) => {
+                        if glasschain_identity::verify_ed25519(
+                            pinned_key,
+                            &glasschain_identity::tofu_pin_message(node_id, cert_fingerprint),
+                            proof,
+                        ) {
+                            RotationProof::Valid
+                        } else {
+                            RotationProof::Invalid
+                        }
+                    }
+                    _ => RotationProof::Missing,
                 }
-                cert_fingerprint.clone_into(&mut existing.cert_fingerprint);
-                existing.org_verified = org_verified;
-                if public_key.is_some() {
-                    existing.public_key = public_key;
+            }
+            _ => RotationProof::Missing,
+        };
+
+        let decision = glasschain_core::pin::decide(
+            pinned.as_ref(),
+            self.poisoned.contains_key(listen_addr),
+            &claim,
+            rotation_proof,
+        );
+        let poison_reason = self.poisoned.get(listen_addr).map(String::as_str);
+        match decision {
+            PinDecision::Rejected(reason) => Err(tofu_rejection_message(
+                reason,
+                poison_reason,
+                listen_addr,
+                node_id,
+                org,
+                pinned.as_ref(),
+            )),
+            PinDecision::New => {
+                self.peers.insert(
+                    listen_addr.to_owned(),
+                    VerifiedPeer {
+                        node_id: node_id.to_owned(),
+                        cert_fingerprint: cert_fingerprint.to_owned(),
+                        org: org.to_owned(),
+                        org_verified,
+                        public_key,
+                        advertised: Vec::new(),
+                    },
+                );
+                Ok(TofuOutcome::New)
+            }
+            PinDecision::Known => {
+                // Same identity: the pin's identity fields stay, but org
+                // verification is **session evidence** — each Hello
+                // re-authorizes or downgrades it (zero-trust §5
+                // established-session reauthorization: a check at a previous
+                // Hello cannot promise indefinite membership).
+                // Identity/fingerprint pins never flap.
+                if let Some(peer) = self.peers.get_mut(listen_addr) {
+                    peer.org_verified = org_verified;
+                    if peer.public_key.is_none() && public_key.is_some() {
+                        peer.public_key = public_key;
+                    }
                 }
-                return Ok(TofuOutcome::Rotated);
+                Ok(TofuOutcome::Known)
             }
-            // Same identity: the pin's identity fields stay, but org
-            // verification is **session evidence** — each Hello re-authorizes
-            // or downgrades it (zero-trust §5 established-session
-            // reauthorization: a check at a previous Hello cannot promise
-            // indefinite membership). Identity/fingerprint pins never flap.
-            existing.org_verified = org_verified;
-            if existing.public_key.is_none() && public_key.is_some() {
-                existing.public_key = public_key;
+            PinDecision::Rotated => {
+                if let Some(peer) = self.peers.get_mut(listen_addr) {
+                    cert_fingerprint.clone_into(&mut peer.cert_fingerprint);
+                    peer.org_verified = org_verified;
+                    if public_key.is_some() {
+                        peer.public_key = public_key;
+                    }
+                }
+                Ok(TofuOutcome::Rotated)
             }
-            Ok(TofuOutcome::Known)
-        } else {
-            self.peers.insert(
-                listen_addr.to_owned(),
-                VerifiedPeer {
-                    node_id: node_id.to_owned(),
-                    cert_fingerprint: cert_fingerprint.to_owned(),
-                    org: org.to_owned(),
-                    org_verified,
-                    public_key,
-                    advertised: Vec::new(),
-                },
-            );
-            Ok(TofuOutcome::New)
         }
     }
 
@@ -680,6 +694,46 @@ impl PeerRegistry {
         self.peers
             .get(listen_addr)
             .is_none_or(|peer| !peer.supports(set))
+    }
+}
+
+/// The operator-facing message for a rejected TOFU decision
+/// (`glasschain_core::pin`).
+fn tofu_rejection_message(
+    reason: RejectReason,
+    poison_reason: Option<&str>,
+    listen_addr: &str,
+    node_id: &str,
+    org: &str,
+    pinned: Option<&PinState<'_>>,
+) -> String {
+    match reason {
+        RejectReason::Poisoned => format!(
+            "persisted TOFU pin for '{listen_addr}' is unreadable ({}); \
+             remove the stored pin to re-trust this address",
+            poison_reason.unwrap_or("unreadable")
+        ),
+        RejectReason::NodeIdChanged => format!(
+            "node_id changed: expected '{}', got '{node_id}'",
+            pinned.map_or("", |pin| pin.node_id),
+        ),
+        RejectReason::OrgChanged => format!(
+            "org changed for node '{node_id}': expected '{}', got '{org}'",
+            pinned.map_or("", |pin| pin.org),
+        ),
+        RejectReason::NoPinnedKey => format!(
+            "TLS certificate fingerprint changed for node '{node_id}' and no \
+             pinned identity key is available for a signed rotation; operator \
+             action required"
+        ),
+        RejectReason::MissingProof => format!(
+            "TLS certificate fingerprint changed for node '{node_id}' without a \
+             signed rotation proof"
+        ),
+        RejectReason::InvalidProof => format!(
+            "TLS certificate fingerprint changed for node '{node_id}' with an \
+             invalid rotation proof (not signed by the pinned key)"
+        ),
     }
 }
 
