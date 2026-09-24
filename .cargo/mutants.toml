@@ -68,8 +68,8 @@ exclude_re = [
     "replace \\+ with (-|\\*) in verify_chain_certificates",
     # libp2p_swarm.rs — fire-and-forget command enqueues; their effects live
     # inside the swarm loop and are not surfaced through any public API.
-    "in LibP2pNode::add_known_peer",
-    "in LibP2pNode::shutdown",
+    "replace LibP2pNode::add_known_peer with \\(\\)",
+    "replace LibP2pNode::shutdown with \\(\\)",
     # ocsp.rs — `0xA0 | (index & 0x1F)` and `0xA0 ^ (index & 0x1F)` are
     # bit-identical: 0xA0's low five bits are zero.
     "replace \\| with \\^ in write_explicit",
