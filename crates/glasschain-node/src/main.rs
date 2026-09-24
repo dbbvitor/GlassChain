@@ -501,16 +501,14 @@ impl CliArgs {
 /// compatibility); a missing value keeps the current one.
 fn parse_args(args: &[String]) -> CliArgs {
     let mut parsed = CliArgs::defaults();
-    let mut i = 1;
-    while i < args.len() {
-        let flag = args[i].as_str();
-        i += 1;
-        if i >= args.len() {
+    // A flag/value pair per iteration; a trailing flag without a value ends
+    // the scan. No index arithmetic to mis-mutate into a non-terminating loop.
+    let mut args = args.iter().skip(1);
+    while let Some(flag) = args.next() {
+        let Some(value) = args.next() else {
             break;
-        }
-        let value = &args[i];
-        i += 1;
-        match flag {
+        };
+        match flag.as_str() {
             "--id" => parsed.node_id.clone_from(value),
             "--listen" => parsed.listen_addr.clone_from(value),
             "--peer" => parsed.seed_peers.push(value.clone()),

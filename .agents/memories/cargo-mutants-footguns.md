@@ -48,24 +48,27 @@ setting `RUSTFLAGS=-C link-arg=-fuse-ld=wild`. `-C linker=wild` alone fails
 so the jobs suffix their key with `-wild` or the cached artifacts never match
 the wild-linked fingerprints.
 
-## the timeout bucket is non-fatal but hides missed
+## timeouts fail too, and are fixed at the source
 
 cargo-mutants returns 3 (timeout) in preference to 2 (missed) when a run has
-both, so the CI gates check `mutants.out/missed.txt` rather than the exit
-code. Known timeout mutants (the suite hangs under them, so they are
-detections, not survivors — not skipped):
+both, so the CI gates read `mutants.out/missed.txt` as well as the exit code.
+Both codes fail. The 15 timeout mutants from the first full run were fixed
+rather than skipped:
 
-- `glasschain-core` `Block::calculate_hash` / `crypto::sha256` whole-body
-  replacements: `Block::mine`'s nonce loop never terminates.
-- `glasschain-core` `Ledger::fold_capability` / `fold_committed_ids`
-  `+=`→`*=`: the fold loop never advances.
-- `glasschain-cli` `channel_admin::execute` retry-guard → `true` and
-  `glasschain-node` `parse_args` first `i += 1`→`-=`: infinite loops.
-- `glasschain-network` `PeerWriter::send -> Ok(())` and `>`→`<`: small sends
-  never leave, so peers spin to their own deadlines.
-
-Turning any of these into a fast assertion needs a production-side bound or a
-test-level timeout around the loop.
+- `Block::calculate_hash` / `crypto::sha256` whole-body replacements:
+  `Block::mine` now `debug_assert`s that the hash is 64 hex chars, so the
+  non-terminating PoW loop panics immediately instead of spinning.
+- `Ledger::fold_capability` / `fold_committed_ids` `+=`→`*=`: the counters
+  use `saturating_add`, which the mutator cannot turn into a stall.
+- `glasschain-node` `parse_args`: iterator-based (a flag/value pair per
+  iteration), so there is no index `+=` to mis-mutate.
+- `glasschain-cli` `channel_admin::execute`: the retry window is now enforced
+  by an outer `tokio::time::timeout`, so a broken guard cannot spin.
+- `glasschain-network` `PeerWriter::send -> Ok(())` / `>`→`<` and
+  `PeerReader::receive` `>`→`==`: the peer tests bound their receives with
+  `tokio::time::timeout`, so a writer that never sends fails the test.
+- `demo` `build_federation` / `wait_for_ids`: skipped in
+  `demo/.cargo/mutants.toml` (the runner internals).
 
 ## test code is skipped
 

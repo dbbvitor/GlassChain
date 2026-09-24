@@ -113,8 +113,8 @@ exclude_re = [
     # mutants-skip: cli/main.rs — the binary entry point is not invoked by the unit tests.
     "replace main -> anyhow::Result",
     # mutants-skip: channel_admin.rs — the retry loop's one-instant boundary is unobservable
-    # without injecting time.
-    ":132:.*replace < with <= in execute",
+    # without injecting time (the outer 10 s safety timeout makes it moot).
+    "channel_admin.rs:.*replace < with <= in execute",
     # mutants-skip: node/main.rs — the REPL entry point and side-effect-only helpers.
     "replace usage with \\(\\)",
     "replace log_event with \\(\\)",
@@ -126,9 +126,6 @@ exclude_re = [
     # all-digits check at line 28 is a real branch and stays mutated.
     ":21:.*replace \\|\\| with && in parse_price",
     ":31:.*replace \\|\\| with && in parse_price",
-    # mutants-skip: node/main.rs — parse_args' second `i += 1` only changes how many loop
-    # steps run; the parsed CliArgs is unchanged.
-    ":512:.*replace \\+= with (-=|\\*=) in parse_args",
     # mutants-skip: sdk/client.rs — the `!missing.is_empty()` guard is log-only.
     "delete ! in GlasschainClient::build_asset_registration_tx",
     # mutants-skip: rpc/server.rs — `get_peers` returns the Node's peer registry, which has

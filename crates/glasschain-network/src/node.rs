@@ -8205,17 +8205,24 @@ mod tests {
         }
 
         // Both Hellos must be fully processed before either connection drops.
+        // The receives are bounded so a writer that never sends fails the test
+        // instead of blocking it forever.
         for (reader, writer) in &mut clients {
-            assert!(matches!(
-                reader.receive().await.unwrap(),
-                Message::Hello { .. }
-            ));
+            let hello = tokio::time::timeout(std::time::Duration::from_secs(5), reader.receive())
+                .await
+                .expect("the server Hello must not block")
+                .unwrap();
+            assert!(matches!(hello, Message::Hello { .. }));
             writer
                 .send(&hello_message("peer-node", "peer-fp", 5))
                 .await
                 .unwrap();
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(5), reader.receive())
+                .await
+                .expect("the chain request must not block")
+                .unwrap();
             assert!(matches!(
-                reader.receive().await.unwrap(),
+                reply,
                 Message::RequestChain | Message::RequestChainFrom { .. }
             ));
         }

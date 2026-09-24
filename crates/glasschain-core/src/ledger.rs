@@ -184,7 +184,8 @@ impl Ledger {
             .get_or_insert_with(CapabilityHistory::default);
         while self.history_len < self.chain.len() {
             history.validate_block(&self.chain[self.history_len].clone())?;
-            self.history_len += 1;
+            // Saturating: a mutated counter must not wrap or stall the fold.
+            self.history_len = self.history_len.saturating_add(1);
         }
         Ok(())
     }
@@ -207,7 +208,8 @@ impl Ledger {
             for tx in &self.chain[self.ids_len].transactions {
                 ids.insert(tx.id.clone());
             }
-            self.ids_len += 1;
+            // Saturating: a mutated counter must not wrap or stall the fold.
+            self.ids_len = self.ids_len.saturating_add(1);
         }
     }
 

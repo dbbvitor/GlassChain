@@ -159,6 +159,13 @@ impl Block {
             }
             self.nonce = self.nonce.wrapping_add(1);
             self.hash = self.calculate_hash();
+            // A malformed hash can never satisfy the target, so the loop would
+            // spin forever; catch it where it is produced instead.
+            debug_assert_eq!(
+                self.hash.len(),
+                64,
+                "a block hash must be a 64-character SHA-256 hex digest"
+            );
         }
         log::debug!(
             "Block {} mined with nonce {} → {}",

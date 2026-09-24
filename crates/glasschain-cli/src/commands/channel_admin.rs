@@ -120,21 +120,27 @@ async fn execute(
     headers: [(&'static str, String); 4],
 ) -> Result<String> {
     // Retry briefly until the server accepts (a freshly spawned server needs
-    // a moment to bind).
+    // a moment to bind). The outer `timeout` enforces the window on its own,
+    // so a broken retry guard cannot spin forever.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    let channel = loop {
-        match tonic::transport::Endpoint::from_shared(endpoint.to_owned())
-            .expect("valid endpoint")
-            .connect()
-            .await
-        {
-            Ok(channel) => break channel,
-            Err(_e) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let connect = async {
+        loop {
+            match tonic::transport::Endpoint::from_shared(endpoint.to_owned())
+                .expect("valid endpoint")
+                .connect()
+                .await
+            {
+                Ok(channel) => break Ok(channel),
+                Err(_e) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(e) => return Err(anyhow::anyhow!("cannot connect to {endpoint}: {e}")),
             }
-            Err(e) => return Err(anyhow::anyhow!("cannot connect to {endpoint}: {e}")),
         }
     };
+    let channel = tokio::time::timeout(std::time::Duration::from_secs(10), connect)
+        .await
+        .map_err(|_| anyhow::anyhow!("cannot connect to {endpoint}: retry window elapsed"))??;
     let mut client = NodeServiceClient::new(channel);
 
     match op {
@@ -348,6 +354,40 @@ mod tests {
         if let Ok(Err(serve_error)) = server_handle.await {
             panic!("gRPC server failed: {serve_error}");
         }
+    }
+
+    /// A dead endpoint is given up on at the retry deadline, not retried
+    /// forever: the loop guard must be a real deadline.
+    #[tokio::test]
+    async fn execute_gives_up_on_a_dead_endpoint() {
+        let headers = [
+            ("x-glasschain-node", String::new()),
+            ("x-glasschain-auth-ts", String::new()),
+            ("x-glasschain-auth-sig", String::new()),
+            ("x-glasschain-cert", String::new()),
+        ];
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            execute(
+                "http://127.0.0.1:1",
+                &AdminOp::CreateChannel {
+                    name: "pricing".into(),
+                    description: "dead endpoint".into(),
+                    member_ids: Vec::new(),
+                    retention_secs: 0,
+                },
+                headers,
+            ),
+        )
+        .await
+        .expect("the retry loop must not outlive its own safety timeout");
+        assert!(outcome.is_err(), "a dead endpoint cannot be reached");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(8),
+            "the 5 s retry deadline must fire, not the 10 s safety timeout: {:?}",
+            started.elapsed()
+        );
     }
 
     /// `run()` end to end: reads the certificate from disk, parses the seed,

@@ -798,14 +798,16 @@ artifact with `if: always()`. `--no-shuffle` is the tool's default since 27.x.
 Doctests are deliberately *not* skipped (`-- --all-targets` would drop them):
 a mutation caught only by a doctest would otherwise report as missed.
 
-**Survivors fail both mutation gates.** A survivor must be caught/fixed, or
-deliberately skipped with a reason in `.cargo/mutants.toml`'s `exclude_re`
-list (`rg 'mutants-skip:' .cargo/mutants.toml`). The jobs read
-`mutants.out/missed.txt` rather than the exit code, because cargo-mutants
-returns 3 (timeout) in preference to 2 (missed) when a run has both. A
-timeout — a mutant that hangs the suite — is a detection, not a silent
-survivor, and stays non-fatal (the known cases are tracked in
-`.agents/memories/cargo-mutants-footguns.md`).
+**Survivors and timeouts fail both mutation gates.** A mutant must be
+caught/fixed, or deliberately skipped with a reason in `.cargo/mutants.toml`'s
+`exclude_re` list (`rg 'mutants-skip:' .cargo/mutants.toml`). The jobs read
+`mutants.out/missed.txt` as well as the exit code, because cargo-mutants
+returns 3 (timeout) in preference to 2 (missed) when a run has both. The 15
+timeout mutants from the first full run are fixed: a `debug_assert` on the
+block-hash length turns the non-terminating PoW loop into a fast panic,
+the fold counters use `saturating_add`, `parse_args` is iterator-based (no
+index to mis-mutate), and the peer/CLI tests bound their waits. The two demo
+runner timeouts are skipped in `demo/.cargo/mutants.toml`.
 
 `deep-checks.yml` — scheduled, never blocking a PR. Nightly: the Miri matrix
 over six crates, the full mutants run in 16 serial shards, ASan/LSan over the

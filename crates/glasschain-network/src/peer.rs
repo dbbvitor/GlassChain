@@ -144,8 +144,13 @@ mod tests {
             )
             .await
             .unwrap();
+        // Bounded: a size guard that lets the frame through would block on a
+        // body that never arrives.
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), reader.receive())
+            .await
+            .expect("an oversized frame must be rejected, not block on its body");
         assert!(matches!(
-            reader.receive().await,
+            received,
             Err(NetworkError::MessageTooLarge { .. })
         ));
     }
