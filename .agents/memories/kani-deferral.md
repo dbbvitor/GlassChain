@@ -28,10 +28,10 @@ no leverage; tests + mutation for the primitives underneath (ADR-019).
 
 | Surface | Decision code | Verdict |
 |---|---|---|
-| Endorsement policy algebra (`core/endorsement.rs`) | `validate`, `evaluate`, `required_count`, `covers` | Verus (pure policy tree) |
-| Trust score (`core/asset.rs`) | `MetadataTrustScore::compute`, `is_valid_iso8601_date` | Verus (bounded ints; Kani has parity today) |
+| Endorsement policy algebra (`core/endorsement.rs`) | `validate`, `evaluate`, `required_count`, `covers` | **Neither tool today** (evidence below) — tests + mutation |
+| Trust score (`core/asset.rs`) | `MetadataTrustScore::compute`, `is_valid_iso8601_date` | Verus — score arithmetic proved 2026-09-24 (`asset::trust_proofs`: exact 20/10 formula, `<= 100`, standard gate); Kani keeps the ISO-8601 structural parity |
 | BFT quorum/bitmap/context (`core/{bft,consensus}.rs`) | `QuorumCertificate::validate`, `verify_certificate`, vote/context messages | Verus — quorum/bitmap kernels proved 2026-09-24 (`proof_arith` in `bft.rs`); context framing deferred (panic-on-length-cast path); BLS assumed |
-| TOFU pin transition (`network/node.rs`) | `PeerRegistry::verify_or_register` | Verus (HashMap state machine; ed25519 assumed) |
+| TOFU pin transition (`network/node.rs`) | `PeerRegistry::verify_or_register` → `core::pin::decide` | Verus — `spec_decide` gate proved 2026-09-24 (`pin.rs`: poisoned/NodeId/Org reject, rotate only with a valid proof under the pinned key); ed25519 assumed |
 | Private-payload gate (`network/node.rs`) | `private_peer_trusted`, `payload_targets`, `Channel::is_member` | Verus (membership conjunction; hash assumed) |
 | Channel/membership rules (`identity/channel.rs`, `msp_policy`) | `is_member`, height-bounded authorization | Verus (modulo ed25519) |
 | OCSP DER codec (`identity/ocsp.rs`) | `minimal_be`, `read_tlv`, `read_generalized` | Kani (slices/parsers) — `minimal_be`/`read_tlv` proved |
@@ -113,7 +113,47 @@ functions is supported, but no harness has needed it yet.
 - Verus is the tool for the zero-trust modules in the table above (#170
   roadmap); Kani picks up what Verus cannot model.
 
+## Endorsement policy algebra: neither tool today (2026-09-24)
+
+The zero-trust policy tree (`PolicyExpression::{validate, evaluate,
+required_count}`) was attempted in both tools. Evidence:
+
+- **Verus**: `Principal` and `PolicyExpression` are serde-derived types
+  declared outside `verus!`. Specs cannot pattern-match an external type —
+  `#[verifier::external_type_specification]` + `external_body` makes it
+  opaque ("pattern constructor for an opaque datatype") — and declaring the
+  types inside `verus!` instead makes Verus ICE on serde's generated
+  `deserialize::visit_enum` items (`VerusErasureCtxt has not been
+  initialized`). Making `vstd` unconditional in `glasschain-core` was tried
+  for this and reverted. Revisit path: hand-written `Serialize`/`Deserialize`
+  impls in a `verus!`-declared enum (wire format pinned by the existing
+  round-trip tests), or an upstream fix.
+- **Kani**: construction alone hangs CBMC. A harness that only builds
+  `PolicyExpression::NOutOf { required: 1, rules: vec![signed_by("org-a")] }`
+  and calls `required_count()` does not finish in 120s; a leaf-only
+  `SignedBy` harness verifies in 0.38s. The recursive heap tree
+  (`Vec<Self>` + `String` fields + recursive drop glue) is beyond CBMC, the
+  same limit class as the symbolic `Option<String>` blow-up above.
+- **HashSet**: the production `evaluate` signature takes `&HashSet<Principal>`,
+  which would additionally need vstd's key-model assumption
+  (`assume(obeys_key_model::<Principal>())`, sanctioned by vstd for custom
+  keys) — against the no-cheat gate — and a `HashSet` probe timed out at
+  600s under Kani.
+
+What the attempt did buy: an unvalidated `NOutOf { required: 0, rules: [...] }`
+evaluated **true** (zero-of-n is an allow-all shape) because the guard only
+covered empty rules. `evaluate` now fails closed on `required == 0`, pinned
+by `test_zero_required_never_evaluates_true`.
+
 ## Verus toolchain notes
+
+- Proved modules: `glasschain-vm` gas, `glasschain-core` BFT
+  quorum/bitmap (`bft::proof_arith`), `glasschain-core` TOFU pin decision
+  (`pin`, with `spec_decide` as the total model the exec function is proved
+  equal to), and `glasschain-core` trust-score arithmetic
+  (`asset::trust_proofs`: `trust_score_value` sums 20/10-point flags and
+  `is_standard_score` is the ≥80 gate). `vstd` is unconditional in
+  `glasschain-core` now that non-`bft` modules need it.
 
 - Verified with the pinned release `0.2026.09.20.aef82ed`;
   `cargo verus verify -p glasschain-vm -p glasschain-core --all-features

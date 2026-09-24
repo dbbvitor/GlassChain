@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-09-21
-**Revised:** 2026-09-24 — Kani and Verus moved to PR/push `ci.yml` jobs; Verus-first zero-trust assignment with the BFT quorum/bitmap slice proved; autoharness deferral
+**Revised:** 2026-09-24 — Kani and Verus moved to PR/push `ci.yml` jobs; Verus-first zero-trust assignment with the BFT quorum/bitmap, TOFU pin and trust-score slices proved; endorsement algebra deferred on both tools with evidence; autoharness deferral
 **Decision owner:** project owner
 **Relates to:**
 [ADR-015](adr-015-audited-c-crypto-backends.md) (audited backends / dependency evidence) ·
@@ -110,18 +110,27 @@ it — Verus whenever possible, Kani where Verus has no leverage, tests +
 mutation for the crypto primitives underneath:
 
 - **Verus is the primary tool** for zero-trust decision logic that is pure
-  Rust: endorsement policy algebra, trust-score arithmetic, BFT
-  quorum/bitmap rules, the TOFU pin transition, channel membership and the
-  private-payload gate. Verus also owns the critical roadmap (gas → quorum
-  safety → determinism → chain rules → scoring). Two modules are already
-  proved in production form: the vm gas arithmetic, and the BFT
-  quorum/bitmap kernels in `glasschain-core` (`quorum_threshold`,
-  `bitmap_len`/`bitmap_byte`/`bitmap_mask`, `meets_quorum`, and the
-  `bitmap_contains` bounds lemma) — the certificate gate and every signer
-  bitmap access now route through them. Both proof jobs run in `ci.yml` on
-  every PR and push. BFT context-message framing is Kani/mutation territory
-  (it has a panic-on-length-cast path Verus cannot discharge for arbitrary
-  `&str`).
+  Rust: trust-score arithmetic, BFT quorum/bitmap rules, the TOFU pin
+  transition, channel membership and the private-payload gate. Verus also
+  owns the critical roadmap (gas → quorum safety → determinism → chain rules
+  → scoring). Four modules are already proved in production form: the vm gas
+  arithmetic; the BFT quorum/bitmap kernels in `glasschain-core`
+  (`quorum_threshold`, `bitmap_len`/`bitmap_byte`/`bitmap_mask`,
+  `meets_quorum`, and the `bitmap_contains` bounds lemma) — the certificate
+  gate and every signer bitmap access now route through them; the TOFU
+  pin decision (`pin::decide`/`spec_decide`, with `poisoned_always_rejects`,
+  `known_keeps_the_fingerprint` and `rotation_requires_a_valid_proof`) — the
+  network's `PeerRegistry` delegates every Hello's accept/reject/rotate
+  decision to it, and the ed25519 check is reduced to `RotationProof` before
+  the call; and the trust-score arithmetic (`asset::trust_proofs`: the exact
+  20/10-point formula, the `<= 100` bound and the ≥ 80 standard gate).
+  Both proof jobs run in `ci.yml` on every PR and push.
+- **The endorsement policy algebra is deferred on both tools** (Verus cannot
+  pattern-match the serde-derived external enum without an upstream fix;
+  CBMC times out on its recursive heap tree) and stays tests + mutation
+  until a trigger in the table below. BFT context-message framing is
+  Kani/mutation territory by the same panic-on-length-cast reasoning as
+  before.
 - **Kani is the fallback** wherever Verus cannot model the code but CBMC can:
   parsers, byte-framing, and hash-adjacent structural properties. Its
   curated scope today is listed above; the per-surface assignment and its
@@ -142,6 +151,7 @@ mutation for the crypto primitives underneath:
 | Kani expansion | CBMC supports the allocation/intrinsic paths |
 | Kani autoharness sweep | Kani stops killing `goto-instrument` and stops hitting the `catch_unwind` ICE on whole-crate runs |
 | Kani hash-path proofs | a harness needs a hash-adjacent property; `crypto::sha256` is the `#[kani::stub]` seam |
+| Endorsement policy algebra proofs | a tool models the serde-derived recursive enum (Verus upstream fix or hand-written serde in a `verus!` type) or CBMC learns the recursive heap tree |
 | Singular (`integer_ring`) | a ring-equality proof appears **and** Singular 4.3.2 is the installed version (4.4.x is incompatible) |
 | verusdoc | specs must render in rustdoc; verusdoc currently needs Verus built from source |
 | nightly live-mutation triage | the mutants shards' `outcomes.json` show a stable survivor set worth a score gate |
