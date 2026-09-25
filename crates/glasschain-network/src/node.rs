@@ -742,6 +742,22 @@ fn tofu_rejection_message(
 /// Storage-key prefix for persisted TOFU pins (#88).
 const TOFU_PIN_PREFIX: &str = "tofu:peer:";
 
+/// How far in the future a block timestamp may be before it is rejected.
+const FUTURE_TIMESTAMP_WINDOW_SECS: u64 = 7_200;
+
+/// `true` when a block's timestamp is admissible: genesis (index 0, timestamp
+/// 0 by design) is exempt, and every other block may be at most
+/// [`FUTURE_TIMESTAMP_WINDOW_SECS`] ahead of `now_secs`. The exact boundary is
+/// admitted (`block.timestamp == now_secs + window`); one second past it is
+/// not. Pure so the boundary is unit-testable without a wall clock.
+const fn timestamp_within_future_window(
+    block_index: u64,
+    block_timestamp: u64,
+    now_secs: u64,
+) -> bool {
+    block_index == 0 || block_timestamp <= now_secs + FUTURE_TIMESTAMP_WINDOW_SECS
+}
+
 /// Persist a pin through the state seam; a write failure is logged and the
 /// pin stays in memory (the next successful write persists it).
 fn persist_tofu_pin(storage: &Arc<dyn StorageProvider>, listen_addr: &str, peer: &VerifiedPeer) {
@@ -4422,13 +4438,14 @@ async fn process_message(
                     return MessageEffect::default();
                 }
             }
-            // Reject blocks with implausible timestamps (> 2 hours in the future).
-            // Block 0 (genesis) uses timestamp 0 by design and is exempt.
+            // Reject blocks with implausible timestamps (> 2 hours in the
+            // future). Block 0 (genesis) uses timestamp 0 by design and is
+            // exempt.
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            if block.index > 0 && block.timestamp > now_secs + 7_200 {
+            if !timestamp_within_future_window(block.index, block.timestamp, now_secs) {
                 log::warn!(
                     "Rejected block {} from {addr}: timestamp {} is {} seconds in the future",
                     block.index,
@@ -7538,8 +7555,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn future_timestamp_window_is_exact() {
+        let now = 1_700_000_000u64;
+        assert!(
+            timestamp_within_future_window(0, u64::MAX, now),
+            "genesis (index 0) is exempt regardless of timestamp"
+        );
+        assert!(
+            timestamp_within_future_window(1, now + FUTURE_TIMESTAMP_WINDOW_SECS, now),
+            "a block exactly at the window boundary is admitted"
+        );
+        assert!(
+            !timestamp_within_future_window(1, now + FUTURE_TIMESTAMP_WINDOW_SECS + 1, now),
+            "one second past the boundary is rejected"
+        );
+        assert!(timestamp_within_future_window(1, now, now));
+        assert!(timestamp_within_future_window(7, now - 60, now));
+    }
+
     #[tokio::test]
-    async fn block_at_the_future_timestamp_boundary_is_admitted() {
+    async fn block_inside_the_future_window_is_admitted() {
         let node = Node::new("n-ts", "127.0.0.1:0", 1);
         let ctx = peer_context(&node);
         let _rx = install_peer(&node, "127.0.0.1:4445", "org-a", false).await;
@@ -7554,7 +7590,10 @@ mod tests {
             .unwrap()
             .as_secs();
         let mut block = Block::new(1, vec![], genesis);
-        block.timestamp = now_secs + 7_200;
+        // One hour inside the 2-hour window: a wall-clock step between this
+        // read and the admission check cannot flip the outcome. The exact
+        // boundary is unit-tested on `timestamp_within_future_window`.
+        block.timestamp = now_secs + 3_600;
         block.mine(1);
 
         process_message(
@@ -7567,20 +7606,10 @@ mod tests {
             &[],
         )
         .await;
-        // `process_message` reads the wall clock itself; if the clock stepped
-        // backward between the two reads the +2h boundary moved, so the exact
-        // boundary case is not evaluable under a non-monotonic clock.
-        let now_after = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        if now_after < now_secs {
-            return;
-        }
         assert_eq!(
             node.ledger.lock().await.chain.len(),
             2,
-            "a block exactly at the +2h boundary is not 'too far ahead' (before={now_secs}, after={now_after})"
+            "a block inside the +2h window is admitted (now={now_secs})"
         );
     }
 
