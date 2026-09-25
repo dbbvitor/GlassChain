@@ -324,7 +324,10 @@ jobs:
           unzip -q verus.zip
           echo "$PWD/verus-x86-linux" >> "$GITHUB_PATH"
 
-      # The gas module and the BFT quorum/bitmap kernels are the roadmap
-      # modules (#170); more crates join as their annotations land.
+      # The zero-trust modules (#170): gas, BFT quorum/bitmap + certificate
+      # admission, TOFU pin, trust score, MSP height windows. More crates join
+      # as their annotations land.
       - name: Verify the production proofs
-        run: cargo verus verify -p glasschain-vm -p glasschain-core --all-features --locked
+        run: >-
+          cargo verus verify -p glasschain-vm -p glasschain-core -p glasschain-identity
+          --all-features --locked

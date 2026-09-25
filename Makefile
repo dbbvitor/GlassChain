@@ -194,8 +194,9 @@ kani-coverage: ## Kani source-coverage report for the curated harnesses (local g
 	cargo kani -p glasschain-core -p glasschain-identity --default-unwind 16 \
 	  --coverage -Z source-coverage --output-format=terse
 
-verus: ## Verify the zero-trust roadmap (gas + BFT quorum/bitmap proofs)
-	cargo verus verify -p glasschain-vm -p glasschain-core --all-features --locked -- --expand-errors
+verus: ## Verify the zero-trust roadmap (gas, BFT, certificate, TOFU, trust score, MSP heights)
+	cargo verus verify -p glasschain-vm -p glasschain-core -p glasschain-identity --all-features \
+	  --locked -- --expand-errors
 
 llvm-lines: ## Compile-time bloat diagnostic: LLVM IR lines per generic function
 	cargo llvm-lines -p glasschain-core | head -30

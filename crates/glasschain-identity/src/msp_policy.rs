@@ -39,6 +39,114 @@ use glasschain_core::{
 };
 use std::collections::{HashMap, HashSet};
 
+/// Height-window authorization for registry entries, proved in production
+/// form with Verus (ADR-019). The committed bounds are the only authority a
+/// replay has (no wall clock, no mutable CRL): an entry is valid from its
+/// registration height and revoked from its revocation height onward.
+mod authz_proofs {
+    use vstd::prelude::*;
+
+    verus! {
+
+    /// The height-window outcome for one registry entry.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum HeightOutcome {
+        /// The committed window covers this height.
+        Authorized,
+        /// The height precedes registration (`height < valid_from`).
+        NotYetValid,
+        /// The revocation height has been reached (`height >= revoked_at`).
+        Revoked,
+    }
+
+    /// The window decision: registration lower bound first, then the
+    /// go-forward revocation bound.
+    pub open spec fn spec_height_outcome(
+        valid_from: u64,
+        revoked_at: Option<u64>,
+        height: u64,
+    ) -> HeightOutcome {
+        if height < valid_from {
+            HeightOutcome::NotYetValid
+        } else if match revoked_at {
+            Some(revoked) => height >= revoked,
+            None => false,
+        } {
+            HeightOutcome::Revoked
+        } else {
+            HeightOutcome::Authorized
+        }
+    }
+
+    /// Decide the window outcome from the committed bounds.
+    #[must_use]
+    pub const fn height_outcome(
+        valid_from: u64,
+        revoked_at: Option<u64>,
+        height: u64,
+    ) -> (outcome: HeightOutcome)
+        ensures outcome == spec_height_outcome(valid_from, revoked_at, height),
+    {
+        if height < valid_from {
+            return HeightOutcome::NotYetValid;
+        }
+        if let Some(revoked) = revoked_at {
+            if height >= revoked {
+                return HeightOutcome::Revoked;
+            }
+        }
+        HeightOutcome::Authorized
+    }
+
+    /// Authorized means the committed window covers this height exactly.
+    pub proof fn authorized_is_in_window(
+        valid_from: u64,
+        revoked_at: Option<u64>,
+        height: u64,
+    )
+        ensures
+            spec_height_outcome(valid_from, revoked_at, height) == HeightOutcome::Authorized
+                ==> height >= valid_from && match revoked_at {
+                    Some(revoked) => height < revoked,
+                    None => true,
+                },
+    {
+    }
+
+    /// A height before registration is never authorized.
+    pub proof fn registered_before_use(valid_from: u64, revoked_at: Option<u64>, height: u64)
+        ensures
+            height < valid_from ==> spec_height_outcome(
+                valid_from,
+                revoked_at,
+                height,
+            ) == HeightOutcome::NotYetValid,
+    {
+    }
+
+    /// Revocation is go-forward: an entry already past registration that is
+    /// revoked at one height stays revoked at every later height.
+    pub proof fn revoked_stays_revoked(
+        valid_from: u64,
+        revoked: u64,
+        height: u64,
+        later: u64,
+    )
+        requires
+            valid_from <= height,
+            height >= revoked,
+            later >= height,
+        ensures
+            spec_height_outcome(valid_from, Some(revoked), height) == HeightOutcome::Revoked,
+            spec_height_outcome(valid_from, Some(revoked), later) == HeightOutcome::Revoked,
+    {
+    }
+
+    } // verus!
+}
+
+use authz_proofs::{height_outcome, HeightOutcome};
+
 /// Errors from certificate-bound principal registration.
 #[derive(Debug, thiserror::Error)]
 pub enum MspRegistrationError {
@@ -226,22 +334,25 @@ impl EndorsementProvider for MspEndorsementProvider {
                 )));
             }
             // Height-based authorization (#87): the committed decision, not a
-            // current-time check. A key is valid from its registration height
-            // and stops being valid at its revocation height.
-            if height < entry.valid_from {
-                return Err(CoreError::InvalidTransaction(format!(
-                    "endorsement: principal '{}' is not authorized at height {height} \
-                     (valid from {})",
-                    entry.principal.as_str(),
-                    entry.valid_from
-                )));
-            }
-            if entry.revoked_at.is_some_and(|revoked| height >= revoked) {
-                return Err(CoreError::InvalidTransaction(format!(
-                    "endorsement: principal '{}' was revoked at height {}",
-                    entry.principal.as_str(),
-                    entry.revoked_at.expect("checked by is_some_and")
-                )));
+            // current-time check. The verified `authz_proofs` kernel owns the
+            // window semantics (go-forward revocation).
+            match height_outcome(entry.valid_from, entry.revoked_at, height) {
+                HeightOutcome::Authorized => {}
+                HeightOutcome::NotYetValid => {
+                    return Err(CoreError::InvalidTransaction(format!(
+                        "endorsement: principal '{}' is not authorized at height {height} \
+                         (valid from {})",
+                        entry.principal.as_str(),
+                        entry.valid_from
+                    )));
+                }
+                HeightOutcome::Revoked => {
+                    return Err(CoreError::InvalidTransaction(format!(
+                        "endorsement: principal '{}' was revoked at height {}",
+                        entry.principal.as_str(),
+                        entry.revoked_at.expect("checked by is_some_and")
+                    )));
+                }
             }
 
             let Ok(key_bytes) = <[u8; 32]>::try_from(signer.public_key.as_slice()) else {
