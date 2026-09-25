@@ -748,7 +748,8 @@ mod bft_finality_gate_section {
     /// Measures leader-side finality latency (the Step 0 number) and replica
     /// replication lag.
     ///
-    /// NOTE: run with a raised fd limit — the mesh holds ~2·n² sockets:
+    /// NOTE: the meshes hold ~2·n² sockets; CI runs at its 65535-fd hard limit
+    /// and skips the >=200-validator gates. On a larger host:
     /// `ulimit -n 524288 && cargo test ... --ignored --nocapture`.
     #[allow(clippy::too_many_lines)]
     async fn bft_finality_gate(validator_count: usize, txs_per_round: usize, rounds: usize) {
@@ -977,7 +978,7 @@ mod bft_finality_gate_section {
         bft_finality_gate(100, 10, 10).await;
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    #[ignore = "bft finality gate: heavier mesh (~80k sockets); raise the fd limit first"]
+    #[ignore = "bft finality gate: manual-only — the ~80k-socket mesh exceeds the 65535-fd CI runner limit; run on a larger host with `ulimit -n 524288`"]
     async fn bft_finality_gate_200_validators() {
         bft_finality_gate(200, 10, 10).await;
     }

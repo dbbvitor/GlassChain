@@ -414,10 +414,11 @@ jobs:
         run: cargo test -p glasschain-network --test turmoil_chaos --features turmoil-sim --locked
 
   # The ignored capacity/measurement gates run on every PR and push: measured
-  # at ~7 minutes of test time serially (the 300-validator BFT finality gate
-  # is manual-only — its ~180k-socket mesh does not diffuse on a 4-core
-  # runner). Serial so concurrent meshes do not distort the measurements or
-  # starve each other's diffusion.
+  # at ~5 minutes of test time serially. The 200- and 300-validator BFT
+  # finality gates are manual-only: their ~80k/~180k-socket meshes exceed the
+  # 65535-fd hard limit of a GitHub-hosted runner (and the 300-validator mesh
+  # does not diffuse on 4 cores either). Serial so concurrent meshes do not
+  # distort the measurements or starve each other's diffusion.
   gates:
     name: Ignored gates
     runs-on: ubuntu-latest
@@ -440,25 +441,26 @@ jobs:
 
       - name: Capacity and finality gates
         run: |
-          ulimit -n 524288
+          ulimit -n 65535
           cargo test -p glasschain-network --test consensus_capacity --all-features --locked -- \
             --ignored --nocapture --test-threads=1 \
+            --skip bft_finality_gate_200_validators \
             --skip bft_finality_gate_300_validators
 
       - name: TCP partition gates
         run: |
-          ulimit -n 524288
+          ulimit -n 65535
           cargo test -p glasschain-network --test tcp_partition --all-features --locked -- \
             --ignored --nocapture --test-threads=1
 
       - name: Read-path memory gates
         run: |
-          ulimit -n 524288
+          ulimit -n 65535
           cargo test -p glasschain-indexer --test read_path_memory --all-features --locked -- \
             --ignored --nocapture --test-threads=1
 
       - name: Verification cost measurement
         run: |
-          ulimit -n 524288
+          ulimit -n 65535
           cargo test -p glasschain-network --lib --all-features --locked -- \
             --ignored --nocapture --test-threads=1

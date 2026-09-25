@@ -46,9 +46,10 @@ over the workspace. Everything whose measured run fits the 30-minute
 guardrail runs in `ci.yml` on every PR and push instead: Kani (6m33s cold),
 Verus (2m13s cold), the six-crate Miri matrix (long pole `glasschain-core`
 ~19 minutes), turmoil (sub-second) and the `#[ignore]`d capacity/measurement
-gates (~7 minutes of test time, serial under `ulimit -n 524288`). The
-300-validator BFT finality gate is manual-only: its ~180k-socket mesh does
-not diffuse on a 4-core runner (measured >15 minutes).
+gates (~5 minutes of test time, serial under the runner's 65535-fd hard
+limit). The 200- and 300-validator BFT finality gates are manual-only: their
+~80k/~180k-socket meshes exceed that limit, and the 300-validator mesh does
+not diffuse on a 4-core runner either (measured >15 minutes).
 
 Failures surface as **one rolling issue per workflow** (`ci-failure` label):
 `ci-failure-issues.yml` opens or updates it on a scheduled failure and closes
