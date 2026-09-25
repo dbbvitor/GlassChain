@@ -69,3 +69,13 @@ fn read_tlv_never_overreads() {
         }
     }
 }
+
+/// `GeneralizedTime` bodies (`YYYYMMDDHHMMSSZ`) are total over arbitrary
+/// 15-byte input: any parse failure is a rejection, never a panic.
+#[kani::proof]
+fn read_generalized_is_total() {
+    use crate::ocsp::read_generalized;
+
+    let body: [u8; 15] = kani::any();
+    let _ = read_generalized(&body);
+}

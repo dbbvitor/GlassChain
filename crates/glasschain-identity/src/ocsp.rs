@@ -458,7 +458,7 @@ pub(crate) fn parse_staple(der_bytes: &[u8]) -> Result<ParsedStaple<'_>, OcspErr
 }
 
 /// Parse a `YYYYMMDDHHMMSSZ` `GeneralizedTime` body as Unix seconds.
-fn read_generalized(body: &[u8]) -> Result<u64, OcspError> {
+pub(crate) fn read_generalized(body: &[u8]) -> Result<u64, OcspError> {
     let text = std::str::from_utf8(body).map_err(|_| OcspError::Malformed)?;
     let bytes = text.as_bytes();
     if bytes.len() != 15 || !bytes[..14].iter().all(u8::is_ascii_digit) || bytes[14] != b'Z' {

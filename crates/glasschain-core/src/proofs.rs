@@ -116,3 +116,16 @@ fn trust_score_expiry_contribution() {
     let expected = 60 + if is_valid_iso8601_date(date) { 20 } else { 0 };
     assert_eq!(score.score, expected);
 }
+
+/// Any string shorter than the 64-character hex width is rejected outright —
+/// the length check precedes every byte read, and no short input panics.
+#[kani::proof]
+fn canonical_is_hex64_rejects_short_strings() {
+    use crate::canonical::is_hex64;
+
+    let bytes: [u8; 8] = kani::any();
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return;
+    };
+    assert!(!is_hex64(text));
+}

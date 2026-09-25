@@ -531,7 +531,7 @@ fn err(schema_id: &str, message: impl Into<String>) -> CoreError {
     CoreError::InvalidTransaction(format!("canonical record {schema_id}: {}", message.into()))
 }
 
-fn is_hex64(s: &str) -> bool {
+pub(crate) fn is_hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
