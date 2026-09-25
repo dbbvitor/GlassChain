@@ -41,7 +41,10 @@ watcher automation engine, a TLS-encrypted TCP/libp2p P2P layer, and a gRPC API.
   `verus`, `miri`, `turmoil` and `gates` jobs run on every push and PR (each
   measured inside the 30-minute guardrail); `deep-checks.yml` the nightly
   heavy tier (full mutants, ASan/LSan);
-  scheduled failures file a rolling `ci-failure` issue (ADR-019). It is a safety net, not a substitute — run
+  scheduled failures file a rolling `ci-failure` issue (ADR-019). PR checks
+  are diff-scoped to the changed crates plus their reverse-dependency
+  closure (`scripts/affected-crates.sh`); workspace-level files or pushes to
+  main run the full workspace. It is a safety net, not a substitute — run
   the checks below locally before declaring work done, because a cold CI build
   takes minutes.
 

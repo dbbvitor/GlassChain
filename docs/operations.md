@@ -787,6 +787,16 @@ code, default builds the fallbacks, and both must stay green.
 | `verus` | ubuntu | `cargo verus verify -p glasschain-vm -p glasschain-core --all-features --locked` — production-form proofs for the gas arithmetic, the BFT quorum/bitmap kernels and certificate admission, the TOFU pin decision (`glasschain-core/src/pin.rs`), the trust-score arithmetic (`glasschain-core/src/asset.rs`) and the MSP height-window authorization (`glasschain-identity/src/msp_policy.rs`); Verus `0.2026.09.20.aef82ed` from the pinned release zip. A cheat-marker grep (bare `assume(`/`admit(`, `external_body`, `axiom`) runs first so proofs cannot pass vacuously. Warm seconds, 30-minute timeout |
 | `audit` | ubuntu (own workflow: `audit.yml`) | `cargo audit --deny warnings --file Cargo.lock` (RustSec); prebuilt installs via `taiki-e/install-action` |
 
+Both PR workflows **diff-scope** their jobs where the tool allows:
+`scripts/affected-crates.sh` prints the changed crates plus their
+reverse-dependency closure, and package-oriented jobs (clippy, tests,
+cargo-careful, feature matrix, Miri, Kani, Verus, the ignored gates, turmoil)
+run on that set; file-oriented jobs (`typos`, mutation) run on the changed
+files. Workspace-level files (manifests, lockfile, toolchain/lint config,
+`.cargo/`, `.config/`, `.github/`) and pushes to main run the full workspace.
+`cargo fmt`, coverage (the Codecov project gate needs the full report), snarf
+and deny/machete stay whole-workspace by nature.
+
 `analysis.yml` — the blocking PR gate (ADR-019): `cargo machete
 --with-metadata` + `cargo deny --all-features check`, `typos`, `cargo +nightly
 snarf --format github`, `cargo hack check --each-feature`, `cargo +nightly

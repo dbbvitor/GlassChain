@@ -39,6 +39,26 @@ Guardrail: a job whose cold-cache runtime exceeds 20 minutes moves to the
 scheduled workflow. The first measurement (PR #175) kept every job in place;
 the slowest was the cache-line layout at ~6.5 minutes.
 
+### Diff-scoped PR checks
+
+Every PR check runs over the diff where its tool allows, so a leaf-crate PR
+does not pay for the whole workspace:
+
+- **File-oriented** gates run on the changed files: `typos` and the mutation
+  `--in-diff` job.
+- **Package-oriented** gates run on the changed crates plus their
+  reverse-dependency closure (`scripts/affected-crates.sh`): clippy, the test
+  matrix, cargo-careful, the feature matrix, Miri, Kani, Verus, the ignored
+  gates and turmoil.
+- **Workspace-level files** (manifests, lockfile, toolchain/lint config,
+  `.cargo/`, `.config/`, `.github/`) switch every gate back to the full
+  workspace, and pushes to main always run full — main is verified end to end
+  after merge.
+- **Whole-workspace by nature**: `cargo fmt` (module-aware and ~13s), the
+  coverage job (the Codecov project gate needs the complete report; patch
+  coverage is Codecov's own diff status), snarf (whole-program analysis) and
+  deny/machete (lockfile-wide).
+
 ### Scheduled deep checks — `deep-checks.yml`
 
 Nightly: the full mutants run over all 12 crates in 16 shards, and ASan/LSan

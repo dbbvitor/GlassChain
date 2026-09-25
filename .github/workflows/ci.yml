@@ -42,6 +42,43 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The PR diff's affected packages: changed crates plus every crate that
+  # depends on them (reverse-dependency closure), so package-scoped checks
+  # never miss a dependent. `ALL` (workspace-level file or non-PR event) runs
+  # the full workspace; `NONE` (no crate touched) skips the package jobs.
+  # Pushes to main run full — main is verified end to end after merge.
+  changes:
+    name: Affected packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      packages: ${{ steps.affected.outputs.packages }}
+      cargo_flags: ${{ steps.affected.outputs.cargo_flags }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The diff needs the merge base with the target branch.
+          fetch-depth: 0
+
+      - name: Compute affected packages
+        id: affected
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="origin/${{ github.base_ref }}"
+          else
+            base="HEAD~1"
+          fi
+          packages=$(scripts/affected-crates.sh "$base")
+          flags=$(scripts/affected-crates.sh "$base" --cargo-flags)
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            packages=ALL
+            flags=--workspace
+          fi
+          echo "packages=$packages" >> "$GITHUB_OUTPUT"
+          echo "cargo_flags=$flags" >> "$GITHUB_OUTPUT"
+          echo "affected: $packages"
+
   # DCO (Silver `1.dco`): every PR commit must carry a `Signed-off-by` line
   # matching its author. Contributors run `git commit -s`; a missing sign-off
   # is fixed with `git commit --amend -s`. Bot-authored commits (Dependabot,
@@ -97,6 +134,8 @@ jobs:
 
   clippy:
     name: Clippy
+    needs: changes
+    if: needs.changes.outputs.packages != 'NONE'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -123,12 +162,16 @@ jobs:
           shared-key: rust-cache
           cache-on-failure: true
 
+      # Scoped to the affected packages (the diff plus their dependents).
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: >-
+          cargo clippy ${{ needs.changes.outputs.cargo_flags }}
+          --all-targets --all-features --locked -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})
-    needs: [fmt]
+    needs: [changes, fmt]
+    if: needs.changes.outputs.packages != 'NONE' 
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -176,7 +219,9 @@ jobs:
           tool: cargo-nextest
 
       - name: Run all tests
-        run: cargo nextest run --profile ci --workspace --lib --bins --tests --all-features --locked
+        run: >-
+          cargo nextest run --profile ci ${{ needs.changes.outputs.cargo_flags }}
+          --lib --bins --tests --all-features --locked
 
       - name: Upload test results to Codecov
         if: ${{ !cancelled() && env.CODECOV_TOKEN != '' }}
@@ -185,6 +230,8 @@ jobs:
           token: ${{ env.CODECOV_TOKEN }}
           files: target/nextest/ci/junit.xml
 
+  # Full workspace on purpose: the Codecov project gate needs the complete
+  # report; patch coverage is Codecov's own diff-scoped status.
   coverage:
     name: Code coverage
     needs: test
@@ -250,6 +297,11 @@ jobs:
   # .agents/memories/kani-deferral.md).
   kani:
     name: Kani proofs
+    needs: changes
+    if: >-
+      needs.changes.outputs.packages == 'ALL' ||
+      contains(needs.changes.outputs.packages, 'glasschain-core') ||
+      contains(needs.changes.outputs.packages, 'glasschain-identity')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -299,6 +351,12 @@ jobs:
   # weekly deep-checks Verus job was retired with this move.
   verus:
     name: Verus proofs
+    needs: changes
+    if: >-
+      needs.changes.outputs.packages == 'ALL' ||
+      contains(needs.changes.outputs.packages, 'glasschain-core') ||
+      contains(needs.changes.outputs.packages, 'glasschain-identity') ||
+      contains(needs.changes.outputs.packages, 'glasschain-vm')
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -339,6 +397,17 @@ jobs:
   # retired.
   miri:
     name: Miri (${{ matrix.crate }})
+    needs: changes
+    # The six-crate allowlist runs when the diff (plus dependents) touches any
+    # of it; a leaf crate outside the list skips the matrix entirely.
+    if: >-
+      needs.changes.outputs.packages == 'ALL' ||
+      contains(needs.changes.outputs.packages, 'glasschain-core') ||
+      contains(needs.changes.outputs.packages, 'glasschain-contracts') ||
+      contains(needs.changes.outputs.packages, 'glasschain-indexer') ||
+      contains(needs.changes.outputs.packages, 'glasschain-workflows') ||
+      contains(needs.changes.outputs.packages, 'glasschain-storage') ||
+      contains(needs.changes.outputs.packages, 'glasschain-sdk')
     runs-on: ubuntu-latest
     timeout-minutes: 40
     strategy:
@@ -392,6 +461,10 @@ jobs:
   # deep-checks leg was retired.
   turmoil:
     name: Turmoil chaos
+    needs: changes
+    if: >-
+      needs.changes.outputs.packages == 'ALL' ||
+      contains(needs.changes.outputs.packages, 'glasschain-network')
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -421,6 +494,11 @@ jobs:
   # distort the measurements or starve each other's diffusion.
   gates:
     name: Ignored gates
+    needs: changes
+    if: >-
+      needs.changes.outputs.packages == 'ALL' ||
+      contains(needs.changes.outputs.packages, 'glasschain-network') ||
+      contains(needs.changes.outputs.packages, 'glasschain-indexer')
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
