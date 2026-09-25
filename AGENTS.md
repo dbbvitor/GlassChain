@@ -37,11 +37,11 @@ watcher automation engine, a TLS-encrypted TCP/libp2p P2P layer, and a gRPC API.
   Linux-only build-twice hash verification), and `release.yml` (on `v*` tags:
   cargo-auditable build, CycloneDX SBOMs, git-cliff notes, Cosign keyless
   signing). `analysis.yml` adds the blocking PR gates (machete, deny, typos,
-  snarf, cargo-hack, cargo-careful, diff mutants); `ci.yml`'s `kani` and
-  `verus` jobs run the curated proofs on every push and PR; `deep-checks.yml`
-  the scheduled tiers (miri, full mutants, ASan/LSan, the ignored
-  gates, turmoil); scheduled failures file a rolling `ci-failure` issue
-  (ADR-019). It is a safety net, not a substitute — run
+  snarf, cargo-hack, cargo-careful, diff mutants); `ci.yml`'s `kani`,
+  `verus`, `miri`, `turmoil` and `gates` jobs run on every push and PR (each
+  measured inside the 30-minute guardrail); `deep-checks.yml` the nightly
+  heavy tier (full mutants, ASan/LSan);
+  scheduled failures file a rolling `ci-failure` issue (ADR-019). It is a safety net, not a substitute — run
   the checks below locally before declaring work done, because a cold CI build
   takes minutes.
 

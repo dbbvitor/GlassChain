@@ -41,10 +41,14 @@ the slowest was the cache-line layout at ~6.5 minutes.
 
 ### Scheduled deep checks — `deep-checks.yml`
 
-Nightly: Miri over the six-crate allowlist (per-crate skips, strict flags);
-the full mutants run over all 12 crates in 16 shards; ASan/LSan over the
-workspace. Weekly Monday: the 13 `#[ignore]`d measurement and capacity gates
-under `ulimit -n 65535`, and the turmoil determinism scenario.
+Nightly: the full mutants run over all 12 crates in 16 shards, and ASan/LSan
+over the workspace. Everything whose measured run fits the 30-minute
+guardrail runs in `ci.yml` on every PR and push instead: Kani (6m33s cold),
+Verus (2m13s cold), the six-crate Miri matrix (long pole `glasschain-core`
+~19 minutes), turmoil (sub-second) and the `#[ignore]`d capacity/measurement
+gates (~7 minutes of test time, serial under `ulimit -n 524288`). The
+300-validator BFT finality gate is manual-only: its ~180k-socket mesh does
+not diffuse on a 4-core runner (measured >15 minutes).
 
 Failures surface as **one rolling issue per workflow** (`ci-failure` label):
 `ci-failure-issues.yml` opens or updates it on a scheduled failure and closes
@@ -178,10 +182,13 @@ CBMC-blocked codec harnesses — are tracked as technical debt in
   panics and boundary violations in minutes — and only then invest in specs.
   Proof code is code: it decays when the implementation moves, so every
   proved module keeps its tests and mutation coverage.
-- Both proof jobs run on PRs because they measured inside the guardrail
-  (cold: Verus 2m13s, Kani 6m33s). If the Kani harness set approaches the
-  30-minute cap, Kani moves back to `deep-checks.yml` first; Verus stays on
-  PRs.
+- Kani, Verus, Miri, turmoil and the ignored gates run on PRs because they
+  measured inside the 30-minute guardrail (cold: Verus 2m13s, Kani 6m33s;
+  Miri's long pole ~19 minutes; turmoil sub-second; gates ~7 minutes test
+  time). If the Kani harness set approaches the cap, Kani moves back to
+  `deep-checks.yml` first. The full mutants run stays nightly (16 runners
+  would duplicate the diff job on every PR) and ASan/LSan stays nightly (its
+  cold `-Zbuild-std` build exceeds 50 minutes).
 - Contributors run `make ci` before a PR; the raw equivalents stay in
   `AGENTS.md`/`CONTRIBUTING.md`. Deep tooling is opt-in locally and pinned in
   the scheduled workflow.

@@ -780,6 +780,9 @@ code, default builds the fallbacks, and both must stay green.
 | `fmt` / `clippy` | ubuntu | `cargo fmt --all --check`; clippy with `RUSTFLAGS=-D warnings` |
 | `test` | **matrix ubuntu / macOS / Windows** | `cargo nextest run --profile ci --workspace --lib --bins --tests --all-features` with `RUSTFLAGS=-D warnings`, `RUSTDOCFLAGS=-D warnings` — process-per-test isolation; loopback ports come from the shared per-process band allocator (`tests/common/ports.rs`), so no cross-test port race |
 | `coverage` | ubuntu | `cargo llvm-cov nextest --profile ci … --lcov` (nextest integration; benches excluded like the test job), upload to Codecov when a token exists. Verified at 94.18% line coverage before the tarpaulin → llvm-cov flip (ADR-019) |
+| `miri` | matrix: 6 crates | `cargo +nightly-2026-09-20 miri test -p <crate> --lib` with `-Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check`, no `-Zmiri-ignore-leaks`; per-crate skips. Measured: core ~19 min, the rest <2 min. Moved from nightly `deep-checks.yml` (ADR-019) |
+| `turmoil` | ubuntu | `cargo test -p glasschain-network --test turmoil_chaos --features turmoil-sim --locked` — deterministic partition/repair; measured ~0.2 s of test time. Moved from weekly `deep-checks.yml` |
+| `gates` | ubuntu | the `#[ignore]`d capacity/measurement gates (`consensus_capacity`, `tcp_partition`, `read_path_memory`, the network cost measurement) under `ulimit -n 524288`, serial (`--test-threads=1`) so concurrent meshes do not distort them; `bft_finality_gate_300_validators` is skipped (manual-only, ~180k sockets). Measured ~7 min test time. Moved from weekly `deep-checks.yml` |
 | `kani` | ubuntu | `cargo kani -p glasschain-core -p glasschain-identity --default-unwind 16 --output-format=terse --sarif kani.sarif -Z concrete-playback --concrete-playback=print` — curated proofs for the core predicate surface and the identity zero-trust byte surfaces; SARIF on the Code Scanning tab. Warm 2m40s, 30-minute timeout. `cargo kani autoharness` is deliberately not a step (0.68.0 kills `goto-instrument`; evidence in `.agents/memories/kani-deferral.md`) |
 | `verus` | ubuntu | `cargo verus verify -p glasschain-vm -p glasschain-core --all-features --locked` — production-form proofs for the gas arithmetic, the BFT quorum/bitmap kernels and certificate admission, the TOFU pin decision (`glasschain-core/src/pin.rs`), the trust-score arithmetic (`glasschain-core/src/asset.rs`) and the MSP height-window authorization (`glasschain-identity/src/msp_policy.rs`); Verus `0.2026.09.20.aef82ed` from the pinned release zip. A cheat-marker grep (bare `assume(`/`admit(`, `external_body`, `axiom`) runs first so proofs cannot pass vacuously. Warm seconds, 30-minute timeout |
 | `audit` | ubuntu (own workflow: `audit.yml`) | `cargo audit --deny warnings --file Cargo.lock` (RustSec); prebuilt installs via `taiki-e/install-action` |
@@ -812,13 +815,12 @@ the fold counters use `saturating_add`, `parse_args` is iterator-based (no
 index arithmetic to mutate), and the peer/CLI tests bound their waits. The two demo
 runner timeouts are skipped in `demo/.cargo/mutants.toml`.
 
-`deep-checks.yml` — scheduled, never blocking a PR. Nightly: the Miri matrix
-over six crates, the full mutants run in 16 serial shards, ASan/LSan over the
-workspace. Weekly Monday: the 13 `#[ignore]`d capacity/measurement gates under
-`ulimit -n 65535`, and the turmoil deterministic partition scenario (`cargo
-test -p glasschain-network --test turmoil_chaos --features turmoil-sim`).
-Kani and Verus moved to `ci.yml`'s blocking jobs (scope and evidence in
-`.agents/memories/kani-deferral.md`).
+`deep-checks.yml` — nightly, never blocking a PR: the full mutants run in 16
+serial shards and ASan/LSan over the workspace. Everything whose measured
+run fits the 30-minute guardrail moved to `ci.yml`'s blocking jobs — Kani,
+Verus, the six-crate Miri matrix, turmoil and the ignored
+capacity/measurement gates (scope and evidence in
+`.agents/memories/kani-deferral.md` and ADR-019).
 
 `ci-failure-issues.yml` — turns a scheduled failure into one rolling issue per
 workflow (`ci-failure` label) and closes it on the next green run. `fuzz.yml`,

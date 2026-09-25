@@ -33,8 +33,9 @@ A first build pulls `wasmtime`, `libp2p`, and `tonic` — expect several minutes
 
 The blocking PR gates (`analysis.yml`: dependency hygiene, spelling, snarf,
 feature matrix, cargo-careful, diff mutants; `ci.yml`: the curated Kani and
-Verus proofs) and the scheduled deep checks (`deep-checks.yml`: miri, full
-mutants, ASan/LSan) are documented in
+Verus proofs, the six-crate Miri matrix, the turmoil scenario and the ignored
+capacity/measurement gates) and the nightly deep checks (`deep-checks.yml`:
+full mutants, ASan/LSan) are documented in
 [ADR-019](docs/adr/adr-019-analysis-stack.md).
 
 ## Before opening a pull request

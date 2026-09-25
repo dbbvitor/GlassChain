@@ -331,3 +331,134 @@ jobs:
         run: >-
           cargo verus verify -p glasschain-vm -p glasschain-core -p glasschain-identity
           --all-features --locked
+
+  # Miri runs on every PR and push (ADR-019): six crates, strict flags, leaks
+  # are failures. Measured locally, the long pole is glasschain-core at ~19
+  # minutes; the other five legs finish under two. The matrix wall-clock stays
+  # inside the 30-minute guardrail, so the nightly deep-checks Miri matrix was
+  # retired.
+  miri:
+    name: Miri (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - glasschain-core
+          - glasschain-contracts
+          - glasschain-indexer
+          - glasschain-workflows
+          - glasschain-storage
+          - glasschain-sdk
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install nightly Rust with miri
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          # Dated, not `nightly`: a moving toolchain invalidates the
+          # rust-cache every run (wayfinder #167).
+          toolchain: nightly-2026-09-20
+          components: miri
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: miri-${{ matrix.crate }}
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      # Strict flags (wayfinder #153), no `-Zmiri-ignore-leaks`: the `Cow`
+      # schema-hash fix removed the only known leak. Default features only;
+      # FFI crates (blst, wasmtime, ring) cannot run under Miri.
+      - name: Run Miri
+        env:
+          MIRIFLAGS: >-
+            -Zmiri-disable-isolation
+            -Zmiri-strict-provenance
+            -Zmiri-symbolic-alignment-check
+        run: |
+          cargo +nightly-2026-09-20 miri test -p ${{ matrix.crate }} --lib -- \
+            --skip wasm \
+            --skip test_pending_pool_bound_rejects_and_drains \
+            --skip test_slice_quota_spreads_a_burst_across_rounds \
+            --skip ledger_default_uses_the_workspace_difficulty \
+            --skip test_d3_index_semantics_match_full_rebuild_after_history_growth
+
+  # The deterministic partition/repair scenario runs on every PR and push:
+  # measured at ~0.2 s of test time (21 s including the build), so the weekly
+  # deep-checks leg was retired.
+  turmoil:
+    name: Turmoil chaos
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.98.1
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: turmoil
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      - name: Run the deterministic chaos scenario
+        run: cargo test -p glasschain-network --test turmoil_chaos --features turmoil-sim --locked
+
+  # The ignored capacity/measurement gates run on every PR and push: measured
+  # at ~7 minutes of test time serially (the 300-validator BFT finality gate
+  # is manual-only — its ~180k-socket mesh does not diffuse on a 4-core
+  # runner). Serial so concurrent meshes do not distort the measurements or
+  # starve each other's diffusion.
+  gates:
+    name: Ignored gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.98.1
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: gates
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      - name: Capacity and finality gates
+        run: |
+          ulimit -n 524288
+          cargo test -p glasschain-network --test consensus_capacity --all-features --locked -- \
+            --ignored --nocapture --test-threads=1 \
+            --skip bft_finality_gate_300_validators
+
+      - name: TCP partition gates
+        run: |
+          ulimit -n 524288
+          cargo test -p glasschain-network --test tcp_partition --all-features --locked -- \
+            --ignored --nocapture --test-threads=1
+
+      - name: Read-path memory gates
+        run: |
+          ulimit -n 524288
+          cargo test -p glasschain-indexer --test read_path_memory --all-features --locked -- \
+            --ignored --nocapture --test-threads=1
+
+      - name: Verification cost measurement
+        run: |
+          ulimit -n 524288
+          cargo test -p glasschain-network --lib --all-features --locked -- \
+            --ignored --nocapture --test-threads=1
