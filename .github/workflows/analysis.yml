@@ -116,7 +116,8 @@ jobs:
             typos
             exit 0
           fi
-          mapfile -t files < <(git diff --name-only "origin/${{ github.base_ref }}...HEAD")
+          # Deleted paths would be passed to typos as missing files.
+          mapfile -t files < <(git diff --name-only --diff-filter=ACMR "origin/${{ github.base_ref }}...HEAD")
           if [ "${#files[@]}" -eq 0 ]; then
             echo "no changed files"
             exit 0
