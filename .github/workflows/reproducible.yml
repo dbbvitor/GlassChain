@@ -64,28 +64,25 @@ jobs:
         with:
           tool: cargo-auditable
 
-      # The isolated build dirs are what is cached; the default `target` dir
-      # is never written here.
-      - name: Cache build directories
+      - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ github.job }}
           shared-key: rust-cache
-          cache-targets: false
-          cache-directories: |-
-            target-a
-            target-b
           cache-on-failure: true
 
-      - name: Build twice in isolated target dirs
+      # Both builds must use the *same* target directory: release artifacts
+      # embed their output paths (`.d` files, rlib metadata), so two isolated
+      # dirs can never match bit-for-bit. `cargo clean` between the passes
+      # makes the second build fully cold — the comparison is
+      # cached-then-rebuilt vs rebuilt, over the exact path release.yml uses.
+      - name: Build twice, compare hashes
         run: |
-          CARGO_TARGET_DIR=target-a cargo auditable build --release --locked
-          CARGO_TARGET_DIR=target-b cargo auditable build --release --locked
-
-      - name: Compare artifact hashes
-        run: |
-          (cd target-a/release && find . -maxdepth 1 -type f | sort | xargs sha256sum) > /tmp/hashes-a
-          (cd target-b/release && find . -maxdepth 1 -type f | sort | xargs sha256sum) > /tmp/hashes-b
+          cargo auditable build --release --locked
+          (cd target/release && find . -maxdepth 1 -type f | sort | xargs sha256sum) > /tmp/hashes-a
+          cargo clean
+          cargo auditable build --release --locked
+          (cd target/release && find . -maxdepth 1 -type f | sort | xargs sha256sum) > /tmp/hashes-b
           if ! diff -u /tmp/hashes-a /tmp/hashes-b; then
             echo "::error::Release artifacts are not bit-for-bit reproducible; see the hash diff above."
             exit 1
