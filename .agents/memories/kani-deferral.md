@@ -10,12 +10,14 @@ cargo kani -p glasschain-core -p glasschain-identity --default-unwind 16 \
   -Z concrete-playback --concrete-playback=print
 ```
 
-Five harnesses verify (measured warm, 2m40s for both crates):
+Seven harnesses verify (measured warm, ~3 min for both crates):
 
 - `glasschain-core`: ISO-8601 structural check, allocation-free proof-of-work
-  prefix predicate, expiry-date trust-score contribution.
-- `glasschain-identity`: `ocsp::minimal_be` (serial comparison) and
-  `ocsp::read_tlv` (DER framing never over-reads).
+  prefix predicate, expiry-date trust-score contribution, and
+  `canonical_is_hex64_rejects_short_strings` (the 64-character width gate).
+- `glasschain-identity`: `ocsp::minimal_be` (serial comparison),
+  `ocsp::read_tlv` (DER framing never over-reads), and
+  `ocsp::read_generalized` (a `GeneralizedTime` body is total).
 
 Local helpers: `make kani` (same command), `make kani-coverage`
 (`--coverage -Z source-coverage`, writes `target/kani/**/kanicov_*` JSON for
@@ -30,10 +32,11 @@ no leverage; tests + mutation for the primitives underneath (ADR-019).
 |---|---|---|
 | Endorsement policy algebra (`core/endorsement.rs`) | `validate`, `evaluate`, `required_count`, `covers` | **Neither tool today** (evidence below) — tests + mutation |
 | Trust score (`core/asset.rs`) | `MetadataTrustScore::compute`, `is_valid_iso8601_date` | Verus — score arithmetic proved 2026-09-24 (`asset::trust_proofs`: exact 20/10 formula, `<= 100`, standard gate); Kani keeps the ISO-8601 structural parity |
-| BFT quorum/bitmap/context (`core/{bft,consensus}.rs`) | `QuorumCertificate::validate`, `verify_certificate`, vote/context messages | Verus — quorum/bitmap kernels proved 2026-09-24 (`proof_arith` in `bft.rs`); context framing deferred (panic-on-length-cast path); BLS assumed |
+| BFT quorum/bitmap/context (`core/{bft,consensus}.rs`) | `QuorumCertificate::validate`, `verify_certificate`, vote/context messages | Verus — quorum/bitmap kernels (`bft::proof_arith`) and certificate admission (`consensus::cert_proofs`: acceptance iff names the block and is degenerate-or-complete) proved 2026-09-24; context framing and the round-loop state machine deferred; BLS assumed |
 | TOFU pin transition (`network/node.rs`) | `PeerRegistry::verify_or_register` → `core::pin::decide` | Verus — `spec_decide` gate proved 2026-09-24 (`pin.rs`: poisoned/NodeId/Org reject, rotate only with a valid proof under the pinned key); ed25519 assumed |
 | Private-payload gate (`network/node.rs`) | `private_peer_trusted`, `payload_targets`, `Channel::is_member` | Verus (membership conjunction; hash assumed; `HashMap`/`HashSet<String>` state will need the key-model assumption below) |
-| Channel/membership rules (`identity/channel.rs`, `msp_policy`) | `is_member`, height-bounded authorization | Verus (modulo ed25519; `member_set: HashSet<String>` — same key-model cost) |
+| MSP height-window authorization (`identity/msp_policy.rs`) | `MspEndorsementProvider::evaluate` bounds checks | Verus — `authz_proofs` proved 2026-09-24 (registered-before-use, go-forward revocation); ed25519 assumed |
+| Channel membership (`identity/channel.rs`) | `Channel::is_member` | Planned (trivial `HashSet` membership; `HashSet<String>` needs the key-model cost) — see #176 |
 | OCSP DER codec (`identity/ocsp.rs`) | `minimal_be`, `read_tlv`, `read_generalized` | Kani (slices/parsers) — `minimal_be`/`read_tlv` proved |
 | Signed message encoders (`identity/possession.rs`) | `org_possession_message`, `tofu_pin_message`, `msp_registration_message` | Kani attempted; CBMC times out (below) — tests + mutation |
 | Canonical record rules (`core/canonical.rs`) | `is_hex64`, `is_present`, `matches_type`, `validate_record_with` | Kani (predicates); JSON/`format!` body deferred |
@@ -46,6 +49,27 @@ no leverage; tests + mutation for the primitives underneath (ADR-019).
 - Bounded symbolic heap: one symbolic dimension (e.g. the eight digits of a
   date) with concrete allocations everywhere else.
 - `read_tlv` with a symbolic buffer length: pure slice arithmetic, 10s.
+- `read_generalized` on a fully symbolic 15-byte body: fast (the time-crate
+  conversions are oracle-free arithmetic).
+- Short-string width gates on heap-free predicates (`is_hex64`).
+
+## Manual codec safety battery (2026-09-24)
+
+The zero-annotation autoharness tier is toolchain-blocked (below), so the
+substitute is hand-written panic-freedom harnesses over untrusted-input
+codecs. Two landed; four targets are blocked with evidence:
+
+- **`wire::base64_decode`**: CBMC cannot finish the base64 engine even at a
+  4-symbolic-byte input (`status 15`). Stubbing the engine would make the
+  harness vacuous.
+- **`ocsp::parse_staple`**: the nested `read_sequence` `Vec` allocations over
+  symbolic bytes hang CBMC at 4 and 8 bytes. `read_tlv` (the single-element
+  core) stays the verified unit.
+- **64-byte `is_hex64` exactness**: symbolic UTF-8 validation over 64 bytes
+  hangs; the cheap, useful half is the short-input rejection harness.
+- **`verify_ed25519` shape gate**: even though a ≤8-byte key makes the dalek
+  call unreachable at runtime, its codegen kills `goto-instrument` (the same
+  kill as autoharness). The gate stays test/mutation-pinned.
 
 ## Autoharness: not a gate
 
@@ -148,12 +172,15 @@ by `test_zero_required_never_evaluates_true`.
 ## Verus toolchain notes
 
 - Proved modules: `glasschain-vm` gas, `glasschain-core` BFT
-  quorum/bitmap (`bft::proof_arith`), `glasschain-core` TOFU pin decision
-  (`pin`, with `spec_decide` as the total model the exec function is proved
-  equal to), and `glasschain-core` trust-score arithmetic
-  (`asset::trust_proofs`: `trust_score_value` sums 20/10-point flags and
-  `is_standard_score` is the ≥80 gate). `vstd` is unconditional in
-  `glasschain-core` now that non-`bft` modules need it.
+  quorum/bitmap (`bft::proof_arith`), certificate admission
+  (`consensus::cert_proofs`: acceptance iff the certificate names the block
+  and is degenerate-or-complete), the TOFU pin decision (`pin`, with
+  `spec_decide` as the total model the exec function is proved equal to),
+  trust-score arithmetic (`asset::trust_proofs`: `trust_score_value` sums
+  20/10-point flags and `is_standard_score` is the ≥80 gate), and the MSP
+  height-window authorization (`identity/msp_policy.rs::authz_proofs`).
+  `vstd` is unconditional in `glasschain-core` (and now `glasschain-identity`)
+  now that non-`bft` modules need it.
 
 - Verified with the pinned release `0.2026.09.20.aef82ed`;
   `cargo verus verify -p glasschain-vm -p glasschain-core --all-features

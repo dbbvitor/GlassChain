@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-09-21
-**Revised:** 2026-09-24 — Kani and Verus moved to PR/push `ci.yml` jobs; Verus-first zero-trust assignment with the BFT quorum/bitmap, TOFU pin and trust-score slices proved; endorsement algebra deferred on both tools with evidence; autoharness deferral
+**Revised:** 2026-09-24 — Kani and Verus moved to PR/push `ci.yml` jobs; Verus-first zero-trust assignment with the BFT quorum/bitmap, certificate-admission, TOFU pin, trust-score and MSP height-window slices proved; endorsement algebra deferred on both tools with evidence; autoharness deferral
 **Decision owner:** project owner
 **Relates to:**
 [ADR-015](adr-015-audited-c-crypto-backends.md) (audited backends / dependency evidence) ·
@@ -113,7 +113,7 @@ mutation for the crypto primitives underneath:
   Rust: trust-score arithmetic, BFT quorum/bitmap rules, the TOFU pin
   transition, channel membership and the private-payload gate. Verus also
   owns the critical roadmap (gas → quorum safety → determinism → chain rules
-  → scoring). Four modules are already proved in production form: the vm gas
+  → scoring). Six modules are already proved in production form: the vm gas
   arithmetic; the BFT quorum/bitmap kernels in `glasschain-core`
   (`quorum_threshold`, `bitmap_len`/`bitmap_byte`/`bitmap_mask`,
   `meets_quorum`, and the `bitmap_contains` bounds lemma) — the certificate
@@ -122,8 +122,13 @@ mutation for the crypto primitives underneath:
   `known_keeps_the_fingerprint` and `rotation_requires_a_valid_proof`) — the
   network's `PeerRegistry` delegates every Hello's accept/reject/rotate
   decision to it, and the ed25519 check is reduced to `RotationProof` before
-  the call; and the trust-score arithmetic (`asset::trust_proofs`: the exact
-  20/10-point formula, the `<= 100` bound and the ≥ 80 standard gate).
+  the call; the trust-score arithmetic (`asset::trust_proofs`: the exact
+  20/10-point formula, the `<= 100` bound and the ≥ 80 standard gate); and
+  the certificate-admission gate (`consensus::cert_proofs`: acceptance iff
+  the certificate names the block and is degenerate-or-complete — no
+  bitmap-only or mislabelled certificate passes); and the MSP height-window
+  authorization (`identity/msp_policy.rs::authz_proofs`: registered-before-use
+  and go-forward revocation, the committed-height rules a replay enforces).
   Both proof jobs run in `ci.yml` on every PR and push.
 - **The endorsement policy algebra is deferred on both tools** (Verus cannot
   pattern-match the serde-derived external enum without an upstream fix;
@@ -132,9 +137,13 @@ mutation for the crypto primitives underneath:
   Kani/mutation territory by the same panic-on-length-cast reasoning as
   before.
 - **Kani is the fallback** wherever Verus cannot model the code but CBMC can:
-  parsers, byte-framing, and hash-adjacent structural properties. Its
-  curated scope today is listed above; the per-surface assignment and its
-  effort estimate live in `.agents/memories/kani-deferral.md`.
+  parsers, byte-framing, and hash-adjacent structural properties. The
+  curated set is a hand-written safety battery over untrusted-input codecs
+  (the ISO-8601 check, the PoW prefix, the expiry contribution, the
+  `is_hex64` width gate, and the identity `minimal_be`/`read_tlv`/
+  `read_generalized` parsers); the per-surface assignment, the
+  attempted-but-blocked targets and the toolchain evidence live in
+  `.agents/memories/kani-deferral.md`.
 - **Neither tool reaches the primitives** (`ed25519-dalek`, BLS12-381,
   `ring`, `webpki`) or the DER/X.509 parsers they sit behind. Those stay
   tested and mutation-covered; a proof may only assume them.
@@ -155,6 +164,11 @@ mutation for the crypto primitives underneath:
 | Singular (`integer_ring`) | a ring-equality proof appears **and** Singular 4.3.2 is the installed version (4.4.x is incompatible) |
 | verusdoc | specs must render in rustdoc; verusdoc currently needs Verus built from source |
 | nightly live-mutation triage | the mutants shards' `outcomes.json` show a stable survivor set worth a score gate |
+
+The remaining blockers — the consensus round loop, the bitmap-expansion
+quorum predicate, the HashMap-keyed membership/gating surfaces and the
+CBMC-blocked codec harnesses — are tracked as technical debt in
+[#176](https://github.com/dbbvitor/GlassChain/issues/176).
 
 ## Consequences
 
