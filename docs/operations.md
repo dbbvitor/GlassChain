@@ -773,7 +773,8 @@ code, default builds the fallbacks, and both must stay green.
 
 ### What CI runs (`.github/workflows/`)
 
-`ci.yml` — every push and PR:
+`ci.yml` — every push and PR (diff-scoped on PRs, full workspace on push),
+plus a nightly full-workspace sweep (`10 3` UTC):
 
 | Job | Runner | Runs |
 |---|---|---|
@@ -783,8 +784,9 @@ code, default builds the fallbacks, and both must stay green.
 | `miri` | matrix: 6 crates | `cargo +nightly-2026-09-20 miri test -p <crate> --lib` with `-Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check`, no `-Zmiri-ignore-leaks`; per-crate skips. Measured: core ~19 min, the rest <2 min. Moved from nightly `deep-checks.yml` (ADR-019) |
 | `turmoil` | ubuntu | `cargo test -p glasschain-network --test turmoil_chaos --features turmoil-sim --locked` — deterministic partition/repair; measured ~0.2 s of test time. Moved from weekly `deep-checks.yml` |
 | `gates` | ubuntu | the `#[ignore]`d capacity/measurement gates (`consensus_capacity`, `tcp_partition`, `read_path_memory`, the network cost measurement) under the runner's 65535-fd hard limit, serial (`--test-threads=1`) so concurrent meshes do not distort them. The 200- and 300-validator BFT finality gates are skipped (manual-only: ~80k/~180k sockets). Measured ~5 min test time. Moved from weekly `deep-checks.yml` |
+| `asan` | ubuntu | `cargo +nightly-2026-09-20 test --workspace --lib --bins --tests --all-features --locked -Zbuild-std --target x86_64-unknown-linux-gnu` with `ASAN_OPTIONS=detect_leaks=1`, zero suppressions (wayfinder #163), preceded by a deliberate-leak canary that fails if LSan is not armed. Measured 5m22s including the build on a GitHub runner, so it moved from nightly `deep-checks.yml` (#166 re-evaluation) |
 | `kani` | ubuntu | `cargo kani -p glasschain-core -p glasschain-identity --default-unwind 16 --output-format=terse --sarif kani.sarif -Z concrete-playback --concrete-playback=print` — curated proofs for the core predicate surface and the identity zero-trust byte surfaces; SARIF on the Code Scanning tab. Warm 2m40s, 30-minute timeout. `cargo kani autoharness` is deliberately not a step (0.68.0 kills `goto-instrument`; evidence in `.agents/memories/kani-deferral.md`) |
-| `verus` | ubuntu | `cargo verus verify -p glasschain-vm -p glasschain-core -p glasschain-identity --all-features --locked` — production-form proofs for the gas arithmetic, the BFT quorum/bitmap kernels and certificate admission, the TOFU pin decision (`glasschain-core/src/pin.rs`), the trust-score arithmetic (`glasschain-core/src/asset.rs`) and the MSP height-window authorization (`glasschain-identity/src/msp_policy.rs`); Verus `0.2026.09.20.aef82ed` from the pinned release zip. A cheat-marker grep (bare `assume(`/`admit(`, `external_body`, `axiom`) runs first so proofs cannot pass vacuously. Warm seconds, 30-minute timeout |
+| `verus` | ubuntu | `cargo verus verify -p glasschain-vm -p glasschain-core -p glasschain-identity --all-features --locked` — production-form proofs for the gas arithmetic, the BFT quorum/bitmap kernels + bitmap expansion + certificate admission, the consensus-round kernels (`glasschain-core/src/rounds.rs`), the TOFU pin decision (`glasschain-core/src/pin.rs`), the trust-score arithmetic (`glasschain-core/src/asset.rs`), the MSP height-window authorization (`glasschain-identity/src/msp_policy.rs`), channel membership (`glasschain-identity/src/channel.rs`) and the private-payload gate (`glasschain-identity/src/payload_gate.rs`); Verus `0.2026.09.24.b9416fa` from the pinned rolling-release zip. A cheat-marker grep (bare `assume(`/`admit(`, `external_body`, `axiom`) runs first so proofs cannot pass vacuously. Warm seconds, 30-minute timeout |
 | `audit` | ubuntu (own workflow: `audit.yml`) | `cargo audit --deny warnings --file Cargo.lock` (RustSec); prebuilt installs via `taiki-e/install-action` |
 
 Both PR workflows **diff-scope** their jobs where the tool allows:
@@ -793,24 +795,37 @@ reverse-dependency closure, and package-oriented jobs (clippy, tests,
 cargo-careful, feature matrix, Miri, Kani, Verus, the ignored gates, turmoil)
 run on that set; file-oriented jobs (`typos`, mutation) run on the changed
 files. Workspace-level files (manifests, lockfile, toolchain/lint config,
-`.cargo/`, `.config/`, `.github/`) and pushes to main run the full workspace.
+`.cargo/`, `.config/`, `.github/`) and pushes to main run the full workspace,
+and `ci.yml`/`analysis.yml` re-run the full workspace nightly so the whole
+repo is swept even when no merge lands.
 `cargo fmt`, coverage (the Codecov project gate needs the full report), snarf
-and deny/machete stay whole-workspace by nature.
+and deny/machete stay whole-workspace by nature; ASan/LSan is package-scoped
+like the other build jobs (the `-Zbuild-std` std rebuild is a fixed cost, the
+per-crate test builds are not).
 
-`analysis.yml` — the blocking PR gate (ADR-019): `cargo machete
+`analysis.yml` — the blocking gate (ADR-019): `cargo machete
 --with-metadata` + `cargo deny --all-features check`, `typos`, `cargo +nightly
 snarf --format github`, `cargo hack check --each-feature`, `cargo +nightly
 careful nextest run --profile ci`, and `cargo mutants --in-diff` over the
-merge-base diff (`--baseline=skip --in-place --timeout 240`; the nightly shards use 180 and `make mutants` 60; the cap absorbs
+merge-base diff. PRs are diff-scoped; pushes to main and the nightly
+full-workspace sweep (`37 3` UTC) run the whole repo — the mutation-diff job
+stays PR-only (the full-repo run is `deep-checks.yml`) (`--baseline=skip --in-place --timeout 240`; the nightly shards use 180 and `make mutants` 60; the cap absorbs
 the first mutant's cold test-binary build). Both mutation
 jobs follow the cargo-mutants CI guidance
 ([ci](https://mutants.rs/ci.html), [pr-diff](https://mutants.rs/pr-diff.html),
 [performance](https://mutants.rs/performance.html)): `taiki-e/install-action`
-installs `cargo-mutants` and the **`wild` linker** (exposed as `ld.wild`, used
-via `RUSTFLAGS=-C link-arg=-fuse-ld=wild` — it more than halves the
-per-mutant relinks), `--in-place` runs in a scratch tree so builds are reused,
-and the whole `mutants.out` (survivor diffs included) is uploaded as an
-artifact with `if: always()`. `--no-shuffle` is the tool's default since 27.x.
+installs `cargo-mutants` and `wild`, and `scripts/prefer-fast-linker.sh`
+appends the selected linker to `RUSTFLAGS` (clang `--ld-path`; gcc only
+accepts `-fuse-ld=wild` from 16.1). **Linker policy: wild is preferred; where
+the platform has no wild build (aarch64 Linux has no release artifact), fall
+back to `mold` (`-fuse-ld=mold` through clang).** The same selector is applied
+to the other Linux workspace-build jobs — `test`'s ubuntu leg, `coverage`,
+`cargo-careful`, ASan/LSan — and `make mutants` does it locally. Mold covers
+aarch64/arm/riscv64/… Linux too (it is the aarch64 fallback); neither tool
+links Mach-O or PE, so macOS and Windows keep their default linker. `--in-place` runs in a scratch tree so
+builds are reused, and the whole `mutants.out` (survivor diffs included) is
+uploaded as an artifact with `if: always()`. `--no-shuffle` is the tool's
+default since 27.x.
 Doctests are deliberately *not* skipped (`-- --all-targets` would drop them):
 a mutation caught only by a doctest would otherwise report as missed.
 
@@ -818,7 +833,12 @@ a mutation caught only by a doctest would otherwise report as missed.
 caught/fixed, or deliberately skipped with a reason in `.cargo/mutants.toml`'s
 `exclude_re` list (`rg 'mutants-skip:' .cargo/mutants.toml`). The jobs read
 `mutants.out/missed.txt` as well as the exit code, because cargo-mutants
-returns 3 (timeout) in preference to 2 (missed) when a run has both. The 15
+returns 3 (timeout) in preference to 2 (missed) when a run has both. A run
+that tested **no** mutants (`total_mutants > 0` with
+`caught + missed + timeout == 0` in `mutants.out/outcomes.json`, i.e. every
+mutant unviable) also fails: cargo-mutants exits 0 on a build-level failure,
+and the PR gate was once green while testing nothing
+(`.agents/memories/cargo-mutants-footguns.md`). The 15
 timeout mutants from the first full run are fixed: a `debug_assert` on the
 block-hash length turns the non-terminating PoW loop into a fast panic,
 the fold counters use `saturating_add`, `parse_args` is iterator-based (no
@@ -826,15 +846,29 @@ index arithmetic to mutate), and the peer/CLI tests bound their waits. The two d
 runner timeouts are skipped in `demo/.cargo/mutants.toml`.
 
 `deep-checks.yml` — nightly, never blocking a PR: the full mutants run in 16
-serial shards and ASan/LSan over the workspace. Everything whose measured
-run fits the owner's 30-minute promotion rule moved to `ci.yml`'s blocking jobs — Kani,
-Verus, the six-crate Miri matrix, turmoil and the ignored
-capacity/measurement gates (scope and evidence in
-`.agents/memories/kani-deferral.md` and ADR-019).
+serial shards (the whole workspace cannot be diff-scoped, unlike the PR's
+`--in-diff` job). It is the only schedule-only workload: everything else that
+measured inside the owner's 30-minute promotion rule runs on PR/push and keeps
+a scheduled whole-repo sweep — the `ci.yml` jobs (Kani, Verus, the six-crate
+Miri matrix, turmoil, ASan/LSan, the ignored gates; full workspace nightly at
+`10 3`), the `analysis.yml` gates (full workspace nightly at `37 3`), and the
+weekly `fuzz.yml` (300s deep runs; 60s smoke per PR/push),
+`reproducible.yml` (~10m), `coverage-insights.yml` (5-11m per job, advisory)
+and `bench.yml` (~7m), which now also run per code PR/push (scope and evidence
+in `.agents/memories/kani-deferral.md`,
+`.agents/memories/cargo-mutants-footguns.md` and ADR-019).
 
 `ci-failure-issues.yml` — turns a scheduled failure into one rolling issue per
-workflow (`ci-failure` label) and closes it on the next green run. `fuzz.yml`,
-`reproducible.yml` and `coverage-insights.yml` stay on their weekly schedules.
+workflow (`ci-failure` label) and closes it on the next green run; it now
+watches `CI` and `Analysis` too, so a red nightly full sweep files an issue.
+
+`pr-summary.yml` — upserts one rolling comment per PR with the latest Actions
+results for its head commit (`scripts/pr-summary.sh`), edited in place as each
+watched workflow completes: every job without native PR reporting in one
+table. Codecov statuses and Code Scanning annotations are not duplicated. It
+never gates; fork PRs are skipped (the `workflow_run` token is read-only
+there) and, because `workflow_run` requires the workflow file on the default
+branch, it activates on `main` after this lands.
 
 All `protoc`-requiring jobs install it via `arduino/setup-protoc`; the test
 workflow is path-filtered to code — **docs-only changes skip CI**. Every
@@ -856,7 +890,7 @@ workflow action is pinned to a commit SHA and updated by Dependabot.
 | `make ci` | `check` → `test` → `analysis` |
 | `make snarf` / `careful` / `miri` / `sanitize` | Deep checks: cache-line false sharing / cargo-careful suite / six-crate Miri allowlist with strict flags / ASan+LSan with leaks-as-failures |
 | `make mutants` / `mutants-diff` | Mutation testing (`MUTANTS_PKG=…`, default `glasschain-core`) / diff-only (CI PR-gate command) |
-| `make kani` / `kani-coverage` / `verus` / `llvm-lines` | Curated Kani proofs (`glasschain-core` + `glasschain-identity`) / Kani source-coverage report for local gap analysis / Verus zero-trust roadmap (`glasschain-vm` gas + `glasschain-core` BFT quorum/bitmap) / compile-time bloat diagnostic |
+| `make kani` / `kani-coverage` / `verus` / `llvm-lines` | Curated Kani proofs (`glasschain-core` + `glasschain-identity`) / Kani source-coverage report for local gap analysis / Verus zero-trust proofs (`glasschain-vm` gas; `glasschain-core` BFT quorum/bitmap + rounds; `glasschain-identity` TOFU pin, MSP heights, channel gate) / compile-time bloat diagnostic |
 | `make audit` / `coverage` / `coverage-xml` | `cargo audit --deny warnings` / llvm-cov HTML / Cobertura XML with the 90% line gate |
 | `make node id=… port=…` | Interactive node REPL — never in automation (Section 2) |
 | `make doc` / `clean` / `bench` | `cargo doc --workspace --no-deps` / `cargo clean` / criterion benches (see Section 12 caveat) |

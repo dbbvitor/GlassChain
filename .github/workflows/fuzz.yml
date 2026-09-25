@@ -2,13 +2,20 @@ name: Fuzz
 
 # Dynamic analysis (Gold `dynamically_analysis`): two libFuzzer harnesses over
 # the untrusted decode surfaces — `fuzz-wire` (network `Message` JSON) and
-# `fuzz-transactions` (core `Transaction` JSON). PRs get a short smoke run;
-# the weekly scheduled run digs deeper. OSS-Fuzz integration is intentionally
-# out of scope pre-release.
+# `fuzz-transactions` (core `Transaction` JSON). PRs and pushes get a short
+# smoke run; the weekly scheduled run digs deeper (wayfinder #166
+# re-evaluation). OSS-Fuzz integration is intentionally out of scope
+# pre-release.
 
 on:
   schedule:
     - cron: "0 4 * * 1" # Weekly, Monday 04:00 UTC
+  push:
+    branches: [main]
+    paths:
+      - "crates/glasschain-core/**"
+      - "crates/glasschain-network/**"
+      - ".github/workflows/fuzz.yml"
   pull_request:
     branches: [main]
     paths:
@@ -74,7 +81,7 @@ jobs:
       # Ubuntu does not provide (no musl-g++ for libFuzzer's C++ runtime).
       - name: Smoke fuzz on PRs, deep fuzz on schedule
         env:
-          RUSTUP_TOOLCHAIN: nightly
+          RUSTUP_TOOLCHAIN: nightly-2026-09-20
         run: |
           secs=60
           if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then

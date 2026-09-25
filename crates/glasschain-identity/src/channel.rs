@@ -38,7 +38,47 @@ use crate::error::IdentityError;
 use glasschain_core::crypto::sha256;
 use glasschain_core::endorsement::PolicyExpression;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+
+/// Channel membership, proved in production form with Verus (ADR-019/#176).
+/// The member store is a `Vec<String>` (never a `HashSet`, whose lookup Verus
+/// cannot model): membership is the slice predicate the shipped
+/// [`Channel::is_member`] delegates to, the TOFU precedent. The private-payload
+/// gate lives in [`crate::payload_gate`].
+mod channel_proofs {
+    use vstd::prelude::*;
+
+    verus! {
+
+    /// The membership predicate: `node_id` equals one of `members`.
+    pub open spec fn spec_contains_str(members: &[String], node_id: &str) -> bool {
+        exists|i: int| 0 <= i < members@.len() && #[trigger] members@[i]@ == node_id@
+    }
+
+    /// Slice membership over the channel's canonical member list; the shipped
+    /// [`super::Channel::is_member`] delegates here.
+    #[must_use]
+    pub fn contains_str(members: &[String], node_id: &str) -> (found: bool)
+        ensures found == spec_contains_str(members, node_id),
+    {
+        let mut i: usize = 0;
+        while i < members.len()
+            invariant
+                i <= members.len(),
+                forall|j: int| 0 <= j < i ==> #[trigger] members@[j]@ != node_id@,
+            decreases members.len() - i,
+        {
+            if members[i].as_str() == node_id {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    } // verus!
+}
+
+use channel_proofs::contains_str;
 
 /// Organizations that are policy-level members of **every** collection by
 /// default (ADR-003 decision 2).
@@ -96,8 +136,12 @@ pub struct Channel {
     /// Full payloads stored off-chain (in practice these would be encrypted
     /// and distributed only to channel members).
     private_data: Vec<PrivateDataEntry>,
-    /// Fast membership lookup.
-    member_set: HashSet<String>,
+    /// The effective member organizations (configured members plus the default
+    /// regulators). The source of truth for [`Self::is_member`]; kept as a
+    /// slice so the membership predicate is the proved kernel (ADR-019/#176).
+    /// Collections hold a handful of orgs, so the predicate's linear scan is
+    /// immaterial — and it is the shape Verus can prove.
+    members: Vec<String>,
 }
 
 /// An off-chain private data entry with an on-chain hash commitment.
@@ -119,15 +163,18 @@ impl Channel {
     /// decision 2), so [`Self::is_member`] accepts them without being listed.
     #[must_use]
     pub fn new(config: ChannelConfig) -> Self {
-        let mut member_set: HashSet<String> = config.member_ids.iter().cloned().collect();
-        for regulator in DEFAULT_REGULATOR_ORGS {
-            member_set.insert((*regulator).to_owned());
-        }
+        let mut members: Vec<String> = config.member_ids.clone();
+        members.extend(DEFAULT_REGULATOR_ORGS.iter().map(|org| (*org).to_owned()));
+        // The old `HashSet` collapsed duplicates, including ones already in
+        // `config.member_ids`; the effective member list stays unique (and
+        // sorted) now that it is the membership source of truth.
+        members.sort_unstable();
+        members.dedup();
         Self {
             config,
             committed_hashes: Vec::new(),
             private_data: Vec::new(),
-            member_set,
+            members,
         }
     }
 
@@ -142,15 +189,16 @@ impl Channel {
     /// default regulators.
     #[must_use]
     pub fn member_orgs(&self) -> Vec<&str> {
-        let mut orgs: Vec<&str> = self.member_set.iter().map(String::as_str).collect();
+        let mut orgs: Vec<&str> = self.members.iter().map(String::as_str).collect();
         orgs.sort_unstable();
         orgs
     }
 
-    /// Return `true` if `node_id` is a member of this channel.
+    /// Return `true` if `node_id` is a member of this channel. The membership
+    /// predicate is the proved kernel (ADR-019/#176).
     #[must_use]
     pub fn is_member(&self, node_id: &str) -> bool {
-        self.member_set.contains(node_id)
+        contains_str(&self.members, node_id)
     }
 
     /// Submit private data to the channel.
@@ -200,10 +248,12 @@ impl Channel {
         &self.committed_hashes
     }
 
-    /// Add a new member to the channel.
+    /// Add a new member to the channel. Idempotent.
     pub fn add_member(&mut self, node_id: impl Into<String>) {
         let nid = node_id.into();
-        self.member_set.insert(nid.clone());
+        if !self.is_member(&nid) {
+            self.members.push(nid.clone());
+        }
         if !self.config.member_ids.contains(&nid) {
             self.config.member_ids.push(nid);
         }
@@ -216,7 +266,8 @@ impl Channel {
         if DEFAULT_REGULATOR_ORGS.contains(&node_id) {
             return false;
         }
-        let was_member = self.member_set.remove(node_id);
+        let was_member = self.is_member(node_id);
+        self.members.retain(|id| id != node_id);
         self.config.member_ids.retain(|id| id != node_id);
         was_member
     }
@@ -277,6 +328,26 @@ mod tests {
         assert!(ch.is_member("fabricante-abc"));
         assert!(ch.is_member("farmacia-sul"));
         assert!(!ch.is_member("outsider"));
+    }
+
+    /// Duplicate listings (including one that repeats a default regulator)
+    /// collapse to one effective member: the member store is the membership
+    /// source of truth now, so it must behave like the `HashSet` it replaced.
+    #[test]
+    fn duplicate_member_listings_are_collapsed() {
+        let ch = Channel::new(ChannelConfig {
+            name: "dupes".into(),
+            member_ids: vec!["org-a".into(), "org-a".into(), "anvisa".into()],
+            description: String::new(),
+            endorsement_policy: None,
+            retention_secs: default_retention_secs(),
+        });
+        assert_eq!(
+            ch.member_orgs(),
+            vec!["anvisa", "mapa", "org-a"],
+            "the effective member list is unique and sorted"
+        );
+        assert!(ch.is_member("org-a"));
     }
 
     #[test]

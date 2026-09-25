@@ -5,9 +5,25 @@ name: Benchmarks
 # yields no test coverage), so this workflow is where they run for real:
 # release builds, full criterion measurement.
 #
-# Weekly rather than per-PR (wayfinder #158/#167): a benchmark run contributes
-# no gate, and on PRs it only burned runner time.
+# Runs per code PR/push (measured ~7 minutes, inside the 30-minute promotion
+# rule) and keeps the weekly scheduled full run (wayfinder #166
+# re-evaluation). A benchmark contributes no gate: it never blocks, and the
+# weekly run is the stable measurement baseline.
 on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
   schedule:
     - cron: "0 6 * * 1" # Weekly, Monday 06:00 UTC
   workflow_dispatch:

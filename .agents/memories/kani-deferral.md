@@ -32,11 +32,11 @@ no leverage; tests + mutation for the primitives underneath (ADR-019).
 |---|---|---|
 | Endorsement policy algebra (`core/endorsement.rs`) | `validate`, `evaluate`, `required_count`, `covers` | **Neither tool today** (evidence below) — tests + mutation |
 | Trust score (`core/asset.rs`) | `MetadataTrustScore::compute`, `is_valid_iso8601_date` | Verus — score arithmetic proved 2026-09-24 (`asset::trust_proofs`: exact 20/10 formula, `<= 100`, standard gate); Kani keeps the ISO-8601 structural parity |
-| BFT quorum/bitmap/context (`core/{bft,consensus}.rs`) | `QuorumCertificate::validate`, `verify_certificate`, vote/context messages | Verus — quorum/bitmap kernels (`bft::proof_arith`) and certificate admission (`consensus::cert_proofs`: acceptance iff names the block and is degenerate-or-complete) proved 2026-09-24; context framing and the round-loop state machine deferred; BLS assumed |
+| BFT quorum/bitmap/context (`core/{bft,consensus}.rs`) | `QuorumCertificate::validate`, `verify_certificate`, vote/context messages | Verus — quorum/bitmap kernels (`bft::proof_arith`) and certificate admission (`consensus::cert_proofs`: acceptance iff names the block and is degenerate-or-complete) proved 2026-09-24; the bitmap expansion (`expand_signers`/`signers_in_range`, exact set bits) and the pure round kernels (`rounds::{proposer_slot, receipt_action, should_retain}`) proved 2026-09-25 (#176); context framing deferred; BLS assumed |
 | TOFU pin transition (`network/node.rs`) | `PeerRegistry::verify_or_register` → `core::pin::decide` | Verus — `spec_decide` gate proved 2026-09-24 (`pin.rs`: poisoned/NodeId/Org reject, rotate only with a valid proof under the pinned key); ed25519 assumed |
-| Private-payload gate (`network/node.rs`) | `private_peer_trusted`, `payload_targets`, `Channel::is_member` | Verus (membership conjunction; hash assumed; `HashMap`/`HashSet<String>` state will need the key-model assumption below) |
+| Private-payload gate (`network/node.rs`) | `private_peer_trusted`, `payload_targets`, `Channel::is_member` | Verus — `payload_gate::private_payload_allowed` (the fail-closed conjunction) and the slice membership `channel::contains_str` proved 2026-09-25 (#176); the hash lookups stay behind the seam |
 | MSP height-window authorization (`identity/msp_policy.rs`) | `MspEndorsementProvider::evaluate` bounds checks | Verus — `authz_proofs` proved 2026-09-24 (registered-before-use, go-forward revocation); ed25519 assumed |
-| Channel membership (`identity/channel.rs`) | `Channel::is_member` | Planned (trivial `HashSet` membership; `HashSet<String>` needs the key-model cost) — see #176 |
+| Channel membership (`identity/channel.rs`) | `Channel::is_member` | Verus — the `HashSet<String>` was replaced by a `Vec<String>` and `is_member` routes through `contains_str`, proved 2026-09-25 (#176) |
 | OCSP DER codec (`identity/ocsp.rs`) | `minimal_be`, `read_tlv`, `read_generalized` | Kani (slices/parsers) — `minimal_be`/`read_tlv` proved |
 | Signed message encoders (`identity/possession.rs`) | `org_possession_message`, `tofu_pin_message`, `msp_registration_message` | Kani attempted; CBMC times out (below) — tests + mutation |
 | Canonical record rules (`core/canonical.rs`) | `is_hex64`, `is_present`, `matches_type`, `validate_record_with` | Kani (predicates); JSON/`format!` body deferred |
@@ -71,6 +71,15 @@ codecs. Two landed; four targets are blocked with evidence:
   call unreachable at runtime, its codegen kills `goto-instrument` (the same
   kill as autoharness). The gate stays test/mutation-pinned.
 
+**Re-attempted 2026-09-25 (#176)** on the same kani-verifier 0.68.0 / CBMC
+6.11.0, one harness at a time with `--default-unwind 16 -Z unstable-options
+--harness-timeout 5m`. Outcomes unchanged: `base64_decode` → `CBMC failed with
+status 15`; 64-byte `is_hex64` exactness and `parse_staple` → `CBMC timed out`
+(5m); `verify_ed25519` → `goto-instrument exited with status 15`. The four
+harnesses were removed again; the recorded trigger (a Kani/CBMC release that
+stops killing `goto-instrument` and finishes these formulas) still gates a
+retry.
+
 ## Autoharness: not a gate
 
 `cargo kani autoharness -Z autoharness` (0.68.0) is unusable on this
@@ -89,6 +98,20 @@ workspace as a CI step. Evidence:
 - Autoharness defaults to a 60s per-harness timeout and its own unwind bound;
   the manual harnesses it also runs need `--default-unwind 16` explicitly.
 - `--exclude-pattern` does not filter the crate's manual harnesses.
+
+**Re-attempted 2026-09-25 (#176)**, still on 0.68.0 (the latest release).
+Raising the timeout does not help: none of these failures is a CBMC
+verification timeout, and `--harness-timeout` does not govern compilation or
+`goto-instrument`. `glasschain-core` again ended at
+`goto-instrument exited with status 15` after ~30 generated suites verified
+(with `--harness-timeout 10m`, `-j 1`); a rerun on the warm incremental cache
+died earlier with a second compiler bug —
+`kani-compiler/src/kani_middle/analysis.rs:29:45: called Option::unwrap() on
+a None value`. A GitHub-hosted runner uses the same toolchain, so the
+compiler panics and the unimplemented `catch_unwind` (#267) reproduce there;
+only the `goto-instrument` crash could be memory-influenced (this box had
+~3 GB free), and testing that half would need an advisory, non-gating run on
+a fresh runner. Not a gate; the revisit trigger below stands.
 
 Useful part: the generated-harness table lists every skipped function with a
 reason (`Missing Arbitrary implementation`, `Generic Function`, ...), which is
@@ -176,14 +199,25 @@ by `test_zero_required_never_evaluates_true`.
   (`consensus::cert_proofs`: acceptance iff the certificate names the block
   and is degenerate-or-complete), the TOFU pin decision (`pin`, with
   `spec_decide` as the total model the exec function is proved equal to),
-  trust-score arithmetic (`asset::trust_proofs`: `trust_score_value` sums
-  20/10-point flags and `is_standard_score` is the ≥80 gate), and the MSP
-  height-window authorization (`identity/msp_policy.rs::authz_proofs`).
+  trust-score arithmetic   (`asset::trust_proofs`: `trust_score_value` sums
+  20/10-point flags and `is_standard_score` is the ≥80 gate), the MSP
+  height-window authorization (`identity/msp_policy.rs::authz_proofs`), and
+  the #176 residues: the bitmap expansion (`bft::proof_arith::expand_signers`),
+  the consensus-round kernels (`glasschain-core/src/rounds.rs`), channel
+  membership (`glasschain-identity/src/channel.rs`) and the private-payload
+  gate (`glasschain-identity/src/payload_gate.rs`).
   `vstd` is unconditional in `glasschain-core` (and now `glasschain-identity`)
   now that non-`bft` modules need it.
 
-- Verified with the pinned release `0.2026.09.20.aef82ed`;
-  `cargo verus verify -p glasschain-vm -p glasschain-core --all-features
+- Verified with the pinned release `0.2026.09.24.b9416fa` (upgraded from
+  `0.2026.09.20.aef82ed` on 2026-09-25; the newest release with x86-linux and
+  macOS assets). The `vstd` crate stays at the newest published snapshot
+  (`0.0.0-2026-09-20-0158` — no newer snapshot is on crates.io), so the
+  binary and crate versions differ by design.
+- Verus 2026 releases isolate loop bodies: facts from outside a loop are
+  invisible inside it unless the loop invariant carries them — every loop
+  invariant in the proofs keeps its own bounds. `cargo verus verify -p
+  glasschain-vm -p glasschain-core -p glasschain-identity --all-features
   --locked` (the `cargo_verus` guide's Verus-relevant Cargo options come
   before the `--` separator). `make verus` adds `-- --expand-errors`;
   `cargo verus focus` is the local iteration loop (skips deps).

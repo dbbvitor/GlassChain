@@ -1,0 +1,53 @@
+name: PR summary
+
+# Compile the Actions results that have no native PR reporting into one
+# rolling PR comment (`scripts/pr-summary.sh`): the check marks that otherwise
+# only live on the Checks tab. Codecov and Code Scanning report natively and
+# are deliberately not duplicated. Never gates, and skips non-PR runs, fork
+# PRs (the `workflow_run` token is read-only there) and GitHub's dynamic CodeQL
+# workflows.
+#
+# `workflow_run` only fires once this file is on the default branch; the
+# comment then updates in place as each watched workflow completes.
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+      - Analysis
+      - Security audit
+      - Fuzz
+      - Benchmarks
+      - Reproducible build
+      - Coverage insights
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+
+concurrency:
+  group: pr-summary-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
+jobs:
+  summary:
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.fork == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # The workspace default branch: the summary only runs after this file is
+      # on `main`, so its script is the reviewed one.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Compile the rolling summary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: scripts/pr-summary.sh

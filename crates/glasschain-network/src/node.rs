@@ -26,7 +26,7 @@ use glasschain_core::{
 #[cfg(feature = "bft")]
 use glasschain_core::{BftConsensusProvider, EquivocationProof, VotePhase};
 use glasschain_identity::CertChainVerifier;
-use glasschain_identity::{Channel, ChannelConfig, Identity};
+use glasschain_identity::{private_payload_allowed, Channel, ChannelConfig, Identity};
 use glasschain_indexer::{
     indexed_transactions_of, AnalyticalFlattener, EventBusProvider, InMemoryEventBus,
     InMemoryIndexer, IndexedBlock, IndexerProvider, ProvenanceIndex,
@@ -392,13 +392,17 @@ impl NodeState {
     ///
     /// Fail closed (#86, zero-trust §2): with no verifier configured, or before
     /// the peer's org is verified, the self-asserted `Hello` org is never
-    /// trusted for private data.
+    /// trusted for private data. The conjunction is the proved kernel
+    /// (ADR-019/#176); the hash lookups stay behind the seam.
     fn private_peer_trusted(&self, addr: &str, collection: &str) -> bool {
-        self.cert_verifier.is_some()
-            && self.peer_org(addr).is_some_and(|org| {
-                self.peer_registry.org_verified(addr, &org) == Some(true)
-                    && self.is_collection_member(collection, &org)
-            })
+        let org = self.peer_org(addr);
+        let org_verified = org
+            .as_deref()
+            .is_some_and(|org| self.peer_registry.org_verified(addr, org) == Some(true));
+        let org_is_member = org
+            .as_deref()
+            .is_some_and(|org| self.is_collection_member(collection, org));
+        private_payload_allowed(self.cert_verifier.is_some(), org_verified, org_is_member)
     }
 
     /// Write channels of peers that support the `active` capability set;

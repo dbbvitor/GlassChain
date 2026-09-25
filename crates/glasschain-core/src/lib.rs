@@ -14,6 +14,7 @@ pub mod pin;
 #[cfg(kani)]
 mod proofs;
 pub mod providers;
+pub mod rounds;
 pub mod schema;
 pub mod transaction;
 pub mod wire;
@@ -48,6 +49,7 @@ pub use providers::{
     validate_tip_chain, ConsensusProvider, EndorsementProvider, ExecutionLimits, ExecutionProvider,
     NetworkProvider, PowConsensusProvider, StorageProvider,
 };
+pub use rounds::{proposer_slot, receipt_action, should_retain, ReceiptAction};
 pub use schema::{
     validate_asset, SchemaValidationReport, SchemaViolation, SncmField, ViolationSeverity,
     SNCM_SCHEMA,

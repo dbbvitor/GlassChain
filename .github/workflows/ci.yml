@@ -32,6 +32,11 @@ on:
       - "Makefile"
       - "codecov.yml"
       - ".github/**"
+  # Nightly full-workspace sweep (wayfinder #166 re-evaluation): PRs run the
+  # diff-scoped variants of these jobs, so the whole workspace is re-verified
+  # every night even when no merge has landed.
+  schedule:
+    - cron: "10 3 * * *"
   workflow_dispatch:
 
 env:
@@ -224,6 +229,17 @@ jobs:
         with:
           tool: cargo-nextest
 
+      # wild/mold are ELF linkers: Linux only, and the selector is a no-op on
+      # the macOS/Windows legs (AGENTS.md / ADR-019 linker policy).
+      - name: Install wild (preferred linker)
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
+        with:
+          tool: wild
+
+      - name: Select the preferred linker
+        run: scripts/prefer-fast-linker.sh
+
       - name: Run all tests
         run: >-
           cargo nextest run --profile ci ${{ needs.changes.outputs.cargo_flags }}
@@ -267,10 +283,13 @@ jobs:
           shared-key: rust-cache
           cache-on-failure: true
 
-      - name: Install cargo-llvm-cov and cargo-nextest
+      - name: Install cargo-llvm-cov, cargo-nextest and wild
         uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
         with:
-          tool: cargo-llvm-cov,cargo-nextest
+          tool: cargo-llvm-cov,cargo-nextest,wild
+
+      - name: Select the preferred linker
+        run: scripts/prefer-fast-linker.sh
 
       - name: Generate coverage report
         # cargo-llvm-cov with nextest: the same runner and flags as the test
@@ -384,8 +403,8 @@ jobs:
       - name: Install Verus
         run: |
           curl -sSLo verus.zip \
-            https://github.com/verus-lang/verus/releases/download/release%2F0.2026.09.20.aef82ed/verus-0.2026.09.20.aef82ed-x86-linux.zip
-          echo "7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33  verus.zip" | sha256sum -c -
+            https://github.com/verus-lang/verus/releases/download/release%2Frolling%2F0.2026.09.24.b9416fa/verus-0.2026.09.24.b9416fa-x86-linux.zip
+          echo "5d3df98fb0cefc3d11d3948220a65439b0002771a06fecabf98ecd74913c1312  verus.zip" | sha256sum -c -
           unzip -q verus.zip
           echo "$PWD/verus-x86-linux" >> "$GITHUB_PATH"
 
@@ -462,6 +481,98 @@ jobs:
             --skip test_slice_quota_spreads_a_burst_across_rounds \
             --skip ledger_default_uses_the_workspace_difficulty \
             --skip test_d3_index_semantics_match_full_rebuild_after_history_growth
+
+  # ASan/LSan runs on every PR and push (ADR-019), diff-scoped like the other
+  # build jobs: the affected crates' tests under `-Zbuild-std`, zero
+  # suppressions — leaks are failures (wayfinder #163). The std rebuild is a
+  # fixed cost, so scoping still cuts the per-crate test builds. Measured on a
+  # GitHub runner at 5m22s for the full workspace (the 50-minute figure that
+  # kept it scheduled was a cold local 4-core box); the nightly `ci.yml` sweep
+  # and pushes run it whole-workspace. A deliberate-leak canary proves LSan is
+  # armed before the suite runs.
+  asan:
+    name: ASan/LSan
+    needs: changes
+    if: needs.changes.outputs.packages != 'NONE'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install nightly Rust with rust-src
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          # Dated, not `nightly`: a moving toolchain invalidates the
+          # rust-cache every run (wayfinder #167).
+          toolchain: nightly-2026-09-20
+          components: rust-src
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: asan
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      - name: Install wild (preferred linker)
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
+        with:
+          tool: wild
+
+      # The selector reads this step's RUSTFLAGS and writes the combined value
+      # (sanitizer + wild/mold) for the run step (AGENTS.md / ADR-019).
+      - name: Select the preferred linker with ASan
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+        run: scripts/prefer-fast-linker.sh
+
+      # Prove leak detection is actually armed before trusting a clean suite:
+      # a deliberately leaked allocation must fail this canary. LSan silently
+      # no-ops where its ptrace-based tracer cannot start, which would turn
+      # "zero suppressions" into zero coverage.
+      - name: Canary — LSan catches a deliberate leak
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          ASAN_OPTIONS: detect_leaks=1
+        run: |
+          mkdir -p "$RUNNER_TEMP/lsan-canary/src"
+          cat > "$RUNNER_TEMP/lsan-canary/Cargo.toml" <<'EOF'
+          [package]
+          name = "lsan-canary"
+          version = "0.0.0"
+          edition = "2021"
+          EOF
+          cat > "$RUNNER_TEMP/lsan-canary/src/main.rs" <<'EOF'
+          fn main() {
+              std::mem::forget(Box::new(42u8));
+          }
+          EOF
+          cd "$RUNNER_TEMP/lsan-canary"
+          log="$RUNNER_TEMP/lsan-canary.log"
+          if cargo +nightly-2026-09-20 run --quiet >"$log" 2>&1; then
+            echo "::error::LSan did not fail a deliberate leak — leak detection is not armed"
+            exit 1
+          fi
+          if ! grep -Eq "LeakSanitizer|leaked in" "$log"; then
+            echo "::error::expected a LeakSanitizer report"
+            cat "$log"
+            exit 1
+          fi
+          echo "LSan canary passed: the deliberate leak was caught."
+
+      - name: Run the suite under ASan/LSan
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+        run: >-
+          cargo +nightly-2026-09-20 test ${{ needs.changes.outputs.cargo_flags }}
+          --lib --bins --tests --all-features --locked
+          -Zbuild-std --target x86_64-unknown-linux-gnu
 
   # The deterministic partition/repair scenario runs on every PR and push:
   # measured at ~0.2 s of test time (21 s including the build), so the weekly

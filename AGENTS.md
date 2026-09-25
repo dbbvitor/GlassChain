@@ -28,25 +28,31 @@ watcher automation engine, a TLS-encrypted TCP/libp2p P2P layer, and a gRPC API.
   dependency audit on every push and PR. Coverage uploads require the
   `CODECOV_TOKEN` repository secret; `codecov.yml` gates project coverage at
   **≥90%** (Gold target met 2026-09-16, `target: 90%` + 0.5% threshold —
-  regressions beyond noise fail). New code should keep patch coverage high. Additional scheduled/tagged workflows:
-  `fuzz.yml` (cargo-fuzz smoke on PRs touching core/network, weekly deep runs
-  over `fuzz-wire` and `fuzz-transactions`), `coverage-insights.yml` (weekly
-  advisory coverage uploads, all `joined: false` so they never move the gate:
-  `fuzz` = what the libFuzzer harnesses reach, `no-bft`/`no-pq-tls` =
-  feature-sensitivity views), `reproducible.yml` (weekly
-  Linux-only build-twice hash verification), and `release.yml` (on `v*` tags:
+  regressions beyond noise fail). New code should keep patch coverage high.
+  Every job that measures under the owner's 30-minute promotion rule runs on
+  PR/push: `fuzz.yml` (cargo-fuzz smoke on PRs/pushes touching core/network,
+  weekly deep runs over `fuzz-wire` and `fuzz-transactions`),
+  `coverage-insights.yml` (advisory coverage uploads on PR/push and weekly,
+  all `joined: false` so they never move the gate: `fuzz` = what the
+  libFuzzer harnesses reach, `no-bft`/`no-pq-tls` = feature-sensitivity
+  views), `reproducible.yml` (Linux-only build-twice hash verification on
+  code PR/push and weekly), `bench.yml` (criterion benches on code PR/push
+  and weekly; never a gate), and `release.yml` (on `v*` tags:
   cargo-auditable build, CycloneDX SBOMs, git-cliff notes, Cosign keyless
-  signing). `analysis.yml` adds the blocking PR gates (machete, deny, typos,
+  signing). `analysis.yml` adds the blocking gates (machete, deny, typos,
   snarf, cargo-hack, cargo-careful, diff mutants); `ci.yml`'s `kani`,
-  `verus`, `miri`, `turmoil` and `gates` jobs run on every push and PR (each
-  measured inside the owner's 30-minute promotion rule); `deep-checks.yml` the nightly
-  heavy tier (full mutants, ASan/LSan);
-  scheduled failures file a rolling `ci-failure` issue (ADR-019). PR checks
-  are diff-scoped to the changed crates plus their reverse-dependency
-  closure (`scripts/affected-crates.sh`); workspace-level files or pushes to
-  main run the full workspace. It is a safety net, not a substitute — run
-  the checks below locally before declaring work done, because a cold CI build
-  takes minutes.
+  `verus`, `miri`, `turmoil`, `asan` and `gates` jobs run on every push and
+  PR;   `deep-checks.yml` is the nightly schedule-only workload (full mutation
+  shards). Scheduled failures file a rolling `ci-failure` issue (ADR-019), and
+  `pr-summary.yml` compiles the Actions-only PR results into one rolling
+  conversation comment (`scripts/pr-summary.sh`) — checks without native
+  reporting; Codecov and Code Scanning keep their own surfaces.
+  PR checks are diff-scoped to the changed crates plus their
+  reverse-dependency closure (`scripts/affected-crates.sh`); workspace-level
+  files or pushes to main run the full workspace, and `ci.yml`/`analysis.yml`
+  re-run the full workspace nightly. It is a safety net, not a substitute —
+  run the checks below locally before declaring work done, because a cold CI
+  build takes minutes.
 
 ### Pre-release status and architectural priorities
 
@@ -98,8 +104,9 @@ finding a failure locally is far cheaper than finding it in CI.
 opt-in (`make miri`, `make sanitize`, `make mutants`, `make careful`, `make kani`,
 `make verus`, `make snarf`). `make kani` runs the same curated harnesses as
 `ci.yml`'s `kani` job; `make verus` runs the same proofs as its `verus` job
-(gas, BFT quorum/bitmap + certificate admission, TOFU pin, trust score, MSP
-height windows). The Kani scope, the zero-trust Verus-first
+(gas, BFT quorum/bitmap + bitmap expansion + certificate admission,
+consensus-round kernels, TOFU pin, trust score, MSP height windows, channel
+membership + private-payload gate). The Kani scope, the zero-trust Verus-first
 assignment and the toolchain limits are recorded in
 `.agents/memories/kani-deferral.md`. See the `Makefile` and
 [`docs/operations.md`](docs/operations.md#makefile-targets).
@@ -266,6 +273,35 @@ hide unrelated warnings with broad `#[allow]` attributes.
 - Doctests in `///` examples are compiled and run. If you add an example that
   can't run standalone, mark the fence `ignore` or `no_run` rather than letting it break.
 
+### Test definitions
+
+A "test" is any of: unit tests in `#[cfg(test)] mod tests`, integration tests
+under `crates/*/tests/`, doctests in `///` examples, Kani harnesses
+(`#[cfg(kani)]` proofs) and Verus proofs (`verus!` modules with
+`[package.metadata.verus] verify = true`). Criterion benches are compiled
+always and executed via `cargo bench`; the libFuzzer targets under
+`crates/*/fuzz` run in `fuzz.yml`. `make ci` is the local gate; the raw
+commands above are authoritative.
+
+### Scores and targets
+
+The suite is scored, not just pass/fail. Leave every score at least where you
+found it, and move it up with new work:
+
+| Score | Reported by | Target |
+|---|---|---|
+| Line coverage | `coverage` job → Codecov project gate (`codecov.yml`) | project ≥ 90%; patch coverage on new code stays high |
+| Mutation caught | `analysis.yml` diff mutants (PR) + nightly 16 shards | 0 survivors; `exclude_re` only with a reasoned `mutants-skip:` comment. First full baseline: 90.1% (401 caught / 495) |
+| Kani / Verus | `kani`, `verus` jobs | all harnesses/proofs verify, 0 errors, no `assume(`/`admit(`/`external_body`/`axiom` markers |
+| Miri | `miri` matrix | 0 leaks/UB with the strict flags; a new skip needs a comment explaining why |
+| ASan/LSan | `asan` job | 0 sanitizer reports; the leak canary must trip on its deliberate leak |
+| rustfmt / clippy / typos / snarf | `fmt`, `clippy`, `analysis.yml` | zero warnings/findings |
+| Fuzz | `fuzz.yml` | no crash/hang in smoke or deep runs; a crash found on schedule lands as a regression test |
+
+Never silence a score to make it pass: no broad `#[allow]`, no coverage
+exclusions, no mutation exclusions, no sanitizer suppressions. A relaxation is
+a documented exception with evidence in ADR-019's strictness section.
+
 ---
 
 ## Security considerations
@@ -419,6 +455,16 @@ See [`.agents/README.md`](.agents/README.md) for file templates.
   seam (ticket #38). The dev/test Proof-of-Work driver remains available
   programmatically as `Node::mine()` / `Node::mine_async()`; PoW difficulty
   comes from `DEFAULT_DIFFICULTY` in `glasschain-core::ledger`.
+- **Linker policy:** Linux Rust builds prefer the **`wild`** linker, selected
+  through clang (`--ld-path`; gcc only accepts `-fuse-ld=wild` from 16.1);
+  where wild has no build for the platform — aarch64 Linux has no release
+  artifact — fall back to **`mold`**. `scripts/prefer-fast-linker.sh` applies
+  it to the mutation jobs and the other Linux workspace-build jobs (`test`'s
+  ubuntu leg, `coverage`, `cargo-careful`, ASan/LSan); `make mutants` does the
+  same locally. Both cover Linux ELF (mold also has aarch64/arm/riscv64/…
+  releases — it is the aarch64 fallback because wild ships no aarch64 Linux
+  artifact), but neither links Mach-O or PE: macOS and Windows keep their
+  default linker.
 - Contract and watcher state are **rebuilt by replaying the committed chain** on
   restart or chain replacement. Any new automation state must be replayable the
   same way, or it will silently diverge after a sync.

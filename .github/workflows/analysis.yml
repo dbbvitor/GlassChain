@@ -1,13 +1,31 @@
 name: Analysis
 
-# PR-only gates that do not belong in the core ci.yml (wayfinder #165):
-# dependency hygiene, supply-chain policy, spelling, cache-line layout,
-# feature-combination compilation, mutation testing on the diff, and the
-# nightly cargo-careful run.
+# Gates that do not belong in the core ci.yml (wayfinder #165): dependency
+# hygiene, supply-chain policy, spelling, cache-line layout, feature-
+# combination compilation, mutation testing on the diff, and cargo-careful.
 #
-# Every job is ubuntu-only and blocking. Guardrail (wayfinder #139): a job
-# whose cold-cache runtime exceeds 20 minutes moves to deep-checks.yml.
+# PRs are diff-scoped; pushes to main and the nightly schedule run the whole
+# workspace (wayfinder #166 re-evaluation). The mutation-diff job stays
+# PR-only — the full-repo mutation run is deep-checks.yml's nightly job.
+# Every job is ubuntu-only and blocking; pushes and the schedule are the
+# same gate, not a second one. Guardrail (wayfinder #139): a job whose
+# cold-cache runtime exceeds 20 minutes moves to deep-checks.yml.
 on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "clippy.toml"
+      - "deny.toml"
+      - ".cargo/**"
+      - ".config/**"
+      - ".typos.toml"
+      - "scripts/**"
+      - "Makefile"
+      - ".github/**"
   pull_request:
     branches: [main]
     paths:
@@ -23,6 +41,8 @@ on:
       - "scripts/**"
       - "Makefile"
       - ".github/**"
+  schedule:
+    - cron: "37 3 * * *"
   workflow_dispatch:
 
 env:
@@ -241,10 +261,13 @@ jobs:
           shared-key: rust-cache
           cache-on-failure: true
 
-      - name: Install cargo-careful and cargo-nextest
+      - name: Install cargo-careful, cargo-nextest and wild
         uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
         with:
-          tool: cargo-careful,cargo-nextest
+          tool: cargo-careful,cargo-nextest,wild
+
+      - name: Select the preferred linker
+        run: scripts/prefer-fast-linker.sh
 
       - name: Run the suite with std debug assertions
         run: >-
@@ -285,17 +308,18 @@ jobs:
 
       # cargo-mutants runs `cargo test`, not nextest: nextest skips doctests,
       # and a mutation caught only by a doctest would falsely report as missed.
-      # `wild` is the linker from https://mutants.rs/performance.html: each
-      # mutant relinks, and it more than halves those relinks.
       - name: Install cargo-mutants and wild
         uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
         with:
           tool: cargo-mutants,wild
 
-      # gcc's `-fuse-ld=wild` resolves `ld.wild` on PATH; the release ships
-      # only `wild`.
-      - name: Expose wild as ld.wild
-        run: ln -sf "$CARGO_HOME/bin/wild" "$CARGO_HOME/bin/ld.wild"
+      # wild (https://wild-linker.github.io/wild) cuts the per-mutant relink.
+      # scripts/prefer-fast-linker.sh selects wild through clang (`--ld-path`):
+      # gcc only accepts `-fuse-ld=wild` from 16.1, and the runner image's gcc
+      # rejects it. It appends to RUSTFLAGS and falls back to mold where wild
+      # has no build (AGENTS.md / ADR-019).
+      - name: Select the preferred linker
+        run: scripts/prefer-fast-linker.sh
 
       - name: Write the PR diff
         env:
@@ -325,8 +349,6 @@ jobs:
       # also compiles the test binaries when the `-wild` cache is cold.
       - name: Mutate only the diff
         working-directory: ${{ runner.temp }}/mutants
-        env:
-          RUSTFLAGS: -C link-arg=-fuse-ld=wild
         run: |
           set +e
           cargo mutants --in-diff pr.diff --baseline=skip --in-place --timeout 240
@@ -335,6 +357,16 @@ jobs:
           if [ "$code" = "2" ] || [ -s mutants.out/missed.txt ]; then
             echo "::error::cargo-mutants found $(wc -l < mutants.out/missed.txt) survivor(s) in the diff — catch/fix them, or add a reasoned exclude_re entry to .cargo/mutants.toml"
             exit 2
+          fi
+          # A build-level failure marks every mutant unviable and
+          # cargo-mutants still exits 0 — found in the #166 re-evaluation,
+          # where this gate had silently tested nothing. Never pass a run that
+          # tested no mutants when the diff had candidates.
+          total=$(jq -r '.total_mutants // 0' mutants.out/outcomes.json 2>/dev/null || echo 0)
+          tested=$(jq -r '(.caught + .missed + .timeout) // 0' mutants.out/outcomes.json 2>/dev/null || echo 0)
+          if [ "$total" -gt 0 ] && [ "$tested" -eq 0 ]; then
+            echo "::error::cargo-mutants tested no mutants ($total unviable) — inspect mutants.out/log"
+            exit 1
           fi
           exit "$code"
 

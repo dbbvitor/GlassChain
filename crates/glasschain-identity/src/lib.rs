@@ -60,6 +60,7 @@ pub mod identity;
 pub mod msp;
 pub mod msp_policy;
 pub mod ocsp;
+pub mod payload_gate;
 pub mod possession;
 
 #[cfg(kani)]
@@ -78,6 +79,7 @@ pub use msp::Organization;
 pub use msp::ADMIN_ROLE;
 pub use msp_policy::MspEndorsementProvider;
 pub use ocsp::{OcspError, OcspStatus, OCSP_VALIDITY_SECS};
+pub use payload_gate::private_payload_allowed;
 pub use possession::{
     certificate_admin_role, certificate_admin_role_der, certificate_ed25519_public_key,
     certificate_ed25519_public_key_der, certificate_organization, certificate_subject_cn,
