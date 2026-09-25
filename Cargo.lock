@@ -423,9 +423,9 @@ checksum = "ecc7fce0356b52c2483bb6188cc8bdc11add526bce75d1a44e5e5d889a6ab008"
 dependencies = [
  "blst",
  "blstrs",
- "ff",
- "group",
- "pairing",
+ "ff 0.13.1",
+ "group 0.13.0",
+ "pairing 0.23.0",
  "rand_core 0.6.4",
  "subtle",
  "thiserror 1.0.69",
@@ -438,9 +438,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7bc6d6292be3a19e6379786dac800f551e5865a5bb51ebbe3064ab80433f403"
 dependencies = [
  "digest 0.9.0",
- "ff",
- "group",
- "pairing",
+ "ff 0.13.1",
+ "group 0.13.0",
+ "pairing 0.23.0",
  "rand_core 0.6.4",
  "subtle",
 ]
@@ -465,9 +465,9 @@ checksum = "7a8a8ed6fefbeef4a8c7b460e4110e12c5e22a5b7cf32621aae6ad650c4dcf29"
 dependencies = [
  "blst",
  "byte-slice-cast",
- "ff",
- "group",
- "pairing",
+ "ff 0.13.1",
+ "group 0.13.0",
+ "pairing 0.23.0",
  "rand_core 0.6.4",
  "serde",
  "subtle",
@@ -1336,6 +1336,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ff"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1f686ab92a9fb0eaf188f6c6c87b89490baa6fdb0db4544ba4dc47f7942489f"
+dependencies = [
+ "rand_core 0.10.1",
+ "subtle",
+]
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1651,10 +1661,10 @@ dependencies = [
  "bls12_381",
  "blstrs",
  "criterion",
- "group",
+ "group 0.13.0",
  "hex",
  "log",
- "pairing",
+ "pairing 0.24.0",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -1841,10 +1851,21 @@ version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0f9ef7462f7c099f518d754361858f86d8a07af53ba9af0fe635bbccb151a63"
 dependencies = [
- "ff",
+ "ff 0.13.1",
  "rand 0.8.6",
  "rand_core 0.6.4",
  "rand_xorshift",
+ "subtle",
+]
+
+[[package]]
+name = "group"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7fd1a1c7a5206c5b7a3f5a0d7ccd3ff85d0c8f5133d62a02680255b0004af5f4"
+dependencies = [
+ "ff 0.14.0",
+ "rand_core 0.10.1",
  "subtle",
 ]
 
@@ -3216,7 +3237,16 @@ version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81fec4625e73cf41ef4bb6846cafa6d44736525f442ba45e407c4a000a13996f"
 dependencies = [
- "group",
+ "group 0.13.0",
+]
+
+[[package]]
+name = "pairing"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33f6413397336802d16a342e69a5bd9c8b8cc2fa9fc9298044cd3443f77f1010"
+dependencies = [
+ "group 0.14.0",
 ]
 
 [[package]]
