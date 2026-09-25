@@ -298,6 +298,19 @@ pub(crate) use proof_arith::{
     quorum_threshold, signers_in_range,
 };
 
+/// `true` when a signer bitmap exceeds what [`expand_signers`]' bit-span
+/// arithmetic can represent — a length no real allocation reaches, kept as a
+/// fail-closed guard at the certificate boundary (#176).
+///
+/// Extracted so the mutation gate can exercise the boundary: the guard itself
+/// is unreachable from a test because no `Vec<u8>` of that size can be
+/// allocated, and a bare comparison inside `verify_certificate` survived as
+/// three untestable mutants.
+#[cfg(feature = "bft")]
+const fn bitmap_too_large(bitmap_len: usize) -> bool {
+    bitmap_len > usize::MAX / 8
+}
+
 /// One validator in the BFT validator set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatorInfo {
@@ -553,7 +566,7 @@ impl BftConsensusProvider {
         // The kernel's expansion bound is a hard requirement (bit-span
         // arithmetic); a bitmap above it cannot come off the wire, so a peer
         // claiming one fails closed here.
-        if certificate.signers_bitmap.len() > usize::MAX / 8 {
+        if bitmap_too_large(certificate.signers_bitmap.len()) {
             return Err(CoreError::InvalidBlock(
                 "bft: signer bitmap is too large to expand".into(),
             ));
@@ -979,6 +992,19 @@ mod tests {
             keys.push(secret);
         }
         (validators, keys)
+    }
+
+    /// The certificate-boundary size guard: only lengths above the expansion
+    /// kernel's bound are rejected, and the bound itself is accepted. A test
+    /// cannot build such a bitmap, so the predicate carries the cases the
+    /// mutation gate would otherwise report as untestable survivors.
+    #[test]
+    fn bitmap_size_guard_rejects_only_the_unrepresentable() {
+        assert!(!bitmap_too_large(0));
+        assert!(!bitmap_too_large(8));
+        assert!(!bitmap_too_large(usize::MAX / 8));
+        assert!(bitmap_too_large(usize::MAX / 8 + 1));
+        assert!(bitmap_too_large(usize::MAX));
     }
 
     /// `count` validators with the signing key at `local` (bitmap index).
