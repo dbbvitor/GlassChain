@@ -195,7 +195,7 @@ kani-coverage: ## Kani source-coverage report for the curated harnesses (local g
 	cargo kani -p glasschain-core -p glasschain-identity --default-unwind 16 \
 	  --coverage -Z source-coverage --output-format=terse
 
-verus: ## Verify the zero-trust roadmap (gas, BFT, certificate, TOFU, trust score, MSP heights)
+verus: ## Verify the zero-trust proofs (gas, BFT bitmap/certificate, rounds, TOFU, trust score, MSP heights, channel gate)
 	cargo verus verify -p glasschain-vm -p glasschain-core -p glasschain-identity --all-features \
 	  --locked -- --expand-errors
 

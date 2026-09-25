@@ -34,7 +34,7 @@ no leverage; tests + mutation for the primitives underneath (ADR-019).
 | Trust score (`core/asset.rs`) | `MetadataTrustScore::compute`, `is_valid_iso8601_date` | Verus — score arithmetic proved 2026-09-24 (`asset::trust_proofs`: exact 20/10 formula, `<= 100`, standard gate); Kani keeps the ISO-8601 structural parity |
 | BFT quorum/bitmap/context (`core/{bft,consensus}.rs`) | `QuorumCertificate::validate`, `verify_certificate`, vote/context messages | Verus — quorum/bitmap kernels (`bft::proof_arith`) and certificate admission (`consensus::cert_proofs`: acceptance iff names the block and is degenerate-or-complete) proved 2026-09-24; the bitmap expansion (`expand_signers`/`signers_in_range`, exact set bits) and the pure round kernels (`rounds::{proposer_slot, receipt_action, should_retain}`) proved 2026-09-25 (#176); context framing deferred; BLS assumed |
 | TOFU pin transition (`network/node.rs`) | `PeerRegistry::verify_or_register` → `core::pin::decide` | Verus — `spec_decide` gate proved 2026-09-24 (`pin.rs`: poisoned/NodeId/Org reject, rotate only with a valid proof under the pinned key); ed25519 assumed |
-| Private-payload gate (`network/node.rs`) | `private_peer_trusted`, `payload_targets`, `Channel::is_member` | Verus — `channel::private_payload_allowed` (the fail-closed conjunction) and the slice membership `channel::contains_str` proved 2026-09-25 (#176); the hash lookups stay behind the seam |
+| Private-payload gate (`network/node.rs`) | `private_peer_trusted`, `payload_targets`, `Channel::is_member` | Verus — `payload_gate::private_payload_allowed` (the fail-closed conjunction) and the slice membership `channel::contains_str` proved 2026-09-25 (#176); the hash lookups stay behind the seam |
 | MSP height-window authorization (`identity/msp_policy.rs`) | `MspEndorsementProvider::evaluate` bounds checks | Verus — `authz_proofs` proved 2026-09-24 (registered-before-use, go-forward revocation); ed25519 assumed |
 | Channel membership (`identity/channel.rs`) | `Channel::is_member` | Verus — the `HashSet<String>` was replaced by a `Vec<String>` and `is_member` routes through `contains_str`, proved 2026-09-25 (#176) |
 | OCSP DER codec (`identity/ocsp.rs`) | `minimal_be`, `read_tlv`, `read_generalized` | Kani (slices/parsers) — `minimal_be`/`read_tlv` proved |
@@ -203,8 +203,9 @@ by `test_zero_required_never_evaluates_true`.
   20/10-point flags and `is_standard_score` is the ≥80 gate), the MSP
   height-window authorization (`identity/msp_policy.rs::authz_proofs`), and
   the #176 residues: the bitmap expansion (`bft::proof_arith::expand_signers`),
-  the consensus-round kernels (`glasschain-core/src/rounds.rs`), and channel
-  membership plus the private-payload gate (`glasschain-identity/src/channel.rs`).
+  the consensus-round kernels (`glasschain-core/src/rounds.rs`), channel
+  membership (`glasschain-identity/src/channel.rs`) and the private-payload
+  gate (`glasschain-identity/src/payload_gate.rs`).
   `vstd` is unconditional in `glasschain-core` (and now `glasschain-identity`)
   now that non-`bft` modules need it.
 

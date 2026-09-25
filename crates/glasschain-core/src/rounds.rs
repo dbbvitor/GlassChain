@@ -7,7 +7,9 @@
 //! The round state itself — `BftRound` and the `VoteReceipts` journal — stays
 //! in `glasschain-network/src/rounds.rs`, which delegates every pure decision
 //! to this module. That is the TOFU precedent (ADR-019): the `HashMap`-backed
-//! state never enters a spec, only the decision does.
+//! state never enters a spec, only the decision does, and the kernels take
+//! primitives rather than wrapper types so the spec stays the decision table
+//! the caller reads.
 
 use vstd::prelude::*;
 

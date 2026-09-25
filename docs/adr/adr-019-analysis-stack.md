@@ -209,10 +209,11 @@ mutation for the crypto primitives underneath:
   the consensus-round kernels (`rounds::{proposer_slot, receipt_action,
   should_retain}`: overflow-safe rotation, the equivocation decision table,
   the retirement bound — the network's `VoteReceipts` delegates each); and
-  channel membership plus the private-payload gate
-  (`identity/channel.rs::channel_proofs`: slice membership on a `Vec` member
-  store, and the fail-closed `verifier ∧ verified ∧ member` conjunction the
-  node delegates to). Both proof jobs run in `ci.yml` on every PR and push.
+  channel membership and the private-payload gate
+  (`identity/channel.rs::channel_proofs` proves slice membership on a `Vec`
+  member store; `identity/payload_gate.rs` proves the fail-closed
+  `verifier ∧ verified ∧ member` conjunction the node delegates to). Both
+  proof jobs run in `ci.yml` on every PR and push.
 - **The endorsement policy algebra is deferred on both tools** (Verus cannot
   pattern-match the serde-derived external enum without an upstream fix;
   CBMC times out on its recursive heap tree) and stays tests + mutation

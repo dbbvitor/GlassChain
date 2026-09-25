@@ -482,11 +482,14 @@ jobs:
             --skip ledger_default_uses_the_workspace_difficulty \
             --skip test_d3_index_semantics_match_full_rebuild_after_history_growth
 
-  # ASan/LSan runs on every PR and push (ADR-019): the full workspace under
-  # `-Zbuild-std`, zero suppressions — leaks are failures (wayfinder #163).
-  # Measured on a GitHub runner at 5m22s for the build plus all 35 suites (the
-  # 50-minute figure that kept it scheduled was a cold local 4-core box), so
-  # the nightly deep-checks leg was retired (wayfinder #166 re-evaluation).
+  # ASan/LSan runs on every PR and push (ADR-019), diff-scoped like the other
+  # build jobs: the affected crates' tests under `-Zbuild-std`, zero
+  # suppressions — leaks are failures (wayfinder #163). The std rebuild is a
+  # fixed cost, so scoping still cuts the per-crate test builds. Measured on a
+  # GitHub runner at 5m22s for the full workspace (the 50-minute figure that
+  # kept it scheduled was a cold local 4-core box); the nightly `ci.yml` sweep
+  # and pushes run it whole-workspace. A deliberate-leak canary proves LSan is
+  # armed before the suite runs.
   asan:
     name: ASan/LSan
     needs: changes
@@ -567,7 +570,8 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=1
         run: >-
-          cargo +nightly-2026-09-20 test --workspace --lib --bins --tests --all-features --locked
+          cargo +nightly-2026-09-20 test ${{ needs.changes.outputs.cargo_flags }}
+          --lib --bins --tests --all-features --locked
           -Zbuild-std --target x86_64-unknown-linux-gnu
 
   # The deterministic partition/repair scenario runs on every PR and push:

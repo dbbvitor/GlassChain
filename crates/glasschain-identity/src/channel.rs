@@ -39,11 +39,11 @@ use glasschain_core::crypto::sha256;
 use glasschain_core::endorsement::PolicyExpression;
 use serde::{Deserialize, Serialize};
 
-/// Membership and the private-payload gate, proved in production form with
-/// Verus (ADR-019/#176). The member store is a `Vec<String>` (never a
-/// `HashSet`, whose lookup Verus cannot model): membership is a slice
-/// predicate, the TOFU precedent, and the gate is the proved conjunction that
-/// fails closed.
+/// Channel membership, proved in production form with Verus (ADR-019/#176).
+/// The member store is a `Vec<String>` (never a `HashSet`, whose lookup Verus
+/// cannot model): membership is the slice predicate the shipped
+/// [`Channel::is_member`] delegates to, the TOFU precedent. The private-payload
+/// gate lives in [`crate::payload_gate`].
 mod channel_proofs {
     use vstd::prelude::*;
 
@@ -75,61 +75,10 @@ mod channel_proofs {
         false
     }
 
-    /// The private-payload gate: a peer's org may receive private payloads
-    /// only when a certificate verifier is configured, the org was
-    /// certificate-verified in this session, and the org is a channel member
-    /// (ADR-003, #86). The caller reduces its lookups to these three booleans.
-    pub open spec fn spec_private_payload_allowed(
-        verifier_present: bool,
-        org_verified: bool,
-        org_is_member: bool,
-    ) -> bool {
-        verifier_present && org_verified && org_is_member
-    }
-
-    /// Decide the private-payload gate from the extracted conditions.
-    #[must_use]
-    pub const fn private_payload_allowed(
-        verifier_present: bool,
-        org_verified: bool,
-        org_is_member: bool,
-    ) -> (allowed: bool)
-        ensures
-            allowed == spec_private_payload_allowed(verifier_present, org_verified, org_is_member),
-    {
-        verifier_present && org_verified && org_is_member
-    }
-
-    /// Fail closed: any missing condition denies private payloads.
-    pub proof fn missing_condition_denies_private_payloads(
-        verifier_present: bool,
-        org_verified: bool,
-        org_is_member: bool,
-    )
-        ensures
-            !verifier_present ==> !spec_private_payload_allowed(
-                verifier_present,
-                org_verified,
-                org_is_member,
-            ),
-            !org_verified ==> !spec_private_payload_allowed(
-                verifier_present,
-                org_verified,
-                org_is_member,
-            ),
-            !org_is_member ==> !spec_private_payload_allowed(
-                verifier_present,
-                org_verified,
-                org_is_member,
-            ),
-    {
-    }
-
     } // verus!
 }
 
 use channel_proofs::contains_str;
-pub use channel_proofs::private_payload_allowed;
 
 /// Organizations that are policy-level members of **every** collection by
 /// default (ADR-003 decision 2).
@@ -190,6 +139,8 @@ pub struct Channel {
     /// The effective member organizations (configured members plus the default
     /// regulators). The source of truth for [`Self::is_member`]; kept as a
     /// slice so the membership predicate is the proved kernel (ADR-019/#176).
+    /// Collections hold a handful of orgs, so the predicate's linear scan is
+    /// immaterial — and it is the shape Verus can prove.
     members: Vec<String>,
 }
 
