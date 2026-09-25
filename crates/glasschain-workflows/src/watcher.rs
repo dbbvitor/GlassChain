@@ -722,4 +722,12 @@ mod tests {
         // Bytes that are not valid JSON matching WatcherStateSnapshot.
         assert!(svc.restore_from_bytes(b"not json").is_err());
     }
+
+    #[test]
+    fn debug_format_names_the_service_and_executor_state() {
+        let svc = WatcherService::new();
+        let rendered = format!("{svc:?}");
+        assert!(rendered.contains("WatcherService"), "got {rendered}");
+        assert!(rendered.contains("<none>"), "got {rendered}");
+    }
 }

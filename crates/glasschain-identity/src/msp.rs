@@ -533,7 +533,7 @@ impl IntermediateCa {
 
     /// Revoke a previously issued member certificate (ADR-013). See
     /// [`Organization::revoke_identity`]; revocations mint into this CA's own
-    /// CRL, which verifiers check against intermediate-issued leafs.
+    /// CRL, which verifiers check against intermediate-issued leaves.
     ///
     /// # Errors
     ///
@@ -942,6 +942,55 @@ mod tests {
     }
 
     #[test]
+    fn root_ca_accessors_expose_the_issuer_identity() {
+        // The OCSP minter signs with the CA key and names the CA subject as
+        // the responder; both accessors must return the CA certificate's own
+        // material, byte for byte.
+        let org = Organization::new("AccessorCorp").unwrap();
+        let der = rustls_pki_types::CertificateDer::from_pem_slice(org.root_ca_cert_pem.as_bytes())
+            .unwrap();
+        let cert = x509_cert::Certificate::from_der(der.as_ref()).unwrap();
+        let mut subject = Vec::new();
+        cert.tbs_certificate()
+            .subject()
+            .encode_to_vec(&mut subject)
+            .unwrap();
+        assert_eq!(org.ca_subject_der(), subject.as_slice());
+        assert_eq!(
+            org.ca_public_key(),
+            cert.tbs_certificate()
+                .subject_public_key_info()
+                .subject_public_key
+                .raw_bytes()
+        );
+    }
+
+    #[test]
+    fn each_intermediate_issued_certificate_gets_a_fresh_serial() {
+        let mut org = Organization::new("SerialCorp").unwrap();
+        let mut intermediate = org
+            .issue_intermediate_ca("SerialCorp Intermediate")
+            .unwrap();
+        let first = intermediate.issue_identity("node-1").unwrap();
+        let second = intermediate.issue_identity("node-2").unwrap();
+
+        let serial = |identity: &Identity| {
+            let pem = identity.certificate_pem.as_ref().unwrap();
+            let der = rustls_pki_types::CertificateDer::from_pem_slice(pem.as_bytes()).unwrap();
+            x509_cert::Certificate::from_der(der.as_ref())
+                .unwrap()
+                .tbs_certificate()
+                .serial_number()
+                .clone()
+        };
+        assert_ne!(
+            serial(&first),
+            serial(&second),
+            "every issued certificate must carry a distinct serial"
+        );
+    }
+
+    #[test]
     fn test_issue_identity_creates_member_cert() {
         let mut org = Organization::new("PharmaCorp").unwrap();
         let identity = org.issue_identity("node-1").unwrap();
@@ -1018,5 +1067,28 @@ mod tests {
             revocation_reason_from_code(255),
             RevocationReason::Unspecified
         );
+    }
+
+    #[test]
+    fn intermediate_ca_mints_a_parseable_good_staple() {
+        let mut org = Organization::new("RootOrg").expect("org");
+        let mut intermediate = org.issue_intermediate_ca("InterOrg").expect("intermediate");
+        let member = intermediate.issue_identity("node-i").expect("member");
+        assert!(member.certificate_pem.is_some());
+
+        let staple = intermediate.ocsp_response_der("node-i").expect("staple");
+        let parsed = crate::ocsp::parse_staple(&staple).expect("parseable staple");
+        assert!(parsed.status, "a minted staple attests good");
+        assert!(
+            !parsed.serial.is_empty(),
+            "the staple names the member serial"
+        );
+        assert!(
+            parsed.next_update > parsed.this_update,
+            "the staple window is forward in time"
+        );
+
+        // An unknown node has no live certificate to attest.
+        assert!(intermediate.ocsp_response_der("missing").is_err());
     }
 }

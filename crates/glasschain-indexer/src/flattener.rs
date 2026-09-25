@@ -746,6 +746,50 @@ mod tests {
         assert!(!low[0].missing_core_fields.is_empty());
     }
 
+    #[test]
+    fn low_trust_records_excludes_the_threshold() {
+        let mut flattener = AnalyticalFlattener::new();
+        let block = make_block();
+        // All four core fields, no bonus fields: exactly 80.
+        let mut asset = full_asset();
+        asset.anvisa_registration = None;
+        asset.manufacturer_id = None;
+        let tx = make_asset_tx(asset, "manufacture", "tx-boundary");
+        flattener.ingest_indexed_block(&block, &[tx]);
+
+        assert_eq!(
+            flattener.records()[0].trust_score,
+            80,
+            "the fixture must sit exactly on the threshold"
+        );
+        assert!(
+            flattener.low_trust_records().is_empty(),
+            "the threshold itself is not low trust"
+        );
+    }
+
+    #[test]
+    fn csv_quotes_each_special_character_on_its_own() {
+        let tx = make_asset_tx(full_asset(), "manufacture", "tx-csv-single");
+        let mut record =
+            AnalyticalFlattener::flatten_transaction(&tx, 1, "abc123def456", 1_700_000_000)
+                .unwrap();
+
+        record.missing_core_fields = "a,b".into();
+        let row = AnalyticalFlattener::to_csv_row(&record);
+        assert!(
+            row.contains("\"a,b\""),
+            "a comma alone must quote the field"
+        );
+
+        record.missing_core_fields = "a\"b".into();
+        let row = AnalyticalFlattener::to_csv_row(&record);
+        assert!(
+            row.contains("\"a\"\"b\""),
+            "a double-quote alone must quote the field"
+        );
+    }
+
     // ── Test 7: total_quantity_for_gtin sums across matching records ──────────
 
     #[test]

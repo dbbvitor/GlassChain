@@ -1009,6 +1009,54 @@ mod tests {
         );
     }
 
+    fn unix_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// A self-signed certificate with an exact validity window (seconds).
+    fn cert_with_validity(not_before: u64, not_after: u64) -> Certificate {
+        let mut params = rcgen::CertificateParams::default();
+        params.not_before =
+            time::OffsetDateTime::from_unix_timestamp(i64::try_from(not_before).unwrap()).unwrap();
+        params.not_after =
+            time::OffsetDateTime::from_unix_timestamp(i64::try_from(not_after).unwrap()).unwrap();
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        Certificate::from_der(cert.der().as_ref()).unwrap()
+    }
+
+    #[test]
+    fn validity_window_boundaries_are_inclusive() {
+        // The window is open at its first second: `now == not_before` is not
+        // "not yet valid".
+        loop {
+            let now = unix_now();
+            let cert = cert_with_validity(now, now + 3_600);
+            let result = CertChainVerifier::check_validity(&cert);
+            if unix_now() != now {
+                continue; // the clock ticked mid-check; retry with a fresh window
+            }
+            assert!(result.is_ok(), "now == not_before must be valid");
+            break;
+        }
+
+        // The window is open at its last second: `now == not_after` is not
+        // "expired".
+        loop {
+            let now = unix_now();
+            let cert = cert_with_validity(now - 3_600, now);
+            let result = CertChainVerifier::check_validity(&cert);
+            if unix_now() != now {
+                continue;
+            }
+            assert!(result.is_ok(), "now == not_after must be valid");
+            break;
+        }
+    }
+
     // ── 12. verify_cert_pem rejects garbage PEM ──────────────────────────────
 
     #[test]
@@ -1249,6 +1297,31 @@ mod tests {
         assert!(verifier.verify_cert_pem(&member_b).is_ok());
         std::fs::remove_file(&path).ok();
     }
+    #[test]
+    fn crl_file_loads_and_counts_every_block() {
+        let org_a = Organization::new("CrlCorpA").unwrap();
+        let org_b = Organization::new("CrlCorpB").unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "glasschain-crl-bundle-{}-{}.crl",
+            std::process::id(),
+            unix_now()
+        ));
+        let bundle = format!("{}\n{}", org_a.crl_pem().unwrap(), org_b.crl_pem().unwrap());
+        std::fs::write(&path, bundle).unwrap();
+
+        let mut verifier = CertChainVerifier::from_org(&org_a).unwrap();
+        assert_eq!(verifier.crl_count(), 0, "a fresh verifier holds no CRLs");
+        verifier
+            .add_crl_file(&path)
+            .expect("a CRL bundle must load");
+        assert_eq!(
+            verifier.crl_count(),
+            2,
+            "every CRL block in the file must be counted"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn empty_trust_store_files_fail_with_precise_errors() {
         let dir = std::env::temp_dir().join(format!(

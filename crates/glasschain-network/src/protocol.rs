@@ -190,3 +190,14 @@ pub enum Message {
 /// `Chain { from_index, blocks }` response shape (latency plan #4) — a `/6`
 /// peer cannot parse either.
 pub const PROTOCOL_VERSION: &str = "glasschain/7";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The frame cap is a real 16 MiB, not an accidental arithmetic result.
+    #[test]
+    fn max_message_size_is_sixteen_mib() {
+        assert_eq!(MAX_MESSAGE_SIZE, 16_777_216);
+    }
+}

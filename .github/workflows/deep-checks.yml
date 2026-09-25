@@ -1,0 +1,155 @@
+name: Deep checks
+
+# Scheduled Tier-3/Tier-4 analysis (wayfinder #166, policy from #147):
+# the full cargo-mutants run sharded 16 ways and ASan/LSan over the
+# workspace. Everything whose measured run fits the 30-minute guardrail —
+# Kani, Verus, Miri, turmoil and the ignored capacity/measurement gates —
+# lives in ci.yml and runs on every PR and push (ADR-019). No job blocks a
+# PR, so failures surface as the rolling `ci-failure` issue managed by
+# ci-failure-issues.yml.
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deep-checks-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  mutants:
+    name: Mutation (shard ${{ matrix.shard }}/16)
+    runs-on: ubuntu-latest
+    # 2 256 mutants over 16 serial shards; the first cold shard dominates.
+    # `wild` (https://mutants.rs/performance.html) more than halves the
+    # per-mutant relinks, so it applies to the proof run and the shards alike.
+    timeout-minutes: 240
+    env:
+      RUSTFLAGS: -C link-arg=-fuse-ld=wild
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.98.1
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: mutants-${{ matrix.shard }}-wild
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      - name: Install cargo-mutants, cargo-nextest and wild
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
+        with:
+          tool: cargo-mutants,cargo-nextest,wild
+
+      # gcc's `-fuse-ld=wild` resolves `ld.wild` on PATH; the release ships
+      # only `wild`.
+      - name: Expose wild as ld.wild
+        run: ln -sf "$CARGO_HOME/bin/wild" "$CARGO_HOME/bin/ld.wild"
+
+      # `--in-place` is what lets each mutant reuse the previous build; the
+      # scratch copy (target included, so the rust-cache still pays off) keeps
+      # cargo-mutants from ever touching the checked-out tree. `--jobs` would
+      # force copy mode, which the tool documents as losing all build reuse —
+      # for the full workspace that is thousands of cold builds.
+      - name: Stage a scratch tree
+        run: |
+          mkdir -p "$RUNNER_TEMP/mutants"
+          rsync -a --exclude .git "$GITHUB_WORKSPACE/" "$RUNNER_TEMP/mutants/"
+
+      # `--baseline=skip` requires the tests to pass in the same tree, and
+      # sharding must not run the baseline 16 times.
+      - name: Prove the suite passes before mutating
+        working-directory: ${{ runner.temp }}/mutants
+        run: cargo nextest run --profile ci --workspace --lib --bins --tests --all-features --locked
+
+      # A shard is serial: `--in-place` cannot combine with `--jobs`.
+      # `--all-features` and the Kani-harness exclusion come from
+      # `.cargo/mutants.toml`.
+      #
+      # Survivors (2) and timeouts (3) both fail the shard: catch/fix them, or
+      # add a reasoned `exclude_re` entry (`mutants-skip:`) to
+      # `.cargo/mutants.toml`. cargo-mutants gives timeouts precedence over
+      # missed in its exit code, so the survivor check reads `missed.txt` for
+      # a precise message; both codes fail either way.
+      - name: Mutate shard ${{ matrix.shard }}
+        working-directory: ${{ runner.temp }}/mutants
+        run: |
+          set +e
+          cargo mutants --shard ${{ matrix.shard }}/16 --in-place --baseline=skip --timeout 180
+          code=$?
+          set -e
+          if [ "$code" = "2" ] || [ -s mutants.out/missed.txt ]; then
+            echo "::error::cargo-mutants shard ${{ matrix.shard }} found $(wc -l < mutants.out/missed.txt) survivor(s) — catch/fix them, or add a reasoned exclude_re entry to .cargo/mutants.toml"
+            exit 2
+          fi
+          exit "$code"
+
+      # The whole `mutants.out` (outcomes.json, missed.txt and the per-mutant
+      # diff/ files) so a failed shard is diagnosable without a re-run.
+      - name: Upload mutants.out
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mutants-out-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/mutants/mutants.out
+          if-no-files-found: ignore
+
+  asan:
+    name: ASan/LSan
+    runs-on: ubuntu-latest
+    # Cold `-Zbuild-std` workspace build exceeds 50 minutes even on 8 cores.
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install nightly Rust with rust-src
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          # Dated, not `nightly`: a moving toolchain invalidates the
+          # rust-cache every night (wayfinder #167).
+          toolchain: nightly-2026-09-20
+          components: rust-src
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: asan
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      # Zero suppressions: leaks are failures (wayfinder #163).
+      - name: Run the suite under ASan/LSan
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          ASAN_OPTIONS: detect_leaks=1
+        run: >-
+          cargo +nightly-2026-09-20 test --workspace --lib --bins --tests --all-features --locked
+          -Zbuild-std --target x86_64-unknown-linux-gnu

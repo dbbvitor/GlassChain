@@ -33,6 +33,13 @@ rustls-webpki = { version = "0.103", default-features = false, features = ["ring
 ring = "0.17"
 # certID SHA-256 hashes (ADR-017), the same 0.11 tree glasschain-core uses.
 sha2 = "0.11"
+# Verus's standard library. The MSP height-window authorization is proved
+# against it; in normal (non-Verus) builds it compiles to erased ghost code
+# (ADR-019: Verus first on zero-trust, #170).
+vstd = "=0.0.0-2026-09-20-0158"
+
+[package.metadata.verus]
+verify = true
 
 [dev-dependencies]
 

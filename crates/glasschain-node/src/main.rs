@@ -501,16 +501,14 @@ impl CliArgs {
 /// compatibility); a missing value keeps the current one.
 fn parse_args(args: &[String]) -> CliArgs {
     let mut parsed = CliArgs::defaults();
-    let mut i = 1;
-    while i < args.len() {
-        let flag = args[i].as_str();
-        i += 1;
-        if i >= args.len() {
+    // A flag/value pair per iteration; a trailing flag without a value ends
+    // the scan. No index arithmetic for a mutation to turn into a loop.
+    let mut args = args.iter().skip(1);
+    while let Some(flag) = args.next() {
+        let Some(value) = args.next() else {
             break;
-        }
-        let value = &args[i];
-        i += 1;
-        match flag {
+        };
+        match flag.as_str() {
             "--id" => parsed.node_id.clone_from(value),
             "--listen" => parsed.listen_addr.clone_from(value),
             "--peer" => parsed.seed_peers.push(value.clone()),
@@ -1720,11 +1718,20 @@ mod tests {
             admin_gate: Some(glasschain_rpc::AdminGate::new(Arc::new(gate_verifier))),
         };
 
-        // A bad path hits the `Err` branch and the REPL keeps going.
+        assert!(
+            node.cert_verifier().await.is_none(),
+            "the REPL node starts without a verifier"
+        );
+        // A bad path hits the `Err` branch and the REPL keeps going, without
+        // installing anything.
         let reload = parse_command("reload-trust-store /tmp/bad-path")
             .unwrap()
             .unwrap();
         assert!(execute_repl_command(&node, reload, &ctx).await);
+        assert!(
+            node.cert_verifier().await.is_none(),
+            "a failed reload must not install a verifier"
+        );
 
         // The directory store reload succeeds: files and CRLs counted,
         // verifier and admin gate swapped.
@@ -1732,6 +1739,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(execute_repl_command(&node, reload, &ctx).await);
+        assert!(
+            node.cert_verifier().await.is_some(),
+            "the matching (org, root) arm must install the reloaded verifier"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

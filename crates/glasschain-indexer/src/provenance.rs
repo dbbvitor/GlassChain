@@ -237,6 +237,27 @@ mod tests {
     }
 
     #[test]
+    fn verify_lineage_with_no_expectations_is_vacuously_complete() {
+        let mut index = ProvenanceIndex::new();
+        index.record_event(CustodyEvent {
+            asset_id: "GTIN:x".into(),
+            event_type: "manufacture".into(),
+            custodian_id: "custodian".into(),
+            transaction_id: "tx-1".into(),
+            block_index: 1,
+            timestamp: 0,
+        });
+        assert!(
+            index.verify_lineage("GTIN:x", &[]),
+            "no expected events means nothing is missing"
+        );
+        assert!(
+            !index.verify_lineage("GTIN:x", &["manufacture", "receive"]),
+            "a chain shorter than the expectation is incomplete"
+        );
+    }
+
+    #[test]
     fn test_verify_lineage_incomplete() {
         let mut idx = ProvenanceIndex::new();
         idx.record_event(CustodyEvent {

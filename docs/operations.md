@@ -771,17 +771,74 @@ code paths: `BftConsensusProvider`, `set_bft_consensus`, and the
 `#[cfg(not(feature = "bft"))]` fallbacks — `--all-features` compiles the BFT
 code, default builds the fallbacks, and both must stay green.
 
-### What CI runs (`.github/workflows/ci.yml`)
+### What CI runs (`.github/workflows/`)
+
+`ci.yml` — every push and PR:
 
 | Job | Runner | Runs |
 |---|---|---|
 | `fmt` / `clippy` | ubuntu | `cargo fmt --all --check`; clippy with `RUSTFLAGS=-D warnings` |
 | `test` | **matrix ubuntu / macOS / Windows** | `cargo nextest run --profile ci --workspace --lib --bins --tests --all-features` with `RUSTFLAGS=-D warnings`, `RUSTDOCFLAGS=-D warnings` — process-per-test isolation; loopback ports come from the shared per-process band allocator (`tests/common/ports.rs`), so no cross-test port race |
-| `coverage` | ubuntu | `cargo tarpaulin … --lib --bins --tests --engine llvm --out xml` (llvm engine because wasmtime traps abort the default ptrace engine; benches excluded like the test job), upload to Codecov when a token exists |
+| `coverage` | ubuntu | `cargo llvm-cov nextest --profile ci … --lcov` (nextest integration; benches excluded like the test job), upload to Codecov when a token exists. Verified at 94.18% line coverage before the tarpaulin → llvm-cov flip (ADR-019) |
+| `miri` | matrix: 6 crates | `cargo +nightly-2026-09-20 miri test -p <crate> --lib` with `-Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check`, no `-Zmiri-ignore-leaks`; per-crate skips. Measured: core ~19 min, the rest <2 min. Moved from nightly `deep-checks.yml` (ADR-019) |
+| `turmoil` | ubuntu | `cargo test -p glasschain-network --test turmoil_chaos --features turmoil-sim --locked` — deterministic partition/repair; measured ~0.2 s of test time. Moved from weekly `deep-checks.yml` |
+| `gates` | ubuntu | the `#[ignore]`d capacity/measurement gates (`consensus_capacity`, `tcp_partition`, `read_path_memory`, the network cost measurement) under the runner's 65535-fd hard limit, serial (`--test-threads=1`) so concurrent meshes do not distort them. The 200- and 300-validator BFT finality gates are skipped (manual-only: ~80k/~180k sockets). Measured ~5 min test time. Moved from weekly `deep-checks.yml` |
+| `kani` | ubuntu | `cargo kani -p glasschain-core -p glasschain-identity --default-unwind 16 --output-format=terse --sarif kani.sarif -Z concrete-playback --concrete-playback=print` — curated proofs for the core predicate surface and the identity zero-trust byte surfaces; SARIF on the Code Scanning tab. Warm 2m40s, 30-minute timeout. `cargo kani autoharness` is deliberately not a step (0.68.0 kills `goto-instrument`; evidence in `.agents/memories/kani-deferral.md`) |
+| `verus` | ubuntu | `cargo verus verify -p glasschain-vm -p glasschain-core -p glasschain-identity --all-features --locked` — production-form proofs for the gas arithmetic, the BFT quorum/bitmap kernels and certificate admission, the TOFU pin decision (`glasschain-core/src/pin.rs`), the trust-score arithmetic (`glasschain-core/src/asset.rs`) and the MSP height-window authorization (`glasschain-identity/src/msp_policy.rs`); Verus `0.2026.09.20.aef82ed` from the pinned release zip. A cheat-marker grep (bare `assume(`/`admit(`, `external_body`, `axiom`) runs first so proofs cannot pass vacuously. Warm seconds, 30-minute timeout |
 | `audit` | ubuntu (own workflow: `audit.yml`) | `cargo audit --deny warnings --file Cargo.lock` (RustSec); prebuilt installs via `taiki-e/install-action` |
 
-All `protoc`-requiring jobs install it via `arduino/setup-protoc`, and the
-workflow is path-filtered to code — **docs-only changes skip CI**.
+Both PR workflows **diff-scope** their jobs where the tool allows:
+`scripts/affected-crates.sh` prints the changed crates plus their
+reverse-dependency closure, and package-oriented jobs (clippy, tests,
+cargo-careful, feature matrix, Miri, Kani, Verus, the ignored gates, turmoil)
+run on that set; file-oriented jobs (`typos`, mutation) run on the changed
+files. Workspace-level files (manifests, lockfile, toolchain/lint config,
+`.cargo/`, `.config/`, `.github/`) and pushes to main run the full workspace.
+`cargo fmt`, coverage (the Codecov project gate needs the full report), snarf
+and deny/machete stay whole-workspace by nature.
+
+`analysis.yml` — the blocking PR gate (ADR-019): `cargo machete
+--with-metadata` + `cargo deny --all-features check`, `typos`, `cargo +nightly
+snarf --format github`, `cargo hack check --each-feature`, `cargo +nightly
+careful nextest run --profile ci`, and `cargo mutants --in-diff` over the
+merge-base diff (`--baseline=skip --in-place --timeout 240`; the nightly shards use 180 and `make mutants` 60; the cap absorbs
+the first mutant's cold test-binary build). Both mutation
+jobs follow the cargo-mutants CI guidance
+([ci](https://mutants.rs/ci.html), [pr-diff](https://mutants.rs/pr-diff.html),
+[performance](https://mutants.rs/performance.html)): `taiki-e/install-action`
+installs `cargo-mutants` and the **`wild` linker** (exposed as `ld.wild`, used
+via `RUSTFLAGS=-C link-arg=-fuse-ld=wild` — it more than halves the
+per-mutant relinks), `--in-place` runs in a scratch tree so builds are reused,
+and the whole `mutants.out` (survivor diffs included) is uploaded as an
+artifact with `if: always()`. `--no-shuffle` is the tool's default since 27.x.
+Doctests are deliberately *not* skipped (`-- --all-targets` would drop them):
+a mutation caught only by a doctest would otherwise report as missed.
+
+**Survivors and timeouts fail both mutation gates.** A mutant must be
+caught/fixed, or deliberately skipped with a reason in `.cargo/mutants.toml`'s
+`exclude_re` list (`rg 'mutants-skip:' .cargo/mutants.toml`). The jobs read
+`mutants.out/missed.txt` as well as the exit code, because cargo-mutants
+returns 3 (timeout) in preference to 2 (missed) when a run has both. The 15
+timeout mutants from the first full run are fixed: a `debug_assert` on the
+block-hash length turns the non-terminating PoW loop into a fast panic,
+the fold counters use `saturating_add`, `parse_args` is iterator-based (no
+index arithmetic to mutate), and the peer/CLI tests bound their waits. The two demo
+runner timeouts are skipped in `demo/.cargo/mutants.toml`.
+
+`deep-checks.yml` — nightly, never blocking a PR: the full mutants run in 16
+serial shards and ASan/LSan over the workspace. Everything whose measured
+run fits the owner's 30-minute promotion rule moved to `ci.yml`'s blocking jobs — Kani,
+Verus, the six-crate Miri matrix, turmoil and the ignored
+capacity/measurement gates (scope and evidence in
+`.agents/memories/kani-deferral.md` and ADR-019).
+
+`ci-failure-issues.yml` — turns a scheduled failure into one rolling issue per
+workflow (`ci-failure` label) and closes it on the next green run. `fuzz.yml`,
+`reproducible.yml` and `coverage-insights.yml` stay on their weekly schedules.
+
+All `protoc`-requiring jobs install it via `arduino/setup-protoc`; the test
+workflow is path-filtered to code — **docs-only changes skip CI**. Every
+workflow action is pinned to a commit SHA and updated by Dependabot.
 
 ### Makefile targets
 
@@ -790,7 +847,7 @@ workflow is path-filtered to code — **docs-only changes skip CI**.
 | Target | Runs |
 |---|---|
 | `make setup` | Install pinned toolchain + rustfmt/clippy + `protoc` (may need sudo) |
-| `make tools` / `tools-nightly` / `tools-formal` | Stable tooling (nextest, deny, machete, mutants, typos, cargo-hack, llvm-cov, tarpaulin, audit) / nightly components + careful + snarf / Kani + Verus pointer |
+| `make tools` / `tools-nightly` / `tools-formal` | Stable tooling (nextest, deny, machete, mutants, typos, cargo-hack, llvm-cov, audit) / nightly components + careful + snarf / Kani + Verus pointer |
 | `make build` / `build-release` | `cargo build` / `cargo build --release` |
 | `make check` | `fmt-check` → `clippy` → `cargo check` (fast, no tests) |
 | `make test` / `test-pkg pkg=…` / `test-one pkg=… test=…` | nextest with the CI `ci` profile / one crate / substring match |
@@ -799,7 +856,7 @@ workflow is path-filtered to code — **docs-only changes skip CI**.
 | `make ci` | `check` → `test` → `analysis` |
 | `make snarf` / `careful` / `miri` / `sanitize` | Deep checks: cache-line false sharing / cargo-careful suite / six-crate Miri allowlist with strict flags / ASan+LSan with leaks-as-failures |
 | `make mutants` / `mutants-diff` | Mutation testing (`MUTANTS_PKG=…`, default `glasschain-core`) / diff-only (CI PR-gate command) |
-| `make kani` / `verus` / `llvm-lines` | Kani proofs for `glasschain-core` / Verus critical-code roadmap (`glasschain-vm` first) / compile-time bloat diagnostic |
+| `make kani` / `kani-coverage` / `verus` / `llvm-lines` | Curated Kani proofs (`glasschain-core` + `glasschain-identity`) / Kani source-coverage report for local gap analysis / Verus zero-trust roadmap (`glasschain-vm` gas + `glasschain-core` BFT quorum/bitmap) / compile-time bloat diagnostic |
 | `make audit` / `coverage` / `coverage-xml` | `cargo audit --deny warnings` / llvm-cov HTML / Cobertura XML with the 90% line gate |
 | `make node id=… port=…` | Interactive node REPL — never in automation (Section 2) |
 | `make doc` / `clean` / `bench` | `cargo doc --workspace --no-deps` / `cargo clean` / criterion benches (see Section 12 caveat) |
@@ -829,9 +886,9 @@ star topology.
 
 ```bash
 cargo test -p glasschain-network --test consensus_capacity -- --ignored --nocapture
-# deterministic madsim run:
-RUSTFLAGS="--cfg madsim" cargo test -p glasschain-network \
-  --test consensus_capacity -- --ignored --nocapture
+# the weekly deep-checks job raises the fd limit first:
+ulimit -n 65535 && cargo test -p glasschain-network --test consensus_capacity \
+  --all-features --locked -- --ignored --nocapture
 ```
 
 Interpretation is subtle: the degenerate PoW quorum certificate measures

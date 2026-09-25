@@ -36,7 +36,15 @@ watcher automation engine, a TLS-encrypted TCP/libp2p P2P layer, and a gRPC API.
   feature-sensitivity views), `reproducible.yml` (weekly
   Linux-only build-twice hash verification), and `release.yml` (on `v*` tags:
   cargo-auditable build, CycloneDX SBOMs, git-cliff notes, Cosign keyless
-  signing). It is a safety net, not a substitute — run
+  signing). `analysis.yml` adds the blocking PR gates (machete, deny, typos,
+  snarf, cargo-hack, cargo-careful, diff mutants); `ci.yml`'s `kani`,
+  `verus`, `miri`, `turmoil` and `gates` jobs run on every push and PR (each
+  measured inside the owner's 30-minute promotion rule); `deep-checks.yml` the nightly
+  heavy tier (full mutants, ASan/LSan);
+  scheduled failures file a rolling `ci-failure` issue (ADR-019). PR checks
+  are diff-scoped to the changed crates plus their reverse-dependency
+  closure (`scripts/affected-crates.sh`); workspace-level files or pushes to
+  main run the full workspace. It is a safety net, not a substitute — run
   the checks below locally before declaring work done, because a cold CI build
   takes minutes.
 
@@ -88,7 +96,12 @@ finding a failure locally is far cheaper than finding it in CI.
 `make ci` runs the same fast gate locally (`make check` → `make test` →
 `make analysis`); `make tools` installs the optional tooling and deep checks are
 opt-in (`make miri`, `make sanitize`, `make mutants`, `make careful`, `make kani`,
-`make verus`, `make snarf`). See the `Makefile` and
+`make verus`, `make snarf`). `make kani` runs the same curated harnesses as
+`ci.yml`'s `kani` job; `make verus` runs the same proofs as its `verus` job
+(gas, BFT quorum/bitmap + certificate admission, TOFU pin, trust score, MSP
+height windows). The Kani scope, the zero-trust Verus-first
+assignment and the toolchain limits are recorded in
+`.agents/memories/kani-deferral.md`. See the `Makefile` and
 [`docs/operations.md`](docs/operations.md#makefile-targets).
 
 ### Running a node
@@ -201,7 +214,9 @@ Most style is enforced mechanically — read `Cargo.toml`'s `[workspace.lints]` 
 - **Errors:** each crate defines its own `error.rs` with a `thiserror`-derived
   enum (`CoreError`, `NetworkError`, …). Propagate with `?`; do not `unwrap()` or
   `expect()` in library code. `unwrap`/`expect`/`panic!`/`dbg!`/`println!` are
-  explicitly allowed inside `#[test]` functions (see `clippy.toml`).
+  explicitly allowed inside `#[test]` functions (see `clippy.toml`) and inside
+  `#[cfg(kani)]` / `verus!` proof harnesses, where a violated invariant must
+  fail the proof loudly (clippy never compiles those modules).
 - **Logging:** the `log` crate (`log::info!`, `log::warn!`) in libraries;
   `env_logger` is initialized only in binaries. Use inline format captures
   (`log::warn!("bad addr {addr:?}: {e}")`) — pedantic clippy enforces this.
@@ -239,7 +254,8 @@ hide unrelated warnings with broad `#[allow]` attributes.
 
 - Unit tests live in `#[cfg(test)] mod tests` blocks inside the module they cover.
   Integration tests live in `crates/glasschain-network/tests/`
-  (`node_integration.rs`, `chaos_tests.rs`, `madsim_chaos.rs`, `sncm_compliance.rs`).
+  (`node_integration.rs`, `chaos_tests.rs`, `deterministic_chaos.rs`,
+  `turmoil_chaos.rs`, `sncm_compliance.rs`).
 - Treat the current test run as evidence; do not copy historical test counts or
   claim all tests passed from a partial run. Large scale benchmarks are ignored
   by default and are separate from the ordinary suite.

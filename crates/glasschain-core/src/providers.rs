@@ -451,7 +451,7 @@ pub mod in_memory {
 
         // The atomic section must hold both write locks until every write is
         // applied and the block insert is complete — the guards deliberately
-        // live to the end of the function (the lint mis-reads the loop's last
+        // live to the end of the function (the lint misreads the loop's last
         // use as a tighter drop point).
         #[allow(clippy::significant_drop_tightening)]
         fn apply_block(&self, block: &Block) -> Result<(), CoreError> {
@@ -932,5 +932,10 @@ mod default_impl_tests {
             .unwrap();
         assert_eq!(result.ephemeral, vec![("payload".to_owned(), Vec::new())]);
         assert_eq!(ExecutionLimits::new(7, 8).fuel_limit, 7);
+    }
+
+    #[test]
+    fn in_memory_storage_provider_name_is_stable() {
+        assert_eq!(InMemoryStorageProvider::new().name(), "in-memory");
     }
 }

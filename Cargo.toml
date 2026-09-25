@@ -35,6 +35,11 @@ resolver = "2"
 # explicit `#[allow(unsafe_code)]` with a safety comment explaining why it is
 # sound.
 unsafe_code = "deny"
+# `cfg(kani)` gates the proof-harness modules. Verus's `verus_only` ghost-import
+# guard is deliberately not declared: no crate uses it yet (Verus 0.2026 does
+# not pass the flag for this workspace), so re-add `cfg(verus_only)` to
+# check-cfg when a `#[cfg(verus_only)]` guard lands (decision #170).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
 
 [workspace.lints.clippy]
 # ── Core lint groups ──────────────────────────────────────────────────────────
@@ -46,3 +51,10 @@ all      = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 nursery  = { level = "warn", priority = -1 }
 cargo    = { level = "warn", priority = -1 }
+
+# Mutation runs compile once per viable mutant; debug info is pure overhead
+# there and failure output stays readable enough without it (mutants.rs
+# performance guidance, wayfinder #166).
+[profile.mutants]
+inherits = "test"
+debug = "none"

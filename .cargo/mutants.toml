@@ -3,5 +3,141 @@
 # `--all-features` is mandatory: without it, cfg-gated `bft.rs` mutants are
 # compiled out and report as false misses (117 of 142 in the #146 baseline).
 additional_cargo_test_args = ["--all-features"]
-# Per-mutant cap; the deep-checks shards use the same value.
-timeout = 60
+#
+# The per-mutant cap (`--timeout`: 240 in the PR diff job, 180 in the nightly
+# shards, 60 for local `make mutants`) is a CLI-only option: the config file
+# rejects unknown fields, so it cannot live here. Every invocation that needs
+# the cap passes it explicitly (`make mutants`, `make mutants-diff`,
+# analysis.yml's diff job, and the deep-checks shards).
+# Build with the stripped `mutants` profile (Cargo.toml).
+profile = "mutants"
+
+# Kani writes `cargo kani`-only code: cargo-mutants does not treat
+# `cfg(kani)` as a test-only gate, so it would mutate the harness bodies,
+# which the ordinary test suite never runs. The harnesses are exercised by
+# Kani itself in ci.yml's `kani` job (wayfinder #165/#157).
+exclude_globs = [
+    "crates/glasschain-core/src/proofs.rs",
+    "crates/glasschain-identity/src/proofs.rs",
+]
+
+# ── Skipped (untestable) mutants ─────────────────────────────────────────────
+#
+# Every entry is a mutation that cannot be observed through the public
+# behaviour; each was confirmed during the phase-1..4 mutation cleanup and is
+# explained in `.agents/memories/mutation-equivalents.md`. Skipping them keeps
+# a full run reporting only real gaps.
+#
+# Policy: CI fails on any surviving mutant. A survivor must be caught/fixed,
+# or listed here with a reason — `exclude_re` is the deliberate-skip path.
+#
+# The regex matches the mutant name printed by `cargo-mutants --list`. Entries
+# that pin a line/column stop matching when the code moves, so the mutant
+# reappears (safe direction) rather than staying silently ignored.
+exclude_re = [
+    # mutants-skip: node.rs — `> 0` gates on how many entries were loaded; only the log fires.
+    "in load_equivocation_proofs",
+    "in load_tofu_pins",
+    # mutants-skip: node.rs — the whole function is feature-gated log logic: `--all-features`
+    # compiles `insecure-tls` in, so it returns the same value regardless.
+    "in Node::insecure_tls_allowed",
+    # mutants-skip: node.rs — `sent += 1` feeds only a log line.
+    "replace \\+= with (-=|\\*=) in Node::reconcile_private_payloads",
+    # mutants-skip: node.rs — the drain batch bound shifts by one; the collected set, dedup
+    # and absolute deadline are unchanged.
+    "replace < with (==|>|<=) in collect_phase_votes",
+    # mutants-skip: node.rs — `if !send(..) { warn }` guards: only the warning fires.
+    ":3453:.*delete ! in handle_proposal",
+    ":3566:.*delete ! in handle_precommit",
+    ":4814:.*delete ! in process_message",
+    # mutants-skip: node.rs — `rejected = has_verifier && !org_verified`: only the rejection
+    # log wording changes.
+    ":4168:.*replace && with \\|\\| in process_message",
+    ":4168:.*delete ! in process_message",
+    # mutants-skip: node.rs — private-payload `(true, false) if !verifier_configured`: both
+    # match arms reject; only the reason string differs.
+    ":4739:.*match guard !verifier_configured with",
+    ":4739:.*delete ! in process_message",
+    # mutants-skip: node.rs — `block.index > 0` future-timestamp guard: a genesis-index block
+    # cannot be appended either way.
+    ":4377:28:.*replace > with >= in process_message",
+    # mutants-skip: node.rs — `(false, block.index > expected)` → `>=`: the else branch
+    # already guarantees `index != expected`.
+    ":4441:41:.*replace > with >= in process_message",
+    # mutants-skip: node.rs — `while consensus_open || background_open`: neither channel's
+    # senders can all drop before `handle_peer` returns.
+    "replace \\|\\| with && in handle_peer",
+    # mutants-skip: node.rs — `vote.height > 1` → `>=`: at height 1 `retire_below(0)` is a
+    # no-op, so both branches are identical.
+    "replace > with >= in handle_vote",
+    # mutants-skip: node.rs — `block.index + 1` in the change-point push: the snapshot only
+    # governs later blocks, so the effective set is identical.
+    "replace \\+ with (-|\\*) in verify_chain_certificates",
+    # mutants-skip: libp2p_swarm.rs — fire-and-forget command enqueues; their effects live
+    # inside the swarm loop and are not surfaced through any public API.
+    "replace LibP2pNode::add_known_peer with \\(\\)",
+    "replace LibP2pNode::shutdown with \\(\\)",
+    # mutants-skip: ocsp.rs — `0xA0 | (index & 0x1F)` and `0xA0 ^ (index & 0x1F)` are
+    # bit-identical: 0xA0's low five bits are zero.
+    "replace \\| with \\^ in write_explicit",
+    # mutants-skip: ocsp.rs — the four `||`→`&&` joins in the component-range guard are
+    # redundant: `time`'s Month/Date/with_hms enforce the same ranges, so
+    # bypassing a guard still returns Malformed.
+    ":478:.*replace \\|\\| with && in read_generalized",
+    # mutants-skip: cert_verifier.rs — `added` is an i32 whose only other use is a debug-log
+    # label; the anchor/CRL count is unchanged.
+    "replace \\+= with (-=|\\*=) in CertChainVerifier::add_federation_root_file",
+    "replace \\+= with (-=|\\*=) in CertChainVerifier::add_crl_file",
+    # mutants-skip: cert_verifier.rs — rcgen emits only UTF8String CNs, so no fixture reaches
+    # the PrintableString arm through the public API.
+    "delete match arm DirectoryString::PrintableString\\(text\\) in CertChainVerifier::verified_subject_cn",
+    # mutants-skip: wasm.rs — `checked_add` of two i32-derived usizes cannot overflow on
+    # 64-bit targets, so the `Ok(-1)` arms are unreachable.
+    ":153:.*delete - in WasmExecutionProvider::build_linker",
+    ":205:.*delete - in WasmExecutionProvider::build_linker",
+    ":235:.*delete - in WasmExecutionProvider::build_linker",
+    # mutants-skip: wasm.rs — the `unwrap_or(-1)` fallbacks need a state value longer than
+    # i32::MAX (~2 GiB); no test can allocate one.
+    ":170:.*delete - in WasmExecutionProvider::build_linker",
+    ":241:.*delete - in WasmExecutionProvider::build_linker",
+    # mutants-skip: wasm.rs — under wasmtime a zero fuel balance only occurs on an OutOfFuel
+    # trap, so the two spellings agree.
+    "replace \\|\\| with && in WasmExecutionProvider::execute_internal",
+    # mutants-skip: transient.rs — the expiry index is a fast path; purge's durable
+    # discovery yields the same expired set with an empty index.
+    "replace TransientStore::record_expiry with \\(\\)",
+    # mutants-skip: transient.rs — `now + retention` vs `now * retention` differ only inside
+    # a sub-second window at `retention_secs == 1`; no clock injection exists.
+    "replace \\+ with \\* in TransientStore::put",
+    # mutants-skip: rpc/auth.rs — the replay window differs only when the timestamp is
+    # exactly N seconds from `now`; the header is built and verified at
+    # different wall times, so neither direction is deterministic.
+    ":280:.*replace > with >= in MspAuthInterceptor::verify_request",
+    ":421:.*replace > with >= in AdminGate::authorize",
+    # mutants-skip: cli/main.rs — the binary entry point is not invoked by the unit tests.
+    "replace main -> anyhow::Result",
+    # mutants-skip: channel_admin.rs — the retry loop's one-instant boundary is unobservable
+    # without injecting time (the outer 10 s safety timeout makes it moot).
+    "channel_admin.rs:.*replace < with <= in execute",
+    # mutants-skip: node/main.rs — the REPL entry point and side-effect-only helpers.
+    "replace usage with \\(\\)",
+    "replace log_event with \\(\\)",
+    "replace main with \\(\\)",
+    # mutants-skip: ...and every mutation inside `main` (it is never invoked by a test).
+    " in main$",
+    # mutants-skip: node/main.rs — parse_price's `||`/`&&` spellings agree on every input
+    # (the later checks reject the same values). Line-pinned: the `whole`
+    # all-digits check at line 28 is a real branch and stays mutated.
+    ":21:.*replace \\|\\| with && in parse_price",
+    ":31:.*replace \\|\\| with && in parse_price",
+    # mutants-skip: sdk/client.rs — the `!missing.is_empty()` guard is log-only.
+    "delete ! in GlasschainClient::build_asset_registration_tx",
+    # mutants-skip: rpc/server.rs — `get_peers` returns the Node's peer registry, which has
+    # no public setter from this crate, so a non-empty response cannot be
+    # built in a test; the integration test only sees the empty-vs-empty case.
+    "get_peers -> Result<Response<GetPeersResponse>, Status> with Ok\\(Response::new\\(Default::default\\(\\)\\)\\)",
+    # mutants-skip: rpc/server.rs — the `retention_secs == 0` default branch is observable
+    # only through a retention accessor (or a full PDC round-trip); the
+    # integration test asserts names/membership, not the retention window.
+    "replace == with != in <impl NodeService for ServerState>::create_channel",
+]

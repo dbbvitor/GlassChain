@@ -321,10 +321,36 @@ mod tests {
     }
 
     #[test]
+    fn default_retention_is_exactly_72_hours() {
+        assert_eq!(default_retention_secs(), 259_200);
+    }
+
+    #[test]
     fn test_add_member() {
         let mut ch = test_channel();
         ch.add_member("new-node");
         assert!(ch.is_member("new-node"));
+    }
+
+    #[test]
+    fn test_add_member_is_idempotent() {
+        let mut ch = test_channel();
+        let before = ch.config.member_ids.clone();
+        // Re-adding an existing member must not duplicate its listing.
+        ch.add_member("fabricante-abc");
+        assert_eq!(ch.config.member_ids, before);
+    }
+
+    #[test]
+    fn remove_member_keeps_the_other_listings() {
+        let mut channel = test_channel();
+        channel.add_member("org-new-member");
+        assert!(channel.remove_member("org-new-member"));
+        assert_eq!(
+            channel.config.member_ids,
+            vec!["fabricante-abc".to_owned(), "farmacia-sul".to_owned()],
+            "removing one member must not rewrite the other listings"
+        );
     }
     #[test]
     fn remove_member_drops_only_listed_members() {

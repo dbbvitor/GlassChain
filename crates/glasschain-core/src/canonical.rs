@@ -21,6 +21,7 @@ use crate::error::CoreError;
 use crate::TraceableAsset;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 use uuid::Uuid;
@@ -414,13 +415,14 @@ const LEGACY_ASSET_KEYS: [&str; 6] = [
 
 /// One immutable schema version in the registry: the descriptor plus its
 /// derived `schema_hash` (ADR-006 decision 6).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaEntry {
     /// The immutable descriptor.
     pub descriptor: &'static SchemaDescriptor,
     /// SHA-256 of the descriptor's canonical form — the registry key's third
-    /// component.
-    pub schema_hash: &'static str,
+    /// component. Borrowed for the static v1 tables, owned for versions added
+    /// at runtime by [`Registry::with_schema`].
+    pub schema_hash: Cow<'static, str>,
 }
 
 /// An immutable, network-wide schema registry keyed by
@@ -483,7 +485,7 @@ impl Registry {
     pub fn with_schema(mut self, descriptor: &'static SchemaDescriptor) -> Self {
         let entry = SchemaEntry {
             descriptor,
-            schema_hash: descriptor_hash(descriptor).leak(),
+            schema_hash: Cow::Owned(descriptor_hash(descriptor)),
         };
         self.schemas
             .insert((descriptor.schema_id, descriptor.version), entry);
@@ -496,7 +498,7 @@ impl Registry {
             .map(|d| {
                 let entry = SchemaEntry {
                     descriptor: d,
-                    schema_hash: SCHEMA_HASHES[&(d.schema_id, d.version)].as_str(),
+                    schema_hash: Cow::Borrowed(SCHEMA_HASHES[&(d.schema_id, d.version)].as_str()),
                 };
                 ((d.schema_id, d.version), entry)
             })
@@ -515,7 +517,7 @@ impl Registry {
         self.schemas
             .iter()
             .find(|((id, ver), _)| *id == schema_id && *ver == version)
-            .map(|(_, entry)| *entry)
+            .map(|(_, entry)| entry.clone())
     }
 
     /// Look up a registered extension namespace by name.
@@ -529,7 +531,7 @@ fn err(schema_id: &str, message: impl Into<String>) -> CoreError {
     CoreError::InvalidTransaction(format!("canonical record {schema_id}: {}", message.into()))
 }
 
-fn is_hex64(s: &str) -> bool {
+pub(crate) fn is_hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -1645,5 +1647,89 @@ mod tests {
             validate_record(&record),
             Err(CoreError::InvalidTransaction(msg)) if msg.contains("unsupported version")
         ));
+    }
+
+    #[test]
+    fn test_hex64_predicate_is_exact() {
+        assert!(is_hex64(&"a".repeat(64)));
+        assert!(is_hex64(&"0123456789abcdef".repeat(4)));
+        assert!(!is_hex64(&"a".repeat(63)));
+        assert!(!is_hex64(&"a".repeat(65)));
+        assert!(!is_hex64(&"g".repeat(64)));
+    }
+
+    #[test]
+    fn test_matches_type_accepts_signed_and_unsigned_integers() {
+        assert!(matches_type(&json!(7), ExtensionFieldType::Integer));
+        assert!(matches_type(&json!(-7), ExtensionFieldType::Integer));
+        assert!(matches_type(&json!(u64::MAX), ExtensionFieldType::Integer));
+        assert!(!matches_type(&json!("7"), ExtensionFieldType::Integer));
+    }
+
+    #[test]
+    fn test_certification_dates_allow_equal_bounds_and_reject_one_bad_bound() {
+        // Equal bounds are valid: only `valid_to < valid_from` is rejected.
+        let mut record = valid_record("quality_certification");
+        record
+            .payload
+            .insert("valid_from".into(), json!("2026-01-01"));
+        record
+            .payload
+            .insert("valid_to".into(), json!("2026-01-01"));
+        anchor(&mut record);
+        assert!(
+            validate_record(&record).is_ok(),
+            "equal bounds are valid: {:?}",
+            validate_record(&record)
+        );
+
+        // Exactly one invalid bound is enough to reject.
+        let mut record = valid_record("quality_certification");
+        record
+            .payload
+            .insert("valid_from".into(), json!("2026-01-01"));
+        record
+            .payload
+            .insert("valid_to".into(), json!("31/12/2026"));
+        anchor(&mut record);
+        assert!(validate_record(&record).is_err(), "one bad bound rejects");
+    }
+
+    #[test]
+    fn test_state_commitment_counterparties_and_ratio_boundaries() {
+        // An empty or non-string member inside the list is rejected even when
+        // the signature count matches.
+        let mut record = valid_record("state_commitment");
+        record.payload.insert("counterparties".into(), json!([""]));
+        anchor(&mut record);
+        assert!(validate_record(&record).is_err(), "empty member rejects");
+
+        let mut record = valid_record("state_commitment");
+        record.payload.insert("counterparties".into(), json!([7]));
+        assert!(
+            validate_record(&record).is_err(),
+            "non-string member rejects"
+        );
+
+        // Exactly one signature per counterparty is the boundary that passes.
+        let record = valid_record("state_commitment");
+        let counterparties = record
+            .payload
+            .get("counterparties")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        assert_eq!(record.signatures.len(), counterparties);
+        assert!(validate_record(&record).is_ok());
+
+        // Ratio 1 is the smallest sane value; 0 is rejected.
+        let mut record = valid_record("state_commitment");
+        record.payload.insert("aggregation_ratio".into(), json!(1));
+        anchor(&mut record);
+        assert!(validate_record(&record).is_ok(), "ratio 1 is sane");
+
+        let mut record = valid_record("state_commitment");
+        record.payload.insert("aggregation_ratio".into(), json!(0));
+        anchor(&mut record);
+        assert!(validate_record(&record).is_err(), "ratio 0 rejects");
     }
 }

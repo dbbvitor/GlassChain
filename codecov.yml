@@ -3,8 +3,8 @@
 # Coverage gate: the Gold >= 90% project (line) coverage target was measured
 # at 90.02% on 2026-09-16 and is now pinned (`target: 90%`). A 0.5% threshold
 # absorbs measurement noise without reopening the floor. Branch coverage is
-# tracked on the Codecov dashboard but is not a status check (tarpaulin
-# measures line coverage; a branch gate would need a second engine). Patch
+# tracked on the Codecov dashboard but is not a status check (the
+# llvm-cov engine emits branch totals; the gate stays on lines). Patch
 # coverage is informational — new code is encouraged, not blocked.
 # Repository branch protection should require the `codecov/project` status
 # check alongside the workflow jobs.
@@ -14,8 +14,8 @@
 #                    `curl --data-binary @codecov.yml https://codecov.io/validate`
 # * commit-status  — `coverage.status` below: `codecov/project` is the single
 #                    blocking gate (ratchet); `codecov/patch` is informational.
-# * flags          — CI uploads exactly one tarpaulin report, flagged
-#                    `tarpaulin` in the uploader step. A single report must
+# * flags          — CI uploads exactly one llvm-cov report, flagged
+#                    `llvm-cov` in the uploader step. A single report must
 #                    map to exactly one flag (many-to-one uploads attribute
 #                    the whole report's coverage to every flag). With one
 #                    flag, `flag_management` (automatic) would mint per-flag
@@ -51,7 +51,7 @@ comment:
   layout: "reach, diff, flags, components, files"
 
 flags:
-  tarpaulin:
+  llvm-cov:
     paths:
       - crates/**
     carryforward: false

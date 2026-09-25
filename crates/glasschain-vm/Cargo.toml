@@ -20,6 +20,12 @@ wasmtime = {
 }
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
+# Verus's standard library. The gas arithmetic is proved against it; in normal
+# (non-Verus) builds it compiles to erased ghost code (decision #170).
+vstd = "=0.0.0-2026-09-20-0158"
+
+[package.metadata.verus]
+verify = true
 
 [dev-dependencies]
 wat = "1.258"

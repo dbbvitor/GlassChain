@@ -79,6 +79,31 @@ async fn invalid_peer_certificate_lengths_are_refused() {
         .expect_err("the node refuses the oversized length and closes");
 }
 
+/// A certificate advertised at exactly the 64 KiB cap is accepted (only
+/// lengths strictly above the cap are refused) and the exchange completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn certificate_length_at_the_cap_is_accepted() {
+    let (_node, _node_cert, addr) = node_with_cert().await;
+
+    let mut stream = TcpStream::connect(&addr).await.unwrap();
+    stream
+        .write_all(&u32::try_from(64 * 1024).unwrap().to_be_bytes())
+        .await
+        .unwrap();
+    stream.write_all(&vec![0u8; 64 * 1024]).await.unwrap();
+
+    // The node read the whole body and answers with its own certificate.
+    let mut len_buf = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut len_buf))
+        .await
+        .expect("timeout")
+        .expect("a certificate exactly at the cap must be read and answered");
+    assert!(
+        u32::from_be_bytes(len_buf) > 0,
+        "the node advertises its own certificate"
+    );
+}
+
 /// A truncated certificate body hits EOF mid-read; the node drops the
 /// connection without a handshake.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -159,16 +184,33 @@ enum FakePeer {
     ZeroLength,
     /// Advertises a length and truncates the certificate body.
     Truncated,
+    /// Advertises a certificate length one byte above the 64 KiB cap.
+    AboveCap,
+    /// Advertises exactly the 64 KiB cap and never sends the body.
+    AtCap,
 }
 
-fn spawn_fake_peer(kind: FakePeer) -> String {
+/// What the dialing node did after the fake peer's advertisement.
+#[derive(Debug, PartialEq, Eq)]
+enum DialOutcome {
+    /// The node sent bytes (a TLS ClientHello): it accepted the length.
+    Proceeded,
+    /// The node closed the connection without sending anything.
+    Closed,
+    /// The node is waiting for a certificate body that never arrives.
+    Waiting,
+}
+
+fn spawn_fake_peer(kind: FakePeer) -> (String, tokio::sync::oneshot::Receiver<DialOutcome>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let addr = listener.local_addr().unwrap().to_string();
+    let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         use tokio::io::AsyncReadExt as _;
         use tokio::io::AsyncWriteExt as _;
-        let (std_stream, _) = listener.accept().unwrap();
-        let stream = tokio::net::TcpStream::from_std(std_stream).unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
         let mut stream = tokio::io::BufReader::new(stream);
         // Read the node's advertised certificate (length + body) so the node
         // proceeds to reading ours.
@@ -182,20 +224,45 @@ fn spawn_fake_peer(kind: FakePeer) -> String {
             return;
         }
         match kind {
-            FakePeer::SilentDrop => drop(stream),
+            FakePeer::SilentDrop => {
+                drop(stream);
+                return;
+            }
             FakePeer::ZeroLength => {
                 let _ = stream.write_all(&0u32.to_be_bytes()).await;
             }
             FakePeer::Truncated => {
                 let _ = stream.write_all(&16u32.to_be_bytes()).await;
                 let _ = stream.write_all(&[9u8; 3]).await;
-                drop(stream);
+                // EOF on the node's side, while we keep reading.
+                let _ = stream.shutdown().await;
+            }
+            FakePeer::AboveCap => {
+                let _ = stream
+                    .write_all(&u32::try_from(64 * 1024 + 1).unwrap().to_be_bytes())
+                    .await;
+            }
+            FakePeer::AtCap => {
+                let _ = stream
+                    .write_all(&u32::try_from(64 * 1024).unwrap().to_be_bytes())
+                    .await;
             }
         }
+        // What did the node do with the advertisement? A closed socket means
+        // the length was refused; data means it went on to the TLS handshake;
+        // no event at all means it is still waiting for a body.
+        let mut buf = [0u8; 1];
+        let observed =
+            match tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await {
+                Err(_) => DialOutcome::Waiting,
+                Ok(Ok(0) | Err(_)) => DialOutcome::Closed,
+                Ok(Ok(_)) => DialOutcome::Proceeded,
+            };
+        let _ = observed_tx.send(observed);
         // Hold the task open briefly so the socket lingers.
         tokio::time::sleep(Duration::from_millis(300)).await;
     });
-    addr
+    (addr, observed_rx)
 }
 
 async fn dial_node_with_seed(seed: &str) -> Node {
@@ -210,20 +277,56 @@ async fn dial_node_with_seed(seed: &str) -> Node {
 /// exchange without crashing the node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dial_to_silent_peer_fails_cleanly() {
-    let seed = spawn_fake_peer(FakePeer::SilentDrop);
+    let (seed, _observed) = spawn_fake_peer(FakePeer::SilentDrop);
     let _node = dial_node_with_seed(&seed).await;
 }
 
-/// A zero-length peer certificate advertisement is refused.
+/// A zero-length peer certificate advertisement is refused before the
+/// handshake.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dial_rejects_zero_length_peer_certificate() {
-    let seed = spawn_fake_peer(FakePeer::ZeroLength);
+    let (seed, observed) = spawn_fake_peer(FakePeer::ZeroLength);
     let _node = dial_node_with_seed(&seed).await;
+    assert_eq!(
+        observed.await.unwrap(),
+        DialOutcome::Closed,
+        "a zero length is refused, not handed to the TLS stack"
+    );
+}
+
+/// A length one byte above the 64 KiB cap is refused before the handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dial_rejects_an_over_cap_peer_certificate() {
+    let (seed, observed) = spawn_fake_peer(FakePeer::AboveCap);
+    let _node = dial_node_with_seed(&seed).await;
+    assert_eq!(
+        observed.await.unwrap(),
+        DialOutcome::Closed,
+        "a length above the cap is refused, not handed to the TLS stack"
+    );
+}
+
+/// A length exactly at the 64 KiB cap is accepted and read: the node waits
+/// for the body rather than closing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dial_accepts_a_peer_certificate_at_the_cap() {
+    let (seed, observed) = spawn_fake_peer(FakePeer::AtCap);
+    let _node = dial_node_with_seed(&seed).await;
+    assert_eq!(
+        observed.await.unwrap(),
+        DialOutcome::Waiting,
+        "a length exactly at the cap is read, not refused"
+    );
 }
 
 /// A truncated peer certificate body is dropped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dial_rejects_truncated_peer_certificate() {
-    let seed = spawn_fake_peer(FakePeer::Truncated);
+    let (seed, observed) = spawn_fake_peer(FakePeer::Truncated);
     let _node = dial_node_with_seed(&seed).await;
+    assert_eq!(
+        observed.await.unwrap(),
+        DialOutcome::Closed,
+        "a truncated body drops the connection"
+    );
 }

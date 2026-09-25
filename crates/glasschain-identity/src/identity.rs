@@ -267,6 +267,16 @@ mod tests {
     }
 
     #[test]
+    fn test_verifying_key_matches_public_key_bytes() {
+        let identity = Identity::generate("node-1");
+        assert_eq!(
+            identity.verifying_key().to_bytes().to_vec(),
+            identity.public_key_bytes(),
+            "the exposed verifying key must be the identity's own key"
+        );
+    }
+
+    #[test]
     fn test_signed_transaction_serialization_roundtrip() {
         let identity = Identity::generate("node-1");
         let signed = identity.sign_transaction(sample_tx()).unwrap();

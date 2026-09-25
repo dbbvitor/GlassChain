@@ -2,8 +2,8 @@
 
 **Status:** gate executed 2026-09-01 at 200 and 300 validators, in-process.
 **Reproduce:** `cargo test -p glasschain-network --test consensus_capacity -- --ignored --nocapture`
-(harness: `crates/glasschain-network/tests/consensus_capacity.rs`; madsim mode:
-`RUSTFLAGS="--cfg madsim" ...`, seeded/deterministic scheduling).
+(harness: `crates/glasschain-network/tests/consensus_capacity.rs`; the weekly
+`deep-checks.yml` job runs these gates under `ulimit -n 65535`).
 
 ## Methodology
 
@@ -373,7 +373,7 @@ bounded and small; revisit only if the harness grows much longer.
    the 2026-09-03 table).
 3. **Recovery** models an application-layer partition (validators that never
    dialed join late); it does not sever established TCP sessions. WAN delay is
-   not injected; madsim's deterministic scheduling covers ordering, not
+   not injected; the weekly deep-checks run covers ordering, not
    latency.
 4. **No production capacity claim** is made or implied: this gate evidences
    that the compact workload executes and converges at 200/300 in-process

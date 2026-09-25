@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 dbbvitor
 use crate::error::NetworkError;
+use crate::net::{connect, from_std, TcpListener};
 use crate::peer::{PeerReader, PeerWriter};
 use crate::protocol::{Message, PROTOCOL_VERSION};
 #[cfg(feature = "bft")]
@@ -10,6 +11,7 @@ use crate::rounds::{
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use glasschain_contracts::ContractEngine;
 use glasschain_core::crypto::sha256;
+use glasschain_core::pin::{IdentityClaim, PinDecision, PinState, RejectReason, RotationProof};
 use glasschain_core::providers::in_memory::InMemoryStorageProvider;
 #[cfg(feature = "bft")]
 use glasschain_core::BFT_CONSENSUS_CAPABILITY_ID;
@@ -39,7 +41,6 @@ use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
 use std::collections::{HashMap, HashSet};
 use std::net::TcpListener as StdTcpListener;
 use std::sync::{Arc, OnceLock};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{broadcast, Mutex};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -229,6 +230,9 @@ impl PeerWrite {
         }
     }
 
+    /// Only the BFT vote paths (`handle_vote` / `handle_precommit`) await a
+    /// queued send; without `bft` the async variant has no callers.
+    #[cfg(feature = "bft")]
     async fn send(&self, msg: Message) -> bool {
         if is_consensus_class(&msg) {
             self.consensus.send(msg).await.is_ok()
@@ -566,85 +570,98 @@ impl PeerRegistry {
         public_key: Option<Vec<u8>>,
         fingerprint_proof: Option<&[u8]>,
     ) -> Result<TofuOutcome, String> {
-        if let Some(reason) = self.poisoned.get(listen_addr) {
-            return Err(format!(
-                "persisted TOFU pin for '{listen_addr}' is unreadable ({reason}); \
-                 remove the stored pin to re-trust this address"
-            ));
-        }
-        if let Some(existing) = self.peers.get_mut(listen_addr) {
-            if existing.node_id != node_id {
-                return Err(format!(
-                    "node_id changed: expected '{}', got '{node_id}'",
-                    existing.node_id,
-                ));
-            }
-            // Org drift: a returning peer claiming a different organization is
-            // either a re-keyed node or an impersonation; both are rejections
-            // (ticket #47 — the org gates private-payload delivery).
-            if existing.org != org {
-                return Err(format!(
-                    "org changed for node '{node_id}': expected '{}', got '{org}'",
-                    existing.org
-                ));
-            }
-            if existing.cert_fingerprint != cert_fingerprint {
-                // Transport re-issue (#88): only the pinned identity key may
-                // authorize a new fingerprint, so a persisted pin never
-                // silently forgets the original peer.
-                let Some(pinned_key) = existing.public_key.as_deref() else {
-                    return Err(format!(
-                        "TLS certificate fingerprint changed for node '{node_id}' and no \
-                         pinned identity key is available for a signed rotation; operator \
-                         action required"
-                    ));
-                };
-                let Some(proof) = fingerprint_proof else {
-                    return Err(format!(
-                        "TLS certificate fingerprint changed for node '{node_id}' without a \
-                         signed rotation proof"
-                    ));
-                };
-                if !glasschain_identity::verify_ed25519(
-                    pinned_key,
-                    &glasschain_identity::tofu_pin_message(node_id, cert_fingerprint),
-                    proof,
-                ) {
-                    return Err(format!(
-                        "TLS certificate fingerprint changed for node '{node_id}' with an \
-                         invalid rotation proof (not signed by the pinned key)"
-                    ));
+        let pinned = self.peers.get(listen_addr).map(|peer| PinState {
+            node_id: peer.node_id.as_str(),
+            cert_fingerprint: peer.cert_fingerprint.as_str(),
+            org: peer.org.as_str(),
+            public_key: peer.public_key.as_deref(),
+        });
+        let claim = IdentityClaim {
+            node_id,
+            cert_fingerprint,
+            org,
+            public_key: public_key.as_deref(),
+        };
+        // Transport re-issue (#88): only the pinned identity key may authorize
+        // a new fingerprint, so a persisted pin never silently forgets the
+        // original peer. The proof is checked only when the fingerprint
+        // changed and a pinned key exists; `glasschain_core::pin::decide` is
+        // the verified gate that turns this into accept/reject/rotate.
+        let rotation_proof = match pinned.as_ref() {
+            Some(pin) if pin.cert_fingerprint != cert_fingerprint => {
+                match (pin.public_key, fingerprint_proof) {
+                    (Some(pinned_key), Some(proof)) => {
+                        if glasschain_identity::verify_ed25519(
+                            pinned_key,
+                            &glasschain_identity::tofu_pin_message(node_id, cert_fingerprint),
+                            proof,
+                        ) {
+                            RotationProof::Valid
+                        } else {
+                            RotationProof::Invalid
+                        }
+                    }
+                    _ => RotationProof::Missing,
                 }
-                cert_fingerprint.clone_into(&mut existing.cert_fingerprint);
-                existing.org_verified = org_verified;
-                if public_key.is_some() {
-                    existing.public_key = public_key;
+            }
+            _ => RotationProof::Missing,
+        };
+
+        let decision = glasschain_core::pin::decide(
+            pinned.as_ref(),
+            self.poisoned.contains_key(listen_addr),
+            &claim,
+            rotation_proof,
+        );
+        let poison_reason = self.poisoned.get(listen_addr).map(String::as_str);
+        match decision {
+            PinDecision::Rejected(reason) => Err(tofu_rejection_message(
+                reason,
+                poison_reason,
+                listen_addr,
+                node_id,
+                org,
+                pinned.as_ref(),
+            )),
+            PinDecision::New => {
+                self.peers.insert(
+                    listen_addr.to_owned(),
+                    VerifiedPeer {
+                        node_id: node_id.to_owned(),
+                        cert_fingerprint: cert_fingerprint.to_owned(),
+                        org: org.to_owned(),
+                        org_verified,
+                        public_key,
+                        advertised: Vec::new(),
+                    },
+                );
+                Ok(TofuOutcome::New)
+            }
+            PinDecision::Known => {
+                // Same identity: the pin's identity fields stay, but org
+                // verification is **session evidence** — each Hello
+                // re-authorizes or downgrades it (zero-trust §5
+                // established-session reauthorization: a check at a previous
+                // Hello cannot promise indefinite membership).
+                // Identity/fingerprint pins never flap.
+                if let Some(peer) = self.peers.get_mut(listen_addr) {
+                    peer.org_verified = org_verified;
+                    if peer.public_key.is_none() && public_key.is_some() {
+                        peer.public_key = public_key;
+                    }
                 }
-                return Ok(TofuOutcome::Rotated);
+                Ok(TofuOutcome::Known)
             }
-            // Same identity: the pin's identity fields stay, but org
-            // verification is **session evidence** — each Hello re-authorizes
-            // or downgrades it (zero-trust §5 established-session
-            // reauthorization: a check at a previous Hello cannot promise
-            // indefinite membership). Identity/fingerprint pins never flap.
-            existing.org_verified = org_verified;
-            if existing.public_key.is_none() && public_key.is_some() {
-                existing.public_key = public_key;
+            PinDecision::Rotated => {
+                if let Some(peer) = self.peers.get_mut(listen_addr) {
+                    cert_fingerprint.clone_into(&mut peer.cert_fingerprint);
+                    peer.org_verified = org_verified;
+                    if public_key.is_some() {
+                        peer.public_key = public_key;
+                    }
+                }
+                Ok(TofuOutcome::Rotated)
             }
-            Ok(TofuOutcome::Known)
-        } else {
-            self.peers.insert(
-                listen_addr.to_owned(),
-                VerifiedPeer {
-                    node_id: node_id.to_owned(),
-                    cert_fingerprint: cert_fingerprint.to_owned(),
-                    org: org.to_owned(),
-                    org_verified,
-                    public_key,
-                    advertised: Vec::new(),
-                },
-            );
-            Ok(TofuOutcome::New)
         }
     }
 
@@ -680,10 +697,66 @@ impl PeerRegistry {
     }
 }
 
+/// The operator-facing message for a rejected TOFU decision
+/// (`glasschain_core::pin`).
+fn tofu_rejection_message(
+    reason: RejectReason,
+    poison_reason: Option<&str>,
+    listen_addr: &str,
+    node_id: &str,
+    org: &str,
+    pinned: Option<&PinState<'_>>,
+) -> String {
+    match reason {
+        RejectReason::Poisoned => format!(
+            "persisted TOFU pin for '{listen_addr}' is unreadable ({}); \
+             remove the stored pin to re-trust this address",
+            poison_reason.unwrap_or("unreadable")
+        ),
+        RejectReason::NodeIdChanged => format!(
+            "node_id changed: expected '{}', got '{node_id}'",
+            pinned.map_or("", |pin| pin.node_id),
+        ),
+        RejectReason::OrgChanged => format!(
+            "org changed for node '{node_id}': expected '{}', got '{org}'",
+            pinned.map_or("", |pin| pin.org),
+        ),
+        RejectReason::NoPinnedKey => format!(
+            "TLS certificate fingerprint changed for node '{node_id}' and no \
+             pinned identity key is available for a signed rotation; operator \
+             action required"
+        ),
+        RejectReason::MissingProof => format!(
+            "TLS certificate fingerprint changed for node '{node_id}' without a \
+             signed rotation proof"
+        ),
+        RejectReason::InvalidProof => format!(
+            "TLS certificate fingerprint changed for node '{node_id}' with an \
+             invalid rotation proof (not signed by the pinned key)"
+        ),
+    }
+}
+
 // ── Node ──────────────────────────────────────────────────────────────────────
 
 /// Storage-key prefix for persisted TOFU pins (#88).
 const TOFU_PIN_PREFIX: &str = "tofu:peer:";
+
+/// How far in the future a block timestamp may be before it is rejected.
+const FUTURE_TIMESTAMP_WINDOW_SECS: u64 = 7_200;
+
+/// `true` when a block's timestamp is admissible: genesis (index 0, timestamp
+/// 0 by design) is exempt, and every other block may be at most
+/// [`FUTURE_TIMESTAMP_WINDOW_SECS`] ahead of `now_secs`. The exact boundary is
+/// admitted (`block.timestamp == now_secs + window`); one second past it is
+/// not. Pure so the boundary is unit-testable without a wall clock.
+const fn timestamp_within_future_window(
+    block_index: u64,
+    block_timestamp: u64,
+    now_secs: u64,
+) -> bool {
+    block_index == 0 || block_timestamp <= now_secs + FUTURE_TIMESTAMP_WINDOW_SECS
+}
 
 /// Persist a pin through the state seam; a write failure is logged and the
 /// pin stays in memory (the next successful write persists it).
@@ -1839,7 +1912,7 @@ impl Node {
         // (see `stash_prebound_listener`): re-binding a just-probed address
         // is the `AddrInUse` window Windows refuses to paper over.
         let listener = match adopt_prebound_listener(&self.listen_addr) {
-            Some(std_listener) => TcpListener::from_std(std_listener)?,
+            Some(std_listener) => from_std(std_listener)?,
             None => TcpListener::bind(&self.listen_addr).await?,
         };
         log::info!("Node {} listening on {}", self.node_id, self.listen_addr);
@@ -3926,7 +3999,7 @@ async fn connect_to_peer(
     storage: Arc<dyn StorageProvider>,
     tls: Arc<NodeTls>,
 ) {
-    match TcpStream::connect(&peer_addr).await {
+    match connect(&peer_addr).await {
         Ok(mut stream) => {
             log::info!("Connected to peer {peer_addr}");
 
@@ -4365,13 +4438,14 @@ async fn process_message(
                     return MessageEffect::default();
                 }
             }
-            // Reject blocks with implausible timestamps (> 2 hours in the future).
-            // Block 0 (genesis) uses timestamp 0 by design and is exempt.
+            // Reject blocks with implausible timestamps (> 2 hours in the
+            // future). Block 0 (genesis) uses timestamp 0 by design and is
+            // exempt.
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            if block.index > 0 && block.timestamp > now_secs + 7_200 {
+            if !timestamp_within_future_window(block.index, block.timestamp, now_secs) {
                 log::warn!(
                     "Rejected block {} from {addr}: timestamp {} is {} seconds in the future",
                     block.index,
@@ -4939,7 +5013,7 @@ mod tests {
         // no one else can take the port in between.
         assert!(adopt_prebound_listener(&addr).is_none());
         assert!(StdTcpListener::bind(&addr).is_err());
-        assert!(TcpStream::connect(&addr).await.is_ok());
+        assert!(tokio::net::TcpStream::connect(&addr).await.is_ok());
     }
 
     #[tokio::test]
@@ -5452,7 +5526,12 @@ mod tests {
         storage.put_block(&genesis).unwrap();
 
         let ledger = Node::restore_ledger(&storage, 2);
-        assert_eq!(ledger.try_lock().unwrap().chain.len(), 1);
+        let restored = ledger.try_lock().unwrap().chain.clone();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(
+            restored[0].previous_hash, "0",
+            "the stored block must not be adopted: its genesis anchor is wrong"
+        );
     }
 
     // ── 2. build_tls — identity-backed certificate ────────────────────────────
@@ -5612,6 +5691,7 @@ mod tests {
         );
         let mut block = Block::new(1, vec![tx], prev_hash);
         block.mine(2);
+        let mut events = node.subscribe();
 
         let generated = Node::after_block_commit(
             &node.ledger,
@@ -5628,6 +5708,22 @@ mod tests {
 
         assert!(!generated.is_empty(), "watcher should emit a PurchaseOrder");
         let order_tx = &generated[0];
+        let mut announced_trigger = None;
+        while let Ok(event) = events.try_recv() {
+            if let NodeEvent::AutonomousTransactionGenerated {
+                trigger_id,
+                transaction_id,
+            } = event
+            {
+                assert_eq!(transaction_id, order_tx.id);
+                announced_trigger = Some(trigger_id);
+            }
+        }
+        assert_eq!(
+            announced_trigger.as_deref(),
+            Some("trig-1"),
+            "the event names the contract the watcher order targets"
+        );
         assert!(
             matches!(
                 order_tx.kind,
@@ -6240,7 +6336,6 @@ mod tests {
         .expect("valid validators")
     }
 
-    #[cfg(feature = "bft")]
     fn peer_context(node: &Node) -> PeerContext {
         let (dial_tx, dial_rx) = tokio::sync::mpsc::unbounded_channel();
         drop(dial_rx);
@@ -6999,5 +7094,1241 @@ mod tests {
         let client_group =
             glasschain_group(client_stream.get_ref().1.negotiated_key_exchange_group());
         assert_eq!(client_group, rustls::NamedGroup::X25519);
+    }
+
+    // ── Accessor, predicate and admin-surface coverage ───────────────────────
+
+    fn channel_config(name: &str) -> ChannelConfig {
+        ChannelConfig {
+            name: name.to_owned(),
+            member_ids: vec!["org-member".to_owned()],
+            description: "test channel".to_owned(),
+            endorsement_policy: None,
+            retention_secs: 3_600,
+        }
+    }
+
+    #[test]
+    fn consensus_classes_are_classified_exactly() {
+        assert!(is_consensus_class(&Message::RequestChain));
+        assert!(!is_consensus_class(&Message::Peers(Vec::new())));
+    }
+
+    #[tokio::test]
+    async fn channel_admin_surface_is_exact() {
+        let node = Node::new("channel-admin", "127.0.0.1:0", 1);
+        assert!(node.collection_names().await.is_empty());
+
+        node.admin_create_channel(channel_config("pricing"))
+            .await
+            .expect("create channel");
+        assert_eq!(node.collection_names().await, vec!["pricing".to_owned()]);
+
+        // Duplicate names are rejected.
+        assert!(node
+            .admin_create_channel(channel_config("pricing"))
+            .await
+            .is_err());
+
+        // Unknown channels are rejected by both member operations.
+        assert!(node
+            .admin_channel_add_member("missing", "org-x")
+            .await
+            .is_err());
+        assert!(node
+            .admin_channel_remove_member("missing", "org-x")
+            .await
+            .is_err());
+
+        // Remove reports whether the member was present.
+        assert!(!node
+            .admin_channel_remove_member("pricing", "org-x")
+            .await
+            .expect("remove absent member"));
+        node.admin_channel_add_member("pricing", "org-x")
+            .await
+            .expect("add member");
+        assert!(node
+            .admin_channel_remove_member("pricing", "org-x")
+            .await
+            .expect("remove present member"));
+    }
+
+    #[tokio::test]
+    async fn node_accessors_fail_closed_and_start_at_zero() {
+        let node = Node::new("accessors", "127.0.0.1:0", 1);
+
+        // No send has failed yet, and no private payload is stored.
+        assert_eq!(node.dropped_outbound("127.0.0.1:9").await, 0);
+        assert_eq!(
+            node.purge_expired_private_payloads()
+                .await
+                .expect("purge empty store"),
+            0
+        );
+
+        // Without a certificate verifier, private paths are never trusted.
+        let state = node.state.lock().await;
+        let trusted = state.private_peer_trusted("127.0.0.1:9", "pricing");
+        drop(state);
+        assert!(!trusted);
+
+        #[cfg(feature = "bft")]
+        assert!(
+            node.last_round_phase_timings().await.is_none(),
+            "no round has committed on a fresh node"
+        );
+    }
+
+    // ── Private-path targeting, relay and TOFU invariants ────────────────────
+
+    /// Register a peer as if its `Hello` had been accepted, with a live write
+    /// channel; returns the receiving end so a test can observe sends.
+    async fn install_peer(
+        node: &Node,
+        addr: &str,
+        org: &str,
+        org_verified: bool,
+    ) -> tokio::sync::mpsc::Receiver<Message> {
+        install_peer_with(node, addr, org, org_verified, CAPABILITY_V1).await
+    }
+
+    async fn install_peer_with(
+        node: &Node,
+        addr: &str,
+        org: &str,
+        org_verified: bool,
+        advertised: &[glasschain_core::CapabilityDescriptor],
+    ) -> tokio::sync::mpsc::Receiver<Message> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Message>(16);
+        let write = PeerWrite {
+            consensus: tx.clone(),
+            background: tx,
+        };
+        let mut s = node.state.lock().await;
+        s.peer_registry.peers.insert(
+            addr.to_owned(),
+            VerifiedPeer {
+                node_id: format!("peer-{addr}"),
+                cert_fingerprint: format!("fp-{addr}"),
+                org: org.to_owned(),
+                org_verified,
+                public_key: None,
+                advertised: advertised
+                    .iter()
+                    .map(|c| CapabilityAdvertisement {
+                        id: c.id.to_owned(),
+                        version: c.version,
+                    })
+                    .collect(),
+            },
+        );
+        s.peer_senders.insert(addr.to_owned(), write);
+        rx
+    }
+
+    fn test_org_verifier() -> CertChainVerifier {
+        let org = glasschain_identity::Organization::new("PharmaCorp").unwrap();
+        let mut verifier = CertChainVerifier::from_org(&org).unwrap();
+        verifier.add_crl_pem(&org.crl_pem().unwrap()).unwrap();
+        verifier
+    }
+
+    fn collection_of(name: &str, members: &[&str]) -> Channel {
+        Channel::new(ChannelConfig {
+            name: name.to_owned(),
+            member_ids: members.iter().map(|member| (*member).to_owned()).collect(),
+            description: "test collection".to_owned(),
+            endorsement_policy: None,
+            retention_secs: 3_600,
+        })
+    }
+
+    fn plain_inventory_tx(id: &str) -> Transaction {
+        Transaction::with_id(
+            id.to_owned(),
+            TransactionKind::InventoryUpdate(InventoryUpdate {
+                product_id: "SKU".into(),
+                owner_id: "owner-1".into(),
+                quantity_delta: 1,
+                reason: "test".into(),
+            }),
+        )
+    }
+
+    fn public_write(channel: &str, contract: &str, key: &str) -> PersistentWrite {
+        PersistentWrite {
+            channel: channel.to_owned(),
+            contract: contract.to_owned(),
+            key: key.to_owned(),
+            op: WriteOp::Set(b"value".to_vec()),
+            visibility: WriteVisibility::Public,
+        }
+    }
+
+    #[tokio::test]
+    async fn payload_targets_require_a_verifier_and_a_verified_member() {
+        let node = Node::new("n-targets", "127.0.0.1:0", 1);
+        node.set_collections(vec![collection_of("pricing", &["org-a"])])
+            .await;
+        let _rx = install_peer(&node, "10.0.0.1:1", "org-a", true).await;
+
+        // No verifier: even a member-org peer with a "verified" pin is not a
+        // private-payload target (fail closed, #86).
+        {
+            let s = node.state.lock().await;
+            let collection = s.collection("pricing").expect("configured");
+            assert!(s.payload_targets(collection).is_empty());
+            assert!(!s.private_peer_trusted("10.0.0.1:1", "pricing"));
+            drop(s);
+        }
+
+        // With a verifier the same peer becomes trusted and targeted.
+        node.set_cert_verifier(test_org_verifier()).await;
+        {
+            let s = node.state.lock().await;
+            let collection = s.collection("pricing").expect("configured");
+            assert_eq!(s.payload_targets(collection).len(), 1);
+            assert!(s.private_peer_trusted("10.0.0.1:1", "pricing"));
+            drop(s);
+        }
+
+        // A member org whose pin was never certificate-verified stays out.
+        node.state
+            .lock()
+            .await
+            .peer_registry
+            .peers
+            .get_mut("10.0.0.1:1")
+            .unwrap()
+            .org_verified = false;
+        let s = node.state.lock().await;
+        let collection = s.collection("pricing").expect("configured");
+        assert!(s.payload_targets(collection).is_empty());
+        assert!(!s.private_peer_trusted("10.0.0.1:1", "pricing"));
+        drop(s);
+    }
+
+    #[tokio::test]
+    async fn relay_targets_exclude_read_only_observers() {
+        let node = Node::new("n-relay", "127.0.0.1:0", 1);
+        // A peer that advertises nothing cannot support the genesis set.
+        let mut observer_rx = install_peer_with(&node, "10.0.0.2:1", "org-a", false, &[]).await;
+        let mut writer_rx = install_peer(&node, "10.0.0.3:1", "org-a", false).await;
+
+        let targets = {
+            let s = node.state.lock().await;
+            s.relay_targets(&glasschain_core::CapabilitySet::genesis())
+        };
+        assert_eq!(targets.len(), 1, "only the capability-complete peer relays");
+        assert!(targets[0].try_send(Message::Goodbye {
+            reason: "relay".into()
+        }));
+        assert!(
+            matches!(writer_rx.try_recv(), Ok(Message::Goodbye { .. })),
+            "the capable peer receives the relay"
+        );
+        assert!(
+            observer_rx.try_recv().is_err(),
+            "the read-only observer must not be a relay target"
+        );
+    }
+
+    #[test]
+    fn tofu_never_forgets_a_pinned_key() {
+        let mut reg = PeerRegistry::new();
+        let pinned = vec![7u8; 32];
+        reg.verify_or_register(
+            "127.0.0.1:1",
+            "node-a",
+            "fp-a",
+            "org-a",
+            true,
+            Some(pinned.clone()),
+            None,
+        )
+        .unwrap();
+
+        // A later Hello with the same identity fields but a different key must
+        // not move the pin: only a signed rotation may.
+        reg.verify_or_register(
+            "127.0.0.1:1",
+            "node-a",
+            "fp-a",
+            "org-a",
+            true,
+            Some(vec![9u8; 32]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(reg.peers["127.0.0.1:1"].public_key, Some(pinned));
+    }
+
+    #[tokio::test]
+    async fn append_peer_block_anchors_genesis_on_an_empty_chain() {
+        let ledger = Arc::new(Mutex::new(Ledger::new(1)));
+        ledger.lock().await.chain.clear();
+
+        let mut genesis = Block::new(0, vec![], "0".into());
+        genesis.mine(1);
+        assert!(Node::append_peer_block(&ledger, &genesis).await);
+        assert_eq!(ledger.lock().await.chain.len(), 1);
+
+        // A non-genesis block cannot start an empty chain.
+        ledger.lock().await.chain.clear();
+        let mut orphan = Block::new(1, vec![], "0".into());
+        orphan.mine(1);
+        assert!(!Node::append_peer_block(&ledger, &orphan).await);
+        assert!(ledger.lock().await.chain.is_empty());
+    }
+
+    #[tokio::test]
+    async fn try_send_all_counts_only_actual_drops() {
+        let node = Node::new("n-send", "127.0.0.1:0", 1);
+
+        // A healthy channel accepts the message: no drop is recorded.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(4);
+        let write = PeerWrite {
+            consensus: tx.clone(),
+            background: tx,
+        };
+        Node::try_send_all(
+            &node.state,
+            vec![("10.0.0.4:1".to_owned(), write)],
+            Message::RequestChain,
+        )
+        .await;
+        assert_eq!(node.dropped_outbound("10.0.0.4:1").await, 0);
+
+        // A full consensus channel counts the failed send exactly once.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Message>(1);
+        let write = PeerWrite {
+            consensus: tx.clone(),
+            background: tx,
+        };
+        assert!(write.try_send(Message::RequestChain));
+        Node::try_send_all(
+            &node.state,
+            vec![("10.0.0.5:1".to_owned(), write)],
+            Message::RequestChain,
+        )
+        .await;
+        assert_eq!(node.dropped_outbound("10.0.0.5:1").await, 1);
+    }
+
+    #[test]
+    fn restore_ledger_rejects_a_chain_with_an_interior_gap() {
+        let storage: Arc<dyn StorageProvider> = Arc::new(InMemoryStorageProvider::new());
+        let chain = seed_storage(&storage, 2, 2);
+        // Block 2 is missing while block 3 is stored: the loader aborts at the
+        // gap and the partial prefix must not be adopted as history.
+        let mut b3 = Block::new(3, vec![], chain[1].hash.clone());
+        b3.mine(2);
+        storage.put_block(&b3).unwrap();
+        assert_eq!(storage.latest_block_index().unwrap(), Some(3));
+
+        let ledger = Node::restore_ledger(&storage, 2);
+        assert_eq!(
+            ledger.try_lock().unwrap().chain.len(),
+            1,
+            "a gapped chain must fall back to a fresh genesis-only ledger"
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_asset_registration_populates_both_analytics_projections() {
+        let node = Node::new("n-analytics", "127.0.0.1:0", 1);
+        let genesis = node.ledger.lock().await.chain[0].hash.clone();
+        let asset_tx = Transaction::with_id(
+            "asset-1",
+            TransactionKind::AssetRegistration(TraceableAssetRegistration {
+                asset: TraceableAsset {
+                    gtin: Some("07891234100016".into()),
+                    batch_number: None,
+                    expiry_date: None,
+                    serial_number: Some("SN-ANALYTICS".into()),
+                    anvisa_registration: None,
+                    manufacturer_id: None,
+                    product_name: "Dipirona 500mg".into(),
+                    custodian_id: "plant-1".into(),
+                    country_of_origin: None,
+                    storage_temp_celsius: None,
+                    quantity: 3,
+                },
+                event_type: "manufacture".into(),
+                originator_id: "plant-1".into(),
+                purchase_order_ref: None,
+            }),
+        );
+        let mut block = Block::new(1, vec![asset_tx], genesis);
+        block.mine(1);
+        Node::after_block_commit(
+            &node.ledger,
+            &node.state,
+            &node.event_tx,
+            &node.indexer,
+            &node.event_bus,
+            &node.provenance,
+            &node.flattener,
+            &block,
+            &node.storage,
+        )
+        .await;
+
+        // The accessors must hand back the live projections, not empty defaults.
+        assert_eq!(
+            node.provenance_index().lock().await.tracked_assets().len(),
+            1
+        );
+        assert_eq!(node.analytical_flattener().lock().await.records().len(), 1);
+    }
+
+    fn hello_message(node_id: &str, fingerprint: &str, chain_length: u64) -> Message {
+        Message::Hello {
+            node_id: node_id.to_owned(),
+            tls_cert_fingerprint: fingerprint.to_owned(),
+            chain_length,
+            version: PROTOCOL_VERSION.to_owned(),
+            capabilities: CAPABILITY_V1
+                .iter()
+                .map(|c| CapabilityAdvertisement {
+                    id: c.id.to_owned(),
+                    version: c.version,
+                })
+                .collect(),
+            org: "org-a".into(),
+            certificate_pem: None,
+            certificate_proof: None,
+            fingerprint_proof: None,
+            ocsp_response_der: None,
+            listen_addr: "127.0.0.1:4444".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn hello_from_a_longer_chain_requests_only_the_missing_suffix() {
+        let node = Node::new("n-hello", "127.0.0.1:0", 1);
+        let ctx = peer_context(&node);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(16);
+        let write_tx = PeerWrite {
+            consensus: tx.clone(),
+            background: tx,
+        };
+
+        // Genesis-only local chain: bootstrap with the full chain.
+        let effect = process_message(
+            hello_message("peer-node", "peer-fp", 5),
+            "127.0.0.1:4444",
+            &ctx,
+            &write_tx,
+            None,
+            "peer-fp",
+            &[],
+        )
+        .await;
+        assert_eq!(effect.stable_addr.as_deref(), Some("127.0.0.1:4444"));
+        assert!(
+            matches!(rx.try_recv(), Ok(Message::RequestChain)),
+            "a fresh node bootstraps with the full chain"
+        );
+
+        // A node already holding history pulls only the missing suffix.
+        let mut block = Block::new(1, vec![], node.ledger.lock().await.chain[0].hash.clone());
+        block.mine(1);
+        node.ledger.lock().await.chain.push(block);
+        let _ = process_message(
+            hello_message("peer-node", "peer-fp", 5),
+            "127.0.0.1:4444",
+            &ctx,
+            &write_tx,
+            None,
+            "peer-fp",
+            &[],
+        )
+        .await;
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Ok(Message::RequestChainFrom { from_index: 2 })
+            ),
+            "a non-genesis node requests only the suffix"
+        );
+    }
+
+    #[test]
+    fn future_timestamp_window_is_exact() {
+        let now = 1_700_000_000u64;
+        assert!(
+            timestamp_within_future_window(0, u64::MAX, now),
+            "genesis (index 0) is exempt regardless of timestamp"
+        );
+        assert!(
+            timestamp_within_future_window(1, now + FUTURE_TIMESTAMP_WINDOW_SECS, now),
+            "a block exactly at the window boundary is admitted"
+        );
+        assert!(
+            !timestamp_within_future_window(1, now + FUTURE_TIMESTAMP_WINDOW_SECS + 1, now),
+            "one second past the boundary is rejected"
+        );
+        assert!(timestamp_within_future_window(1, now, now));
+        assert!(timestamp_within_future_window(7, now - 60, now));
+    }
+
+    #[tokio::test]
+    async fn block_with_a_plausible_timestamp_is_admitted() {
+        let node = Node::new("n-ts", "127.0.0.1:0", 1);
+        let ctx = peer_context(&node);
+        let _rx = install_peer(&node, "127.0.0.1:4445", "org-a", false).await;
+        let (tx, _out) = tokio::sync::mpsc::channel::<Message>(16);
+        let write_tx = PeerWrite {
+            consensus: tx.clone(),
+            background: tx,
+        };
+        let genesis = node.ledger.lock().await.chain[0].hash.clone();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut block = Block::new(1, vec![], genesis);
+        // A plausible past timestamp: the admission path has no lower bound,
+        // and a runner clock step (forward or backward) cannot flip the
+        // outcome. The exact future window is unit-tested on
+        // `timestamp_within_future_window`.
+        block.timestamp = now_secs.saturating_sub(60);
+        block.mine(1);
+
+        process_message(
+            Message::Block(block),
+            "127.0.0.1:4445",
+            &ctx,
+            &write_tx,
+            Some("127.0.0.1:4445"),
+            "fp",
+            &[],
+        )
+        .await;
+        assert_eq!(
+            node.ledger.lock().await.chain.len(),
+            2,
+            "a block with a plausible timestamp is admitted (now={now_secs})"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_endorsement_evaluates_the_committed_policy() {
+        let node = Node::new("n-endorse-rpc", "127.0.0.1:0", 1);
+        let mut msp = MspEndorsementProvider::new();
+        let org_a = Identity::generate("node-a");
+        msp.register_identity(&org_a, glasschain_core::Principal::new("org-a"));
+        node.set_endorsement_provider(Arc::new(msp)).await;
+
+        // A committed policy update naming org-a for the request's scope.
+        let mut block = Block::new(1, vec![chain_policy_update_tx(None)], "0".into());
+        block.mine(1);
+        node.state.lock().await.policies =
+            PolicyHistory::build_from_blocks(&[block]).expect("valid policy metadata");
+
+        let payload = b"canonical-payload";
+        let request = EndorsementRequest {
+            target: ScopedTarget {
+                channel: "supply".into(),
+                contract: "inventory".into(),
+                keys: vec!["k1".into()],
+                collection: None,
+            },
+            payload: payload.to_vec(),
+            signers: vec![EndorserIdentity {
+                algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
+                claimed_principal: glasschain_core::Principal::new("org-a"),
+                public_key: org_a.public_key_bytes().to_vec(),
+                signature: org_a.sign_bytes(payload),
+            }],
+        };
+        let evaluations = node
+            .verify_endorsement(request.clone())
+            .await
+            .expect("the applicable policy evaluates");
+        assert_eq!(evaluations.len(), 1, "one applicable policy is evaluated");
+        assert!(evaluations[0].satisfied, "org-a satisfies the policy");
+
+        // Without a provider the RPC fails closed.
+        let bare = Node::new("n-endorse-none", "127.0.0.1:0", 1);
+        assert!(bare.verify_endorsement(request).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn private_payload_requests_require_both_trust_and_membership() {
+        let node = Node::new("n-req", "127.0.0.1:0", 1);
+        // `peer_context` presents this connection as `n-under-test`, which is
+        // also the local org the holder-membership gate checks.
+        node.set_collections(vec![collection_of("pricing", &["org-a", "n-under-test"])])
+            .await;
+        node.state
+            .lock()
+            .await
+            .transient
+            .put("pricing", "commit", b"secret", 3_600)
+            .unwrap();
+        let ctx = peer_context(&node);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(16);
+        let write_tx = PeerWrite {
+            consensus: tx.clone(),
+            background: tx,
+        };
+        let request = || Message::RequestPrivatePayload {
+            collection: "pricing".into(),
+            commitment: "commit".into(),
+        };
+
+        // No verifier: the requester is untrusted, so the member holder stays
+        // silent (fail closed, #86).
+        process_message(
+            request(),
+            "10.0.0.9:1",
+            &ctx,
+            &write_tx,
+            Some("10.0.0.9:1"),
+            "fp",
+            &[],
+        )
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "an untrusted requester gets nothing"
+        );
+
+        // A certificate-verified member does get the payload.
+        node.set_cert_verifier(test_org_verifier()).await;
+        let _peer = install_peer(&node, "10.0.0.9:1", "org-a", true).await;
+        process_message(
+            request(),
+            "10.0.0.9:1",
+            &ctx,
+            &write_tx,
+            Some("10.0.0.9:1"),
+            "fp",
+            &[],
+        )
+        .await;
+        assert!(
+            matches!(rx.try_recv(), Ok(Message::PrivatePayload { .. })),
+            "a verified member receives the payload"
+        );
+    }
+
+    // ── Endorsement replay coverage (ADR-008 §4) ─────────────────────────────
+
+    fn governance_provider() -> (MspEndorsementProvider, Identity) {
+        let gov = Identity::generate("gov");
+        let mut msp = MspEndorsementProvider::new();
+        msp.register_identity(&gov, glasschain_core::Principal::new("network-governance"));
+        (msp, gov)
+    }
+
+    /// A transaction carrying a carrier that covers
+    /// `("supply", "inventory", "k1")` and satisfies the fail-closed
+    /// network-governance default.
+    fn endorsed_covering_tx(id: &str, gov: &Identity) -> Transaction {
+        let mut tx = plain_inventory_tx(id);
+        let payload = glasschain_core::TransactionEndorsement::payload(&tx).unwrap();
+        tx.endorsements
+            .push(glasschain_core::TransactionEndorsement {
+                target: ScopedTarget {
+                    channel: "supply".into(),
+                    contract: "inventory".into(),
+                    keys: vec!["k1".into()],
+                    collection: None,
+                },
+                signers: vec![EndorserIdentity {
+                    algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
+                    claimed_principal: glasschain_core::Principal::new("network-governance"),
+                    public_key: gov.public_key_bytes().to_vec(),
+                    signature: gov.sign_bytes(&payload),
+                }],
+            });
+        tx
+    }
+
+    #[tokio::test]
+    async fn replay_endorsement_gate_checks_aggregate_carrier_coverage() {
+        let node = Node::new("n-replay", "127.0.0.1:0", 1);
+        let (msp, gov) = governance_provider();
+        node.set_endorsement_provider(Arc::new(msp)).await;
+        // Activate `endorsement` at height 1 without committing a chain.
+        let TransactionKind::CapabilityActivation(activation) = chain_activation_tx(1).kind else {
+            panic!("helper must build an activation");
+        };
+        let mut history = CapabilityHistory::default();
+        history.apply(activation, 0).unwrap();
+        node.state.lock().await.capability_history = Some(history);
+
+        let genesis = node.ledger.lock().await.chain[0].clone();
+        let write = public_write("supply", "inventory", "k1");
+
+        // Uncovered committed write: rejected on the replay path (no
+        // per-transaction attribution available).
+        let mut uncovered = Block::with_write_set(
+            1,
+            vec![plain_inventory_tx("t-uncovered")],
+            genesis.hash.clone(),
+            vec![write.clone()],
+        );
+        uncovered.mine(1);
+        let error = Node::enforce_block_endorsements(&node.state, &node.ledger, &uncovered, &[])
+            .await
+            .expect_err("an uncovered committed write must reject the block");
+        assert!(
+            error.to_string().contains("outside every declared"),
+            "{error}"
+        );
+
+        // A declared carrier covering the write passes.
+        let mut covered = Block::with_write_set(
+            1,
+            vec![endorsed_covering_tx("t-covered", &gov)],
+            genesis.hash,
+            vec![write],
+        );
+        covered.mine(1);
+        Node::enforce_block_endorsements(&node.state, &node.ledger, &covered, &[])
+            .await
+            .expect("a covered write passes the replay gate");
+    }
+
+    #[tokio::test]
+    async fn sync_endorsement_gate_checks_aggregate_carrier_coverage() {
+        let node = Node::new("n-sync-cov", "127.0.0.1:0", 1);
+        let (msp, gov) = governance_provider();
+        node.set_endorsement_provider(Arc::new(msp)).await;
+
+        let genesis = Ledger::new(1).chain.remove(0);
+        // Block 1 activates `endorsement` at height 2 (strictly future of its
+        // own block); block 2 commits an uncovered write.
+        let mut b1 = Block::with_write_set(
+            1,
+            vec![chain_activation_tx(2)],
+            genesis.hash.clone(),
+            vec![],
+        );
+        b1.mine(1);
+        let mut b2 = Block::with_write_set(
+            2,
+            vec![plain_inventory_tx("t-sync")],
+            b1.hash.clone(),
+            vec![public_write("supply", "inventory", "k1")],
+        );
+        b2.mine(1);
+
+        let error = Node::enforce_chain_endorsements(
+            &node.state,
+            &[genesis.clone(), b1.clone(), b2.clone()],
+        )
+        .await
+        .expect_err("an uncovered committed write must reject the candidate chain");
+        assert!(
+            error.to_string().contains("outside every declared"),
+            "{error}"
+        );
+
+        let mut covered = Block::with_write_set(
+            2,
+            vec![endorsed_covering_tx("t-sync", &gov)],
+            b1.hash.clone(),
+            vec![public_write("supply", "inventory", "k1")],
+        );
+        covered.mine(1);
+        Node::enforce_chain_endorsements(&node.state, &[genesis, b1, covered])
+            .await
+            .expect("a covered write passes the sync gate");
+    }
+
+    // ── BFT round-driver guards (ADR-014) ────────────────────────────────────
+
+    #[cfg(feature = "bft")]
+    fn bft_activation(height: u64) -> CapabilityActivation {
+        CapabilityActivation {
+            capability_id: "bft_consensus".into(),
+            version: 1,
+            hash: capability_hash("bft_consensus", 1),
+            activation_height: height,
+            signatures: vec![RecordSignature {
+                algorithm: glasschain_core::wire::SignatureAlgorithm::Ed25519,
+                signer: "governance".into(),
+                signature_bytes: vec![0x42],
+            }],
+        }
+    }
+
+    /// Poll the driver's vote channel and close it as soon as it opens, so a
+    /// phase with too few votes ends immediately instead of waiting out the
+    /// 3-second timeout.
+    #[cfg(feature = "bft")]
+    fn spawn_channel_closer(state: &Arc<Mutex<NodeState>>) -> tokio::task::JoinHandle<()> {
+        let state = Arc::clone(state);
+        tokio::spawn(async move {
+            loop {
+                let _ = state.lock().await.bft_vote_tx.take();
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "bft")]
+    async fn run_vote_round_drops_a_lock_from_another_height() {
+        let node = Node::new("n-lock", "127.0.0.1:0", 1);
+        node.set_bft_consensus(Arc::new(single_validator_provider()))
+            .await;
+        node.state.lock().await.bft_round = Some(BftRound {
+            height: 99,
+            round: 0,
+            locked: Some("stale-hash".into()),
+            proposal: None,
+        });
+
+        let block = Block::new(1, vec![], node.ledger.lock().await.chain[0].hash.clone());
+        let notification = node.run_vote_round(block).await.expect("quorum");
+
+        assert_eq!(notification.block.index, 1);
+        assert!(
+            node.last_round_phase_timings().await.is_some(),
+            "a committed round records its phase timings"
+        );
+        let s = node.state.lock().await;
+        let round = s.bft_round.as_ref().expect("round state");
+        assert_eq!(round.height, 1);
+        assert_eq!(
+            round.locked, None,
+            "a lock from another height must not carry over"
+        );
+        drop(s);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "bft")]
+    async fn run_vote_round_does_not_precommit_without_a_prevote_quorum() {
+        let node = Node::new("n-prevote", "127.0.0.1:0", 1);
+        let (provider, _keys) = three_validator_provider();
+        node.set_bft_consensus(Arc::new(provider)).await;
+        let mut peer_rx = install_peer(&node, "10.0.0.6:1", "org-a", false).await;
+        let closer = spawn_channel_closer(&node.state);
+
+        // Height 3 makes validator-a (the local key) the round-0 proposer; the
+        // view change at round 1 belongs to another validator.
+        let block = Block::new(3, vec![], node.ledger.lock().await.chain[0].hash.clone());
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            node.run_vote_round(block),
+        )
+        .await;
+        closer.abort();
+
+        let error = outcome
+            .expect("the driver must terminate")
+            .expect_err("the view change hands the round to another validator");
+        assert!(
+            error.to_string().contains("not the round leader"),
+            "a failed prevote round must not run its own round budget, got: {error}"
+        );
+        let (mut proposals, mut precommits) = (0, 0);
+        while let Ok(message) = peer_rx.try_recv() {
+            match message {
+                Message::Proposal { .. } => proposals += 1,
+                Message::Precommit { .. } => precommits += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(proposals, 1, "one proposal per attempted round");
+        assert_eq!(precommits, 0, "no precommit without a prevote quorum");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "bft")]
+    async fn run_vote_round_does_not_return_finality_without_a_precommit_quorum() {
+        let node = Node::new("n-precommit-budget", "127.0.0.1:0", 1);
+        let (provider, signers) = three_validator_provider();
+        let (key_a, key_b) = (signers[1], signers[2]);
+        node.set_bft_consensus(Arc::new(provider)).await;
+        let mut peer_rx = install_peer(&node, "10.0.0.7:1", "org-a", false).await;
+
+        let chain_id = node.ledger.lock().await.chain[0].hash.clone();
+        let mut block = Block::new(3, vec![], chain_id.clone());
+        block.hash = block.calculate_hash();
+        let block_hash = block.hash.clone();
+
+        // Supply the other two prevotes per round, never a precommit, and
+        // close the channel after each supply so the precommit phase ends at
+        // once.
+        let state = Arc::clone(&node.state);
+        let supplier = tokio::spawn(async move {
+            loop {
+                let (tx, round) = {
+                    let mut s = state.lock().await;
+                    (
+                        s.bft_vote_tx.take(),
+                        s.bft_round.as_ref().map(|round| round.round),
+                    )
+                };
+                if let (Some(tx), Some(round)) = (tx, round) {
+                    for key in [&key_a, &key_b] {
+                        let _ = tx
+                            .send(glasschain_core::BftVote::sign(
+                                &chain_id,
+                                3,
+                                round,
+                                VotePhase::Prevote,
+                                &block_hash,
+                                key,
+                            ))
+                            .await;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        });
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            node.run_vote_round(block),
+        )
+        .await;
+        supplier.abort();
+
+        let error = outcome
+            .expect("the driver must terminate")
+            .expect_err("a failed precommit round must not return finality");
+        assert!(
+            error.to_string().contains("not the round leader"),
+            "the view change hands round 1 to another validator, got: {error}"
+        );
+        let mut proposals = 0;
+        while let Ok(message) = peer_rx.try_recv() {
+            if matches!(message, Message::Proposal { .. }) {
+                proposals += 1;
+            }
+        }
+        assert_eq!(proposals, 1, "one proposal per attempted round");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "bft")]
+    async fn handle_proposal_locks_and_candidate_admission_are_exact() {
+        let node = Node::new("n-proposal", "127.0.0.1:0", 1);
+        node.set_bft_consensus(Arc::new(single_validator_provider()))
+            .await;
+        let ctx = peer_context(&node);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(16);
+        let write_tx = PeerWrite {
+            consensus: tx.clone(),
+            background: tx,
+        };
+        let genesis = node.ledger.lock().await.chain[0].hash.clone();
+        let mut block = Block::new(1, vec![], genesis);
+        block.mine(1);
+
+        // A lock at this height on a different hash: abstain, lock preserved.
+        node.state.lock().await.bft_round = Some(BftRound {
+            height: 1,
+            round: 0,
+            locked: Some("elsewhere".into()),
+            proposal: None,
+        });
+        handle_proposal(&ctx, &write_tx, block.clone(), 0).await;
+        assert!(rx.try_recv().is_err(), "a conflicting lock abstains");
+        assert_eq!(
+            node.state
+                .lock()
+                .await
+                .bft_round
+                .as_ref()
+                .unwrap()
+                .locked
+                .as_deref(),
+            Some("elsewhere")
+        );
+
+        // Locked on this hash: re-proposing it is prevoted, not abstained.
+        node.state.lock().await.bft_round = Some(BftRound {
+            height: 1,
+            round: 0,
+            locked: Some(block.hash.clone()),
+            proposal: None,
+        });
+        handle_proposal(&ctx, &write_tx, block, 0).await;
+        assert!(
+            matches!(rx.try_recv(), Ok(Message::Vote(_))),
+            "the locked hash is prevoted"
+        );
+
+        // A candidate that does not chain to the tip is never prevoted.
+        node.state.lock().await.bft_round = None;
+        let mut orphan = Block::new(1, vec![], "not-the-tip".into());
+        orphan.mine(1);
+        handle_proposal(&ctx, &write_tx, orphan, 0).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a non-chaining candidate is rejected"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "bft")]
+    async fn handle_vote_retires_receipts_from_dead_heights() {
+        let node = Node::new("n-receipts", "127.0.0.1:0", 1);
+        let provider = single_validator_provider();
+        node.set_bft_consensus(Arc::new(provider.clone())).await;
+        let ctx = peer_context(&node);
+        let genesis = node.ledger.lock().await.chain[0].hash.clone();
+        let vote = |height: u64, hash: &str| {
+            provider.sign_vote(&genesis, height, 0, VotePhase::Prevote, hash)
+        };
+
+        handle_vote(&ctx, vote(1, "h1")).await;
+        handle_vote(&ctx, vote(2, "h2")).await;
+        // A vote at height 3 retires height-1 receipts but keeps height 2.
+        handle_vote(&ctx, vote(3, "h3")).await;
+
+        handle_vote(&ctx, vote(1, "h1-conflict")).await;
+        assert!(
+            ctx.state.lock().await.equivocations.is_empty(),
+            "height-1 receipts are retired"
+        );
+        handle_vote(&ctx, vote(2, "h2-conflict")).await;
+        assert_eq!(
+            ctx.state.lock().await.equivocations.len(),
+            1,
+            "height-2 receipts are retained"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "bft")]
+    async fn handle_precommit_ignores_a_round_mismatch() {
+        let node = Node::new("n-precommit-handler", "127.0.0.1:0", 1);
+        node.set_bft_consensus(Arc::new(single_validator_provider()))
+            .await;
+        let ctx = peer_context(&node);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(16);
+        let write_tx = PeerWrite {
+            consensus: tx.clone(),
+            background: tx,
+        };
+        let genesis = node.ledger.lock().await.chain[0].hash.clone();
+        let mut block = Block::new(1, vec![], genesis);
+        block.mine(1);
+        let certificate = q_certificate(&block, &[bls_signatures::PrivateKey::new([42; 64])]);
+        node.state.lock().await.bft_round = Some(BftRound {
+            height: 1,
+            round: 0,
+            locked: None,
+            proposal: Some(block.clone()),
+        });
+
+        handle_precommit(&ctx, &write_tx, block.clone(), 7, certificate.clone()).await;
+        assert!(rx.try_recv().is_err(), "a mismatched round is ignored");
+        assert_eq!(node.state.lock().await.bft_round.as_ref().unwrap().round, 0);
+
+        handle_precommit(&ctx, &write_tx, block, 0, certificate).await;
+        assert!(
+            matches!(rx.try_recv(), Ok(Message::Vote(_))),
+            "the matching round locks and precommits"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "bft")]
+    async fn validator_provider_recomputes_on_a_stale_cache() {
+        let node = Node::new("n-validator-cache", "127.0.0.1:0", 1);
+        node.set_bft_consensus(Arc::new(single_validator_provider()))
+            .await;
+        let (other_info, other_key) = test_validator("validator-other", 77);
+        let stale = BftConsensusProvider::new(vec![other_info], other_key).unwrap();
+
+        let mut s = node.state.lock().await;
+        s.bft_validator_cache = Some((u64::MAX, stale));
+        let derived = derive_validator_provider(&mut s).expect("attached provider");
+        assert_eq!(
+            derived.validators()[0].name,
+            "test-validator",
+            "a cache entry whose content hash does not match must not be reused"
+        );
+        drop(s);
+    }
+
+    #[test]
+    #[cfg(feature = "bft")]
+    fn a_bootstrap_certificate_at_a_registry_change_height_verifies() {
+        let genesis = Ledger::new(1).chain.remove(0);
+        let (bootstrap_info, bootstrap_key) = test_validator("bootstrap", 5);
+        let bootstrap = BftConsensusProvider::new(vec![bootstrap_info], bootstrap_key).unwrap();
+        let (new_info, _) = test_validator("validator-new", 9);
+
+        // Block 1 carries a registry change (effective from height 2) and a
+        // certificate signed by the bootstrap set that governs height 1.
+        let mut b1 = Block::with_write_set(
+            1,
+            vec![],
+            genesis.hash.clone(),
+            vec![registry_write(&new_info)],
+        );
+        b1.mine(1);
+        b1.certificate = Some(q_certificate(&b1, &[bootstrap_key]));
+        verify_chain_certificates(&[genesis, b1], Some(&bootstrap))
+            .expect("height 1 is governed by the bootstrap set, not the new one");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "bft")]
+    async fn bft_active_blocks_accept_a_degenerate_certificate_by_pow() {
+        let node = Node::new("n-degenerate", "127.0.0.1:0", 1);
+        node.set_bft_consensus(Arc::new(single_validator_provider()))
+            .await;
+        let ctx = peer_context(&node);
+        let _peer = install_peer(&node, "127.0.0.1:4446", "org-a", false).await;
+        let (tx, _out) = tokio::sync::mpsc::channel::<Message>(16);
+        let write_tx = PeerWrite {
+            consensus: tx.clone(),
+            background: tx,
+        };
+        let genesis = node.ledger.lock().await.chain[0].hash.clone();
+
+        let mut history = CapabilityHistory::default();
+        history.apply(bft_activation(1), 0).unwrap();
+        node.state.lock().await.capability_history = Some(history);
+
+        let mut block = Block::new(1, vec![], genesis);
+        block.mine(1);
+        block.certificate = Some(QuorumCertificate::pow(&block));
+        process_message(
+            Message::Block(block),
+            "127.0.0.1:4446",
+            &ctx,
+            &write_tx,
+            Some("127.0.0.1:4446"),
+            "fp",
+            &[],
+        )
+        .await;
+        assert_eq!(
+            node.ledger.lock().await.chain.len(),
+            2,
+            "a degenerate certificate falls back to the PoW rule"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "bft")]
+    async fn capability_invalid_blocks_are_rejected_even_with_valid_pow() {
+        let node = Node::new("n-cap-invalid", "127.0.0.1:0", 1);
+        node.set_bft_consensus(Arc::new(single_validator_provider()))
+            .await;
+        let ctx = peer_context(&node);
+        let _peer = install_peer(&node, "127.0.0.1:4448", "org-a", false).await;
+        let (tx, _out) = tokio::sync::mpsc::channel::<Message>(16);
+        let write_tx = PeerWrite {
+            consensus: tx.clone(),
+            background: tx,
+        };
+        let genesis = node.ledger.lock().await.chain[0].hash.clone();
+
+        let mut history = CapabilityHistory::default();
+        history.apply(bft_activation(1), 0).unwrap();
+        node.state.lock().await.capability_history = Some(history);
+
+        // The activation names its own block's height: not strictly future.
+        let mut block = Block::with_write_set(
+            1,
+            vec![Transaction::with_id(
+                "bad-activation",
+                TransactionKind::CapabilityActivation(bft_activation(1)),
+            )],
+            genesis,
+            vec![],
+        );
+        block.mine(1);
+        process_message(
+            Message::Block(block),
+            "127.0.0.1:4448",
+            &ctx,
+            &write_tx,
+            Some("127.0.0.1:4448"),
+            "fp",
+            &[],
+        )
+        .await;
+        assert_eq!(
+            node.ledger.lock().await.chain.len(),
+            1,
+            "valid PoW must not admit a capability-invalid block"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_peer_counts_reconnect_attempts_across_duplicate_connections() {
+        let node = Node::new("n-reconnect", "127.0.0.1:0", 1);
+
+        let mut tasks = Vec::new();
+        let mut clients = Vec::new();
+        for _ in 0..2 {
+            let ctx = peer_context(&node);
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let (server_r, server_w) = tokio::io::split(server);
+            let (client_r, client_w) = tokio::io::split(client);
+            tasks.push(tokio::spawn(handle_peer(
+                PeerReader::new(server_r, "127.0.0.1:4444".into()),
+                PeerWriter::new(server_w, "127.0.0.1:4444".into()),
+                "127.0.0.1:4444".into(),
+                ctx,
+                "peer-fp".into(),
+                Vec::new(),
+            )));
+            clients.push((
+                PeerReader::new(client_r, "node".into()),
+                PeerWriter::new(client_w, "node".into()),
+            ));
+        }
+
+        // Both Hellos must be fully processed before either connection drops.
+        // The receives are bounded so a writer that never sends fails the test
+        // instead of blocking it forever.
+        for (reader, writer) in &mut clients {
+            let hello = tokio::time::timeout(std::time::Duration::from_secs(5), reader.receive())
+                .await
+                .expect("the server Hello must not block")
+                .unwrap();
+            assert!(matches!(hello, Message::Hello { .. }));
+            writer
+                .send(&hello_message("peer-node", "peer-fp", 5))
+                .await
+                .unwrap();
+            let reply = tokio::time::timeout(std::time::Duration::from_secs(5), reader.receive())
+                .await
+                .expect("the chain request must not block")
+                .unwrap();
+            assert!(matches!(
+                reply,
+                Message::RequestChain | Message::RequestChainFrom { .. }
+            ));
+        }
+        drop(clients);
+        for task in tasks {
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .expect("handle_peer exits on EOF")
+                .unwrap();
+        }
+
+        let attempts = node
+            .state
+            .lock()
+            .await
+            .reconnect_attempts
+            .get("127.0.0.1:4444")
+            .copied();
+        assert_eq!(
+            attempts,
+            Some(1),
+            "the second disconnect increments the existing backoff entry"
+        );
     }
 }

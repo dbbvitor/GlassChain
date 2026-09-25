@@ -201,7 +201,8 @@ pub fn proposer_index(validators: &BftConsensusProvider, height: u64, round: u32
     (base + offset) % validators.validator_count().max(1)
 }
 
-#[cfg(all(test, feature = "bft"))]
+#[cfg(test)]
+#[cfg(feature = "bft")]
 mod tests {
     use super::*;
     use bls_signatures::PrivateKey;
@@ -380,5 +381,79 @@ mod tests {
         declined.round = 9;
         let _ = saturated.record(&declined);
         assert_eq!(saturated.seen.len(), VOTE_RECEIPT_CAP, "full journal froze");
+
+        // A record at the current height evicts the strictly-lower flood and
+        // is admitted (the eviction must report that it freed space).
+        let current = flood_vote(VOTE_RECEIPT_CAP as u64);
+        let _ = saturated.record(&current);
+        assert_eq!(
+            saturated.seen.len(),
+            1,
+            "a current-height record must evict stale heights and be admitted"
+        );
+        assert!(saturated.seen.contains_key(&(
+            VOTE_RECEIPT_CAP as u64,
+            0,
+            VotePhase::Prevote,
+            public_key
+        )));
+    }
+
+    fn bft_provider(count: usize) -> BftConsensusProvider {
+        let mut validators = Vec::new();
+        let mut keys = Vec::new();
+        for i in 0..count {
+            let secret = PrivateKey::new([u8::try_from(i + 1).expect("count fits u8"); 64]);
+            let public = secret.public_key();
+            let pop = secret.sign(format!(
+                "glasschain-bls-pop:{}",
+                hex::encode(public.as_bytes())
+            ));
+            validators.push(glasschain_core::ValidatorInfo {
+                name: format!("validator-{i}"),
+                public_key: public.as_bytes(),
+                pop: pop.as_bytes(),
+            });
+            keys.push(secret);
+        }
+        BftConsensusProvider::new(validators, keys[0]).expect("valid validators")
+    }
+
+    /// The phase timeout is base + one second per ten validators (integer
+    /// division), so every boundary is exact.
+    #[test]
+    fn phase_timeout_scales_with_the_validator_count() {
+        assert_eq!(phase_timeout(0), std::time::Duration::from_secs(3));
+        assert_eq!(phase_timeout(9), std::time::Duration::from_secs(3));
+        assert_eq!(phase_timeout(10), std::time::Duration::from_secs(4));
+        assert_eq!(phase_timeout(19), std::time::Duration::from_secs(4));
+        assert_eq!(phase_timeout(20), std::time::Duration::from_secs(5));
+        assert_eq!(phase_timeout(25), std::time::Duration::from_secs(5));
+    }
+
+    /// `phase_message_hash` reports the cached proposal's real hash, not a
+    /// constant, and `None` before a proposal exists.
+    #[test]
+    fn phase_message_hash_reports_the_proposal_hash() {
+        let mut round = BftRound::new(7);
+        assert_eq!(round.phase_message_hash(), None, "no proposal yet");
+        let mut block = glasschain_core::Block::new(7, Vec::new(), "prev".into());
+        block.hash = "proposal-hash".into();
+        round.proposal = Some(block);
+        assert_eq!(round.phase_message_hash().as_deref(), Some("proposal-hash"));
+    }
+
+    /// The proposer rotates by `(height + round) % n`, not by their
+    /// difference.
+    #[test]
+    fn proposer_index_rotates_by_height_plus_round() {
+        let provider = bft_provider(10);
+        assert_eq!(proposer_index(&provider, 0, 0), 0);
+        assert_eq!(proposer_index(&provider, 5, 3), 8);
+        assert_eq!(proposer_index(&provider, 5, 5), 0);
+        assert_eq!(proposer_index(&provider, 12, 1), 3);
+        // A single validator always proposes.
+        let solo = bft_provider(1);
+        assert_eq!(proposer_index(&solo, 9, 4), 0);
     }
 }

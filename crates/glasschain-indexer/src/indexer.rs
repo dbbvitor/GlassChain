@@ -286,8 +286,16 @@ mod tests {
     #[test]
     fn test_block_count() {
         let indexer = InMemoryIndexer::new();
-        indexer.index_block(&sample_block()).unwrap();
+        assert_eq!(indexer.block_count().unwrap(), 0, "an empty index counts 0");
+
+        let first = sample_block();
+        indexer.index_block(&first).unwrap();
         assert_eq!(indexer.block_count().unwrap(), 1);
+
+        let mut second = Block::new(2, vec![], first.hash);
+        second.mine(1);
+        indexer.index_block(&second).unwrap();
+        assert_eq!(indexer.block_count().unwrap(), 2);
     }
 
     #[test]

@@ -3,6 +3,10 @@ name: Reproducible build
 # Reproducible-builds.org verification (Gold `build_reproducible`), scoped
 # honestly: Linux x86_64 only. Cross-runner (macOS/Windows) determinism is
 # not claimed; the compliance plan documents this limitation.
+#
+# The build command and SOURCE_DATE_EPOCH must match release.yml, otherwise
+# this proves reproducibility of a build the release never performs
+# (wayfinder #158/#167).
 
 on:
   schedule:
@@ -11,6 +15,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  SOURCE_DATE_EPOCH: "946684800" # 2000-01-01T00:00:00Z
 
 permissions:
   contents: read
@@ -22,31 +27,40 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: 1.98.1
 
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-auditable
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
+        with:
+          tool: cargo-auditable
+
+      # The isolated build dirs are what is cached; the default `target` dir
+      # is never written here.
+      - name: Cache build directories
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ github.job }}
           shared-key: rust-cache
+          cache-targets: false
+          cache-directories: |-
+            target-a
+            target-b
           cache-on-failure: true
 
       - name: Build twice in isolated target dirs
-        env:
-          SOURCE_DATE_EPOCH: "946684800" # 2000-01-01T00:00:00Z
         run: |
-          CARGO_TARGET_DIR=target-a cargo build --release --locked
-          CARGO_TARGET_DIR=target-b cargo build --release --locked
+          CARGO_TARGET_DIR=target-a cargo auditable build --release --locked
+          CARGO_TARGET_DIR=target-b cargo auditable build --release --locked
 
       - name: Compare artifact hashes
         run: |

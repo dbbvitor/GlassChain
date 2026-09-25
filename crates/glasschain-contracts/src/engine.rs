@@ -551,6 +551,40 @@ mod tests {
     }
 
     #[test]
+    fn offer_conditions_are_inclusive_at_their_boundaries() {
+        let mut engine = ContractEngine::new();
+        engine
+            .register_contract(make_contract(
+                "c1", "buyer-1", "SKU-001", 1000, 5, 10, 100, true,
+            ))
+            .unwrap();
+        // Exactly at every limit: price == max, lead == max, quantity == min.
+        let offer = make_offer("seller-1", "SKU-001", 10, 1000, 5);
+        let txs = engine.evaluate_supply_offer(&offer, "offer-tx-1");
+        assert_eq!(
+            txs.len(),
+            2,
+            "an offer exactly at the declared limits must match"
+        );
+    }
+
+    #[test]
+    fn debug_output_names_the_engine() {
+        let mut engine = ContractEngine::new();
+        engine
+            .register_contract(make_contract(
+                "c1", "buyer-1", "SKU-001", 1000, 5, 10, 100, true,
+            ))
+            .unwrap();
+        let debug = format!("{engine:?}");
+        assert!(debug.contains("ContractEngine"), "{debug}");
+        assert!(
+            debug.contains("c1"),
+            "registered contracts are listed: {debug}"
+        );
+    }
+
+    #[test]
     fn test_offer_product_mismatch_rejected() {
         let mut engine = ContractEngine::new();
         engine
@@ -614,6 +648,22 @@ mod tests {
         // Second evaluation should produce nothing (contract is fulfilled).
         let txs2 = engine.evaluate_supply_offer(&offer, "offer-tx-2");
         assert!(txs2.is_empty());
+    }
+
+    #[test]
+    fn test_successful_purchase_accumulates_quantity_and_execution_count() {
+        let mut engine = ContractEngine::new();
+        engine
+            .register_contract(make_contract(
+                "c1", "buyer-1", "SKU-001", 1500, 10, 10, 100, true,
+            ))
+            .unwrap();
+        let offer = make_offer("seller-1", "SKU-001", 50, 1000, 5);
+        let txs = engine.evaluate_supply_offer(&offer, "offer-tx-1");
+        assert_eq!(txs.len(), 2);
+        let c = engine.get_contract("c1").unwrap();
+        assert_eq!(c.quantity_purchased, 50);
+        assert_eq!(c.execution_count, 1);
     }
 
     #[test]
@@ -793,9 +843,13 @@ mod tests {
         let rebuilt = ContractEngine::rebuild_from_chain(&[genesis_block, block1]);
 
         let contract = rebuilt.get_contract("c1").unwrap();
-        assert!(
-            contract.quantity_purchased > 0,
+        assert_eq!(
+            contract.quantity_purchased, 50,
             "quantity_purchased must be restored from the ContractExecution replay"
+        );
+        assert_eq!(
+            contract.execution_count, 1,
+            "execution_count must be restored from the ContractExecution replay"
         );
         // 50 units purchased < max_quantity 100 → still Active, not Fulfilled.
         assert_eq!(

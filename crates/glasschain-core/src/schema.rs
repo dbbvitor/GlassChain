@@ -474,4 +474,45 @@ mod tests {
             expiry.message
         );
     }
+
+    /// An empty `expiry_date` is "missing or empty", never "invalid format":
+    /// the present-but-invalid predicate requires non-empty *and* malformed.
+    #[test]
+    fn test_empty_expiry_date_is_missing_not_invalid() {
+        let mut asset = full_asset();
+        asset.expiry_date = Some(String::new());
+        let report = validate_asset(&asset);
+        let expiry = report
+            .violations
+            .iter()
+            .find(|v| v.field == "expiry_date")
+            .expect("expiry_date violation present");
+        assert!(
+            expiry.message.contains("missing or empty"),
+            "empty expiry_date must read as missing, got: {}",
+            expiry.message
+        );
+        assert!(!expiry.message.contains("invalid format"));
+    }
+
+    /// A malformed `expiry_date` must not relabel *other* fields as
+    /// "invalid format" — the special-case message is keyed to the field name.
+    #[test]
+    fn test_invalid_expiry_does_not_relabel_other_fields() {
+        let mut asset = full_asset();
+        asset.expiry_date = Some("not-a-date".into());
+        asset.gtin = None;
+        let report = validate_asset(&asset);
+        let gtin = report
+            .violations
+            .iter()
+            .find(|v| v.field == "gtin")
+            .expect("gtin violation present");
+        assert!(
+            gtin.message.contains("missing or empty"),
+            "gtin must keep its own message, got: {}",
+            gtin.message
+        );
+        assert!(!gtin.message.contains("invalid format"));
+    }
 }

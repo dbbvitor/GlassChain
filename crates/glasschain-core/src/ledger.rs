@@ -184,7 +184,8 @@ impl Ledger {
             .get_or_insert_with(CapabilityHistory::default);
         while self.history_len < self.chain.len() {
             history.validate_block(&self.chain[self.history_len].clone())?;
-            self.history_len += 1;
+            // Saturating: a mutated counter must not wrap or stall the fold.
+            self.history_len = self.history_len.saturating_add(1);
         }
         Ok(())
     }
@@ -207,7 +208,8 @@ impl Ledger {
             for tx in &self.chain[self.ids_len].transactions {
                 ids.insert(tx.id.clone());
             }
-            self.ids_len += 1;
+            // Saturating: a mutated counter must not wrap or stall the fold.
+            self.ids_len = self.ids_len.saturating_add(1);
         }
     }
 
@@ -1244,5 +1246,21 @@ mod tests {
         let offers: Vec<_> = ledger.committed_supply_offers().collect();
         assert_eq!(offers.len(), 1);
         assert_eq!(offers[0].seller_id, "acme");
+    }
+
+    /// Admission needs a real `PoW` *or* a non-degenerate certificate: a
+    /// degenerate `PoW` certificate never substitutes for a missing `PoW`.
+    #[test]
+    fn block_consensus_admissible_requires_pow_or_live_certificate() {
+        let mut ledger = Ledger::new(1);
+        let block = ledger.mine_pending_transactions().expect("mine").clone();
+        assert!(Ledger::block_consensus_admissible(&block, 1));
+
+        let mut certified = block.clone();
+        certified.certificate = Some(crate::consensus::QuorumCertificate::pow(&block));
+        assert!(
+            !Ledger::block_consensus_admissible(&certified, 64),
+            "a degenerate certificate must not admit a block that fails PoW"
+        );
     }
 }

@@ -103,9 +103,61 @@ pub struct MetadataTrustScore {
     pub bonus_fields_present: Vec<String>,
 }
 
-/// Assets with `score >= TRUST_SCORE_STANDARD_THRESHOLD` qualify for the
-/// 50 % fee discount and are placed in the "High Trust" indexer bucket.
-pub const TRUST_SCORE_STANDARD_THRESHOLD: u8 = 80;
+/// Trust-score arithmetic for [`MetadataTrustScore::compute`], proved in
+/// production form with Verus (ADR-019). The score is exactly
+/// `20 × core-present + 10 × bonus-present` and can never exceed 100; the
+/// standard-compliance gate is the same comparison the proof covers.
+mod trust_proofs {
+    use vstd::prelude::*;
+
+    verus! {
+
+    /// Assets with `score >= TRUST_SCORE_STANDARD_THRESHOLD` qualify for the
+    /// 50 % fee discount and are placed in the "High Trust" indexer bucket.
+    pub const TRUST_SCORE_STANDARD_THRESHOLD: u8 = 80;
+
+    /// `weight` points when `flag` is set, zero otherwise.
+    const fn points(flag: bool, weight: u8) -> (points: u8)
+        ensures points as int == (if flag { weight as int } else { 0 }),
+    {
+        if flag { weight } else { 0 }
+    }
+
+    /// The score: 20 points per core flag, 10 per bonus flag.
+    #[must_use]
+    pub const fn trust_score_value(core: [bool; 4], bonus: [bool; 2]) -> (score: u8)
+        ensures
+            score as int == (
+                (if core[0] { 20int } else { 0int })
+                    + (if core[1] { 20int } else { 0int })
+                    + (if core[2] { 20int } else { 0int })
+                    + (if core[3] { 20int } else { 0int })
+                    + (if bonus[0] { 10int } else { 0int })
+                    + (if bonus[1] { 10int } else { 0int })
+            ),
+            score <= 100,
+    {
+        points(core[0], 20)
+            + points(core[1], 20)
+            + points(core[2], 20)
+            + points(core[3], 20)
+            + points(bonus[0], 10)
+            + points(bonus[1], 10)
+    }
+
+    /// The standard-compliance gate: `score >= TRUST_SCORE_STANDARD_THRESHOLD`.
+    #[must_use]
+    pub const fn is_standard_score(score: u8) -> (standard: bool)
+        ensures standard == (score as int >= TRUST_SCORE_STANDARD_THRESHOLD as int),
+    {
+        score >= TRUST_SCORE_STANDARD_THRESHOLD
+    }
+
+    } // verus!
+}
+
+pub use trust_proofs::TRUST_SCORE_STANDARD_THRESHOLD;
+use trust_proofs::{is_standard_score, trust_score_value};
 
 /// Return `true` if `s` is a well-formed ISO-8601 date (`YYYY-MM-DD`).
 ///
@@ -146,67 +198,62 @@ impl MetadataTrustScore {
     ///   is worth 10 points → maximum 20 points from bonus.
     /// - Total maximum score: **100**.
     pub fn compute(asset: &TraceableAsset) -> Self {
-        let mut score: u8 = 0;
-        let mut missing = Vec::new();
-        let mut bonus = Vec::new();
+        // The presence flags, in scoring order — one evaluation each.
+        let core = [
+            asset.gtin.as_deref().is_some_and(|s| !s.is_empty()),
+            asset.batch_number.as_deref().is_some_and(|s| !s.is_empty()),
+            // expiry_date must be non-empty AND conform to YYYY-MM-DD
+            // (ISO-8601) to earn points. A malformed date does not score.
+            asset
+                .expiry_date
+                .as_deref()
+                .is_some_and(is_valid_iso8601_date),
+            asset
+                .serial_number
+                .as_deref()
+                .is_some_and(|s| !s.is_empty()),
+        ];
+        let bonus = [
+            asset
+                .anvisa_registration
+                .as_deref()
+                .is_some_and(|s| !s.is_empty()),
+            asset
+                .manufacturer_id
+                .as_deref()
+                .is_some_and(|s| !s.is_empty()),
+        ];
+        // The arithmetic is the Verus-proved `trust_proofs` kernel; the pushes
+        // mirror the same flags into the human-facing lists.
+        let score = trust_score_value(core, bonus);
+        let is_standard = is_standard_score(score);
 
-        // Core fields — 20 pts each.
-        if asset.gtin.as_deref().is_some_and(|s| !s.is_empty()) {
-            score += 20;
-        } else {
+        let mut missing = Vec::new();
+        if !core[0] {
             missing.push("gtin".to_owned());
         }
-        if asset.batch_number.as_deref().is_some_and(|s| !s.is_empty()) {
-            score += 20;
-        } else {
+        if !core[1] {
             missing.push("batch_number".to_owned());
         }
-        // expiry_date must be non-empty AND conform to YYYY-MM-DD (ISO-8601)
-        // to earn points.  A malformed date does not score.
-        if asset
-            .expiry_date
-            .as_deref()
-            .is_some_and(is_valid_iso8601_date)
-        {
-            score += 20;
-        } else {
+        if !core[2] {
             missing.push("expiry_date".to_owned());
         }
-        if asset
-            .serial_number
-            .as_deref()
-            .is_some_and(|s| !s.is_empty())
-        {
-            score += 20;
-        } else {
+        if !core[3] {
             missing.push("serial_number".to_owned());
         }
-
-        // Bonus fields — 10 pts each.
-        if asset
-            .anvisa_registration
-            .as_deref()
-            .is_some_and(|s| !s.is_empty())
-        {
-            score += 10;
-            bonus.push("anvisa_registration".to_owned());
+        let mut bonus_fields = Vec::new();
+        if bonus[0] {
+            bonus_fields.push("anvisa_registration".to_owned());
         }
-        if asset
-            .manufacturer_id
-            .as_deref()
-            .is_some_and(|s| !s.is_empty())
-        {
-            score += 10;
-            bonus.push("manufacturer_id".to_owned());
+        if bonus[1] {
+            bonus_fields.push("manufacturer_id".to_owned());
         }
-
-        let is_standard = score >= TRUST_SCORE_STANDARD_THRESHOLD;
 
         Self {
             score,
             is_standard,
             missing_core_fields: missing,
-            bonus_fields_present: bonus,
+            bonus_fields_present: bonus_fields,
         }
     }
 
@@ -370,6 +417,10 @@ mod tests {
         assert!(!super::is_valid_iso8601_date("2027-06-32")); // day > 31
         assert!(!super::is_valid_iso8601_date(""));
         assert!(!super::is_valid_iso8601_date("not-a-date"));
+        // Exactly one separator wrong must reject: the two checks are an AND,
+        // not an OR (a single bad separator must not fall through to parsing).
+        assert!(!super::is_valid_iso8601_date("2027-0630"));
+        assert!(!super::is_valid_iso8601_date("2027x06-30"));
     }
     #[test]
     fn iso8601_date_rejects_unparsable_components() {

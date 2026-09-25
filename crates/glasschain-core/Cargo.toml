@@ -31,6 +31,10 @@ bls-signatures = { version = "0.15", default-features = false, features = [
 blstrs = { version = "0.7", default-features = false, optional = true }
 group = { version = "0.13", default-features = false, optional = true }
 pairing = { version = "0.23", default-features = false, optional = true }
+# Verus's standard library. The TOFU pin transition and the BFT
+# quorum/bitmap kernels are proved against it; in normal (non-Verus) builds
+# it compiles to erased ghost code (ADR-019: Verus first on zero-trust, #170).
+vstd = "=0.0.0-2026-09-20-0158"
 
 [features]
 default = []
@@ -38,6 +42,9 @@ default = []
 # Proof-of-Work remains the dev/test driver. Pulls ed25519-dalek for real
 # validator attestations.
 bft = ["dep:bls-signatures", "dep:blstrs", "dep:group", "dep:pairing"]
+
+[package.metadata.verus]
+verify = true
 
 [dev-dependencies]
 criterion = "0.8"

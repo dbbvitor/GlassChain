@@ -7,6 +7,8 @@ pub mod peer;
 pub mod protocol;
 pub mod rounds;
 
+mod net;
+
 pub use error::NetworkError;
 pub use libp2p_swarm::{
     LibP2pConfig, LibP2pNode, SwarmCommand, SwarmNodeEvent, TOPIC_BLOCKS, TOPIC_TRANSACTIONS,

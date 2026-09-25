@@ -98,18 +98,18 @@ impl WasmExecutionProvider {
                         let Ok(vl) = usize::try_from(val_len) else {
                             return Ok(());
                         };
-                        let Some(kend) = kp.checked_add(kl) else {
+                        let Some(key_end) = kp.checked_add(kl) else {
                             return Ok(());
                         };
-                        let Some(vend) = vp.checked_add(vl) else {
+                        let Some(value_end) = vp.checked_add(vl) else {
                             return Ok(());
                         };
-                        if kend > data.len() || vend > data.len() {
+                        if key_end > data.len() || value_end > data.len() {
                             return Ok(());
                         }
                         (
-                            String::from_utf8_lossy(&data[kp..kend]).to_string(),
-                            data[vp..vend].to_vec(),
+                            String::from_utf8_lossy(&data[kp..key_end]).to_string(),
+                            data[vp..value_end].to_vec(),
                         )
                     };
 
@@ -943,6 +943,59 @@ mod tests {
         assert!(result.canonicalize().is_ok());
     }
 
+    /// `set_state` must accept a key or value whose end lands exactly on the
+    /// end of linear memory: the bounds check rejects only `end > data.len()`.
+    /// A `>=` (or `==`) comparison would drop the last byte of the buffer.
+    #[test]
+    fn test_set_state_accepts_offsets_ending_at_memory_end() {
+        let provider = WasmExecutionProvider::new().unwrap();
+        // 65529 + 7 == 65536: the key ends exactly at the end of the 64 KiB page.
+        let key_at_end = compile_wat(
+            r#"
+(module
+  (import "env" "set_state" (func $set_state (param i32 i32 i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "x")
+  (data (i32.const 65529) "approve")
+  (func (export "execute")
+    (call $set_state (i32.const 65529) (i32.const 7) (i32.const 0) (i32.const 1))
+  )
+)
+"#,
+        );
+        let result = provider
+            .execute("key-at-memory-end", &key_at_end, limits(50_000))
+            .unwrap();
+        assert_eq!(
+            result.ephemeral,
+            vec![("approve".to_string(), b"x".to_vec())],
+            "a key ending exactly at the memory end is accepted"
+        );
+
+        // 65534 + 2 == 65536: the value ends exactly at the end of the page.
+        let value_at_end = compile_wat(
+            r#"
+(module
+  (import "env" "set_state" (func $set_state (param i32 i32 i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "x")
+  (data (i32.const 65534) "42")
+  (func (export "execute")
+    (call $set_state (i32.const 0) (i32.const 1) (i32.const 65534) (i32.const 2))
+  )
+)
+"#,
+        );
+        let result = provider
+            .execute("value-at-memory-end", &value_at_end, limits(50_000))
+            .unwrap();
+        assert_eq!(
+            result.ephemeral,
+            vec![("x".to_string(), b"42".to_vec())],
+            "a value ending exactly at the memory end is accepted"
+        );
+    }
+
     /// The explicit `persist_state` host operation carries channel, contract,
     /// key, set/delete, and public/PDC visibility (ADR-007 decision 3).
     #[test]
@@ -1181,5 +1234,255 @@ mod tests {
             .expect("malformed host calls are ignored, not fatal");
         assert!(result.writes.is_empty());
         assert!(result.ephemeral.is_empty());
+    }
+
+    /// Every malformed host-call argument shape returns the `-1` sentinel:
+    /// negative pointers or lengths (the `i32 -> usize` conversions fail) and
+    /// ends past the memory (kills the `Ok(-1)` mutation to `Ok(1)` and the
+    /// bounds-comparison mutants).
+    #[test]
+    fn test_host_calls_reject_negative_and_out_of_bounds_arguments() {
+        let provider = WasmExecutionProvider::new().unwrap();
+        let wasm = compile_wat(
+            r#"
+(module
+  (import "env" "set_state"     (func $set_state     (param i32 i32 i32 i32)))
+  (import "env" "get_state_len" (func $get_state_len (param i32 i32) (result i32)))
+  (import "env" "get_state"     (func $get_state     (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "key")
+  ;; results[i] holds the low byte of call i's return value
+  (data (i32.const 40) "\00\00\00\00\00\00")
+  (data (i32.const 60) "record")
+  (func $record (param $index i32) (param $value i32)
+    (i32.store8 (i32.add (i32.const 40) (local.get $index)) (local.get $value))
+  )
+  (func (export "execute")
+    ;; get_state_len: negative key pointer, negative key length, key past memory
+    (call $record (i32.const 0) (call $get_state_len (i32.const -1) (i32.const 1)))
+    (call $record (i32.const 1) (call $get_state_len (i32.const 0) (i32.const -1)))
+    (call $record (i32.const 2) (call $get_state_len (i32.const 65530) (i32.const 100)))
+    ;; get_state: negative key pointer, negative value pointer, value past memory
+    (call $record (i32.const 3) (call $get_state (i32.const -1) (i32.const 1) (i32.const 0) (i32.const 8)))
+    (call $record (i32.const 4) (call $get_state (i32.const 0) (i32.const 3) (i32.const -1) (i32.const 8)))
+    (call $record (i32.const 5) (call $get_state (i32.const 0) (i32.const 3) (i32.const 65530) (i32.const 100)))
+    (call $set_state (i32.const 60) (i32.const 6) (i32.const 40) (i32.const 6))
+  )
+)
+"#,
+        );
+        let result = provider
+            .execute("host-argument-rejection", &wasm, limits(50_000))
+            .unwrap();
+        assert_eq!(result.ephemeral.len(), 1);
+        assert_eq!(result.ephemeral[0].0, "record");
+        // -1 as i32, stored byte-wise.
+        assert_eq!(result.ephemeral[0].1, vec![0xFF; 6]);
+    }
+
+    /// Every remaining `-4`/`-3`/`-1` sentinel arm, recorded and asserted
+    /// byte-for-byte: a deleted minus sign would flip a sentinel to a positive
+    /// success code.
+    #[test]
+    fn host_sentinels_are_exact_for_every_malformed_arm() {
+        let provider = WasmExecutionProvider::new().unwrap();
+        let wasm = compile_wat(
+            r#"
+(module
+  (import "env" "get_state_len" (func $get_state_len (param i32 i32) (result i32)))
+  (import "env" "get_state" (func $get_state (param i32 i32 i32 i32) (result i32)))
+  (import "env" "persist_state" (func $persist_state (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "env" "set_state" (func $set_state (param i32 i32 i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "key")
+  (data (i32.const 40) "\00\00\00\00\00\00\00\00\00\00\00\00\00")
+  (data (i32.const 60) "record")
+  (func $record (param $index i32) (param $value i32)
+    (i32.store8 (i32.add (i32.const 40) (local.get $index)) (local.get $value))
+  )
+  (func (export "execute")
+    ;; 0: get_state_len end past memory (key 65530..65630)
+    (call $record (i32.const 0) (call $get_state_len (i32.const 65530) (i32.const 100)))
+    ;; 1: get_state_len missing key
+    (call $record (i32.const 1) (call $get_state_len (i32.const 0) (i32.const 3)))
+    ;; 2: get_state negative key length
+    (call $record (i32.const 2) (call $get_state (i32.const 0) (i32.const -1) (i32.const 0) (i32.const 8)))
+    ;; 3: get_state negative buffer length
+    (call $record (i32.const 3) (call $get_state (i32.const 0) (i32.const 3) (i32.const 0) (i32.const -1)))
+    ;; 4: get_state key end past memory
+    (call $record (i32.const 4) (call $get_state (i32.const 65530) (i32.const 100) (i32.const 0) (i32.const 8)))
+    ;; 5: persist_state malformed channel
+    (call $record (i32.const 5) (call $persist_state (i32.const -1) (i32.const 4) (i32.const 0) (i32.const 3) (i32.const 0) (i32.const 3) (i32.const 0) (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+    ;; 6: persist_state malformed contract
+    (call $record (i32.const 6) (call $persist_state (i32.const 0) (i32.const 3) (i32.const -1) (i32.const 3) (i32.const 0) (i32.const 3) (i32.const 0) (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+    ;; 7: persist_state malformed key
+    (call $record (i32.const 7) (call $persist_state (i32.const 0) (i32.const 3) (i32.const 0) (i32.const 3) (i32.const -1) (i32.const 3) (i32.const 0) (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+    ;; 8: persist_state malformed value (op 0)
+    (call $record (i32.const 8) (call $persist_state (i32.const 0) (i32.const 3) (i32.const 0) (i32.const 3) (i32.const 0) (i32.const 3) (i32.const -1) (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0)))
+    ;; 9: persist_state malformed pdc (visibility 1)
+    (call $record (i32.const 9) (call $persist_state (i32.const 0) (i32.const 3) (i32.const 0) (i32.const 3) (i32.const 0) (i32.const 3) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 1) (i32.const -1) (i32.const 4)))
+    ;; 10: persist_state empty pdc (visibility 1)
+    (call $record (i32.const 10) (call $persist_state (i32.const 0) (i32.const 3) (i32.const 0) (i32.const 3) (i32.const 0) (i32.const 3) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 0) (i32.const 0)))
+    (call $set_state (i32.const 60) (i32.const 6) (i32.const 40) (i32.const 11))
+  )
+)
+"#,
+        );
+        let result = provider
+            .execute("sentinel-arms", &wasm, limits(u64::MAX))
+            .unwrap();
+        assert_eq!(result.ephemeral.len(), 1);
+        assert_eq!(result.ephemeral[0].0, "record");
+        assert_eq!(
+            result.ephemeral[0].1,
+            vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC, 0xFC, 0xFC, 0xFC, 0xFC, 0xFD],
+            "exact sentinels: -1 for bad keys, -4 for malformed persist fields, -3 for empty pdc"
+        );
+        assert!(result.writes.is_empty());
+    }
+
+    /// Without an exported memory the host cannot reach any guest buffer, so
+    /// every memory-reading host call must return the `-1` sentinel rather
+    /// than a positive code.
+    #[test]
+    fn host_functions_without_exported_memory_return_neg_one() {
+        let provider = WasmExecutionProvider::new().unwrap();
+        let wasm = compile_wat(
+            r#"
+(module
+  (import "env" "get_state_len" (func $get_state_len (param i32 i32) (result i32)))
+  (import "env" "get_state" (func $get_state (param i32 i32 i32 i32) (result i32)))
+  (func (export "execute")
+    (if (i32.ne (call $get_state_len (i32.const 0) (i32.const 3)) (i32.const -1))
+      (then (unreachable)))
+    (if (i32.ne (call $get_state (i32.const 0) (i32.const 3) (i32.const 0) (i32.const 8)) (i32.const -1))
+      (then (unreachable)))
+  )
+)
+"#,
+        );
+        let result = provider.execute("no-memory-host", &wasm, limits(u64::MAX));
+        assert!(result.is_ok(), "no-memory sentinel must be -1: {result:?}");
+    }
+
+    /// `get_state` value-write bounds: an in-bounds write succeeds, an
+    /// exact-end write succeeds, and a write past the end is `-1` — never a
+    /// trap.
+    #[test]
+    fn get_state_value_bounds_are_exact() {
+        let provider = WasmExecutionProvider::new().unwrap();
+        let wasm = compile_wat(
+            r#"
+(module
+  (import "env" "get_state" (func $get_state (param i32 i32 i32 i32) (result i32)))
+  (import "env" "set_state" (func $set_state (param i32 i32 i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "key")
+  (data (i32.const 40) "\00\00\00\00\00")
+  (data (i32.const 60) "record")
+  (func $record (param $index i32) (param $value i32)
+    (i32.store8 (i32.add (i32.const 40) (local.get $index)) (local.get $value))
+  )
+  (func (export "execute")
+    ;; 0: value fits with room to spare (end 105 < 65536)
+    (call $record (i32.const 0) (call $get_state (i32.const 0) (i32.const 3) (i32.const 100) (i32.const 5)))
+    ;; 1: exact fit at the memory end (end 65536 == 65536)
+    (call $record (i32.const 1) (call $get_state (i32.const 0) (i32.const 3) (i32.const 65531) (i32.const 5)))
+    ;; 2: value buffer exactly the value length (5 == 5) still succeeds
+    (call $record (i32.const 2) (call $get_state (i32.const 0) (i32.const 3) (i32.const 200) (i32.const 5)))
+    ;; 3: past the memory end (end 65538 > 65536)
+    (call $record (i32.const 3) (call $get_state (i32.const 0) (i32.const 3) (i32.const 65533) (i32.const 5)))
+    (call $set_state (i32.const 60) (i32.const 6) (i32.const 40) (i32.const 4))
+  )
+)
+"#,
+        );
+        let mut initial = HashMap::new();
+        initial.insert("key".to_string(), b"value".to_vec());
+        let result = provider
+            .execute_with_state("value-bounds", &wasm, initial, limits(u64::MAX))
+            .unwrap();
+        assert_eq!(result.ephemeral.len(), 1);
+        assert_eq!(result.ephemeral[0].0, "record");
+        assert_eq!(
+            result.ephemeral[0].1,
+            vec![5, 5, 5, 0xFF],
+            "in-bounds and exact-end writes succeed; past-end is -1"
+        );
+    }
+
+    /// A key ending exactly at the memory end is in bounds: the `>` bounds
+    /// checks must accept `end == len`.
+    #[test]
+    fn key_ending_at_memory_end_is_accepted() {
+        let provider = WasmExecutionProvider::new().unwrap();
+        let wasm = compile_wat(
+            r#"
+(module
+  (import "env" "get_state_len" (func $get_state_len (param i32 i32) (result i32)))
+  (import "env" "get_state" (func $get_state (param i32 i32 i32 i32) (result i32)))
+  (import "env" "set_state" (func $set_state (param i32 i32 i32 i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 65533) "key")
+  (data (i32.const 40) "\00\00")
+  (data (i32.const 60) "record")
+  (func (export "execute")
+    (i32.store8 (i32.const 40) (call $get_state_len (i32.const 65533) (i32.const 3)))
+    (i32.store8 (i32.const 41) (call $get_state (i32.const 65533) (i32.const 3) (i32.const 0) (i32.const 8)))
+    (call $set_state (i32.const 60) (i32.const 6) (i32.const 40) (i32.const 2))
+  )
+)
+"#,
+        );
+        let mut initial = HashMap::new();
+        initial.insert("key".to_string(), b"value".to_vec());
+        let result = provider
+            .execute_with_state("key-at-end", &wasm, initial, limits(u64::MAX))
+            .unwrap();
+        assert_eq!(result.ephemeral.len(), 1);
+        assert_eq!(result.ephemeral[0].1, vec![5, 5]);
+    }
+
+    /// The base-cost guard is strict: a limit exactly equal to the base cost
+    /// leaves room for an empty contract to run.
+    #[test]
+    fn operation_gas_limit_equal_to_base_cost_is_accepted() {
+        let provider = WasmExecutionProvider::new().unwrap();
+        let wasm = compile_wat(r#"(module (func (export "execute")))"#);
+        let result = provider.execute(
+            "base-cost-equal",
+            &wasm,
+            ExecutionLimits::new(10_000, 1_000),
+        );
+        assert!(
+            result.is_ok(),
+            "a limit equal to the base cost must not be rejected: {result:?}"
+        );
+    }
+
+    /// A contract that traps after spending exactly its operation-gas limit is
+    /// a trap, not gas exhaustion: the post-trap guard is strict.
+    #[test]
+    fn operation_gas_limit_equal_to_usage_after_trap_is_execution_error() {
+        let provider = WasmExecutionProvider::new().unwrap();
+        let wasm = compile_wat(
+            r#"
+(module
+  (import "env" "get_state_len" (func $get_state_len (param i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "key")
+  (func (export "execute")
+    ;; One state read charges 50; with base 1_000 the limit is exactly hit.
+    (drop (call $get_state_len (i32.const 0) (i32.const 3)))
+    unreachable
+  )
+)
+"#,
+        );
+        let result = provider.execute("op-limit-equal", &wasm, ExecutionLimits::new(10_000, 1_050));
+        assert!(
+            matches!(result, Err(CoreError::Execution(_))),
+            "a trap at exactly the operation-gas limit is not exhaustion: {result:?}"
+        );
     }
 }

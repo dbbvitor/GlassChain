@@ -10,6 +10,9 @@ pub mod crypto;
 pub mod endorsement;
 pub mod error;
 pub mod ledger;
+pub mod pin;
+#[cfg(kani)]
+mod proofs;
 pub mod providers;
 pub mod schema;
 pub mod transaction;
@@ -40,6 +43,7 @@ pub use endorsement::{
 };
 pub use error::{CoreError, GasMeter};
 pub use ledger::{Ledger, DEFAULT_DIFFICULTY};
+pub use pin::{decide, IdentityClaim, PinDecision, PinState, RejectReason, RotationProof};
 pub use providers::{
     validate_tip_chain, ConsensusProvider, EndorsementProvider, ExecutionLimits, ExecutionProvider,
     NetworkProvider, PowConsensusProvider, StorageProvider,

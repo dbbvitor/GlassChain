@@ -1,0 +1,350 @@
+name: Analysis
+
+# PR-only gates that do not belong in the core ci.yml (wayfinder #165):
+# dependency hygiene, supply-chain policy, spelling, cache-line layout,
+# feature-combination compilation, mutation testing on the diff, and the
+# nightly cargo-careful run.
+#
+# Every job is ubuntu-only and blocking. Guardrail (wayfinder #139): a job
+# whose cold-cache runtime exceeds 20 minutes moves to deep-checks.yml.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "clippy.toml"
+      - "deny.toml"
+      - ".cargo/**"
+      - ".config/**"
+      - ".typos.toml"
+      - "scripts/**"
+      - "Makefile"
+      - ".github/**"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: analysis-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The PR diff's affected packages: changed crates plus every crate that
+  # depends on them, so package-scoped checks never miss a dependent. `ALL`
+  # (workspace-level file or dispatch) runs the full workspace; `NONE` (no
+  # crate touched) skips the package jobs. Kept in sync with ci.yml's job of
+  # the same name.
+  changes:
+    name: Affected packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      packages: ${{ steps.affected.outputs.packages }}
+      cargo_flags: ${{ steps.affected.outputs.cargo_flags }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The diff needs the merge base with the target branch.
+          fetch-depth: 0
+
+      - name: Compute affected packages
+        id: affected
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            packages=$(scripts/affected-crates.sh "origin/$BASE_REF")
+            flags=$(scripts/affected-crates.sh "origin/$BASE_REF" --cargo-flags)
+          else
+            packages=ALL
+            flags=--workspace
+          fi
+          echo "packages=$packages" >> "$GITHUB_OUTPUT"
+          echo "cargo_flags=$flags" >> "$GITHUB_OUTPUT"
+          echo "affected: $packages"
+
+  # Whole workspace on purpose: machete scans every manifest and deny checks
+  # the lockfile-wide supply-chain policy.
+  deps:
+    name: Dependency hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install cargo-machete and cargo-deny
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
+        with:
+          tool: cargo-machete,cargo-deny
+
+      # `crates` scopes machete to the workspace: --with-metadata rewrites the
+      # lockfile of every package it scans, and the excluded demo/ has its own.
+      - name: Unused dependencies
+        run: cargo machete --with-metadata crates
+
+      - name: Supply-chain policy (licenses, bans, advisories, sources)
+        run: cargo deny --all-features check
+
+  typos:
+    name: Spelling
+    needs: changes
+    if: needs.changes.outputs.packages != 'NONE'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The diff needs the merge base with the target branch.
+          fetch-depth: 0
+
+      - name: Install typos
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
+        with:
+          tool: typos
+
+      # File-scoped: a typo gate only needs the files the PR touches.
+      - name: Check spelling
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            typos
+            exit 0
+          fi
+          # Deleted paths would be passed to typos as missing files, and a
+          # full walk skips hidden paths while explicit arguments do not, so
+          # mirror both: ACMR only, and no hidden directories (.agents/,
+          # .github/).
+          mapfile -t files < <(git diff --name-only --diff-filter=ACMR \
+            "origin/$BASE_REF...HEAD" | grep -vE '(^|/)\.' || true)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "no changed files"
+            exit 0
+          fi
+          typos "${files[@]}"
+
+  # Whole workspace on purpose: snarf analyzes the program, not per-package.
+  snarf:
+    name: Cache-line layout
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          # Dated, not `nightly`: a moving toolchain invalidates the
+          # rust-cache every night (wayfinder #167).
+          toolchain: nightly-2026-09-20
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ${{ github.job }}
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      - name: Install cargo-snarf
+        run: cargo install --locked cargo-snarf
+
+      # Findings exit non-zero and are printed to stdout; the ~55k type-name
+      # collision warnings go to stderr, so they are kept out of the job log.
+      - name: Check cache-line sharing
+        run: cargo +nightly-2026-09-20 snarf --format github --color never 2>snarf-warnings.log
+
+  hack:
+    name: Feature matrix
+    needs: changes
+    if: needs.changes.outputs.packages != 'NONE'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.98.1
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ${{ github.job }}
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
+        with:
+          tool: cargo-hack
+
+      # CI otherwise only compiles default and --all-features, so feature
+      # combinations (bft, pq-tls, insecure-tls) are never built.
+      - name: Compile every feature combination
+        run: >-
+          cargo hack check --each-feature ${{ needs.changes.outputs.cargo_flags }}
+          --all-targets --locked
+
+  careful:
+    name: cargo-careful
+    needs: changes
+    if: needs.changes.outputs.packages != 'NONE'
+    runs-on: ubuntu-latest
+    # 20-minute guardrail: measure the cold-cache runtime; demote to
+    # deep-checks.yml if it exceeds 20 minutes.
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install nightly Rust with rust-src
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          # Dated, not `nightly`: a moving toolchain invalidates the
+          # rust-cache every night (wayfinder #167).
+          toolchain: nightly-2026-09-20
+          components: rust-src
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ${{ github.job }}
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      - name: Install cargo-careful and cargo-nextest
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
+        with:
+          tool: cargo-careful,cargo-nextest
+
+      - name: Run the suite with std debug assertions
+        run: >-
+          cargo +nightly-2026-09-20 careful nextest run --profile ci
+          ${{ needs.changes.outputs.cargo_flags }}
+          --lib --bins --tests --all-features --locked
+
+  mutants:
+    name: Mutation (diff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    if: github.event_name == 'pull_request'
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The diff needs the merge base with the target branch.
+          fetch-depth: 0
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: 1.98.1
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # `-wild` keeps the wild-linked artifacts separate from the other
+          # jobs' caches (the flags change every build fingerprint).
+          key: ${{ github.job }}-wild
+          shared-key: rust-cache
+          cache-on-failure: true
+
+      # cargo-mutants runs `cargo test`, not nextest: nextest skips doctests,
+      # and a mutation caught only by a doctest would falsely report as missed.
+      # `wild` is the linker from https://mutants.rs/performance.html: each
+      # mutant relinks, and it more than halves those relinks.
+      - name: Install cargo-mutants and wild
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
+        with:
+          tool: cargo-mutants,wild
+
+      # gcc's `-fuse-ld=wild` resolves `ld.wild` on PATH; the release ships
+      # only `wild`.
+      - name: Expose wild as ld.wild
+        run: ln -sf "$CARGO_HOME/bin/wild" "$CARGO_HOME/bin/ld.wild"
+
+      - name: Write the PR diff
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git diff "origin/$BASE_REF...HEAD" > pr.diff
+
+      # `--in-place` is what lets each mutant reuse the previous build; the
+      # scratch copy (target included, so the rust-cache still pays off) keeps
+      # cargo-mutants from ever touching the checked-out tree. `--jobs` would
+      # force copy mode, which the tool documents as losing all build reuse.
+      - name: Stage a scratch tree
+        run: |
+          mkdir -p "$RUNNER_TEMP/mutants"
+          rsync -a --exclude .git "$GITHUB_WORKSPACE/" "$RUNNER_TEMP/mutants/"
+
+      # `.cargo/mutants.toml` adds --all-features (without it, cfg-gated
+      # mutants are compiled out and report as false misses) and excludes the
+      # Kani-only harness module.
+      #
+      # Survivors (2) and timeouts (3) both fail the gate: catch/fix them, or
+      # add a reasoned `exclude_re` entry (`mutants-skip:`) to
+      # `.cargo/mutants.toml`. cargo-mutants gives timeouts precedence over
+      # missed in its exit code, so the survivor check reads `missed.txt` for
+      # a precise message; both codes fail either way.
+      #
+      # The per-mutant cap is generous because the *first* mutant's test phase
+      # also compiles the test binaries when the `-wild` cache is cold.
+      - name: Mutate only the diff
+        working-directory: ${{ runner.temp }}/mutants
+        env:
+          RUSTFLAGS: -C link-arg=-fuse-ld=wild
+        run: |
+          set +e
+          cargo mutants --in-diff pr.diff --baseline=skip --in-place --timeout 240
+          code=$?
+          set -e
+          if [ "$code" = "2" ] || [ -s mutants.out/missed.txt ]; then
+            echo "::error::cargo-mutants found $(wc -l < mutants.out/missed.txt) survivor(s) in the diff — catch/fix them, or add a reasoned exclude_re entry to .cargo/mutants.toml"
+            exit 2
+          fi
+          exit "$code"
+
+      # Keep the survivor diffs readable: `mutants.out/missed.txt` plus the
+      # per-mutant `diff/` files. The job fails on survivors (exit 2) and on
+      # timeouts, so the artifact is for diagnosis after a failure.
+      - name: Upload mutants.out
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mutants-out
+          path: ${{ runner.temp }}/mutants/mutants.out
+          if-no-files-found: ignore

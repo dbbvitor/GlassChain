@@ -47,6 +47,7 @@ off options that look attractive from a blank page.
 | [016](adr/adr-016-quorum-replication-durability.md) | "Committed" means quorum replication; local disk flush is a separate metric, not the durability promise |
 | [017](adr/adr-017-deployment-trust-and-retention.md) | OCSP stapling only (no responder egress), certificate-bound MSP admin RBAC, backup scrubbing for physical retention, #74 deferred |
 | [018](adr/adr-018-node-identity-custody.md) | Node identity material is an operator-owned `--identity-file`, not storage state; the same key re-presents across restarts |
+| [019](adr/adr-019-analysis-stack.md) | Blocking PR gates in `analysis.yml`, scheduled deep checks in `deep-checks.yml`, the deliberate strictness exceptions, and the deferred tools with their triggers |
 
 ## Evidence
 

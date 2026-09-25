@@ -4,25 +4,12 @@ name: Benchmarks
 # excludes bench *executions* (their test-mode setup dominates runtime and
 # yields no test coverage), so this workflow is where they run for real:
 # release builds, full criterion measurement.
+#
+# Weekly rather than per-PR (wayfinder #158/#167): a benchmark run contributes
+# no gate, and on PRs it only burned runner time.
 on:
-  push:
-    branches: [main]
-    paths:
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "clippy.toml"
-      - ".cargo/**"
-  pull_request:
-    branches: [main]
-    paths:
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "clippy.toml"
-      - ".cargo/**"
+  schedule:
+    - cron: "0 6 * * 1" # Weekly, Monday 06:00 UTC
   workflow_dispatch:
 
 env:
@@ -42,15 +29,15 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: 1.98.1
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: ${{ github.job }}
           shared-key: rust-cache

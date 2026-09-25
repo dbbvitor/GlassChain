@@ -2,8 +2,7 @@
 // Copyright 2026 dbbvitor
 //! TCP-level fault injection via an in-process proxy layer (#70, D7).
 //!
-//! Instead of patching the async runtime (the madsim-tokio route, blocked on
-//! fork support for tokio 1.53 — see the issue), nodes run over **real
+//! Instead of patching the async runtime, nodes run over **real
 //! loopback TCP** with a lightweight in-process proxy between each ordered
 //! pair: the dialer connects to the proxy port, the proxy relays raw byte
 //! streams to the target node, and `partition` kills the established relay

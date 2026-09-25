@@ -4,7 +4,8 @@ name: Release
 # `osps_bom_01`): on a `v*` tag this workflow builds auditable release
 # binaries, generates CycloneDX SBOMs, produces the changelog and release
 # notes from conventional commits (git-cliff), signs everything with Sigstore
-# keyless (OIDC — no long-lived keys), and publishes the GitHub release.
+# keyless (OIDC — no long-lived keys), verifies the tag against the crate
+# versions, and publishes the GitHub release only after the draft checks pass.
 
 on:
   push:
@@ -13,9 +14,16 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The same epoch reproducible.yml builds with: both must agree for the
+  # release candidate to be bit-for-bit reproducible (wayfinder #158/#167).
+  SOURCE_DATE_EPOCH: "946684800" # 2000-01-01T00:00:00Z
 
 permissions:
   contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -27,38 +35,72 @@ jobs:
       id-token: write # Sigstore keyless signing via OIDC
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0 # full history for git-cliff
 
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: 1.98.1
 
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: release
+          shared-key: rust-cache
+          cache-on-failure: true
+
       - name: Install release tooling
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
         with:
           tool: cargo-auditable,cargo-cyclonedx,git-cliff
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      # A tag that disagrees with the crate versions would publish binaries
+      # whose `--version` lies about the release.
+      - name: Verify the tag matches the binary crates
+        run: |
+          metadata=$(cargo metadata --format-version 1 --no-deps --locked)
+          node=$(jq -r '.packages[] | select(.name=="glasschain-node") | .version' <<<"$metadata")
+          cli=$(jq -r '.packages[] | select(.name=="glasschain-cli") | .version' <<<"$metadata")
+          if [ "$node" != "$cli" ]; then
+            echo "::error::glasschain-node $node and glasschain-cli $cli disagree"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_NAME" != "v$node" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version v$node"
+            exit 1
+          fi
 
       - name: Build auditable binaries
         run: cargo auditable build --release --locked
 
+      # `--all` emits one SBOM per workspace member next to its manifest; they
+      # are collected so the release attaches a single flat set.
       - name: Generate CycloneDX SBOMs
-        run: cargo cyclonedx --format json --output-path sbom
+        run: |
+          cargo cyclonedx --format json --all
+          mkdir -p sbom
+          find crates -name '*.cdx.json' -exec cp {} sbom/ \;
 
       - name: Generate changelog and release notes
         run: |
           git-cliff --output CHANGELOG.md
           git-cliff --latest --strip header > release-notes.md
+
+      - name: Write checksums
+        run: |
+          # Bare file names: the draft verification checks them in a flat
+          # download directory.
+          (cd target/release && sha256sum glasschain-node glasschain) > SHA256SUMS
 
       - name: Sign artifacts (Sigstore keyless)
         run: |
@@ -68,19 +110,35 @@ jobs:
           }
           sign target/release/glasschain-node
           sign target/release/glasschain
+          sign SHA256SUMS
           sign CHANGELOG.md
           while IFS= read -r f; do sign "$f"; done < <(find sbom -type f -name "*.json")
 
-      - name: Publish GitHub release
+      # Draft first: the release only goes live after every asset is attached
+      # and the binaries check against SHA256SUMS.
+      - name: Publish the draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
+            --draft \
             --title "$GITHUB_REF_NAME" \
             --notes-file release-notes.md \
             target/release/glasschain-node \
             target/release/glasschain \
             target/release/glasschain-node.sig target/release/glasschain-node.cert \
             target/release/glasschain.sig target/release/glasschain.cert \
+            SHA256SUMS SHA256SUMS.sig SHA256SUMS.cert \
             CHANGELOG.md CHANGELOG.md.sig CHANGELOG.md.cert \
             sbom/*
+
+      - name: Verify the draft, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$GITHUB_REF_NAME" --dir verify
+          (cd verify && sha256sum --check SHA256SUMS)
+          for asset in glasschain-node glasschain SHA256SUMS CHANGELOG.md; do
+            gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | grep -qx "$asset"
+          done
+          gh release edit "$GITHUB_REF_NAME" --draft=false

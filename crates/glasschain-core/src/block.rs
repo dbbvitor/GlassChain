@@ -41,6 +41,18 @@ pub struct Block {
     pub certificate: Option<QuorumCertificate>,
 }
 
+/// Return `true` when `hash` starts with `difficulty` `'0'` bytes.
+///
+/// Allocation-free — the previous inline version built a `"0".repeat(difficulty)`
+/// target string on every call — and the shipped predicate the Kani harness
+/// proves (`proofs::proof_of_work_is_prefix_monotone`).
+pub(crate) fn has_leading_zeros(hash: &str, difficulty: usize) -> bool {
+    hash.len() >= difficulty
+        && hash.as_bytes()[..difficulty]
+            .iter()
+            .all(|&byte| byte == b'0')
+}
+
 impl Block {
     /// Compute the canonical SHA-256 hash for the current block state.
     ///
@@ -75,8 +87,7 @@ impl Block {
     /// (i.e., it starts with `difficulty` leading zero characters).
     #[must_use]
     pub fn has_valid_pow(&self, difficulty: usize) -> bool {
-        let target = "0".repeat(difficulty);
-        self.hash.starts_with(&target)
+        has_leading_zeros(&self.hash, difficulty)
     }
 
     /// Create a new, **unmined** block with no persistent write set.
@@ -137,6 +148,10 @@ impl Block {
     /// timestamp is refreshed to keep the hash space moving.
     pub fn mine(&mut self, difficulty: usize) {
         let target = "0".repeat(difficulty);
+        // Recompute from the current fields first: a block whose fields were
+        // set after construction carries a stale hash, and the loop's target
+        // check must never accept it.
+        self.hash = self.calculate_hash();
         while !self.hash.starts_with(&target) {
             // If the nonce is about to wrap, refresh the timestamp so the
             // hash space changes and mining can continue.
@@ -148,6 +163,13 @@ impl Block {
             }
             self.nonce = self.nonce.wrapping_add(1);
             self.hash = self.calculate_hash();
+            // A malformed hash can never satisfy the target, so the loop would
+            // spin forever; catch it where it is produced instead.
+            debug_assert_eq!(
+                self.hash.len(),
+                64,
+                "a block hash must be a 64-character SHA-256 hex digest"
+            );
         }
         log::debug!(
             "Block {} mined with nonce {} → {}",
@@ -199,6 +221,21 @@ impl Block {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mining_recomputes_a_stale_hash() {
+        // Fields set after construction leave a stale hash; `mine` must
+        // recompute from the current fields instead of trusting the stale one
+        // (which could already start with the target by chance).
+        let mut block = super::Block::new(1, vec![], "prev".into());
+        block.timestamp = 1;
+        block.mine(1);
+        assert!(
+            block.is_valid(),
+            "mine must recompute the hash of the current fields"
+        );
+        assert!(block.hash.starts_with('0'));
+    }
+
     use super::*;
     use crate::transaction::{InventoryUpdate, Transaction, TransactionKind};
 

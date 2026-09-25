@@ -54,11 +54,17 @@ HOST := $(shell rustc -vV 2>/dev/null | sed -n 's/^host: //p')
 # `make mutants` scope; the CI full run shards all 12 crates.
 MUTANTS_PKG ?= glasschain-core
 
+# Mutation testing relinks once per mutant; use the `wild` linker when it is on
+# PATH (https://mutants.rs/performance.html — the CI jobs install it too).
+MUTANTS_RUSTFLAGS := $(strip $(RUSTFLAGS) $(shell command -v wild >/dev/null 2>&1 && echo -C link-arg=-fuse-ld=wild))
+
 # Miri: six-crate allowlist, strict flags, no leak exemption (ticket #153).
 MIRI_FLAGS := -Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check
 MIRI_PKGS := -p glasschain-core -p glasschain-contracts -p glasschain-indexer \
              -p glasschain-workflows -p glasschain-storage -p glasschain-sdk
-MIRI_SKIPS := --skip wasm --skip sled_backend \
+# redb-backed tests are gated with `cfg_attr(miri, ignore)` in-tree (fcntl
+# range locks are unsupported by Miri), so no skip is needed for them.
+MIRI_SKIPS := --skip wasm \
               --skip test_pending_pool_bound_rejects_and_drains \
               --skip test_slice_quota_spreads_a_burst_across_rounds \
               --skip ledger_default_uses_the_workspace_difficulty \
@@ -68,7 +74,7 @@ MIRI_SKIPS := --skip wasm --skip sled_backend \
 
 .PHONY: help setup tools tools-nightly tools-formal build build-release check \
         test test-pkg test-one analysis fmt fmt-check clippy snarf careful \
-        mutants mutants-diff miri sanitize kani verus llvm-lines bench audit \
+        mutants mutants-diff miri sanitize kani kani-coverage verus llvm-lines bench audit \
         coverage coverage-xml ci doc node clean
 
 help: ## Show this help
@@ -102,7 +108,6 @@ tools: ## Install the stable tooling used by the gate and deep targets
 	cargo install --locked typos-cli
 	cargo install --locked cargo-hack
 	cargo install --locked cargo-llvm-cov
-	cargo install --locked cargo-tarpaulin
 	cargo install --locked cargo-audit
 
 tools-nightly: ## Install nightly components and nightly-only tools (miri, careful, snarf)
@@ -167,11 +172,12 @@ snarf: ## Cache-line false-sharing check (nightly; run `make tools-nightly` firs
 careful: ## Run the suite under cargo-careful (nightly, std debug assertions)
 	cargo +nightly careful nextest run --profile ci $(TEST_FLAGS)
 
-mutants: ## Mutation-test one crate (default glasschain-core; override MUTANTS_PKG=...)
-	cargo mutants -p $(MUTANTS_PKG)
+mutants: ## Mutation-test one crate in place (default glasschain-core; override MUTANTS_PKG=...)
+	RUSTFLAGS="$(MUTANTS_RUSTFLAGS)" cargo mutants -p $(MUTANTS_PKG) --in-place --timeout 60
 
 mutants-diff: ## Mutation-test only the current diff (the CI PR-gate command)
-	cargo mutants --in-diff --baseline=skip --in-place --timeout 60
+	# --timeout is a CLI-only option: `.cargo/mutants.toml` rejects it.
+	RUSTFLAGS="$(MUTANTS_RUSTFLAGS)" cargo mutants --in-diff --baseline=skip --in-place --timeout 60
 
 miri: ## Run Miri over the six-crate allowlist with the strictest flags
 	MIRIFLAGS="$(MIRI_FLAGS)" cargo +nightly miri test $(MIRI_PKGS) --lib -- $(MIRI_SKIPS)
@@ -181,11 +187,16 @@ sanitize: ## Run the suite under ASan/LSan (nightly; leaks are failures)
 	  cargo +nightly test --workspace --lib --bins --tests --all-features --locked \
 	  -Zbuild-std --target $(HOST)
 
-kani: ## Run the Kani proofs for glasschain-core
-	cargo kani -p glasschain-core
+kani: ## Run the curated Kani proofs (glasschain-core + glasschain-identity)
+	cargo kani -p glasschain-core -p glasschain-identity --default-unwind 16 --output-format=terse
 
-verus: ## Verify the critical-code roadmap (starts with glasschain-vm gas)
-	cargo verus verify -p glasschain-vm
+kani-coverage: ## Kani source-coverage report for the curated harnesses (local gap analysis)
+	cargo kani -p glasschain-core -p glasschain-identity --default-unwind 16 \
+	  --coverage -Z source-coverage --output-format=terse
+
+verus: ## Verify the zero-trust roadmap (gas, BFT, certificate, TOFU, trust score, MSP heights)
+	cargo verus verify -p glasschain-vm -p glasschain-core -p glasschain-identity --all-features \
+	  --locked -- --expand-errors
 
 llvm-lines: ## Compile-time bloat diagnostic: LLVM IR lines per generic function
 	cargo llvm-lines -p glasschain-core | head -30

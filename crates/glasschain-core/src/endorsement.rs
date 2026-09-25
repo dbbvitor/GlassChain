@@ -143,15 +143,16 @@ impl PolicyExpression {
     /// signatures) is the caller's responsibility — this function assumes its
     /// input is already a set.
     ///
-    /// An `NOutOf` with no rules never evaluates true (the allow-all shape is
-    /// rejected by [`Self::validate`]; this guard keeps unvalidated
-    /// expressions from accidentally passing too).
+    /// An `NOutOf` with no rules never evaluates true, and neither does one
+    /// whose `required` is zero (the allow-all shape is rejected by
+    /// [`Self::validate`]; these guards keep unvalidated expressions from
+    /// accidentally passing too).
     #[must_use]
     pub fn evaluate(&self, principals: &HashSet<Principal>) -> bool {
         match self {
             Self::SignedBy(principal) => principals.contains(principal),
             Self::NOutOf { required, rules } => {
-                if rules.is_empty() {
+                if rules.is_empty() || *required == 0 {
                     return false;
                 }
                 rules
@@ -772,6 +773,18 @@ mod tests {
         assert!(expression.evaluate(&set(&["regulator", "custodian-b"])));
         assert!(!expression.evaluate(&set(&["regulator"])));
         assert!(!expression.evaluate(&set(&["custodian-a", "custodian-b"])));
+    }
+
+    #[test]
+    fn test_zero_required_never_evaluates_true() {
+        // `validate` rejects `required == 0`, but an unvalidated expression
+        // must fail closed too: zero-of-n is an allow-all shape.
+        let expression = PolicyExpression::NOutOf {
+            required: 0,
+            rules: vec![PolicyExpression::signed_by("org-a")],
+        };
+        assert!(!expression.evaluate(&set(&["org-a"])));
+        assert!(!expression.evaluate(&set(&[])));
     }
 
     #[test]
@@ -1446,6 +1459,50 @@ mod tests {
         assert!(
             !endorsement.covers(&write("supply", "inventory", "k1")),
             "a public write is not covered by a collection-scoped carrier"
+        );
+    }
+
+    #[test]
+    fn required_count_reports_the_root_threshold() {
+        assert_eq!(PolicyExpression::signed_by("org-a").required_count(), 1);
+        assert_eq!(
+            PolicyExpression::NOutOf {
+                required: 3,
+                rules: vec![
+                    PolicyExpression::signed_by("org-a"),
+                    PolicyExpression::signed_by("org-b"),
+                    PolicyExpression::signed_by("org-c"),
+                ],
+            }
+            .required_count(),
+            3
+        );
+    }
+
+    #[test]
+    fn endorsement_payload_clears_carriers_and_is_stable() {
+        let tx = Transaction::new(TransactionKind::InventoryUpdate(crate::InventoryUpdate {
+            product_id: "SKU".into(),
+            owner_id: "owner".into(),
+            quantity_delta: 1,
+            reason: "payload".into(),
+        }));
+        let payload = TransactionEndorsement::payload(&tx).expect("serialize");
+        assert!(!payload.is_empty());
+        let decoded: Transaction =
+            serde_json::from_slice(&payload).expect("the payload is a transaction");
+        assert_eq!(decoded.id, tx.id);
+        assert!(decoded.endorsements.is_empty(), "carriers are cleared");
+
+        // Two transactions differing only in their carriers sign identical
+        // bytes: signatures must never be self-referential.
+        let mut carried = tx;
+        carried
+            .endorsements
+            .push(carrier("supply", "inventory", &["k1"]));
+        assert_eq!(
+            TransactionEndorsement::payload(&carried).expect("serialize"),
+            payload
         );
     }
 

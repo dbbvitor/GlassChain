@@ -547,4 +547,10 @@ mod tests {
         let bare = GlasschainClientConfig::new("http://remote:9000");
         assert!(bare.node_id.is_none());
     }
+
+    #[test]
+    fn test_client_endpoint_accessor() {
+        let client = GlasschainClient::new(GlasschainClientConfig::new("http://localhost:9000"));
+        assert_eq!(client.endpoint(), "http://localhost:9000");
+    }
 }

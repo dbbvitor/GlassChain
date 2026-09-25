@@ -12,6 +12,182 @@ use crate::wire::{base64_bytes, SignatureAlgorithm};
 use crate::Block;
 use serde::{Deserialize, Serialize};
 
+/// Certificate-admission logic for [`QuorumCertificate::validate`], proved in
+/// production form with Verus (ADR-019). The gate binds a certificate to the
+/// block it claims (index and hash) and requires a non-degenerate certificate
+/// to carry a non-empty BLS12-381 aggregate; the pairing check itself stays
+/// outside the proof (BLS assumed).
+mod cert_proofs {
+    use crate::pin::str_eq;
+    use vstd::prelude::*;
+
+    verus! {
+
+    /// The admission decision for one certificate/block pair.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CertDecision {
+        /// The certificate names this block and is structurally complete.
+        Accepted,
+        /// The certificate's index differs from the block's.
+        IndexMismatch,
+        /// The certificate's hash differs from the block's.
+        HashMismatch,
+        /// A non-degenerate certificate carries no aggregate signature.
+        MissingAggregate,
+        /// A non-degenerate certificate's aggregate is not BLS12-381.
+        WrongAlgorithm,
+    }
+
+    /// The admission case order, mirroring the shipped checks: index, hash,
+    /// degenerate short-circuit, aggregate presence, discriminant.
+    pub open spec fn spec_decide(
+        block_index: u64,
+        block_hash: &str,
+        cert_index: u64,
+        cert_hash: &str,
+        degenerate: bool,
+        has_aggregate: bool,
+        bls_algorithm: bool,
+    ) -> CertDecision {
+        if cert_index != block_index {
+            CertDecision::IndexMismatch
+        } else if !str_eq(cert_hash, block_hash) {
+            CertDecision::HashMismatch
+        } else if degenerate {
+            CertDecision::Accepted
+        } else if !has_aggregate {
+            CertDecision::MissingAggregate
+        } else if !bls_algorithm {
+            CertDecision::WrongAlgorithm
+        } else {
+            CertDecision::Accepted
+        }
+    }
+
+    /// Decide certificate admission from the extracted certificate and block
+    /// fields.
+    #[must_use]
+    pub fn decide(
+        block_index: u64,
+        block_hash: &str,
+        cert_index: u64,
+        cert_hash: &str,
+        degenerate: bool,
+        has_aggregate: bool,
+        bls_algorithm: bool,
+    ) -> (decision: CertDecision)
+        ensures
+            decision == spec_decide(
+                block_index,
+                block_hash,
+                cert_index,
+                cert_hash,
+                degenerate,
+                has_aggregate,
+                bls_algorithm,
+            ),
+    {
+        if cert_index != block_index {
+            return CertDecision::IndexMismatch;
+        }
+        if !str_eq(cert_hash, block_hash) {
+            return CertDecision::HashMismatch;
+        }
+        if degenerate {
+            return CertDecision::Accepted;
+        }
+        if !has_aggregate {
+            return CertDecision::MissingAggregate;
+        }
+        if !bls_algorithm {
+            return CertDecision::WrongAlgorithm;
+        }
+        CertDecision::Accepted
+    }
+
+    /// The exact acceptance predicate: a certificate is admitted when it
+    /// names the block and is either the degenerate PoW form or carries a
+    /// non-empty BLS12-381 aggregate.
+    pub proof fn acceptance_iff(
+        block_index: u64,
+        block_hash: &str,
+        cert_index: u64,
+        cert_hash: &str,
+        degenerate: bool,
+        has_aggregate: bool,
+        bls_algorithm: bool,
+    )
+        ensures
+            spec_decide(
+                block_index,
+                block_hash,
+                cert_index,
+                cert_hash,
+                degenerate,
+                has_aggregate,
+                bls_algorithm,
+            ) == CertDecision::Accepted <==> (cert_index == block_index && str_eq(
+                cert_hash,
+                block_hash,
+            ) && (degenerate || (has_aggregate && bls_algorithm))),
+    {
+    }
+
+    /// Acceptance binds the certificate to the block it claims.
+    pub proof fn accepted_names_the_block(
+        block_index: u64,
+        block_hash: &str,
+        cert_index: u64,
+        cert_hash: &str,
+        degenerate: bool,
+        has_aggregate: bool,
+        bls_algorithm: bool,
+    )
+        ensures
+            spec_decide(
+                block_index,
+                block_hash,
+                cert_index,
+                cert_hash,
+                degenerate,
+                has_aggregate,
+                bls_algorithm,
+            ) == CertDecision::Accepted ==> cert_index == block_index && str_eq(
+                cert_hash,
+                block_hash,
+            ),
+    {
+    }
+
+    /// A non-degenerate certificate is only admitted with an aggregate and
+    /// the BLS12-381 discriminant — no bitmap-only or mislabelled certificate
+    /// passes the structural gate.
+    pub proof fn non_degenerate_acceptance_is_complete(
+        block_index: u64,
+        block_hash: &str,
+        cert_index: u64,
+        cert_hash: &str,
+        has_aggregate: bool,
+        bls_algorithm: bool,
+    )
+        ensures
+            spec_decide(
+                block_index,
+                block_hash,
+                cert_index,
+                cert_hash,
+                false,
+                has_aggregate,
+                bls_algorithm,
+            ) == CertDecision::Accepted ==> has_aggregate && bls_algorithm,
+    {
+    }
+
+    } // verus!
+}
+
+use cert_proofs::CertDecision;
+
 /// A BLS12-381 aggregate signature over a block hash from a quorum of
 /// validators (ADR-014).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,34 +242,33 @@ impl QuorumCertificate {
     ///
     /// Returns [`CoreError::InvalidBlock`] for the first structural mismatch.
     pub fn validate(&self, block: &Block) -> Result<(), CoreError> {
-        if self.block_index != block.index {
-            return Err(CoreError::InvalidBlock(format!(
+        match cert_proofs::decide(
+            block.index,
+            block.hash.as_str(),
+            self.block_index,
+            self.block_hash.as_str(),
+            self.is_degenerate(),
+            !self.aggregate_signature.is_empty(),
+            self.algorithm == SignatureAlgorithm::Bls12381,
+        ) {
+            CertDecision::Accepted => Ok(()),
+            CertDecision::IndexMismatch => Err(CoreError::InvalidBlock(format!(
                 "quorum certificate: block index {} does not match {}",
                 self.block_index, block.index
-            )));
-        }
-        if self.block_hash != block.hash {
-            return Err(CoreError::InvalidBlock(format!(
+            ))),
+            CertDecision::HashMismatch => Err(CoreError::InvalidBlock(format!(
                 "quorum certificate: block hash mismatch for block {}",
                 block.index
-            )));
-        }
-        if self.is_degenerate() {
-            return Ok(());
-        }
-        if self.aggregate_signature.is_empty() {
-            return Err(CoreError::InvalidBlock(
+            ))),
+            CertDecision::MissingAggregate => Err(CoreError::InvalidBlock(
                 "quorum certificate: non-degenerate certificate carries no aggregate signature"
                     .into(),
-            ));
-        }
-        if self.algorithm != SignatureAlgorithm::Bls12381 {
-            return Err(CoreError::InvalidBlock(format!(
+            )),
+            CertDecision::WrongAlgorithm => Err(CoreError::InvalidBlock(format!(
                 "quorum certificate: aggregate signature algorithm must be Bls12381, got {:?}",
                 self.algorithm
-            )));
+            ))),
         }
-        Ok(())
     }
 }
 
@@ -154,6 +329,23 @@ mod tests {
         let mut tampered = block;
         tampered.hash = "deadbeef".into();
         assert!(certificate.validate(&tampered).is_err());
+    }
+
+    #[test]
+    fn test_notification_validate_propagates_certificate_mismatch() {
+        let mut ledger = Ledger::new(1);
+        let block = ledger.mine_pending_transactions().expect("mine").clone();
+        let certificate = QuorumCertificate::pow(&block);
+        let mut tampered = block;
+        tampered.hash = "deadbeef".into();
+        let notification = CommitNotification {
+            block: tampered,
+            certificate,
+        };
+        assert!(
+            notification.validate().is_err(),
+            "a notification whose certificate does not attest its block must fail"
+        );
     }
 
     #[test]

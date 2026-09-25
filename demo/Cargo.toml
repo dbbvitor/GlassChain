@@ -25,3 +25,9 @@ env_logger = "0.11"
 
 [lints.rust]
 unsafe_code = "deny"
+
+# cargo-mutants profile (mirrors the workspace manifest): stripped debug info
+# keeps the many per-mutant relinks cheap.
+[profile.mutants]
+inherits = "test"
+debug = "none"
