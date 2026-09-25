@@ -827,7 +827,7 @@ runner timeouts are skipped in `demo/.cargo/mutants.toml`.
 
 `deep-checks.yml` — nightly, never blocking a PR: the full mutants run in 16
 serial shards and ASan/LSan over the workspace. Everything whose measured
-run fits the 30-minute guardrail moved to `ci.yml`'s blocking jobs — Kani,
+run fits the owner's 30-minute promotion rule moved to `ci.yml`'s blocking jobs — Kani,
 Verus, the six-crate Miri matrix, turmoil and the ignored
 capacity/measurement gates (scope and evidence in
 `.agents/memories/kani-deferral.md` and ADR-019).

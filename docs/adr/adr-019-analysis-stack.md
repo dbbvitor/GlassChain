@@ -36,7 +36,9 @@ timeout:
 | Mutation (diff) | `cargo mutants --in-diff pr.diff --baseline=skip --in-place --timeout 240` |
 
 Guardrail: a job whose cold-cache runtime exceeds 20 minutes moves to the
-scheduled workflow. The first measurement (PR #175) kept every job in place;
+scheduled workflow (this is the `analysis.yml` demotion gate; the owner's
+separate 30-minute rule below governs the opposite direction, scheduled jobs
+moving onto PR/push). The first measurement (PR #175) kept every job in place;
 the slowest was the cache-line layout at ~6.5 minutes.
 
 ### Diff-scoped PR checks
@@ -62,8 +64,8 @@ does not pay for the whole workspace:
 ### Scheduled deep checks — `deep-checks.yml`
 
 Nightly: the full mutants run over all 12 crates in 16 shards, and ASan/LSan
-over the workspace. Everything whose measured run fits the 30-minute
-guardrail runs in `ci.yml` on every PR and push instead: Kani (6m33s cold),
+over the workspace. Everything whose measured run fits the owner's 30-minute
+promotion rule runs in `ci.yml` on every PR and push instead: Kani (6m33s cold),
 Verus (2m13s cold), the six-crate Miri matrix (long pole `glasschain-core`
 ~19 minutes), turmoil (sub-second) and the `#[ignore]`d capacity/measurement
 gates (~5 minutes of test time, serial under the runner's 65535-fd hard
@@ -103,7 +105,7 @@ it on the next green run. PR failures do not open issues.
   `ci.yml`'s `kani` job on every PR and push — the `glasschain-core`
   predicate surface plus the `glasschain-identity` zero-trust byte surfaces
   (`ocsp::minimal_be` serial comparison, `ocsp::read_tlv` DER framing).
-  Measured warm at 2m40s, inside the 30-minute guardrail, which is why the
+  Measured warm at 2m40s, inside the owner's 30-minute promotion rule, which is why the
   weekly `deep-checks.yml` Kani job was retired. What CBMC still cannot
   reach — the capability SHA-256 path (unsupported x86 intrinsics),
   unbounded symbolic heap, `validate_asset`'s `format!` messages — stays
@@ -206,7 +208,7 @@ CBMC-blocked codec harnesses — are tracked as technical debt in
   Proof code is code: it decays when the implementation moves, so every
   proved module keeps its tests and mutation coverage.
 - Kani, Verus, Miri, turmoil and the ignored gates run on PRs because they
-  measured inside the 30-minute guardrail (cold: Verus 2m13s, Kani 6m33s;
+  measured inside the owner's 30-minute promotion rule (cold: Verus 2m13s, Kani 6m33s;
   Miri's long pole ~19 minutes; turmoil sub-second; gates ~7 minutes test
   time). If the Kani harness set approaches the cap, Kani moves back to
   `deep-checks.yml` first. The full mutants run stays nightly (16 runners
