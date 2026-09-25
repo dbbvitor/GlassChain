@@ -81,7 +81,7 @@ jobs:
       # Ubuntu does not provide (no musl-g++ for libFuzzer's C++ runtime).
       - name: Smoke fuzz on PRs, deep fuzz on schedule
         env:
-          RUSTUP_TOOLCHAIN: nightly
+          RUSTUP_TOOLCHAIN: nightly-2026-09-20
         run: |
           secs=60
           if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
