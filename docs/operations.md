@@ -861,6 +861,14 @@ in `.agents/memories/kani-deferral.md`,
 workflow (`ci-failure` label) and closes it on the next green run; it now
 watches `CI` and `Analysis` too, so a red nightly full sweep files an issue.
 
+`pr-summary.yml` — upserts one rolling comment per PR with the latest Actions
+results for its head commit (`scripts/pr-summary.sh`), edited in place as each
+watched workflow completes: every job without native PR reporting in one
+table. Codecov statuses and Code Scanning annotations are not duplicated. It
+never gates; fork PRs are skipped (the `workflow_run` token is read-only
+there) and, because `workflow_run` requires the workflow file on the default
+branch, it activates on `main` after this lands.
+
 All `protoc`-requiring jobs install it via `arduino/setup-protoc`; the test
 workflow is path-filtered to code — **docs-only changes skip CI**. Every
 workflow action is pinned to a commit SHA and updated by Dependabot.

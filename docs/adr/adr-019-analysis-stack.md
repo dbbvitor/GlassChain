@@ -103,6 +103,13 @@ Failures surface as **one rolling issue per workflow** (`ci-failure` label):
 `ci-failure-issues.yml` opens or updates it on a scheduled or dispatched
 failure and closes it on the next green run. PR failures do not open issues.
 
+PR results are additionally compiled into **one rolling conversation comment**
+per PR (`pr-summary.yml` → `scripts/pr-summary.sh`): every Actions job that
+has no native PR reporting, updated in place as each workflow completes.
+Native reporters (Codecov statuses, Code Scanning annotations) keep their own
+surfaces and are not duplicated. The summary never gates and skips fork PRs,
+whose `workflow_run` token cannot comment.
+
 ### Strictness, and the exceptions that are deliberate
 
 - **Miri** runs with `-Zmiri-disable-isolation -Zmiri-strict-provenance

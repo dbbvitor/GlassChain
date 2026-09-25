@@ -42,8 +42,11 @@ watcher automation engine, a TLS-encrypted TCP/libp2p P2P layer, and a gRPC API.
   signing). `analysis.yml` adds the blocking gates (machete, deny, typos,
   snarf, cargo-hack, cargo-careful, diff mutants); `ci.yml`'s `kani`,
   `verus`, `miri`, `turmoil`, `asan` and `gates` jobs run on every push and
-  PR; `deep-checks.yml` is the nightly schedule-only workload (full mutation
-  shards). Scheduled failures file a rolling `ci-failure` issue (ADR-019).
+  PR;   `deep-checks.yml` is the nightly schedule-only workload (full mutation
+  shards). Scheduled failures file a rolling `ci-failure` issue (ADR-019), and
+  `pr-summary.yml` compiles the Actions-only PR results into one rolling
+  conversation comment (`scripts/pr-summary.sh`) — checks without native
+  reporting; Codecov and Code Scanning keep their own surfaces.
   PR checks are diff-scoped to the changed crates plus their
   reverse-dependency closure (`scripts/affected-crates.sh`); workspace-level
   files or pushes to main run the full workspace, and `ci.yml`/`analysis.yml`
@@ -269,6 +272,35 @@ hide unrelated warnings with broad `#[allow]` attributes.
   suspect a port collision or a missing `tokio::time::timeout`, not a flaky suite.
 - Doctests in `///` examples are compiled and run. If you add an example that
   can't run standalone, mark the fence `ignore` or `no_run` rather than letting it break.
+
+### Test definitions
+
+A "test" is any of: unit tests in `#[cfg(test)] mod tests`, integration tests
+under `crates/*/tests/`, doctests in `///` examples, Kani harnesses
+(`#[cfg(kani)]` proofs) and Verus proofs (`verus!` modules with
+`[package.metadata.verus] verify = true`). Criterion benches are compiled
+always and executed via `cargo bench`; the libFuzzer targets under
+`crates/*/fuzz` run in `fuzz.yml`. `make ci` is the local gate; the raw
+commands above are authoritative.
+
+### Scores and targets
+
+The suite is scored, not just pass/fail. Leave every score at least where you
+found it, and move it up with new work:
+
+| Score | Reported by | Target |
+|---|---|---|
+| Line coverage | `coverage` job → Codecov project gate (`codecov.yml`) | project ≥ 90%; patch coverage on new code stays high |
+| Mutation caught | `analysis.yml` diff mutants (PR) + nightly 16 shards | 0 survivors; `exclude_re` only with a reasoned `mutants-skip:` comment. First full baseline: 90.1% (401 caught / 495) |
+| Kani / Verus | `kani`, `verus` jobs | all harnesses/proofs verify, 0 errors, no `assume(`/`admit(`/`external_body`/`axiom` markers |
+| Miri | `miri` matrix | 0 leaks/UB with the strict flags; a new skip needs a comment explaining why |
+| ASan/LSan | `asan` job | 0 sanitizer reports; the leak canary must trip on its deliberate leak |
+| rustfmt / clippy / typos / snarf | `fmt`, `clippy`, `analysis.yml` | zero warnings/findings |
+| Fuzz | `fuzz.yml` | no crash/hang in smoke or deep runs; a crash found on schedule lands as a regression test |
+
+Never silence a score to make it pass: no broad `#[allow]`, no coverage
+exclusions, no mutation exclusions, no sanitizer suppressions. A relaxation is
+a documented exception with evidence in ADR-019's strictness section.
 
 ---
 
