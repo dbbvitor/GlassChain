@@ -638,13 +638,19 @@ mod bft_finality_gate_section {
 
     // ── BFT finality gate (Step 0's original goal — now unblocked) ──────────────
 
-    /// Deterministic BLS keys for the validator set.
+    /// Deterministic BLS keys for the validator set. The index is encoded in
+    /// the seed's low bytes so sets beyond 255 validators stay unique (the
+    /// 300-validator gate).
     fn bft_keys(count: usize) -> Vec<PrivateKey> {
-        let mut seed = 0u8;
         (0..count)
-            .map(|_| {
-                seed += 1;
-                PrivateKey::new([seed; 64])
+            .map(|index| {
+                let mut seed = [0u8; 64];
+                seed[..8].copy_from_slice(
+                    &u64::try_from(index)
+                        .expect("validator index fits u64")
+                        .to_le_bytes(),
+                );
+                PrivateKey::new(seed)
             })
             .collect()
     }
@@ -743,7 +749,7 @@ mod bft_finality_gate_section {
     /// replication lag.
     ///
     /// NOTE: run with a raised fd limit — the mesh holds ~2·n² sockets:
-    /// `ulimit -n 65535 && cargo test ... --ignored --nocapture`.
+    /// `ulimit -n 524288 && cargo test ... --ignored --nocapture`.
     #[allow(clippy::too_many_lines)]
     async fn bft_finality_gate(validator_count: usize, txs_per_round: usize, rounds: usize) {
         let _ = env_logger::try_init();
@@ -809,9 +815,11 @@ mod bft_finality_gate_section {
         // activation block: a validator still at genesis would mine a local
         // PoW fork instead of erroring as "not the round leader". Poll for
         // mesh-wide convergence before the first vote round.
+        // Diffusion is k-fanout relay waves; the heaviest meshes need longer
+        // than the small-set default (300 validators = ~180k sockets).
         bft_poll_until(
             "activation block diffused to every validator",
-            120,
+            120 + u64::try_from(validator_count).expect("validator count fits u64") * 2,
             || async {
                 for node in &nodes {
                     if node.ledger_snapshot().await.chain.len() < 2 {
@@ -964,7 +972,7 @@ mod bft_finality_gate_section {
         bft_finality_gate(10, 10, 10).await;
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    #[ignore = "bft finality gate: minutes-long, needs a raised fd limit (ulimit -n 65535); run explicitly"]
+    #[ignore = "bft finality gate: minutes-long, needs a raised fd limit (ulimit -n 524288); run explicitly"]
     async fn bft_finality_gate_100_validators() {
         bft_finality_gate(100, 10, 10).await;
     }
@@ -974,7 +982,7 @@ mod bft_finality_gate_section {
         bft_finality_gate(200, 10, 10).await;
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    #[ignore = "bft finality gate: heaviest mesh (~180k sockets); raise the fd limit first"]
+    #[ignore = "bft finality gate: manual-only — the 300-validator mesh does not diffuse on a 4-core runner (measured >15 min); run on a larger host with `ulimit -n 524288`"]
     async fn bft_finality_gate_300_validators() {
         bft_finality_gate(300, 10, 10).await;
     }
