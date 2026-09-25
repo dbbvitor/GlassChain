@@ -116,8 +116,12 @@ jobs:
             typos
             exit 0
           fi
-          # Deleted paths would be passed to typos as missing files.
-          mapfile -t files < <(git diff --name-only --diff-filter=ACMR "origin/${{ github.base_ref }}...HEAD")
+          # Deleted paths would be passed to typos as missing files, and a
+          # full walk skips hidden paths while explicit arguments do not, so
+          # mirror both: ACMR only, and no hidden directories (.agents/,
+          # .github/).
+          mapfile -t files < <(git diff --name-only --diff-filter=ACMR \
+            "origin/${{ github.base_ref }}...HEAD" | grep -vE '(^|/)\.' || true)
           if [ "${#files[@]}" -eq 0 ]; then
             echo "no changed files"
             exit 0
