@@ -148,6 +148,10 @@ impl Block {
     /// timestamp is refreshed to keep the hash space moving.
     pub fn mine(&mut self, difficulty: usize) {
         let target = "0".repeat(difficulty);
+        // Recompute from the current fields first: a block whose fields were
+        // set after construction carries a stale hash, and the loop's target
+        // check must never accept it.
+        self.hash = self.calculate_hash();
         while !self.hash.starts_with(&target) {
             // If the nonce is about to wrap, refresh the timestamp so the
             // hash space changes and mining can continue.
@@ -217,6 +221,21 @@ impl Block {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mining_recomputes_a_stale_hash() {
+        // Fields set after construction leave a stale hash; `mine` must
+        // recompute from the current fields instead of trusting the stale one
+        // (which could already start with the target by chance).
+        let mut block = super::Block::new(1, vec![], "prev".into());
+        block.timestamp = 1;
+        block.mine(1);
+        assert!(
+            block.is_valid(),
+            "mine must recompute the hash of the current fields"
+        );
+        assert!(block.hash.starts_with('0'));
+    }
+
     use super::*;
     use crate::transaction::{InventoryUpdate, Transaction, TransactionKind};
 

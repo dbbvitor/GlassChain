@@ -7575,7 +7575,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn block_inside_the_future_window_is_admitted() {
+    async fn block_with_a_plausible_timestamp_is_admitted() {
         let node = Node::new("n-ts", "127.0.0.1:0", 1);
         let ctx = peer_context(&node);
         let _rx = install_peer(&node, "127.0.0.1:4445", "org-a", false).await;
@@ -7590,10 +7590,11 @@ mod tests {
             .unwrap()
             .as_secs();
         let mut block = Block::new(1, vec![], genesis);
-        // One hour inside the 2-hour window: a wall-clock step between this
-        // read and the admission check cannot flip the outcome. The exact
-        // boundary is unit-tested on `timestamp_within_future_window`.
-        block.timestamp = now_secs + 3_600;
+        // A plausible past timestamp: the admission path has no lower bound,
+        // and a runner clock step (forward or backward) cannot flip the
+        // outcome. The exact future window is unit-tested on
+        // `timestamp_within_future_window`.
+        block.timestamp = now_secs.saturating_sub(60);
         block.mine(1);
 
         process_message(
@@ -7609,7 +7610,7 @@ mod tests {
         assert_eq!(
             node.ledger.lock().await.chain.len(),
             2,
-            "a block inside the +2h window is admitted (now={now_secs})"
+            "a block with a plausible timestamp is admitted (now={now_secs})"
         );
     }
 

@@ -162,7 +162,7 @@ jobs:
       # Findings exit non-zero and are printed to stdout; the ~55k type-name
       # collision warnings go to stderr, so they are kept out of the job log.
       - name: Check cache-line sharing
-        run: cargo +nightly snarf --format github --color never 2>snarf-warnings.log
+        run: cargo +nightly-2026-09-20 snarf --format github --color never 2>snarf-warnings.log
 
   hack:
     name: Feature matrix
@@ -242,7 +242,7 @@ jobs:
 
       - name: Run the suite with std debug assertions
         run: >-
-          cargo +nightly careful nextest run --profile ci
+          cargo +nightly-2026-09-20 careful nextest run --profile ci
           ${{ needs.changes.outputs.cargo_flags }}
           --lib --bins --tests --all-features --locked
 

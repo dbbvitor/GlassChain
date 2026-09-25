@@ -151,5 +151,5 @@ jobs:
           RUSTFLAGS: -Zsanitizer=address
           ASAN_OPTIONS: detect_leaks=1
         run: >-
-          cargo +nightly test --workspace --lib --bins --tests --all-features --locked
+          cargo +nightly-2026-09-20 test --workspace --lib --bins --tests --all-features --locked
           -Zbuild-std --target x86_64-unknown-linux-gnu
