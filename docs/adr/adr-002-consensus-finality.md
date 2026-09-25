@@ -14,7 +14,7 @@ forks)". The ledger today uses Proof-of-Work with longest-chain resolution:
 - `PowConsensusProvider` is the only `ConsensusProvider` implementation
   (`glasschain-core/src/providers.rs:219`).
 - Forking is not a defect but a designed behaviour — `chaos_tests.rs` contains a
-  passing `test_concurrent_mining_longest_chain_wins`, and `madsim_chaos.rs`
+  passing `test_concurrent_mining_longest_chain_wins`, and `deterministic_chaos.rs`
   asserts longest-chain convergence after a partition merge.
 
 PoW gives probabilistic finality. No amount of difficulty tuning turns it into
@@ -138,7 +138,7 @@ this ADR.
 - **Not contained in meaning.** Under Raft there is one canonical chain and no
   reorganisation. Code that assumes forks can be discarded — but the chaos tests
   that *assert* fork resolution (`test_concurrent_mining_longest_chain_wins`,
-  `test_madsim_application_layer_partition_and_merge`) become invalid and must be
+  `test_partition_merge_converges_with_final_commits`) become invalid and must be
   rewritten to assert liveness/quorum behaviour instead.
 - Validator set management becomes a governance concern, tying into §1.2 RBAC.
 - **Design the seam so C is a later swap, not a rewrite.** The cheapest insurance

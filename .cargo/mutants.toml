@@ -4,7 +4,8 @@
 # compiled out and report as false misses (117 of 142 in the #146 baseline).
 additional_cargo_test_args = ["--all-features"]
 #
-# The per-mutant cap (`--timeout 60`) is a CLI-only option: the config file
+# The per-mutant cap (`--timeout`: 240 in the PR diff job, 180 in the nightly
+# shards, 60 for local `make mutants`) is a CLI-only option: the config file
 # rejects unknown fields, so it cannot live here. Every invocation that needs
 # the cap passes it explicitly (`make mutants`, `make mutants-diff`,
 # analysis.yml's diff job, and the deep-checks shards).

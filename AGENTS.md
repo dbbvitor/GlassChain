@@ -98,7 +98,8 @@ finding a failure locally is far cheaper than finding it in CI.
 opt-in (`make miri`, `make sanitize`, `make mutants`, `make careful`, `make kani`,
 `make verus`, `make snarf`). `make kani` runs the same curated harnesses as
 `ci.yml`'s `kani` job; `make verus` runs the same proofs as its `verus` job
-(gas + BFT quorum/bitmap). The Kani scope, the zero-trust Verus-first
+(gas, BFT quorum/bitmap + certificate admission, TOFU pin, trust score, MSP
+height windows). The Kani scope, the zero-trust Verus-first
 assignment and the toolchain limits are recorded in
 `.agents/memories/kani-deferral.md`. See the `Makefile` and
 [`docs/operations.md`](docs/operations.md#makefile-targets).

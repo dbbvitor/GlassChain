@@ -52,7 +52,7 @@ jobs:
 
           issue=$(gh issue list --repo "$REPO" --label ci-failure --state open --limit 50 \
             --json number,title \
-            --jq ".[] | select(.title | contains(\"$WORKFLOW\")) | .number" | head -1)
+            --jq "first(.[] | select(.title | contains(\"$WORKFLOW\")) | .number)")
 
           if [ "$CONCLUSION" = "success" ]; then
             if [ -z "$issue" ]; then

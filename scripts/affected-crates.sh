@@ -40,6 +40,8 @@ if [ "$base" = "--self-test" ]; then
   expect "node only" "crates/glasschain-node/src/main.rs" "glasschain-node"
   expect "docs only" "docs/readme.md" "NONE"
   expect "lockfile" "Cargo.lock" "ALL"
+  expect "the CI script itself" "scripts/affected-crates.sh" "ALL"
+  expect "the Makefile" "Makefile" "ALL"
   core=$(AFFECTED_DIFF="crates/glasschain-core/src/lib.rs" "$0" HEAD)
   all=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name' | sort | tr '\n' ' ' | xargs)
   if [ "$core" != "$all" ]; then
@@ -59,7 +61,7 @@ else
   changed=$(git diff --name-only "$base"...HEAD)
 fi
 
-if printf '%s\n' "$changed" | grep -qE '^(Cargo\.(toml|lock)|rust-toolchain\.toml|clippy\.toml|deny\.toml|\.cargo/|\.config/|\.typos\.toml|\.github/)'; then
+if printf '%s\n' "$changed" | grep -qE '^(Cargo\.(toml|lock)|rust-toolchain\.toml|clippy\.toml|deny\.toml|Makefile|scripts/|\.cargo/|\.config/|\.typos\.toml|\.github/)'; then
   packages=ALL
 else
   dirs=$(printf '%s\n' "$changed" | grep -oE '^crates/[^/]+' | sort -u || true)

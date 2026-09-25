@@ -784,7 +784,7 @@ code, default builds the fallbacks, and both must stay green.
 | `turmoil` | ubuntu | `cargo test -p glasschain-network --test turmoil_chaos --features turmoil-sim --locked` — deterministic partition/repair; measured ~0.2 s of test time. Moved from weekly `deep-checks.yml` |
 | `gates` | ubuntu | the `#[ignore]`d capacity/measurement gates (`consensus_capacity`, `tcp_partition`, `read_path_memory`, the network cost measurement) under the runner's 65535-fd hard limit, serial (`--test-threads=1`) so concurrent meshes do not distort them. The 200- and 300-validator BFT finality gates are skipped (manual-only: ~80k/~180k sockets). Measured ~5 min test time. Moved from weekly `deep-checks.yml` |
 | `kani` | ubuntu | `cargo kani -p glasschain-core -p glasschain-identity --default-unwind 16 --output-format=terse --sarif kani.sarif -Z concrete-playback --concrete-playback=print` — curated proofs for the core predicate surface and the identity zero-trust byte surfaces; SARIF on the Code Scanning tab. Warm 2m40s, 30-minute timeout. `cargo kani autoharness` is deliberately not a step (0.68.0 kills `goto-instrument`; evidence in `.agents/memories/kani-deferral.md`) |
-| `verus` | ubuntu | `cargo verus verify -p glasschain-vm -p glasschain-core --all-features --locked` — production-form proofs for the gas arithmetic, the BFT quorum/bitmap kernels and certificate admission, the TOFU pin decision (`glasschain-core/src/pin.rs`), the trust-score arithmetic (`glasschain-core/src/asset.rs`) and the MSP height-window authorization (`glasschain-identity/src/msp_policy.rs`); Verus `0.2026.09.20.aef82ed` from the pinned release zip. A cheat-marker grep (bare `assume(`/`admit(`, `external_body`, `axiom`) runs first so proofs cannot pass vacuously. Warm seconds, 30-minute timeout |
+| `verus` | ubuntu | `cargo verus verify -p glasschain-vm -p glasschain-core -p glasschain-identity --all-features --locked` — production-form proofs for the gas arithmetic, the BFT quorum/bitmap kernels and certificate admission, the TOFU pin decision (`glasschain-core/src/pin.rs`), the trust-score arithmetic (`glasschain-core/src/asset.rs`) and the MSP height-window authorization (`glasschain-identity/src/msp_policy.rs`); Verus `0.2026.09.20.aef82ed` from the pinned release zip. A cheat-marker grep (bare `assume(`/`admit(`, `external_body`, `axiom`) runs first so proofs cannot pass vacuously. Warm seconds, 30-minute timeout |
 | `audit` | ubuntu (own workflow: `audit.yml`) | `cargo audit --deny warnings --file Cargo.lock` (RustSec); prebuilt installs via `taiki-e/install-action` |
 
 Both PR workflows **diff-scope** their jobs where the tool allows:
@@ -801,7 +801,7 @@ and deny/machete stay whole-workspace by nature.
 --with-metadata` + `cargo deny --all-features check`, `typos`, `cargo +nightly
 snarf --format github`, `cargo hack check --each-feature`, `cargo +nightly
 careful nextest run --profile ci`, and `cargo mutants --in-diff` over the
-merge-base diff (`--baseline=skip --in-place --timeout 240`; the cap absorbs
+merge-base diff (`--baseline=skip --in-place --timeout 240`; the nightly shards use 180 and `make mutants` 60; the cap absorbs
 the first mutant's cold test-binary build). Both mutation
 jobs follow the cargo-mutants CI guidance
 ([ci](https://mutants.rs/ci.html), [pr-diff](https://mutants.rs/pr-diff.html),

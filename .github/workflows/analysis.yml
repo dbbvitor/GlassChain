@@ -20,6 +20,8 @@ on:
       - ".cargo/**"
       - ".config/**"
       - ".typos.toml"
+      - "scripts/**"
+      - "Makefile"
       - ".github/**"
   workflow_dispatch:
 
@@ -56,10 +58,12 @@ jobs:
 
       - name: Compute affected packages
         id: affected
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            packages=$(scripts/affected-crates.sh "origin/${{ github.base_ref }}")
-            flags=$(scripts/affected-crates.sh "origin/${{ github.base_ref }}" --cargo-flags)
+            packages=$(scripts/affected-crates.sh "origin/$BASE_REF")
+            flags=$(scripts/affected-crates.sh "origin/$BASE_REF" --cargo-flags)
           else
             packages=ALL
             flags=--workspace
@@ -111,6 +115,8 @@ jobs:
 
       # File-scoped: a typo gate only needs the files the PR touches.
       - name: Check spelling
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             typos
@@ -121,7 +127,7 @@ jobs:
           # mirror both: ACMR only, and no hidden directories (.agents/,
           # .github/).
           mapfile -t files < <(git diff --name-only --diff-filter=ACMR \
-            "origin/${{ github.base_ref }}...HEAD" | grep -vE '(^|/)\.' || true)
+            "origin/$BASE_REF...HEAD" | grep -vE '(^|/)\.' || true)
           if [ "${#files[@]}" -eq 0 ]; then
             echo "no changed files"
             exit 0
@@ -292,7 +298,9 @@ jobs:
         run: ln -sf "$CARGO_HOME/bin/wild" "$CARGO_HOME/bin/ld.wild"
 
       - name: Write the PR diff
-        run: git diff "origin/${{ github.base_ref }}...HEAD" > pr.diff
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git diff "origin/$BASE_REF...HEAD" > pr.diff
 
       # `--in-place` is what lets each mutant reuse the previous build; the
       # scratch copy (target included, so the rust-cache still pays off) keeps
@@ -330,9 +338,9 @@ jobs:
           fi
           exit "$code"
 
-      # Keep the survivor diffs readable even when the job passes (survivors
-      # are reported, not yet gated): `mutants.out/missed.txt` plus the
-      # per-mutant `diff/` files.
+      # Keep the survivor diffs readable: `mutants.out/missed.txt` plus the
+      # per-mutant `diff/` files. The job fails on survivors (exit 2) and on
+      # timeouts, so the artifact is for diagnosis after a failure.
       - name: Upload mutants.out
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

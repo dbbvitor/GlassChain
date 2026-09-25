@@ -15,6 +15,8 @@ on:
       - "rust-toolchain.toml"
       - "clippy.toml"
       - ".cargo/**"
+      - "scripts/**"
+      - "Makefile"
       - "codecov.yml"
       - ".github/**"
   pull_request:
@@ -26,6 +28,8 @@ on:
       - "rust-toolchain.toml"
       - "clippy.toml"
       - ".cargo/**"
+      - "scripts/**"
+      - "Makefile"
       - "codecov.yml"
       - ".github/**"
   workflow_dispatch:
@@ -63,9 +67,11 @@ jobs:
 
       - name: Compute affected packages
         id: affected
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base="origin/${{ github.base_ref }}"
+            base="origin/$BASE_REF"
           else
             base="HEAD~1"
           fi
@@ -379,6 +385,7 @@ jobs:
         run: |
           curl -sSLo verus.zip \
             https://github.com/verus-lang/verus/releases/download/release%2F0.2026.09.20.aef82ed/verus-0.2026.09.20.aef82ed-x86-linux.zip
+          echo "7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33  verus.zip" | sha256sum -c -
           unzip -q verus.zip
           echo "$PWD/verus-x86-linux" >> "$GITHUB_PATH"
 

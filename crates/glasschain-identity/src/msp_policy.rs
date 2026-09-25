@@ -55,8 +55,9 @@ mod authz_proofs {
         Authorized,
         /// The height precedes registration (`height < valid_from`).
         NotYetValid,
-        /// The revocation height has been reached (`height >= revoked_at`).
-        Revoked,
+        /// The revocation height has been reached (`height >= revoked_at`),
+        /// carrying that committed height.
+        Revoked(u64),
     }
 
     /// The window decision: registration lower bound first, then the
@@ -68,13 +69,15 @@ mod authz_proofs {
     ) -> HeightOutcome {
         if height < valid_from {
             HeightOutcome::NotYetValid
-        } else if match revoked_at {
-            Some(revoked) => height >= revoked,
-            None => false,
-        } {
-            HeightOutcome::Revoked
         } else {
-            HeightOutcome::Authorized
+            match revoked_at {
+                Some(revoked) => if height >= revoked {
+                    HeightOutcome::Revoked(revoked)
+                } else {
+                    HeightOutcome::Authorized
+                },
+                None => HeightOutcome::Authorized,
+            }
         }
     }
 
@@ -92,7 +95,7 @@ mod authz_proofs {
         }
         if let Some(revoked) = revoked_at {
             if height >= revoked {
-                return HeightOutcome::Revoked;
+                return HeightOutcome::Revoked(revoked);
             }
         }
         HeightOutcome::Authorized
@@ -137,8 +140,12 @@ mod authz_proofs {
             height >= revoked,
             later >= height,
         ensures
-            spec_height_outcome(valid_from, Some(revoked), height) == HeightOutcome::Revoked,
-            spec_height_outcome(valid_from, Some(revoked), later) == HeightOutcome::Revoked,
+            spec_height_outcome(valid_from, Some(revoked), height) == HeightOutcome::Revoked(
+                revoked,
+            ),
+            spec_height_outcome(valid_from, Some(revoked), later) == HeightOutcome::Revoked(
+                revoked,
+            ),
     {
     }
 
@@ -346,11 +353,10 @@ impl EndorsementProvider for MspEndorsementProvider {
                         entry.valid_from
                     )));
                 }
-                HeightOutcome::Revoked => {
+                HeightOutcome::Revoked(revoked) => {
                     return Err(CoreError::InvalidTransaction(format!(
-                        "endorsement: principal '{}' was revoked at height {}",
-                        entry.principal.as_str(),
-                        entry.revoked_at.expect("checked by is_some_and")
+                        "endorsement: principal '{}' was revoked at height {revoked}",
+                        entry.principal.as_str()
                     )));
                 }
             }

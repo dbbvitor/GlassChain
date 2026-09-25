@@ -33,7 +33,7 @@ timeout:
 | Cache-line layout | `cargo +nightly snarf --format github` (findings to stdout, collision warnings to a file) |
 | Feature matrix | `cargo hack check --each-feature --workspace --all-targets --locked` |
 | cargo-careful | `cargo +nightly careful nextest run --profile ci --workspace --lib --bins --tests --all-features --locked` |
-| Mutation (diff) | `cargo mutants --in-diff pr.diff --baseline=skip --in-place --timeout 60` |
+| Mutation (diff) | `cargo mutants --in-diff pr.diff --baseline=skip --in-place --timeout 240` |
 
 Guardrail: a job whose cold-cache runtime exceeds 20 minutes moves to the
 scheduled workflow. The first measurement (PR #175) kept every job in place;
@@ -92,8 +92,10 @@ it on the next green run. PR failures do not open issues.
   `mem::forget(handle)` in the RPC tests) were fixed, not suppressed.
 - **Mutants** always runs with `--all-features` (without it, cfg-gated `bft`
   mutants compile out and report as false misses). The per-mutant cap is
-  `--timeout 60` on the command line: `.cargo/mutants.toml` rejects unknown
-  fields, so the cap cannot live in the config file. The full run shards
+  `--timeout` on the command line: `.cargo/mutants.toml` rejects unknown
+  fields, so the cap cannot live in the config file. The diff job uses 240
+  (the first mutant's test phase compiles the cold test binaries), the nightly
+  shards 180, and `make mutants` 60 locally. The full run shards
   because `--in-place` and `--jobs` are mutually exclusive, making each shard
   serial internally.
 - **Kani** is the fallback for zero-trust logic Verus cannot express, and the

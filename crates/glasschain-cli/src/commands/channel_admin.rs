@@ -125,11 +125,9 @@ async fn execute(
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     let connect = async {
         loop {
-            match tonic::transport::Endpoint::from_shared(endpoint.to_owned())
-                .expect("valid endpoint")
-                .connect()
-                .await
-            {
+            let parsed = tonic::transport::Endpoint::from_shared(endpoint.to_owned())
+                .map_err(|e| anyhow::anyhow!("invalid endpoint `{endpoint}`: {e}"))?;
+            match parsed.connect().await {
                 Ok(channel) => break Ok(channel),
                 Err(_e) if tokio::time::Instant::now() < deadline => {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
