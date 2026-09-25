@@ -28,25 +28,28 @@ watcher automation engine, a TLS-encrypted TCP/libp2p P2P layer, and a gRPC API.
   dependency audit on every push and PR. Coverage uploads require the
   `CODECOV_TOKEN` repository secret; `codecov.yml` gates project coverage at
   **≥90%** (Gold target met 2026-09-16, `target: 90%` + 0.5% threshold —
-  regressions beyond noise fail). New code should keep patch coverage high. Additional scheduled/tagged workflows:
-  `fuzz.yml` (cargo-fuzz smoke on PRs touching core/network, weekly deep runs
-  over `fuzz-wire` and `fuzz-transactions`), `coverage-insights.yml` (weekly
-  advisory coverage uploads, all `joined: false` so they never move the gate:
-  `fuzz` = what the libFuzzer harnesses reach, `no-bft`/`no-pq-tls` =
-  feature-sensitivity views), `reproducible.yml` (weekly
-  Linux-only build-twice hash verification), and `release.yml` (on `v*` tags:
+  regressions beyond noise fail). New code should keep patch coverage high.
+  Every job that measures under the owner's 30-minute promotion rule runs on
+  PR/push: `fuzz.yml` (cargo-fuzz smoke on PRs/pushes touching core/network,
+  weekly deep runs over `fuzz-wire` and `fuzz-transactions`),
+  `coverage-insights.yml` (advisory coverage uploads on PR/push and weekly,
+  all `joined: false` so they never move the gate: `fuzz` = what the
+  libFuzzer harnesses reach, `no-bft`/`no-pq-tls` = feature-sensitivity
+  views), `reproducible.yml` (Linux-only build-twice hash verification on
+  code PR/push and weekly), `bench.yml` (criterion benches on code PR/push
+  and weekly; never a gate), and `release.yml` (on `v*` tags:
   cargo-auditable build, CycloneDX SBOMs, git-cliff notes, Cosign keyless
-  signing). `analysis.yml` adds the blocking PR gates (machete, deny, typos,
+  signing). `analysis.yml` adds the blocking gates (machete, deny, typos,
   snarf, cargo-hack, cargo-careful, diff mutants); `ci.yml`'s `kani`,
-  `verus`, `miri`, `turmoil` and `gates` jobs run on every push and PR (each
-  measured inside the owner's 30-minute promotion rule); `deep-checks.yml` the nightly
-  heavy tier (full mutants, ASan/LSan);
-  scheduled failures file a rolling `ci-failure` issue (ADR-019). PR checks
-  are diff-scoped to the changed crates plus their reverse-dependency
-  closure (`scripts/affected-crates.sh`); workspace-level files or pushes to
-  main run the full workspace. It is a safety net, not a substitute — run
-  the checks below locally before declaring work done, because a cold CI build
-  takes minutes.
+  `verus`, `miri`, `turmoil`, `asan` and `gates` jobs run on every push and
+  PR; `deep-checks.yml` is the nightly schedule-only workload (full mutation
+  shards). Scheduled failures file a rolling `ci-failure` issue (ADR-019).
+  PR checks are diff-scoped to the changed crates plus their
+  reverse-dependency closure (`scripts/affected-crates.sh`); workspace-level
+  files or pushes to main run the full workspace, and `ci.yml`/`analysis.yml`
+  re-run the full workspace nightly. It is a safety net, not a substitute —
+  run the checks below locally before declaring work done, because a cold CI
+  build takes minutes.
 
 ### Pre-release status and architectural priorities
 
@@ -419,6 +422,16 @@ See [`.agents/README.md`](.agents/README.md) for file templates.
   seam (ticket #38). The dev/test Proof-of-Work driver remains available
   programmatically as `Node::mine()` / `Node::mine_async()`; PoW difficulty
   comes from `DEFAULT_DIFFICULTY` in `glasschain-core::ledger`.
+- **Linker policy:** Linux Rust builds prefer the **`wild`** linker, selected
+  through clang (`--ld-path`; gcc only accepts `-fuse-ld=wild` from 16.1);
+  where wild has no build for the platform — aarch64 Linux has no release
+  artifact — fall back to **`mold`**. `scripts/prefer-fast-linker.sh` applies
+  it to the mutation jobs and the other Linux workspace-build jobs (`test`'s
+  ubuntu leg, `coverage`, `cargo-careful`, ASan/LSan); `make mutants` does the
+  same locally. Both cover Linux ELF (mold also has aarch64/arm/riscv64/…
+  releases — it is the aarch64 fallback because wild ships no aarch64 Linux
+  artifact), but neither links Mach-O or PE: macOS and Windows keep their
+  default linker.
 - Contract and watcher state are **rebuilt by replaying the committed chain** on
   restart or chain replacement. Any new automation state must be replayable the
   same way, or it will silently diverge after a sync.

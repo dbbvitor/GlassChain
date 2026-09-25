@@ -147,12 +147,155 @@ mod proof_arith {
         bitmap[byte] & mask != 0
     }
 
+    /// `true` when bit `bit < 8` is set in `byte` — the spec form of the
+    /// expansion's shift test.
+    pub open spec fn spec_bit_set(byte: u8, bit: int) -> bool {
+        byte & (1u8 << bit) != 0
+    }
+
+    /// The indices of one byte's set bits, ascending: `base + bit` for every
+    /// `bit < count` whose bit is set. `base` is the byte's first bit index in
+    /// the bitmap.
+    pub open spec fn spec_byte_bits(byte: u8, base: int, count: int) -> Seq<int>
+        decreases count,
+    {
+        if count <= 0 {
+            Seq::empty()
+        } else {
+            spec_byte_bits(byte, base, count - 1) + if spec_bit_set(byte, count - 1) {
+                seq![base + count - 1]
+            } else {
+                Seq::empty()
+            }
+        }
+    }
+
+    /// The exact set-bit indices of a bitmap, ascending — the model
+    /// [`expand_signers`] is proved equal to.
+    pub open spec fn spec_expand_signers(bitmap: Seq<u8>) -> Seq<int>
+        decreases bitmap.len(),
+    {
+        if bitmap.len() == 0 {
+            Seq::empty()
+        } else {
+            spec_expand_signers(bitmap.drop_last()) + spec_byte_bits(
+                bitmap.last(),
+                (bitmap.len() - 1) * 8,
+                8,
+            )
+        }
+    }
+
+    /// The expansion model of a partially scanned bitmap: every complete byte
+    /// plus the `bit` low bits of byte `byte`.
+    pub open spec fn spec_expand_partial(bitmap: Seq<u8>, byte: int, bit: int) -> Seq<int> {
+        spec_expand_signers(bitmap.take(byte)) + spec_byte_bits(bitmap[byte], byte * 8, bit)
+    }
+
+    /// `signers` is pointwise the model — the `usize` production vector
+    /// against the `int` model.
+    pub open spec fn spec_matches(signers: Seq<usize>, model: Seq<int>) -> bool {
+        signers.len() == model.len() && forall|i: int|
+            0 <= i < signers.len() ==> signers[i] as int == model[i]
+    }
+
+    /// The signer indices named by `bitmap`, ascending — exactly the set bits
+    /// (#176). The expansion feeds both the quorum count and the signer key
+    /// list, so a phantom index could admit a certificate with fewer real
+    /// signatures and a dropped index could reject a valid quorum.
+    ///
+    /// Proved `signers@` equals [`spec_expand_signers`]: soundness (only set
+    /// bits), strict ascent (no double-counted validator), the bitmap span
+    /// bound, and completeness (no set bit is truncated).
+    ///
+    /// The `requires` is the arithmetic bound that keeps `byte * 8 + bit`
+    /// representable; a bitmap above it cannot come off the wire (footprint
+    /// beyond the address space) and `verify_certificate` fails closed before
+    /// the call.
+    pub fn expand_signers(bitmap: &[u8]) -> (signers: Vec<usize>)
+        requires bitmap.len() <= usize::MAX / 8,
+        ensures spec_matches(signers@, spec_expand_signers(bitmap@)),
+    {
+        let mut signers: Vec<usize> = Vec::new();
+        let mut byte: usize = 0;
+        while byte < bitmap.len()
+            invariant
+                byte <= bitmap.len(),
+                bitmap.len() <= usize::MAX / 8,
+                spec_matches(signers@, spec_expand_signers(bitmap@.take(byte as int))),
+            decreases bitmap.len() - byte,
+        {
+            let mut bit: usize = 0;
+            while bit < 8
+                invariant
+                    bit <= 8,
+                    byte < bitmap.len(),
+                    bitmap.len() <= usize::MAX / 8,
+                    spec_matches(
+                        signers@,
+                        spec_expand_partial(bitmap@, byte as int, bit as int),
+                    ),
+                decreases 8 - bit,
+            {
+                let value = bitmap[byte];
+                let set = value & (1u8 << bit) != 0;
+                if set {
+                    assert(byte * 8 + bit <= usize::MAX) by (nonlinear_arith)
+                        requires
+                            bitmap.len() <= usize::MAX / 8,
+                            byte < bitmap.len(),
+                            bit <= 7,
+                    ;
+                    let index = byte * 8 + bit;
+                    signers.push(index);
+                }
+                bit += 1;
+            }
+            assert(bitmap@.take(byte as int + 1).len() == byte as int + 1);
+            assert(bitmap@.take(byte as int + 1).drop_last() == bitmap@.take(byte as int));
+            assert(bitmap@.take(byte as int + 1).last() == bitmap@[byte as int]);
+            assert(spec_expand_partial(bitmap@, byte as int, 8) == spec_expand_signers(
+                bitmap@.take(byte as int + 1),
+            ));
+            byte += 1;
+        }
+        assert(bitmap@.take(byte as int) == bitmap@);
+        signers
+    }
+
+    /// `true` exactly when every named validator index is inside the set of
+    /// `validator_count` validators.
+    pub open spec fn spec_signers_in_range(signers: Seq<usize>, validator_count: usize) -> bool {
+        forall|i: int| 0 <= i < signers.len() ==> signers[i] < validator_count
+    }
+
+    /// The range predicate `verify_certificate` uses to reject a bitmap that
+    /// names validators outside the set.
+    pub const fn signers_in_range(signers: &[usize], validator_count: usize) -> (in_range: bool)
+        ensures in_range == spec_signers_in_range(signers@, validator_count),
+    {
+        let mut i: usize = 0;
+        while i < signers.len()
+            invariant
+                i <= signers.len(),
+                forall|j: int| 0 <= j < i ==> signers@[j] < validator_count,
+            decreases signers.len() - i,
+        {
+            if signers[i] >= validator_count {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
         } // verus!
 }
 
 #[cfg(feature = "bft")]
 pub(crate) use proof_arith::{
-    bitmap_byte, bitmap_contains, bitmap_len, bitmap_mask, meets_quorum, quorum_threshold,
+    bitmap_byte, bitmap_contains, bitmap_len, bitmap_mask, expand_signers, meets_quorum,
+    quorum_threshold, signers_in_range,
 };
 
 /// One validator in the BFT validator set.
@@ -403,14 +546,19 @@ impl BftConsensusProvider {
         }
 
         // Bitmap: bit i = validators[i]. Bits beyond the set are malformed.
-        let signer_bits: Vec<usize> = certificate
-            .signers_bitmap
-            .iter()
-            .enumerate()
-            .flat_map(|(byte, bits)| (0..8).map(move |bit| (byte * 8 + bit, bits >> bit & 1 == 1)))
-            .filter(|(_, set)| *set)
-            .map(|(index, _)| index)
-            .collect();
+        // The expansion is proved (#176): it yields exactly the set bits,
+        // ascending, so the quorum counts distinct validators and cannot be
+        // inflated with a phantom index.
+        //
+        // The kernel's expansion bound is a hard requirement (bit-span
+        // arithmetic); a bitmap above it cannot come off the wire, so a peer
+        // claiming one fails closed here.
+        if certificate.signers_bitmap.len() > usize::MAX / 8 {
+            return Err(CoreError::InvalidBlock(
+                "bft: signer bitmap is too large to expand".into(),
+            ));
+        }
+        let signer_bits: Vec<usize> = expand_signers(&certificate.signers_bitmap);
         if !meets_quorum(signer_bits.len(), self.validator_count()) {
             return Err(CoreError::InvalidBlock(format!(
                 "bft: quorum {} not reached ({} validators in bitmap)",
@@ -418,10 +566,7 @@ impl BftConsensusProvider {
                 signer_bits.len()
             )));
         }
-        if signer_bits
-            .iter()
-            .any(|index| *index >= self.validators.len())
-        {
+        if !signers_in_range(&signer_bits, self.validators.len()) {
             return Err(CoreError::InvalidBlock(
                 "bft: certificate bitmap names validators outside the set".into(),
             ));

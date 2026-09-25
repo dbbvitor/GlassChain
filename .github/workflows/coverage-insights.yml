@@ -12,9 +12,29 @@ name: Coverage insights
 #   X25519MLKEM768 hybrid TLS dropped, so feature-coupled coverage gaps
 #   (e.g. the PoW-only paths in `node.rs`) are visible in the dashboard.
 #
-# Scheduled weekly (after `fuzz.yml`) and on demand; never on push/PR.
+# Runs per code PR/push (measured 5-11 minutes per job, inside the 30-minute
+# promotion rule) and keeps the weekly scheduled full run (wayfinder #166
+# re-evaluation). Every upload stays `joined: false`: the views are advisory
+# and never move the Codecov gate. Not diff-scopable by nature — the point is
+# the whole-workspace feature view.
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/**"
   schedule:
     - cron: "30 5 * * 1" # Weekly, Monday 05:30 UTC (after fuzz.yml 04:00)
   workflow_dispatch:

@@ -54,9 +54,10 @@ HOST := $(shell rustc -vV 2>/dev/null | sed -n 's/^host: //p')
 # `make mutants` scope; the CI full run shards all 12 crates.
 MUTANTS_PKG ?= glasschain-core
 
-# Mutation testing relinks once per mutant; use the `wild` linker when it is on
-# PATH (https://mutants.rs/performance.html — the CI jobs install it too).
-MUTANTS_RUSTFLAGS := $(strip $(RUSTFLAGS) $(shell command -v wild >/dev/null 2>&1 && echo -C link-arg=-fuse-ld=wild))
+# Mutation testing relinks once per mutant; append the preferred fast linker
+# (wild, else mold, selected through clang — the AGENTS.md/ADR-019 policy,
+# shared with the CI jobs through scripts/prefer-fast-linker.sh).
+MUTANTS_RUSTFLAGS := $(strip $(RUSTFLAGS) $(shell scripts/prefer-fast-linker.sh))
 
 # Miri: six-crate allowlist, strict flags, no leak exemption (ticket #153).
 MIRI_FLAGS := -Zmiri-disable-isolation -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check

@@ -37,16 +37,47 @@ a rename, a cfg attribute and a test helper, yet it selected 15 mutants in
 `WasmExecutionProvider::build_linker` and `<ShipOrderTransition as
 Transition<PurchaseFlowState>>::apply`.
 
-## `wild` needs an `ld.wild` symlink
+## `wild`: gcc rejects `-fuse-ld=wild` before 16.1, and the failure is silent
 
-`taiki-e/install-action` installs the `wild` binary (alias `wild-linker`) but
-not the `ld.wild` name gcc's `-fuse-ld=wild` resolves on PATH. The CI jobs
-create it (`ln -sf "$CARGO_HOME/bin/wild" "$CARGO_HOME/bin/ld.wild"`) before
-setting `RUSTFLAGS=-C link-arg=-fuse-ld=wild`. `-C linker=wild` alone fails
+`taiki-e/install-action` installs `wild`, and the old jobs created an
+`ld.wild` symlink for gcc's `-fuse-ld=wild`. Upstream
+(https://github.com/wild-linker/wild) documents that flag for **gcc 16.1+**;
+the GitHub runner's gcc rejects it (`cc: error: unrecognized command-line
+option '-fuse-ld=wild'; did you mean '-fuse-ld=gold'?`). Worse, cargo-mutants
+swallows the build failure: every mutant is marked **unviable**, the run exits
+0, and the PR diff gate reported SUCCESS while testing nothing — PR #175's
+Mutation (diff) had `total_mutants = 123`, `unviable = 123`,
+`caught = missed = timeout = 0`.
+
+Both mutation jobs now select wild through `scripts/prefer-fast-linker.sh`,
+which appends `-C linker=clang -C link-arg=--ld-path=<wild>` to `RUSTFLAGS` —
+clang's `--ld-path` works on any gcc. Never select it the old way with a bare
+`-fuse-ld=wild` under the runner's old gcc. `-C linker=wild` alone fails
 ("Couldn't find library `gcc_s`") because rustc then skips the gcc driver.
-`wild` changed the cache key: rust-cache does not hash `RUSTFLAGS` by default,
-so the jobs suffix their key with `-wild` or the cached artifacts never match
-the wild-linked fingerprints.
+
+Both gates now read `mutants.out/outcomes.json` and fail when
+`total_mutants > 0 && caught + missed + timeout == 0`, so a build-level
+failure can never pass as "no mutants". The wild-linked artifacts still need
+their own cache key (`-wild` suffix): rust-cache does not hash cargo-config
+rustflags, so a shared key would restore non-wild fingerprints.
+
+**Linker preference (project rule, AGENTS.md/ADR-019):** wild first; where
+the platform has no wild build (aarch64 Linux has no release artifact), fall
+back to `mold` (`clang -fuse-ld=mold`, clang resolves `ld.mold` on `PATH`).
+`scripts/prefer-fast-linker.sh` applies it to the mutation jobs and the Linux
+workspace-build jobs (`test`'s ubuntu leg, `coverage`, `cargo-careful`,
+ASan/LSan); `make mutants` does the same locally. The gain is largest for
+repeated relinks — that is the mutation workload — but the policy covers the
+Linux build jobs too.
+
+**Where it does not apply:** macOS and Windows (both tools link Linux ELF
+targets only — mold's `*-windows.zip` release asset is a Windows *host* build
+for linking ELF, and `rui314/setup-mold` is Linux-only; neither has a Mach-O
+or PE target), and jobs that never link natively — Miri (interpreter),
+Kani/CBMC (GOTO programs), Verus (verification conditions). Linux's default is
+already the bundled lld
+(`-B<sysroot>/lib/rustlib/<target>/bin/gcc-ld -fuse-ld=lld`), so per-job gains
+are small; the selector is cheap and consistent, not a measured necessity.
 
 ## timeouts fail too, and are fixed at the source
 

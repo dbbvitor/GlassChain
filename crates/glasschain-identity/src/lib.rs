@@ -66,7 +66,9 @@ pub mod possession;
 mod proofs;
 
 pub use cert_verifier::{CertChainVerifier, CertVerificationError, VerificationLevel};
-pub use channel::{default_retention_secs, Channel, ChannelConfig, DEFAULT_REGULATOR_ORGS};
+pub use channel::{
+    default_retention_secs, private_payload_allowed, Channel, ChannelConfig, DEFAULT_REGULATOR_ORGS,
+};
 pub use endorsement::{
     EndorsementEngine, EndorsementPolicy, EndorsementProposal, EndorsementResult,
     EndorsementSignature,

@@ -38,7 +38,98 @@ use crate::error::IdentityError;
 use glasschain_core::crypto::sha256;
 use glasschain_core::endorsement::PolicyExpression;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+
+/// Membership and the private-payload gate, proved in production form with
+/// Verus (ADR-019/#176). The member store is a `Vec<String>` (never a
+/// `HashSet`, whose lookup Verus cannot model): membership is a slice
+/// predicate, the TOFU precedent, and the gate is the proved conjunction that
+/// fails closed.
+mod channel_proofs {
+    use vstd::prelude::*;
+
+    verus! {
+
+    /// The membership predicate: `node_id` equals one of `members`.
+    pub open spec fn spec_contains_str(members: &[String], node_id: &str) -> bool {
+        exists|i: int| 0 <= i < members@.len() && #[trigger] members@[i]@ == node_id@
+    }
+
+    /// Slice membership over the channel's canonical member list; the shipped
+    /// [`super::Channel::is_member`] delegates here.
+    #[must_use]
+    pub fn contains_str(members: &[String], node_id: &str) -> (found: bool)
+        ensures found == spec_contains_str(members, node_id),
+    {
+        let mut i: usize = 0;
+        while i < members.len()
+            invariant
+                i <= members.len(),
+                forall|j: int| 0 <= j < i ==> #[trigger] members@[j]@ != node_id@,
+            decreases members.len() - i,
+        {
+            if members[i].as_str() == node_id {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// The private-payload gate: a peer's org may receive private payloads
+    /// only when a certificate verifier is configured, the org was
+    /// certificate-verified in this session, and the org is a channel member
+    /// (ADR-003, #86). The caller reduces its lookups to these three booleans.
+    pub open spec fn spec_private_payload_allowed(
+        verifier_present: bool,
+        org_verified: bool,
+        org_is_member: bool,
+    ) -> bool {
+        verifier_present && org_verified && org_is_member
+    }
+
+    /// Decide the private-payload gate from the extracted conditions.
+    #[must_use]
+    pub const fn private_payload_allowed(
+        verifier_present: bool,
+        org_verified: bool,
+        org_is_member: bool,
+    ) -> (allowed: bool)
+        ensures
+            allowed == spec_private_payload_allowed(verifier_present, org_verified, org_is_member),
+    {
+        verifier_present && org_verified && org_is_member
+    }
+
+    /// Fail closed: any missing condition denies private payloads.
+    pub proof fn missing_condition_denies_private_payloads(
+        verifier_present: bool,
+        org_verified: bool,
+        org_is_member: bool,
+    )
+        ensures
+            !verifier_present ==> !spec_private_payload_allowed(
+                verifier_present,
+                org_verified,
+                org_is_member,
+            ),
+            !org_verified ==> !spec_private_payload_allowed(
+                verifier_present,
+                org_verified,
+                org_is_member,
+            ),
+            !org_is_member ==> !spec_private_payload_allowed(
+                verifier_present,
+                org_verified,
+                org_is_member,
+            ),
+    {
+    }
+
+    } // verus!
+}
+
+use channel_proofs::contains_str;
+pub use channel_proofs::private_payload_allowed;
 
 /// Organizations that are policy-level members of **every** collection by
 /// default (ADR-003 decision 2).
@@ -96,8 +187,10 @@ pub struct Channel {
     /// Full payloads stored off-chain (in practice these would be encrypted
     /// and distributed only to channel members).
     private_data: Vec<PrivateDataEntry>,
-    /// Fast membership lookup.
-    member_set: HashSet<String>,
+    /// The effective member organizations (configured members plus the default
+    /// regulators). The source of truth for [`Self::is_member`]; kept as a
+    /// slice so the membership predicate is the proved kernel (ADR-019/#176).
+    members: Vec<String>,
 }
 
 /// An off-chain private data entry with an on-chain hash commitment.
@@ -119,15 +212,17 @@ impl Channel {
     /// decision 2), so [`Self::is_member`] accepts them without being listed.
     #[must_use]
     pub fn new(config: ChannelConfig) -> Self {
-        let mut member_set: HashSet<String> = config.member_ids.iter().cloned().collect();
+        let mut members: Vec<String> = config.member_ids.clone();
         for regulator in DEFAULT_REGULATOR_ORGS {
-            member_set.insert((*regulator).to_owned());
+            if !members.iter().any(|id| id == regulator) {
+                members.push((*regulator).to_owned());
+            }
         }
         Self {
             config,
             committed_hashes: Vec::new(),
             private_data: Vec::new(),
-            member_set,
+            members,
         }
     }
 
@@ -142,15 +237,16 @@ impl Channel {
     /// default regulators.
     #[must_use]
     pub fn member_orgs(&self) -> Vec<&str> {
-        let mut orgs: Vec<&str> = self.member_set.iter().map(String::as_str).collect();
+        let mut orgs: Vec<&str> = self.members.iter().map(String::as_str).collect();
         orgs.sort_unstable();
         orgs
     }
 
-    /// Return `true` if `node_id` is a member of this channel.
+    /// Return `true` if `node_id` is a member of this channel. The membership
+    /// predicate is the proved kernel (ADR-019/#176).
     #[must_use]
     pub fn is_member(&self, node_id: &str) -> bool {
-        self.member_set.contains(node_id)
+        contains_str(&self.members, node_id)
     }
 
     /// Submit private data to the channel.
@@ -200,10 +296,12 @@ impl Channel {
         &self.committed_hashes
     }
 
-    /// Add a new member to the channel.
+    /// Add a new member to the channel. Idempotent.
     pub fn add_member(&mut self, node_id: impl Into<String>) {
         let nid = node_id.into();
-        self.member_set.insert(nid.clone());
+        if !self.is_member(&nid) {
+            self.members.push(nid.clone());
+        }
         if !self.config.member_ids.contains(&nid) {
             self.config.member_ids.push(nid);
         }
@@ -216,7 +314,8 @@ impl Channel {
         if DEFAULT_REGULATOR_ORGS.contains(&node_id) {
             return false;
         }
-        let was_member = self.member_set.remove(node_id);
+        let was_member = self.is_member(node_id);
+        self.members.retain(|id| id != node_id);
         self.config.member_ids.retain(|id| id != node_id);
         was_member
     }

@@ -25,7 +25,9 @@
 
 #[cfg(feature = "bft")]
 use glasschain_core::BftConsensusProvider;
-use glasschain_core::{BftVote, EquivocationProof, VotePhase};
+use glasschain_core::{
+    receipt_action, should_retain, BftVote, EquivocationProof, ReceiptAction, VotePhase,
+};
 
 /// Rounds attempted per height before the driver gives up (dev knob).
 pub const MAX_ROUNDS: u32 = 4;
@@ -129,17 +131,26 @@ impl VoteReceipts {
     #[must_use]
     pub fn record(&mut self, vote: &BftVote) -> Option<EquivocationProof> {
         let key = (vote.height, vote.round, vote.phase, vote.public_key.clone());
-        match self.seen.get(&key) {
-            Some(first) if first.block_hash != vote.block_hash => Some(EquivocationProof {
-                height: vote.height,
-                round: vote.round,
-                phase: vote.phase,
-                public_key: vote.public_key.clone(),
-                first_vote: first.clone(),
-                second_vote: vote.clone(),
-            }),
-            Some(_) => None,
-            None => {
+        // The decision table is the proved kernel (ADR-019/#176): the first
+        // vote in a context inserts, a same-hash replay duplicates, and a
+        // different hash in the same context is the only equivocation.
+        let same_hash = self
+            .seen
+            .get(&key)
+            .map(|first| first.block_hash == vote.block_hash);
+        match receipt_action(same_hash.is_some(), same_hash.unwrap_or(false)) {
+            ReceiptAction::Equivocation => {
+                self.seen.get(&key).cloned().map(|first| EquivocationProof {
+                    height: vote.height,
+                    round: vote.round,
+                    phase: vote.phase,
+                    public_key: vote.public_key.clone(),
+                    first_vote: first,
+                    second_vote: vote.clone(),
+                })
+            }
+            ReceiptAction::Duplicate => None,
+            ReceiptAction::Insert => {
                 if self.seen.len() >= VOTE_RECEIPT_CAP && !self.evict_stale(vote.height) {
                     return None;
                 }
@@ -150,10 +161,12 @@ impl VoteReceipts {
     }
 
     /// Drop receipts for heights below `height` (a height is dead once we are
-    /// voting at least one height past it — current + previous retained).
+    /// voting at least one height past it — current + previous retained). The
+    /// retention predicate is the proved kernel (ADR-019/#176).
     pub fn retire_below(&mut self, height: u64) -> usize {
         let before = self.seen.len();
-        self.seen.retain(|(h, _, _, _), _| *h >= height);
+        self.seen
+            .retain(|(h, _, _, _), _| should_retain(*h, height));
         before - self.seen.len()
     }
 
@@ -161,7 +174,8 @@ impl VoteReceipts {
     /// whether anything was freed.
     fn evict_stale(&mut self, height: u64) -> bool {
         let before = self.seen.len();
-        self.seen.retain(|(h, _, _, _), _| *h >= height);
+        self.seen
+            .retain(|(h, _, _, _), _| should_retain(*h, height));
         self.seen.len() < before
     }
 }
@@ -188,17 +202,12 @@ pub struct BftPhaseTimings {
 
 /// Deterministic proposer for `(height, round)`: round-robin over the
 /// validator set's canonical order (ADR-009 — one org one slot, equal power).
+///
+/// The rotation arithmetic is the proved overflow-safe kernel (ADR-019/#176).
 #[cfg(feature = "bft")]
 #[must_use]
 pub fn proposer_index(validators: &BftConsensusProvider, height: u64, round: u32) -> usize {
-    // Deterministic round-robin; usize truncation is impossible for heights
-    // below 2^32 on 32-bit targets and unreachable on 64-bit — and a wrap
-    // would only shift the rotation, never break safety.
-    #[allow(clippy::cast_possible_truncation)]
-    let base = height as usize;
-    #[allow(clippy::cast_possible_truncation)]
-    let offset = round as usize;
-    (base + offset) % validators.validator_count().max(1)
+    glasschain_core::proposer_slot(height, round, validators.validator_count())
 }
 
 #[cfg(test)]

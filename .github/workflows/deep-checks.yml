@@ -1,12 +1,12 @@
 name: Deep checks
 
-# Scheduled Tier-3/Tier-4 analysis (wayfinder #166, policy from #147):
-# the full cargo-mutants run sharded 16 ways and ASan/LSan over the
-# workspace. Everything whose measured run fits the 30-minute guardrail —
-# Kani, Verus, Miri, turmoil and the ignored capacity/measurement gates —
-# lives in ci.yml and runs on every PR and push (ADR-019). No job blocks a
-# PR, so failures surface as the rolling `ci-failure` issue managed by
-# ci-failure-issues.yml.
+# Scheduled Tier-3 analysis (wayfinder #166, policy from #147): the full
+# cargo-mutants run sharded 16 ways. ASan/LSan was promoted to ci.yml after
+# the #166 re-evaluation measured it at 5m22s on a GitHub runner; the full
+# mutation run stays here because the 16 serial shards cover the whole
+# workspace (it cannot be diff-scoped, unlike the PR's `--in-diff` job in
+# analysis.yml). No job blocks a PR, so failures surface as the rolling
+# `ci-failure` issue managed by ci-failure-issues.yml.
 on:
   schedule:
     - cron: "17 2 * * *"
@@ -28,11 +28,8 @@ jobs:
     name: Mutation (shard ${{ matrix.shard }}/16)
     runs-on: ubuntu-latest
     # 2 256 mutants over 16 serial shards; the first cold shard dominates.
-    # `wild` (https://mutants.rs/performance.html) more than halves the
-    # per-mutant relinks, so it applies to the proof run and the shards alike.
+    # wild cuts the per-mutant relink for the proof run and the shards alike.
     timeout-minutes: 240
-    env:
-      RUSTFLAGS: -C link-arg=-fuse-ld=wild
     strategy:
       fail-fast: false
       matrix:
@@ -63,10 +60,13 @@ jobs:
         with:
           tool: cargo-mutants,cargo-nextest,wild
 
-      # gcc's `-fuse-ld=wild` resolves `ld.wild` on PATH; the release ships
-      # only `wild`.
-      - name: Expose wild as ld.wild
-        run: ln -sf "$CARGO_HOME/bin/wild" "$CARGO_HOME/bin/ld.wild"
+      # wild (https://wild-linker.github.io/wild) cuts the per-mutant relink.
+      # scripts/prefer-fast-linker.sh selects wild through clang (`--ld-path`):
+      # gcc only accepts `-fuse-ld=wild` from 16.1, and the runner image's gcc
+      # rejects it. It appends to RUSTFLAGS and falls back to mold where wild
+      # has no build (AGENTS.md / ADR-019).
+      - name: Select the preferred linker
+        run: scripts/prefer-fast-linker.sh
 
       # `--in-place` is what lets each mutant reuse the previous build; the
       # scratch copy (target included, so the rust-cache still pays off) keeps
@@ -104,6 +104,16 @@ jobs:
             echo "::error::cargo-mutants shard ${{ matrix.shard }} found $(wc -l < mutants.out/missed.txt) survivor(s) — catch/fix them, or add a reasoned exclude_re entry to .cargo/mutants.toml"
             exit 2
           fi
+          # A build-level failure marks every mutant unviable and
+          # cargo-mutants still exits 0 — found in the #166 re-evaluation,
+          # where the PR diff gate had silently tested nothing. Never pass a
+          # run that tested no mutants when the shard had candidates.
+          total=$(jq -r '.total_mutants // 0' mutants.out/outcomes.json 2>/dev/null || echo 0)
+          tested=$(jq -r '(.caught + .missed + .timeout) // 0' mutants.out/outcomes.json 2>/dev/null || echo 0)
+          if [ "$total" -gt 0 ] && [ "$tested" -eq 0 ]; then
+            echo "::error::cargo-mutants shard ${{ matrix.shard }} tested no mutants ($total unviable) — inspect mutants.out/log"
+            exit 1
+          fi
           exit "$code"
 
       # The whole `mutants.out` (outcomes.json, missed.txt and the per-mutant
@@ -116,40 +126,4 @@ jobs:
           path: ${{ runner.temp }}/mutants/mutants.out
           if-no-files-found: ignore
 
-  asan:
-    name: ASan/LSan
-    runs-on: ubuntu-latest
-    # Cold `-Zbuild-std` workspace build exceeds 50 minutes even on 8 cores.
-    timeout-minutes: 180
 
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Install Protoc
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Install nightly Rust with rust-src
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
-        with:
-          # Dated, not `nightly`: a moving toolchain invalidates the
-          # rust-cache every night (wayfinder #167).
-          toolchain: nightly-2026-09-20
-          components: rust-src
-
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          key: asan
-          shared-key: rust-cache
-          cache-on-failure: true
-
-      # Zero suppressions: leaks are failures (wayfinder #163).
-      - name: Run the suite under ASan/LSan
-        env:
-          RUSTFLAGS: -Zsanitizer=address
-          ASAN_OPTIONS: detect_leaks=1
-        run: >-
-          cargo +nightly-2026-09-20 test --workspace --lib --bins --tests --all-features --locked
-          -Zbuild-std --target x86_64-unknown-linux-gnu

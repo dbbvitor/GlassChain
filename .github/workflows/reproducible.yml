@@ -7,8 +7,28 @@ name: Reproducible build
 # The build command and SOURCE_DATE_EPOCH must match release.yml, otherwise
 # this proves reproducibility of a build the release never performs
 # (wayfinder #158/#167).
+#
+# Runs per code PR/push (measured ~10 minutes, inside the 30-minute promotion
+# rule) and keeps the weekly scheduled full run (wayfinder #166
+# re-evaluation). Not diff-scopable: it verifies the peak release build.
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/**"
   schedule:
     - cron: "0 5 * * 1" # Weekly, Monday 05:00 UTC
   workflow_dispatch:
