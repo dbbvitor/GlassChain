@@ -210,13 +210,13 @@ by `test_zero_required_never_evaluates_true`.
 
 - Verified with the pinned release `0.2026.09.24.b9416fa` (upgraded from
   `0.2026.09.20.aef82ed` on 2026-09-25; the newest release with x86-linux and
-  macOS assets). Verus 2026 releases isolate loop bodies: facts from outside a
-  loop are invisible inside it unless the loop invariant carries them — every
-  loop invariant in the proofs keeps its own bounds. `cargo verus verify -p glasschain-vm -p glasschain-core --all-features
-  --locked` (the `cargo_verus` guide's Verus-relevant Cargo options come
-  before the `--` separator). `make verus` adds `-- --expand-errors`;
-  `cargo verus focus` is the local iteration loop (skips deps).
-  `cargo verus verify -p glasschain-vm -p glasschain-core --all-features
+  macOS assets). The `vstd` crate stays at the newest published snapshot
+  (`0.0.0-2026-09-20-0158` — no newer snapshot is on crates.io), so the
+  binary and crate versions differ by design.
+- Verus 2026 releases isolate loop bodies: facts from outside a loop are
+  invisible inside it unless the loop invariant carries them — every loop
+  invariant in the proofs keeps its own bounds. `cargo verus verify -p
+  glasschain-vm -p glasschain-core -p glasschain-identity --all-features
   --locked` (the `cargo_verus` guide's Verus-relevant Cargo options come
   before the `--` separator). `make verus` adds `-- --expand-errors`;
   `cargo verus focus` is the local iteration loop (skips deps).

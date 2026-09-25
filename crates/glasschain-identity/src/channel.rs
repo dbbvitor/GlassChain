@@ -213,11 +213,12 @@ impl Channel {
     #[must_use]
     pub fn new(config: ChannelConfig) -> Self {
         let mut members: Vec<String> = config.member_ids.clone();
-        for regulator in DEFAULT_REGULATOR_ORGS {
-            if !members.iter().any(|id| id == regulator) {
-                members.push((*regulator).to_owned());
-            }
-        }
+        members.extend(DEFAULT_REGULATOR_ORGS.iter().map(|org| (*org).to_owned()));
+        // The old `HashSet` collapsed duplicates, including ones already in
+        // `config.member_ids`; the effective member list stays unique (and
+        // sorted) now that it is the membership source of truth.
+        members.sort_unstable();
+        members.dedup();
         Self {
             config,
             committed_hashes: Vec::new(),
@@ -376,6 +377,26 @@ mod tests {
         assert!(ch.is_member("fabricante-abc"));
         assert!(ch.is_member("farmacia-sul"));
         assert!(!ch.is_member("outsider"));
+    }
+
+    /// Duplicate listings (including one that repeats a default regulator)
+    /// collapse to one effective member: the member store is the membership
+    /// source of truth now, so it must behave like the `HashSet` it replaced.
+    #[test]
+    fn duplicate_member_listings_are_collapsed() {
+        let ch = Channel::new(ChannelConfig {
+            name: "dupes".into(),
+            member_ids: vec!["org-a".into(), "org-a".into(), "anvisa".into()],
+            description: String::new(),
+            endorsement_policy: None,
+            retention_secs: default_retention_secs(),
+        });
+        assert_eq!(
+            ch.member_orgs(),
+            vec!["anvisa", "mapa", "org-a"],
+            "the effective member list is unique and sorted"
+        );
+        assert!(ch.is_member("org-a"));
     }
 
     #[test]

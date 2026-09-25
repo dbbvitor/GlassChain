@@ -73,8 +73,10 @@ does not pay for the whole workspace:
 Nightly:
 
 - `deep-checks.yml`: the full mutants run over all 12 crates in 16 shards —
-  the one workload that stays schedule-only (whole-workspace by nature, and
-  a shard's repeated relinks exceed the promotion rule).
+  the one workload that stays schedule-only: whole-workspace by nature, and
+  each shard relinks per mutant (the local baseline measured `glasschain-core`
+  alone at 495 mutants / 33 minutes with `--jobs 8`; the next nightly records
+  per-shard timings, which will confirm or revisit the verdict).
 - `ci.yml` (`10 3` UTC): the full-workspace variants of every diff-scoped PR
   job — clippy, the three-OS test matrix, coverage, Kani, Verus, the
   six-crate Miri matrix, turmoil, ASan/LSan and the capacity gates. All

@@ -134,21 +134,18 @@ impl VoteReceipts {
         // The decision table is the proved kernel (ADR-019/#176): the first
         // vote in a context inserts, a same-hash replay duplicates, and a
         // different hash in the same context is the only equivocation.
-        let same_hash = self
-            .seen
-            .get(&key)
-            .map(|first| first.block_hash == vote.block_hash);
-        match receipt_action(same_hash.is_some(), same_hash.unwrap_or(false)) {
-            ReceiptAction::Equivocation => {
-                self.seen.get(&key).cloned().map(|first| EquivocationProof {
-                    height: vote.height,
-                    round: vote.round,
-                    phase: vote.phase,
-                    public_key: vote.public_key.clone(),
-                    first_vote: first,
-                    second_vote: vote.clone(),
-                })
-            }
+        let existing = self.seen.get(&key);
+        let same_hash = existing.map(|first| first.block_hash == vote.block_hash);
+        let first = existing.cloned();
+        match receipt_action(first.is_some(), same_hash.unwrap_or(false)) {
+            ReceiptAction::Equivocation => first.map(|first| EquivocationProof {
+                height: vote.height,
+                round: vote.round,
+                phase: vote.phase,
+                public_key: vote.public_key.clone(),
+                first_vote: first,
+                second_vote: vote.clone(),
+            }),
             ReceiptAction::Duplicate => None,
             ReceiptAction::Insert => {
                 if self.seen.len() >= VOTE_RECEIPT_CAP && !self.evict_stale(vote.height) {

@@ -529,6 +529,40 @@ jobs:
           RUSTFLAGS: -Zsanitizer=address
         run: scripts/prefer-fast-linker.sh
 
+      # Prove leak detection is actually armed before trusting a clean suite:
+      # a deliberately leaked allocation must fail this canary. LSan silently
+      # no-ops where its ptrace-based tracer cannot start, which would turn
+      # "zero suppressions" into zero coverage.
+      - name: Canary — LSan catches a deliberate leak
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          ASAN_OPTIONS: detect_leaks=1
+        run: |
+          mkdir -p "$RUNNER_TEMP/lsan-canary/src"
+          cat > "$RUNNER_TEMP/lsan-canary/Cargo.toml" <<'EOF'
+          [package]
+          name = "lsan-canary"
+          version = "0.0.0"
+          edition = "2021"
+          EOF
+          cat > "$RUNNER_TEMP/lsan-canary/src/main.rs" <<'EOF'
+          fn main() {
+              std::mem::forget(Box::new(42u8));
+          }
+          EOF
+          cd "$RUNNER_TEMP/lsan-canary"
+          log="$RUNNER_TEMP/lsan-canary.log"
+          if cargo +nightly-2026-09-20 run --quiet >"$log" 2>&1; then
+            echo "::error::LSan did not fail a deliberate leak — leak detection is not armed"
+            exit 1
+          fi
+          if ! grep -Eq "LeakSanitizer|leaked in" "$log"; then
+            echo "::error::expected a LeakSanitizer report"
+            cat "$log"
+            exit 1
+          fi
+          echo "LSan canary passed: the deliberate leak was caught."
+
       - name: Run the suite under ASan/LSan
         env:
           ASAN_OPTIONS: detect_leaks=1
