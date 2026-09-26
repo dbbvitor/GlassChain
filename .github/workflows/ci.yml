@@ -225,7 +225,7 @@ jobs:
       # allocator is per-process, so no collisions) and emits JUnit XML for
       # Codecov test analytics via the `ci` profile (.config/nextest.toml).
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
+        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
         with:
           tool: cargo-nextest
 
@@ -233,7 +233,7 @@ jobs:
       # the macOS/Windows legs (AGENTS.md / ADR-019 linker policy).
       - name: Install wild (preferred linker)
         if: runner.os == 'Linux'
-        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
+        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
         with:
           tool: wild
 
@@ -284,7 +284,7 @@ jobs:
           cache-on-failure: true
 
       - name: Install cargo-llvm-cov, cargo-nextest and wild
-        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
+        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
         with:
           tool: cargo-llvm-cov,cargo-nextest,wild
 
@@ -526,7 +526,7 @@ jobs:
           cache-on-failure: true
 
       - name: Install wild (preferred linker)
-        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
+        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
         with:
           tool: wild
 
