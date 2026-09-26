@@ -57,7 +57,7 @@ criterion = "0.8"
 # `blstrs`, so the bench's two comparison paths compile against one algebraic
 # generation (0.9 pulls ff/group 0.14 and duplicates the production stack).
 # Revisit together with the blstrs/bls-signatures line, not on its own.
-bls12_381 = { version = "0.8", features = ["experimental"] }
+bls12_381 = { version = "0.9", features = ["experimental"] }
 bls-signatures = { version = "0.15", default-features = false, features = ["blst"] }
 blstrs = { version = "0.7", default-features = false }
 group = { version = "0.13", default-features = false }
