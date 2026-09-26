@@ -131,6 +131,7 @@ allowed-duplicate-crates = [
     "socket2",
     "spki",
     "syn",
+    "synstructure",
     "thiserror",
     "thiserror-impl",
     "unsigned-varint",
