@@ -3,7 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-09-21
 **Revised:** 2026-09-24 — Kani and Verus moved to PR/push `ci.yml` jobs; Verus-first zero-trust assignment with the BFT quorum/bitmap, certificate-admission, TOFU pin, trust-score and MSP height-window slices proved; endorsement algebra deferred on both tools with evidence; autoharness deferral
-**Revised:** 2026-09-25 — #166 re-evaluation: ASan/LSan promoted to PR/push `ci.yml` (5m22s measured on a GitHub runner); the mutation gates select wild through `scripts/prefer-fast-linker.sh` and fail when a run tests no mutants; the wild→mold linker policy extended to the Linux workspace-build jobs; Verus pin bumped to `0.2026.09.24.b9416fa`; every measured sub-30-minute job now runs on PR/push, and `ci.yml` + `analysis.yml` add a nightly full-workspace sweep
+**Revised:** 2026-09-25 — #166 re-evaluation: ASan/LSan promoted to PR/push `ci.yml` (5m22s measured on a GitHub runner); the mutation gates select wild through `scripts/prefer-fast-linker.sh` and fail when a run tests no mutants; the wild→mold linker policy extended to the Linux workspace-build jobs; the Verus CI pin stays on the stable `0.2026.09.20.aef82ed` (rolling tags are deleted when the next nightly appears — the `0.2026.09.24.b9416fa` asset 404'd within a day — so they cannot be SHA-pinned); every measured sub-30-minute job now runs on PR/push, and `ci.yml` + `analysis.yml` add a nightly full-workspace sweep
 **Decision owner:** project owner
 **Relates to:**
 [ADR-015](adr-015-audited-c-crypto-backends.md) (audited backends / dependency evidence) ·

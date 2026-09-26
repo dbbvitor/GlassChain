@@ -400,17 +400,22 @@ jobs:
             exit 1
           fi
 
+      # The stable release, not `release/rolling`: rolling tags are deleted
+      # when the next one appears (the 2026-09-24 asset 404'd within a day),
+      # so they cannot be SHA-pinned. 0.2026.09.20.aef82ed is the newest
+      # immutable release and verifies the same proof set (43 + 2 + 9).
       - name: Install Verus
         run: |
-          curl -sSLo verus.zip \
-            https://github.com/verus-lang/verus/releases/download/release%2Frolling%2F0.2026.09.24.b9416fa/verus-0.2026.09.24.b9416fa-x86-linux.zip
-          echo "5d3df98fb0cefc3d11d3948220a65439b0002771a06fecabf98ecd74913c1312  verus.zip" | sha256sum -c -
+          curl -sSLfo verus.zip \
+            https://github.com/verus-lang/verus/releases/download/release%2F0.2026.09.20.aef82ed/verus-0.2026.09.20.aef82ed-x86-linux.zip
+          echo "7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33  verus.zip" | sha256sum -c -
           unzip -q verus.zip
           echo "$PWD/verus-x86-linux" >> "$GITHUB_PATH"
 
       # The zero-trust modules (#170): gas, BFT quorum/bitmap + certificate
-      # admission, TOFU pin, trust score, MSP height windows. More crates join
-      # as their annotations land.
+      # admission, TOFU pin, trust score, MSP height windows, the #176
+      # consensus-round kernels, channel membership and the private-payload
+      # gate. More crates join as their annotations land.
       - name: Verify the production proofs
         run: >-
           cargo verus verify -p glasschain-vm -p glasschain-core -p glasschain-identity

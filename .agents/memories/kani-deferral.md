@@ -209,11 +209,15 @@ by `test_zero_required_never_evaluates_true`.
   `vstd` is unconditional in `glasschain-core` (and now `glasschain-identity`)
   now that non-`bft` modules need it.
 
-- Verified with the pinned release `0.2026.09.24.b9416fa` (upgraded from
-  `0.2026.09.20.aef82ed` on 2026-09-25; the newest release with x86-linux and
-  macOS assets). The `vstd` crate stays at the newest published snapshot
-  (`0.0.0-2026-09-20-0158` — no newer snapshot is on crates.io), so the
-  binary and crate versions differ by design.
+- Verified with the pinned release `0.2026.09.20.aef82ed` (the newest
+  *immutable* release with x86-linux and macOS assets). The current rolling
+  release was tried locally and verifies the same proof set, but rolling tags
+  are deleted when the next nightly appears — the `0.2026.09.24.b9416fa`
+  asset 404'd within a day — so CI pins the stable release and downloads it
+  with `curl -f`, making a missing asset fail loudly instead of
+  checksum-mismatching on an error body. The `vstd` crate stays at the newest
+  published snapshot (`0.0.0-2026-09-20-0158` — no newer snapshot is on
+  crates.io), so the binary and crate versions differ by design.
 - Verus 2026 releases isolate loop bodies: facts from outside a loop are
   invisible inside it unless the loop invariant carries them — every loop
   invariant in the proofs keeps its own bounds. `cargo verus verify -p
