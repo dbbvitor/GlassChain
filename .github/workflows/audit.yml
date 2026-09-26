@@ -44,7 +44,7 @@ jobs:
           toolchain: 1.98.1
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2
+        uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2
         with:
           tool: cargo-audit
 
