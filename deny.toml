@@ -23,17 +23,33 @@ ignore = [
 
 [bans]
 multiple-versions = "deny"
-# Duplicated names tolerated today, ported from clippy.toml's
-# allowed-duplicate-crates (which lists two inert extras, pruned there).
+# The production graph's unavoidable duplicates (upstream-pinned
+# generation splits: RustCrypto 0.9/0.10/0.11 lines, rand 0.8/0.10,
+# ring's getrandom/windows-sys, hashbrown/foldhash, syn 2/3, and the
+# bls-signatures thiserror 1). Keep this list equal to what
+# `cargo deny --all-features check bans` actually reports: a plain
+# `cargo update` that reintroduces a duplicate must re-pin deliberately.
 skip = [
-    "base64", "block-buffer", "chacha20", "cpufeatures", "crypto-common",
-    "curve25519-dalek", "digest", "fiat-crypto", "foldhash", "getrandom",
-    "hashbrown", "r-efi", "rand", "rand_core", "sha2", "syn", "synstructure",
-    "thiserror", "thiserror-impl", "wasm-encoder", "windows-sys",
+    "base64",
+    "block-buffer",
+    "chacha20",
+    "cpufeatures",
+    "crypto-common",
+    "curve25519-dalek",
+    "digest",
+    "fiat-crypto",
+    "foldhash",
+    "getrandom",
+    "hashbrown",
+    "rand",
+    "rand_core",
+    "r-efi",
+    "sha2",
+    "syn",
+    "thiserror",
+    "thiserror-impl",
+    "windows-sys",
 ]
-# `synstructure`: yoke-derive 0.8.3 (ICU/idna chain) moved to 0.14 while the
-# dev-only asn1-rs-derive 0.6 (x509-parser test chain) still needs 0.13.
-# Both are proc-macro helpers; drop this entry when asn1-rs-derive updates.
 # Intra-workspace path dependencies carry `version = "0.1.0"`; the flag stays
 # on for any future path-only dependency.
 wildcards = "deny"

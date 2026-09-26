@@ -28,7 +28,10 @@ vstd = "=0.0.0-2026-09-20-0158"
 verify = true
 
 [dev-dependencies]
-wat = "1.258"
+# Kept on the wasmtime 48 line (`wast 254` / `wasm-encoder 0.254`) so the
+# test-only WAT parser does not duplicate wasm-encoder; bump together with
+# wasmtime, not on its own.
+wat = "~1.254"
 criterion = "0.8"
 
 [[bench]]
