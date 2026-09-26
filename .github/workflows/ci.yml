@@ -366,7 +366,7 @@ jobs:
         # Forks and private repos may not have code scanning enabled; the
         # SARIF upload must never mask a failing (or passing) proof gate.
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@1190a975f95ce23525efb6a3fc21ea29567c1b52 # v3
+        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
         with:
           sarif_file: kani.sarif
 
