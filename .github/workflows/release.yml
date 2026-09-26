@@ -63,6 +63,13 @@ jobs:
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          # The v4 installer defaults to cosign v3, whose `sign-blob` emits a
+          # bundle instead of `--output-signature`/`--output-certificate`. The
+          # signing steps below are written for the v2 interface, so the v2
+          # line is pinned explicitly; migrating to bundles is a deliberate
+          # release-contract change, not a dependency bump.
+          cosign-release: v2.6.5
 
       # A tag that disagrees with the crate versions would publish binaries
       # whose `--version` lies about the release.
