@@ -56,7 +56,7 @@ turmoil      = { version = "0.7.2", optional = true }
 [dev-dependencies]
 env_logger   = "0.11"
 x509-parser  = "0.18"
-wat          = "~1.254"
+wat          = "~1.259"
 tempfile     = "3"
 # BLS keys for the bft_finality scenario (cfg-gated with the bft feature).
 bls-signatures = { version = "0.15", default-features = false, features = ["blst"] }

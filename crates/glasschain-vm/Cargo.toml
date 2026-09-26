@@ -31,7 +31,7 @@ verify = true
 # Kept on the wasmtime 48 line (`wast 254` / `wasm-encoder 0.254`) so the
 # test-only WAT parser does not duplicate wasm-encoder; bump together with
 # wasmtime, not on its own.
-wat = "~1.254"
+wat = "~1.259"
 criterion = "0.8"
 
 [[bench]]

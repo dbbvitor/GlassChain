@@ -17,7 +17,7 @@ thiserror  = "2.0"
 log        = "0.4"
 base64     = "0.23"
 # test_wasm fixtures compile WAT at runtime; other crates' tests consume them.
-wat        = "~1.254"
+wat        = "~1.259"
 
 [dev-dependencies]
 glasschain-vm = { version = "0.1.0", path = "../glasschain-vm" }
