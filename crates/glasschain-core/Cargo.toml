@@ -26,11 +26,14 @@ bls-signatures = { version = "0.15", default-features = false, features = [
 ], optional = true }
 # Same-message multisig verify (ADR-014): `bls-signatures` ships only the
 # distinct-message aggregate verify, so the pairings run over `blstrs`
-# directly (ADR-015). `group`/`pairing` are blstrs' version-matched algebraic
-# trait crates.
+# directly (ADR-015). `group` is blstrs' version-matched algebraic trait crate
+# and stays on the 0.13 line until `blstrs`/`bls-signatures` move — their
+# latest releases still require `group ^0.13` / `pairing ^0.23`, so a solo
+# bump only duplicates the algebraic stack (`deny.toml` bans duplicates).
+# `pairing` itself is never named in production code; the bench keeps its own
+# dev-dependency.
 blstrs = { version = "0.7", default-features = false, optional = true }
 group = { version = "0.13", default-features = false, optional = true }
-pairing = { version = "0.23", default-features = false, optional = true }
 # Verus's standard library. The TOFU pin transition and the BFT
 # quorum/bitmap kernels are proved against it; in normal (non-Verus) builds
 # it compiles to erased ghost code (ADR-019: Verus first on zero-trust, #170).
@@ -41,7 +44,7 @@ default = []
 # Tendermint-class BFT consensus behind the seam (ticket #42). Default-off:
 # Proof-of-Work remains the dev/test driver. Pulls ed25519-dalek for real
 # validator attestations.
-bft = ["dep:bls-signatures", "dep:blstrs", "dep:group", "dep:pairing"]
+bft = ["dep:bls-signatures", "dep:blstrs", "dep:group"]
 
 [package.metadata.verus]
 verify = true

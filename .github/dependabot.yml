@@ -9,6 +9,17 @@ updates:
     directory: "/" # Location of package manifests
     schedule:
       interval: "weekly"
+    ignore:
+      # `blstrs 0.7.1` and `bls-signatures 0.15.0` (both latest) still require
+      # `ff/group ^0.13` and `pairing ^0.23`, so bumping these two alone
+      # duplicates the algebraic stack (`deny.toml` bans duplicates) and
+      # breaks the `bft_verify` bench's trait imports (PRs #138, #177).
+      # Remove the ignores when a blstrs/bls-signatures release moves to the
+      # 0.14/0.24 line; the blstrs bump PR is the signal.
+      - dependency-name: "group"
+        versions: ["0.14.x"]
+      - dependency-name: "pairing"
+        versions: ["0.24.x"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
